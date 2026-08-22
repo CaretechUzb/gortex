@@ -59,6 +59,23 @@ func (c *Catalog) execGuarded(ctx context.Context, subject string, query string,
 	return nil
 }
 
+// execGuardedTx is execGuarded inside an open transaction, for a transition
+// whose compare-and-set has to stand or fall with the other rows it writes.
+func execGuardedTx(ctx context.Context, tx *sql.Tx, subject string, query string, args ...any) error {
+	result, err := tx.ExecContext(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed == 0 {
+		return fmt.Errorf("%w: %s", ErrCatalogStaleGuard, subject)
+	}
+	return nil
+}
+
 // deleteOne runs a delete addressed at a single row and reports a no-op as
 // ErrCatalogNotFound, so a caller can tell "it was already gone" from "the
 // statement failed" without inspecting driver errors.
@@ -1547,13 +1564,21 @@ UPDATE ref_views
 		req.DesiredTree, req.DesiredBuildFingerprint, req.RefViewID)
 }
 
-// AdoptRefViewGeneration points a ref view at a finished build's generation.
+// AdoptRefViewGeneration points a ref view at a finished build's generation
+// and closes the attempt that produced it, in one transaction.
 //
 // The guard is the epoch the build captured plus the tree and fingerprint it
 // was built for, so a view that moved while the build ran adopts nothing and
 // reports ErrCatalogStaleGuard. The epoch is bumped on success for the same
 // reason a route flip bumps it: whatever else was in flight against this view
 // has just been overtaken.
+//
+// A named claim is guarded the same way and in the same transaction: an
+// attempt reclaimed as abandoned while its worker was still running has left
+// the building state, so its late adoption is refused rather than published
+// behind the successor that now owns the slot — and an adoption the view
+// refuses leaves the attempt open instead of recording a publish that did not
+// happen.
 func (c *Catalog) AdoptRefViewGeneration(ctx context.Context, req AdoptRefViewGenerationRequest) error {
 	if err := requireCatalogID("ref_view_id", req.RefViewID); err != nil {
 		return err
@@ -1561,8 +1586,24 @@ func (c *Catalog) AdoptRefViewGeneration(ctx context.Context, req AdoptRefViewGe
 	if req.GenerationID <= 0 {
 		return fmt.Errorf("%w: generation_id %d", ErrCatalogInvalidValue, req.GenerationID)
 	}
-	return c.execGuarded(ctx,
-		fmt.Sprintf("ref view %s at epoch %d", req.RefViewID, req.ExpectedRouteEpoch), `
+	if req.BuildID != "" {
+		if err := requireCatalogID("build_token", req.BuildToken); err != nil {
+			return err
+		}
+	}
+	return c.withTx(ctx, func(tx *sql.Tx) error {
+		if req.BuildID != "" {
+			err := execGuardedTx(ctx, tx, fmt.Sprintf("ref view build %s", req.BuildID), `
+UPDATE ref_view_builds SET state = ?, generation_id = ?, last_progress = ?, error = ''
+ WHERE build_id = ? AND build_token = ? AND state = ?`,
+				string(ViewGenerationReady), req.GenerationID, req.LastProgress,
+				req.BuildID, req.BuildToken, string(ViewGenerationBuilding))
+			if err != nil {
+				return err
+			}
+		}
+		return execGuardedTx(ctx, tx,
+			fmt.Sprintf("ref view %s at epoch %d", req.RefViewID, req.ExpectedRouteEpoch), `
 UPDATE ref_views
    SET active_generation_id = ?, active_ref = ?, active_commit = ?, active_tree = ?,
        active_build_fingerprint = ?, state = ?, exact_view = ?,
@@ -1570,12 +1611,13 @@ UPDATE ref_views
        route_epoch = route_epoch + 1
  WHERE ref_view_id = ? AND route_epoch = ?
    AND desired_tree = ? AND desired_build_fingerprint = ?`,
-		req.GenerationID, catalogNullString(req.ActiveRef), catalogNullString(req.ActiveCommit),
-		catalogNullString(req.ActiveTree), catalogNullString(req.ActiveBuildFingerprint),
-		string(RefViewReady), catalogBoolInt(req.ExactView),
-		req.LastResolved, req.LastSelected,
-		req.RefViewID, req.ExpectedRouteEpoch,
-		req.ExpectedDesiredTree, req.ExpectedDesiredBuildFingerprint)
+			req.GenerationID, catalogNullString(req.ActiveRef), catalogNullString(req.ActiveCommit),
+			catalogNullString(req.ActiveTree), catalogNullString(req.ActiveBuildFingerprint),
+			string(RefViewReady), catalogBoolInt(req.ExactView),
+			req.LastResolved, req.LastSelected,
+			req.RefViewID, req.ExpectedRouteEpoch,
+			req.ExpectedDesiredTree, req.ExpectedDesiredBuildFingerprint)
+	})
 }
 
 // TouchRefViewSelection re-stamps the ref and commit a selection observed, and
@@ -1866,6 +1908,27 @@ UPDATE ref_view_builds SET state = ?, generation_id = ?, last_progress = ?, erro
  WHERE build_id = ? AND build_token = ? AND state = ?`,
 		string(req.State), catalogNullInt(req.GenerationID), req.LastProgress, req.Error,
 		req.BuildID, req.BuildToken, string(ViewGenerationBuilding))
+}
+
+// TouchRefViewBuild stamps progress on one attempt that is still running.
+//
+// The liveness cutoff ClaimRefViewBuild applies reads last_progress and
+// nothing else, so this is the only thing that tells a slow build from a dead
+// one. The guard is the claim's: an attempt is stamped by the worker holding
+// it, and only while it is still in the building state — re-stamping a
+// finished or reclaimed attempt would resurrect a claim the coalescing index
+// has already released.
+func (c *Catalog) TouchRefViewBuild(ctx context.Context, buildID, buildToken string, lastProgress int64) error {
+	if err := requireCatalogID("build_id", buildID); err != nil {
+		return err
+	}
+	if err := requireCatalogID("build_token", buildToken); err != nil {
+		return err
+	}
+	return c.execGuarded(ctx, fmt.Sprintf("ref view build %s", buildID), `
+UPDATE ref_view_builds SET last_progress = ?
+ WHERE build_id = ? AND build_token = ? AND state = ?`,
+		lastProgress, buildID, buildToken, string(ViewGenerationBuilding))
 }
 
 // ListRefViewBuilds returns every attempt recorded for one ref view, oldest

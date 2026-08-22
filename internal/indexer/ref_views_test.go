@@ -32,6 +32,11 @@ import (
 // second has to overtake it. A synctest bubble would virtualise time that no
 // assertion here depends on, around real git subprocesses and a real SQLite
 // writer that it cannot virtualise at all.
+//
+// The few tests that DO depend on a window narrow the manager's own windows
+// instead, for the same reason: the pass under them is real, and last_progress
+// is unix seconds, so a virtual clock would have to advance a stamp the
+// database writes for itself.
 
 type refViewFixture struct {
 	t *testing.T
@@ -160,17 +165,71 @@ func (f *refViewFixture) setRef(ref, oid string) {
 
 func (f *refViewFixture) manager(t *testing.T, barrier func()) *RefViewManager {
 	t.Helper()
-	manager, err := NewRefViewManager(RefViewManagerConfig{
+	return f.managerTuned(t, barrier, nil)
+}
+
+// managerTuned builds a manager whose build timings the caller may narrow.
+// The production windows are minutes wide, which is exactly what a test that
+// drives them cannot wait for.
+func (f *refViewFixture) managerTuned(t *testing.T, barrier func(), tune func(*RefViewManagerConfig)) *RefViewManager {
+	t.Helper()
+	cfg := RefViewManagerConfig{
 		Store:        f.store,
 		Builder:      builderNewBuilder(f.store),
 		Config:       config.Default().Index,
 		Logger:       zap.NewNop(),
 		buildBarrier: barrier,
-	})
+	}
+	if tune != nil {
+		tune(&cfg)
+	}
+	manager, err := NewRefViewManager(cfg)
 	if err != nil {
 		t.Fatalf("NewRefViewManager: %v", err)
 	}
 	return manager
+}
+
+// viewID is the catalog id a request for one ref lands on.
+func (f *refViewFixture) viewID(ref string) string {
+	req := f.request(ref)
+	req.EnrichmentProfile = defaultEnrichmentProfile
+	return refViewID(req)
+}
+
+// awaitBuildState waits for a view's single attempt to reach one state. A
+// build detached from its request finishes on its own goroutine, so the only
+// thing a test can wait on is the row it closes.
+func (f *refViewFixture) awaitBuildState(refViewID string, want store_sqlite.ViewGenerationState) {
+	f.t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		rows := f.builds(refViewID)
+		if len(rows) == 1 && rows[0].State == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			f.t.Fatalf("build rows = %+v, want one attempt in state %q", rows, want)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// awaitBuildProgress waits for a view's single attempt to report progress at
+// or past one stamp.
+func (f *refViewFixture) awaitBuildProgress(refViewID string, want int64) {
+	f.t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		rows := f.builds(refViewID)
+		if len(rows) == 1 && rows[0].LastProgress >= want {
+			return
+		}
+		if time.Now().After(deadline) {
+			f.t.Fatalf("build rows = %+v, want one attempt reporting progress at or past %d", rows, want)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func (f *refViewFixture) request(ref string) RefViewRequest {
@@ -397,56 +456,299 @@ func TestRefViewCoalescesConcurrentSelections(t *testing.T) {
 	}
 }
 
-// TestRefViewCanceledRequestDoesNotWedgeTheView pins what a claim must never
-// outlive: the request that made it. A client that gives up mid-build leaves
-// the attempt behind, and the coalescing index treats any attempt still in the
-// building state as the live claim — so an attempt the canceled request failed
-// to close would hand every later selection of that tree a build nobody is
-// running, and a commit or tag selector's tree never moves to break the tie.
-func TestRefViewCanceledRequestDoesNotWedgeTheView(t *testing.T) {
+// TestRefViewBuildOutlivesACanceledRequest pins what a build must never be
+// owned by: the request that started it. A tool deadline is tens of seconds
+// and a build over a large tree is not, so a build bound to the request ctx is
+// killed exactly when it was most expensive — and the attempt it was holding
+// dies with it, taking every selection that coalesced onto it.
+//
+// The request keeps only the wait. It answers with the build to poll, and the
+// pass runs to publication on the daemon's own context for whoever asks next.
+func TestRefViewBuildOutlivesACanceledRequest(t *testing.T) {
 	f := newRefViewFixture(t)
 	commitB, treeB := f.commitTree(builderTreeB(), "B")
 	f.setRef("refs/heads/feature", commitB)
+	viewID := f.viewID("refs/heads/feature")
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	parked, release := make(chan struct{}), make(chan struct{})
 	var builds atomic.Int64
 	manager := f.manager(t, func() {
 		if builds.Add(1) == 1 {
-			cancel()
+			close(parked)
+			<-release
 		}
 	})
 
-	abandoned, err := manager.EnsureRefView(ctx, f.request("refs/heads/feature"))
-	if err == nil {
-		t.Fatal("a selection whose request was canceled mid-build succeeded")
-	}
-	rows := f.builds(abandoned.RefViewID)
-	if len(rows) != 1 {
-		t.Fatalf("%d build rows, want the canceled selection's one: %+v", len(rows), rows)
-	}
-	if rows[0].State == store_sqlite.ViewGenerationBuilding {
-		t.Fatalf("the canceled request left its attempt claimed: %+v", rows[0])
-	}
-	dead := rows[0].BuildToken
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var (
+		wg        sync.WaitGroup
+		abandoned RefViewResult
+		abandErr  error
+	)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		abandoned, abandErr = manager.EnsureRefView(ctx, f.request("refs/heads/feature"))
+	}()
 
-	// The retry is a fresh request, and it must be able to build: nothing is
-	// running the attempt the cancellation left behind.
-	retry, err := manager.EnsureRefView(context.Background(), f.request("refs/heads/feature"))
+	<-parked
+	cancel()
+	wg.Wait()
+
+	if abandErr != nil {
+		t.Fatalf("a selection whose client gave up mid-build: %v", abandErr)
+	}
+	if abandoned.State != store_sqlite.RefViewBuilding || abandoned.BuildToken == "" {
+		t.Fatalf("selection = %+v, want a building answer naming the build to poll", abandoned)
+	}
+	rows := f.builds(viewID)
+	if len(rows) != 1 || rows[0].State != store_sqlite.ViewGenerationBuilding {
+		t.Fatalf("build rows = %+v, want the claim still held by the detached pass", rows)
+	}
+	if rows[0].BuildToken != abandoned.BuildToken {
+		t.Fatalf("selection named token %q, want the running build's %q",
+			abandoned.BuildToken, rows[0].BuildToken)
+	}
+
+	// The cancellation took the client, not the pass: releasing it publishes.
+	close(release)
+	f.awaitBuildState(viewID, store_sqlite.ViewGenerationReady)
+
+	next, err := manager.EnsureRefView(context.Background(), f.request("refs/heads/feature"))
 	if err != nil {
-		t.Fatalf("retry after a canceled selection: %v", err)
+		t.Fatalf("selection after the canceled one: %v", err)
 	}
-	if retry.State != store_sqlite.RefViewReady || !retry.Built {
-		t.Fatalf("retry = %+v, want a view it built itself", retry)
+	if next.State != store_sqlite.RefViewReady || next.Built {
+		t.Fatalf("selection = %+v, want the detached build's view served without a second pass", next)
 	}
-	if retry.BuildToken == dead {
-		t.Fatalf("the retry was handed the canceled attempt's token %q", dead)
+	if next.Resolved.TreeOID != treeB {
+		t.Fatalf("selection resolved %+v, want tree %s", next.Resolved, treeB)
 	}
-	if retry.Resolved.TreeOID != treeB {
-		t.Fatalf("retry resolved %+v, want tree %s", retry.Resolved, treeB)
+	if n := builds.Load(); n != 1 {
+		t.Fatalf("%d build passes ran, want the one the canceled request started", n)
 	}
-	if view := f.view(retry.RefViewID); view.ActiveGenerationID != retry.GenerationID {
-		t.Fatalf("ref view = %+v, want it serving generation %d", view, retry.GenerationID)
+	if view := f.view(viewID); view.ActiveGenerationID != next.GenerationID {
+		t.Fatalf("ref view = %+v, want it serving generation %d", view, next.GenerationID)
+	}
+	if generations := f.generations(); len(generations) != 1 {
+		t.Fatalf("%d generations, want the detached build's one: %+v", len(generations), generations)
+	}
+}
+
+// TestRefViewSelectionAnswersBuildingPastItsGrace pins the request-side bound.
+// A selection waits out a short grace for the build it claimed — long enough
+// that a trivial view still answers synchronously — and then hands back the
+// token instead of holding the request open for the whole pass.
+func TestRefViewSelectionAnswersBuildingPastItsGrace(t *testing.T) {
+	f := newRefViewFixture(t)
+	commitB, _ := f.commitTree(builderTreeB(), "B")
+	f.setRef("refs/heads/feature", commitB)
+	viewID := f.viewID("refs/heads/feature")
+
+	parked, release := make(chan struct{}), make(chan struct{})
+	var builds atomic.Int64
+	manager := f.managerTuned(t, func() {
+		if builds.Add(1) == 1 {
+			close(parked)
+			<-release
+		}
+	}, func(cfg *RefViewManagerConfig) { cfg.buildGrace = 20 * time.Millisecond })
+
+	result, err := manager.EnsureRefView(context.Background(), f.request("refs/heads/feature"))
+	if err != nil {
+		t.Fatalf("selection: %v", err)
+	}
+	if result.State != store_sqlite.RefViewBuilding || result.Built {
+		t.Fatalf("selection = %+v, want a building answer from a pass it did not wait out", result)
+	}
+	if result.BuildToken == "" {
+		t.Fatal("a building answer named no build to poll")
+	}
+
+	<-parked
+	rows := f.builds(viewID)
+	if len(rows) != 1 || rows[0].BuildToken != result.BuildToken {
+		t.Fatalf("build rows = %+v, want the one attempt the answer named (%q)", rows, result.BuildToken)
+	}
+
+	close(release)
+	f.awaitBuildState(viewID, store_sqlite.ViewGenerationReady)
+
+	next, err := manager.EnsureRefView(context.Background(), f.request("refs/heads/feature"))
+	if err != nil {
+		t.Fatalf("selection after the grace expired: %v", err)
+	}
+	if next.State != store_sqlite.RefViewReady || next.Built || next.GenerationID == 0 {
+		t.Fatalf("selection = %+v, want the finished build's view served as it stands", next)
+	}
+	if n := builds.Load(); n != 1 {
+		t.Fatalf("%d build passes ran, want the one the first selection started", n)
+	}
+}
+
+// TestRefViewHeartbeatKeepsASlowBuildClaimed pins the difference between a
+// slow build and a dead one. The liveness cutoff reads last_progress, and a
+// claim stamped only when it was made looks abandoned to every selection that
+// arrives a window later — so a build that merely takes a while is reclaimed
+// while it is still running, and the duplicate races the original to publish.
+//
+// The windows are narrowed rather than virtualised: last_progress is unix
+// seconds, and the pass under it is real git plumbing against a real SQLite
+// writer, neither of which a synctest bubble can advance a clock through.
+func TestRefViewHeartbeatKeepsASlowBuildClaimed(t *testing.T) {
+	f := newRefViewFixture(t)
+	commitB, _ := f.commitTree(builderTreeB(), "B")
+	f.setRef("refs/heads/feature", commitB)
+	viewID := f.viewID("refs/heads/feature")
+
+	parked, release := make(chan struct{}), make(chan struct{})
+	var builds atomic.Int64
+	manager := f.managerTuned(t, func() {
+		if builds.Add(1) == 1 {
+			close(parked)
+			<-release
+		}
+	}, func(cfg *RefViewManagerConfig) {
+		cfg.buildLiveness = 2 * time.Second
+		cfg.buildHeartbeat = 100 * time.Millisecond
+		cfg.buildGrace = time.Minute
+	})
+
+	ctx := context.Background()
+	var (
+		wg     sync.WaitGroup
+		winner RefViewResult
+		winErr error
+	)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		winner, winErr = manager.EnsureRefView(ctx, f.request("refs/heads/feature"))
+	}()
+	<-parked
+
+	claimed := f.builds(viewID)
+	if len(claimed) != 1 {
+		t.Fatalf("%d build rows while one pass is parked: %+v", len(claimed), claimed)
+	}
+	// Wait until the parked claim reports progress from well past the window
+	// it was claimed in. Nothing else stamps it, so this is where a build that
+	// only ever stamps its claim time stops.
+	f.awaitBuildProgress(viewID, claimed[0].LastProgress+3)
+
+	loser, err := manager.EnsureRefView(ctx, f.request("refs/heads/feature"))
+	if err != nil {
+		t.Fatalf("selection over a live but slow build: %v", err)
+	}
+	if loser.State != store_sqlite.RefViewBuilding || loser.BuildToken != claimed[0].BuildToken {
+		t.Fatalf("selection = %+v, want it coalesced onto the running build %q",
+			loser, claimed[0].BuildToken)
+	}
+	if rows := f.builds(viewID); len(rows) != 1 {
+		t.Fatalf("%d build rows, want the one claim nobody was allowed to reclaim: %+v", len(rows), rows)
+	}
+
+	close(release)
+	wg.Wait()
+	if winErr != nil {
+		t.Fatalf("the parked selection: %v", winErr)
+	}
+	if winner.State != store_sqlite.RefViewReady || !winner.Built {
+		t.Fatalf("the parked selection = %+v, want it to have published its own pass", winner)
+	}
+	if n := builds.Load(); n != 1 {
+		t.Fatalf("%d build passes ran, want the one that was never reclaimed", n)
+	}
+	if generations := f.generations(); len(generations) != 1 {
+		t.Fatalf("%d generations, want the one build's: %+v", len(generations), generations)
+	}
+}
+
+// TestRefViewReclaimedBuildDoesNotPublish pins what losing a claim costs the
+// build that lost it. A pass whose slot was taken over is no longer the one
+// the view is waiting on, and adopting behind its successor would publish a
+// payload nobody asked for over one somebody did — so the finished generation
+// is superseded and the answer is a retry.
+func TestRefViewReclaimedBuildDoesNotPublish(t *testing.T) {
+	f := newRefViewFixture(t)
+	commitB, _ := f.commitTree(builderTreeB(), "B")
+	f.setRef("refs/heads/feature", commitB)
+	viewID := f.viewID("refs/heads/feature")
+
+	parked, release := make(chan struct{}), make(chan struct{})
+	var builds atomic.Int64
+	manager := f.managerTuned(t, func() {
+		if builds.Add(1) == 1 {
+			close(parked)
+			<-release
+		}
+	}, func(cfg *RefViewManagerConfig) {
+		// The reclaim below is the test's decision, so nothing may stamp the
+		// row back to life underneath it.
+		cfg.buildHeartbeat = time.Hour
+		cfg.buildGrace = time.Minute
+	})
+
+	var (
+		wg       sync.WaitGroup
+		outdated RefViewResult
+		outErr   error
+	)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		outdated, outErr = manager.EnsureRefView(context.Background(), f.request("refs/heads/feature"))
+	}()
+	<-parked
+
+	// What a claimant that decided this pass was dead does to it: fail the row
+	// and take the slot. The cutoff is in the future so the reclaim is the
+	// test's rather than the wall clock's.
+	claimed := f.builds(viewID)
+	if len(claimed) != 1 {
+		t.Fatalf("%d build rows while one pass is parked: %+v", len(claimed), claimed)
+	}
+	successor := claimed[0]
+	successor.BuildID, successor.BuildToken = "build-successor", "token-successor"
+	successor.CreatedAt = time.Now().Unix()
+	successor.LastProgress = successor.CreatedAt
+	_, err := f.catalog.ClaimRefViewBuild(context.Background(), successor, successor.CreatedAt+3600)
+	if err != nil {
+		t.Fatalf("reclaim the parked pass's slot: %v", err)
+	}
+
+	close(release)
+	wg.Wait()
+	if outErr != nil {
+		t.Fatalf("the reclaimed selection: %v", outErr)
+	}
+	if outdated.State != store_sqlite.RefViewBuilding || !outdated.Built {
+		t.Fatalf("the reclaimed selection = %+v, want a pass that ran and could not publish", outdated)
+	}
+	if outdated.GenerationID != 0 {
+		t.Fatalf("the reclaimed selection named generation %d, want none", outdated.GenerationID)
+	}
+
+	if view := f.view(viewID); view.ActiveGenerationID != 0 || view.ActiveCommit != "" {
+		t.Fatalf("a reclaimed pass published its generation: %+v", view)
+	}
+	generations := f.generations()
+	if len(generations) != 1 || generations[0].State != store_sqlite.ViewGenerationSuperseded {
+		t.Fatalf("generations = %+v, want the reclaimed pass's one superseded", generations)
+	}
+	byID := map[string]store_sqlite.RefViewBuild{}
+	for _, row := range f.builds(viewID) {
+		byID[row.BuildID] = row
+	}
+	if len(byID) != 2 {
+		t.Fatalf("%d build rows, want the reclaimed pass and its successor: %+v", len(byID), byID)
+	}
+	if row := byID[claimed[0].BuildID]; row.State != store_sqlite.ViewGenerationFailed || row.GenerationID != 0 {
+		t.Fatalf("the reclaimed pass = %+v, want it left failed and publishing nothing", row)
+	}
+	if row := byID["build-successor"]; row.State != store_sqlite.ViewGenerationBuilding {
+		t.Fatalf("the successor = %+v, want its claim untouched", row)
 	}
 }
 

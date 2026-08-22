@@ -493,19 +493,31 @@ type UpdateRefViewDesireRequest struct {
 }
 
 // AdoptRefViewGenerationRequest points a ref view at the generation a finished
-// build produced.
+// build produced, and closes the attempt that produced it.
 //
 // The three expectations are the compare-and-set: the route epoch the build
 // captured when it was claimed, plus the tree and fingerprint it was built
 // for. A view that was re-targeted while the build ran matches none of them,
 // so the adoption changes nothing and reports ErrCatalogStaleGuard rather than
 // serving a payload for a state the selector has left.
+//
+// BuildID and BuildToken are the fourth expectation, and the reason the two
+// writes are one: the claim is the right to publish, so a build whose slot was
+// reclaimed while it ran may not adopt behind its successor, and a build the
+// view refuses may not be recorded as having published.
 type AdoptRefViewGenerationRequest struct {
 	RefViewID          string
 	ExpectedRouteEpoch int64
 
 	ExpectedDesiredTree             string
 	ExpectedDesiredBuildFingerprint string
+
+	// BuildID and BuildToken name the claim the adoption is made under. An
+	// empty BuildID adopts without closing an attempt.
+	BuildID    string
+	BuildToken string
+	// LastProgress is the clock stamped on the closed attempt.
+	LastProgress int64 // unix seconds
 
 	GenerationID           int64
 	ActiveRef              string

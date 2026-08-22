@@ -26,7 +26,7 @@ import (
 // generation whose payload describes that selector's tree, composed over the
 // graph's base corpus, and that is the whole of what this file arranges.
 //
-// Three properties shape it, and none of them is optional:
+// Four properties shape it, and none of them is optional:
 //
 //   - Selection re-resolves, always. Nothing watches the refs a view names, so
 //     a branch that moved while nobody was asking is only ever noticed by the
@@ -46,6 +46,14 @@ import (
 //     cost a rebuild is a new commit carrying the same tree — a rebase, an
 //     amend, an empty commit — because the payload is a function of the tree.
 //     That case adopts the generation and stamps the new commit beside it.
+//
+//   - A build outlives the request that started it and reports for as long as
+//     it runs. The request owns only how long it is willing to wait; past that
+//     it answers with the build's token and the pass carries on toward
+//     publication. Meanwhile the pass re-stamps its claim, because the
+//     liveness cutoff cannot otherwise tell a slow build from a dead one — and
+//     a pass whose claim is taken over anyway loses the right to publish, so
+//     its late result is superseded rather than served.
 
 const (
 	// refViewOwnerKind names who owns the generations a ref view's builds
@@ -78,6 +86,24 @@ const (
 	// duplicate pass, while the cost of not reclaiming a dead one is a view
 	// that never serves again.
 	refViewBuildLiveness = 10 * time.Minute
+
+	// refViewBuildHeartbeat is how often a running build re-stamps the claim
+	// it holds. It is what makes the liveness window mean "nobody is behind
+	// this claim" rather than "this claim is taking a while": the cutoff reads
+	// last_progress and nothing else, and a real build over a large tree
+	// outlasts the window comfortably. Well under the window, so a stamp
+	// delayed behind the store's writer still lands inside it.
+	refViewBuildHeartbeat = 30 * time.Second
+
+	// refViewBuildGrace is how long a selection that claimed a build waits for
+	// it before answering "building".
+	//
+	// The wait belongs to the request and the build does not: a tool call has
+	// tens of seconds, a build over a large tree has as long as it has, and a
+	// selection that blocked on the whole pass would lose the answer to the
+	// deadline. Long enough that a small tree still answers ready in one call,
+	// short enough that a big one hands back a token to poll instead.
+	refViewBuildGrace = 5 * time.Second
 )
 
 // RefViewRequest names one view of one graph.
@@ -129,10 +155,11 @@ type RefViewResult struct {
 	// superseded and the retry will claim a new one.
 	BuildToken string
 
-	// Built reports that this call ran a build pass. It is the difference
-	// between "the view was already current" and "the view was made current",
-	// and it stays true for a build whose result was superseded — the pass ran
-	// either way.
+	// Built reports that a build pass finished inside this call. It is the
+	// difference between "the view was already current" and "the view was made
+	// current", and it stays true for a build whose result was superseded —
+	// the pass ran either way. A build still running when the call answered is
+	// not built: it is a BuildToken to poll.
 	Built bool
 }
 
@@ -155,6 +182,14 @@ type RefViewManagerConfig struct {
 	// the publish step re-resolving the selector, which is exactly the window
 	// the revalidation exists to close. nil in production.
 	buildBarrier func()
+
+	// buildGrace, buildHeartbeat and buildLiveness are test seams over the
+	// three build windows. Zero takes the package constant, which is what
+	// production runs on; the constants are minutes wide, which is exactly
+	// what a test that drives them cannot wait for.
+	buildGrace     time.Duration
+	buildHeartbeat time.Duration
+	buildLiveness  time.Duration
 }
 
 // RefViewManager serves ref views of one store's graphs. It holds no
@@ -169,6 +204,10 @@ type RefViewManager struct {
 	extractors string
 
 	buildBarrier func()
+
+	buildGrace     time.Duration
+	buildHeartbeat time.Duration
+	buildLiveness  time.Duration
 }
 
 // NewRefViewManager builds a manager over one store.
@@ -184,14 +223,26 @@ func NewRefViewManager(cfg RefViewManagerConfig) (*RefViewManager, error) {
 		logger = zap.NewNop()
 	}
 	return &RefViewManager{
-		store:        cfg.Store,
-		catalog:      cfg.Store.Catalog(),
-		builder:      cfg.Builder,
-		logger:       logger,
-		configHash:   indexConfigHash(cfg.Config),
-		extractors:   extractorVersionsFingerprint(),
-		buildBarrier: cfg.buildBarrier,
+		store:          cfg.Store,
+		catalog:        cfg.Store.Catalog(),
+		builder:        cfg.Builder,
+		logger:         logger,
+		configHash:     indexConfigHash(cfg.Config),
+		extractors:     extractorVersionsFingerprint(),
+		buildBarrier:   cfg.buildBarrier,
+		buildGrace:     refViewWindow(cfg.buildGrace, refViewBuildGrace),
+		buildHeartbeat: refViewWindow(cfg.buildHeartbeat, refViewBuildHeartbeat),
+		buildLiveness:  refViewWindow(cfg.buildLiveness, refViewBuildLiveness),
 	}, nil
+}
+
+// refViewWindow takes the configured build window, or the default when the
+// caller set none.
+func refViewWindow(value, fallback time.Duration) time.Duration {
+	if value > 0 {
+		return value
+	}
+	return fallback
 }
 
 // EnsureRefView makes one view current and reports what serving it would read.
@@ -403,7 +454,7 @@ func (m *RefViewManager) startBuild(
 		BuildToken:         uuid.NewV7().String(),
 		CreatedAt:          now,
 		LastProgress:       now,
-	}, now-int64(refViewBuildLiveness/time.Second))
+	}, now-int64(m.buildLiveness/time.Second))
 	if err != nil {
 		if errors.Is(err, store_sqlite.ErrRefViewBuildInFlight) {
 			viewmetrics.Count(viewmetrics.RefViewSelectionTotal, viewmetrics.RefViewCoalesced)
@@ -421,7 +472,98 @@ func (m *RefViewManager) startBuild(
 		}
 		return RefViewResult{}, err
 	}
-	return m.runBuild(ctx, req, view, claimed, base, resolved, identity)
+	return m.runDetached(ctx, req, view, claimed, base, resolved, identity)
+}
+
+// runDetached runs a claimed build on a context the request cannot cancel, and
+// waits out the grace for it.
+//
+// The pass is the daemon's work, not the request's. A client that gives up —
+// or a tool deadline that expires — must not destroy a build every other
+// selection of that tree is coalescing onto, and the pass is also what closes
+// the claim, so killing it wedges the view until the liveness window expires.
+// What the request keeps is the wait: past the grace it answers with the token
+// and the build publishes for whoever selects next.
+func (m *RefViewManager) runDetached(
+	ctx context.Context,
+	req RefViewRequest,
+	view store_sqlite.RefView,
+	build store_sqlite.RefViewBuild,
+	base primaryBase,
+	resolved gitstate.ResolvedSelector,
+	identity GenerationIdentity,
+) (RefViewResult, error) {
+	type outcome struct {
+		result RefViewResult
+		err    error
+	}
+	// Buffered by one: the grace can end the wait first, and the build must
+	// never block on a receiver that has already answered.
+	done := make(chan outcome, 1)
+	buildCtx := context.WithoutCancel(ctx)
+	go func() {
+		stop := m.heartbeat(buildCtx, build)
+		defer stop()
+		result, err := m.runBuild(buildCtx, req, view, build, base, resolved, identity)
+		done <- outcome{result: result, err: err}
+	}()
+
+	grace := time.NewTimer(m.buildGrace)
+	defer grace.Stop()
+	select {
+	case finished := <-done:
+		return finished.result, finished.err
+	case <-grace.C:
+	case <-ctx.Done():
+	}
+	viewmetrics.Count(viewmetrics.RefViewSelectionTotal, viewmetrics.RefViewBuilding)
+	m.logger.Debug("ref view manager: selection answered while its build runs on",
+		zap.String("ref_view", view.RefViewID), zap.String("build_token", build.BuildToken))
+	return RefViewResult{
+		RefViewID:  view.RefViewID,
+		Resolved:   resolved,
+		State:      store_sqlite.RefViewBuilding,
+		BuildToken: build.BuildToken,
+	}, nil
+}
+
+// heartbeat re-stamps a running build's claim, until the returned stop is
+// called. The stop waits for the stamping to have finished, so no stamp
+// outlives the completion that closes the attempt.
+//
+// The liveness cutoff reads last_progress and nothing else, so a claim stamped
+// only when it was made is indistinguishable from one whose worker died the
+// moment it made it. Without this, any build slower than the window — a large
+// tree, a cold object store, a long wait behind the store's writer — is
+// reclaimed while it is still running, and the duplicate races the original
+// for the publish.
+//
+// A stamp refused as stale means the claim has already been taken over. That
+// is not this goroutine's to resolve: the build finds out at publish time,
+// where losing the claim costs it the adoption rather than the pass.
+func (m *RefViewManager) heartbeat(ctx context.Context, build store_sqlite.RefViewBuild) func() {
+	done, stopped := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(stopped)
+		ticker := time.NewTicker(m.buildHeartbeat)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				err := m.catalog.TouchRefViewBuild(ctx, build.BuildID, build.BuildToken, time.Now().Unix())
+				if err != nil && !errors.Is(err, store_sqlite.ErrCatalogStaleGuard) {
+					m.logger.Debug("ref view manager: could not stamp a build's progress",
+						zap.String("build", build.BuildID), zap.Error(err))
+				}
+			}
+		}
+	}()
+	return func() {
+		close(done)
+		<-stopped
+	}
 }
 
 // runBuild produces the generation and decides whether it may be adopted.
@@ -475,15 +617,21 @@ func (m *RefViewManager) runBuild(
 	}
 
 	// Revalidation, catalog side: is the row still asking for what was built,
-	// at the epoch the build captured? The ref and commit stamped beside the
-	// generation are the ones current AT PUBLISH, which is how a commit that
-	// moved over an unchanged tree lands without a second pass.
+	// at the epoch the build captured, and does this pass still hold the claim
+	// it started under? The ref and commit stamped beside the generation are
+	// the ones current AT PUBLISH, which is how a commit that moved over an
+	// unchanged tree lands without a second pass. The adoption closes the
+	// attempt in the same transaction, so a pass whose claim was reclaimed
+	// while it ran publishes nothing.
 	now := time.Now().Unix()
 	err = m.catalog.AdoptRefViewGeneration(ctx, store_sqlite.AdoptRefViewGenerationRequest{
 		RefViewID:                       view.RefViewID,
 		ExpectedRouteEpoch:              build.CapturedRouteEpoch,
 		ExpectedDesiredTree:             resolved.TreeOID,
 		ExpectedDesiredBuildFingerprint: build.BuildFingerprint,
+		BuildID:                         build.BuildID,
+		BuildToken:                      build.BuildToken,
+		LastProgress:                    now,
 		GenerationID:                    generationID,
 		ActiveRef:                       published.FullRef,
 		ActiveCommit:                    published.CommitOID,
@@ -499,7 +647,6 @@ func (m *RefViewManager) runBuild(
 		}
 		return RefViewResult{}, err
 	}
-	m.completeBuild(ctx, build, store_sqlite.ViewGenerationReady, generationID, "")
 	viewmetrics.Count(viewmetrics.RefViewSelectionTotal, viewmetrics.RefViewAdopted)
 	return RefViewResult{
 		RefViewID:    view.RefViewID,
@@ -548,17 +695,19 @@ func (m *RefViewManager) supersede(ctx context.Context, build store_sqlite.RefVi
 	m.completeBuild(ctx, build, store_sqlite.ViewGenerationSuperseded, generationID, "")
 }
 
-// completeBuild ends one attempt.
+// completeBuild ends one attempt that will not publish — it failed, or it was
+// overtaken. The attempt that DOES publish is closed by the adoption itself,
+// in the same transaction that points the view at its generation.
 //
-// It runs detached from the request. An attempt left in the building state
-// holds the coalescing claim, and the claim is what every later selection of
-// that tree waits on — so a request that was canceled while its build ran
-// still has to close the attempt it started, or it wedges the view until the
-// liveness window expires. A lost guard means the row went with its ref view.
+// It runs detached from the request, and for the same reason the build does:
+// an attempt left in the building state holds the coalescing claim, and the
+// claim is what every later selection of that tree waits on, so a pass that
+// ends without closing it wedges the view until the liveness window expires.
 //
-// The write itself is still best effort: the answer this selection gives is
-// already decided by the time it runs, and a claim that outlives its worker is
-// reclaimable by the next claimant rather than permanent.
+// The write itself is still best effort. A lost guard means the attempt is no
+// longer this worker's to close — the row went with its ref view, or the claim
+// was reclaimed — and either way the answer this selection gives is already
+// decided by the time it runs.
 func (m *RefViewManager) completeBuild(
 	ctx context.Context,
 	build store_sqlite.RefViewBuild,

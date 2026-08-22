@@ -1020,6 +1020,154 @@ func TestCatalogRefViewAdoptionRevalidates(t *testing.T) {
 	}
 }
 
+// TestCatalogRefViewAdoptionRefusesAReclaimedClaim pins what the claim buys a
+// build: the right to publish. A pass whose slot was reclaimed while it ran no
+// longer holds that right, and a late adoption behind the successor would put
+// a payload nobody is waiting on in front of the one somebody is.
+//
+// The two writes are one transaction, so a refused adoption also leaves the
+// attempt open — an attempt recorded as finished on a generation the view
+// never took would be a build history that lies.
+func TestCatalogRefViewAdoptionRefusesAReclaimedClaim(t *testing.T) {
+	store := openCatalogStore(t)
+	ctx := context.Background()
+	catalog := store.Catalog()
+	seedRefView(t, catalog, "rv-1", "graph-1")
+	generation := seedBuildingGeneration(t, catalog, "graph-1")
+
+	err := catalog.UpdateRefViewDesire(ctx, UpdateRefViewDesireRequest{
+		RefViewID: "rv-1", DesiredRef: "refs/heads/rv-1", DesiredCommit: "c1",
+		DesiredTree: "t1", DesiredBuildFingerprint: "fp-1",
+		State: RefViewBuilding, LastResolved: 10, LastSelected: 10,
+	})
+	if err != nil {
+		t.Fatalf("desire: %v", err)
+	}
+	captured := readRefView(t, catalog, "rv-1").RouteEpoch
+
+	reaped := RefViewBuild{
+		BuildID: "build-reaped", RefViewID: "rv-1", DesiredRef: "refs/heads/rv-1",
+		DesiredCommit: "c1", DesiredTree: "t1", BaseGenerationID: 0,
+		EnrichmentProfile: "default", BuildFingerprint: "fp-1",
+		CapturedRouteEpoch: captured, State: ViewGenerationBuilding,
+		BuildToken: "token-reaped", CreatedAt: 100, LastProgress: 100,
+	}
+	if _, err := catalog.ClaimRefViewBuild(ctx, reaped, 0); err != nil {
+		t.Fatalf("seed the attempt that is about to be reclaimed: %v", err)
+	}
+	successor := reaped
+	successor.BuildID, successor.BuildToken = "build-live", "token-live"
+	successor.CreatedAt, successor.LastProgress = 900, 900
+	if _, err := catalog.ClaimRefViewBuild(ctx, successor, 500); err != nil {
+		t.Fatalf("reclaim the slot: %v", err)
+	}
+
+	adopt := AdoptRefViewGenerationRequest{
+		RefViewID: "rv-1", ExpectedRouteEpoch: captured,
+		ExpectedDesiredTree: "t1", ExpectedDesiredBuildFingerprint: "fp-1",
+		GenerationID: generation, ActiveRef: "refs/heads/rv-1", ActiveCommit: "c1",
+		ActiveTree: "t1", ActiveBuildFingerprint: "fp-1", ExactView: true,
+		LastResolved: 20, LastSelected: 20,
+		BuildID: "build-reaped", BuildToken: "token-reaped", LastProgress: 950,
+	}
+	if err := catalog.AdoptRefViewGeneration(ctx, adopt); !errors.Is(err, ErrCatalogStaleGuard) {
+		t.Fatalf("adoption behind a reclaimed claim = %v, want ErrCatalogStaleGuard", err)
+	}
+	if view := readRefView(t, catalog, "rv-1"); view.ActiveGenerationID != 0 {
+		t.Fatalf("a reclaimed attempt published its generation: %+v", view)
+	}
+
+	// A view that moved refuses the adoption for the other reason, and the
+	// live attempt must come out of it exactly as it went in.
+	moved := adopt
+	moved.BuildID, moved.BuildToken = "build-live", "token-live"
+	moved.ExpectedRouteEpoch = captured + 1
+	if err := catalog.AdoptRefViewGeneration(ctx, moved); !errors.Is(err, ErrCatalogStaleGuard) {
+		t.Fatalf("adoption at a lost epoch = %v, want ErrCatalogStaleGuard", err)
+	}
+	held, found, err := catalog.GetRefViewBuild(ctx, "build-live")
+	if err != nil || !found {
+		t.Fatalf("read the live attempt: found=%v err=%v", found, err)
+	}
+	if held.State != ViewGenerationBuilding || held.GenerationID != 0 {
+		t.Fatalf("a refused adoption closed the attempt anyway: %+v", held)
+	}
+
+	adopt.BuildID, adopt.BuildToken = "build-live", "token-live"
+	if err := catalog.AdoptRefViewGeneration(ctx, adopt); err != nil {
+		t.Fatalf("adoption under the live claim: %v", err)
+	}
+	if view := readRefView(t, catalog, "rv-1"); view.ActiveGenerationID != generation {
+		t.Fatalf("adopted view = %+v, want generation %d", view, generation)
+	}
+	closed, _, err := catalog.GetRefViewBuild(ctx, "build-live")
+	if err != nil {
+		t.Fatalf("re-read the live attempt: %v", err)
+	}
+	if closed.State != ViewGenerationReady || closed.GenerationID != generation {
+		t.Fatalf("the live attempt = %+v, want it closed on generation %d", closed, generation)
+	}
+}
+
+// TestCatalogRefViewBuildProgressKeepsAClaimAlive pins the heartbeat's whole
+// job. The liveness window reads last_progress and nothing else, so a claim
+// that never re-stamps it is indistinguishable from one whose worker died the
+// moment it made it — and a build that outlasts the window is reclaimed while
+// it is still running.
+func TestCatalogRefViewBuildProgressKeepsAClaimAlive(t *testing.T) {
+	store := openCatalogStore(t)
+	ctx := context.Background()
+	catalog := store.Catalog()
+	seedRefView(t, catalog, "rv-1", "graph-1")
+
+	build := RefViewBuild{
+		BuildID: "build-1", RefViewID: "rv-1", DesiredRef: "refs/heads/rv-1",
+		DesiredCommit: "c1", DesiredTree: "t1", BaseGenerationID: 0,
+		EnrichmentProfile: "default", BuildFingerprint: "fp-1",
+		CapturedRouteEpoch: 1, State: ViewGenerationBuilding,
+		BuildToken: "token-1", CreatedAt: 100, LastProgress: 100,
+	}
+	if _, err := catalog.ClaimRefViewBuild(ctx, build, 0); err != nil {
+		t.Fatalf("ClaimRefViewBuild: %v", err)
+	}
+
+	// The token is the proof of who is behind the claim, so it guards the
+	// stamp exactly as it guards the completion.
+	if err := catalog.TouchRefViewBuild(ctx, "build-1", "token-9", 900); !errors.Is(err, ErrCatalogStaleGuard) {
+		t.Fatalf("progress under a foreign token = %v, want ErrCatalogStaleGuard", err)
+	}
+	if err := catalog.TouchRefViewBuild(ctx, "build-1", "token-1", 900); err != nil {
+		t.Fatalf("TouchRefViewBuild: %v", err)
+	}
+
+	racing := build
+	racing.BuildID, racing.BuildToken = "build-2", "token-2"
+	racing.CreatedAt, racing.LastProgress = 950, 950
+	inFlight, err := catalog.ClaimRefViewBuild(ctx, racing, 500)
+	if !errors.Is(err, ErrRefViewBuildInFlight) {
+		t.Fatalf("claim against a stamped attempt = %v, want ErrRefViewBuildInFlight", err)
+	}
+	if inFlight.BuildToken != "token-1" || inFlight.LastProgress != 900 {
+		t.Fatalf("claim returned %+v, want the attempt at its stamped progress", inFlight)
+	}
+	if rows, err := catalog.ListRefViewBuilds(ctx, "rv-1"); err != nil || len(rows) != 1 {
+		t.Fatalf("ListRefViewBuilds = %+v, %v, want the one live attempt", rows, err)
+	}
+
+	// An attempt out of the building state is finished, not slow. Re-stamping
+	// it would resurrect a claim the coalescing index has already released.
+	err = catalog.CompleteRefViewBuild(ctx, CompleteRefViewBuildRequest{
+		BuildID: "build-1", BuildToken: "token-1", State: ViewGenerationReady,
+		GenerationID: 7, LastProgress: 1000,
+	})
+	if err != nil {
+		t.Fatalf("CompleteRefViewBuild: %v", err)
+	}
+	if err := catalog.TouchRefViewBuild(ctx, "build-1", "token-1", 1100); !errors.Is(err, ErrCatalogStaleGuard) {
+		t.Fatalf("progress on a finished attempt = %v, want ErrCatalogStaleGuard", err)
+	}
+}
+
 // TestCatalogRefViewMetadataAndFailureLeaveTheActivePointer covers the two
 // writes that must never move what a view serves: stamping a moved ref, and
 // recording a failed selection.
