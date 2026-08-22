@@ -104,7 +104,7 @@ func (s *Server) handleSuggestReviewers(ctx context.Context, req mcp.CallToolReq
 	blame := blameRowsByID(s.graph)
 	authorCounts := map[string]int{}
 	for _, f := range changedFiles {
-		for _, n := range analysis.JoinFileNodes(s.graph, repoPrefix, f) {
+		for _, n := range analysis.JoinFileNodes(s.graph, repoPrefix, f, analysis.RepoRelativePath) {
 			if la, ok := lastAuthoredFrom(blame, n); ok && la.Email != "" {
 				authorCounts[normalizeReviewer(la.Email)]++
 			}
@@ -116,7 +116,7 @@ func (s *Server) handleSuggestReviewers(ctx context.Context, req mcp.CallToolReq
 	// candidate experts; the count is the number of co-change links.
 	coChangeCounts := map[string]int{}
 	for _, f := range changedFiles {
-		for partner := range s.coChangeScores(analysis.JoinFilePath(s.graph, repoPrefix, f)) {
+		for partner := range s.coChangeScores(analysis.GraphKey(repoPrefix, f, analysis.RepoRelativePath)) {
 			for _, n := range s.graph.GetFileNodes(partner) {
 				if la, ok := lastAuthoredFrom(blame, n); ok && la.Email != "" {
 					coChangeCounts[normalizeReviewer(la.Email)]++

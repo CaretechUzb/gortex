@@ -300,43 +300,61 @@ func TestMapGitDiffMnemonicPrefixConfig(t *testing.T) {
 }
 
 func TestJoinFileNodes(t *testing.T) {
-	g := graph.New()
-	g.AddNode(&graph.Node{ID: "myrepo/a.go::A", Kind: graph.KindFunction, Name: "A", FilePath: "myrepo/a.go"})
-	g.AddNode(&graph.Node{ID: "b.go::B", Kind: graph.KindFunction, Name: "B", FilePath: "b.go"})
+	// Graph keys are "<prefix>/" + the remainder in native separators, so the
+	// fixture is built the same way the indexer would build it. Writing the
+	// '/'-joined form here would pass on POSIX and describe a key that does not
+	// exist on Windows.
+	key := func(rel string) string { return "myrepo/" + filepath.FromSlash(rel) }
 
-	// Raw hit wins (single-repo / unprefixed graph).
-	if nodes := JoinFileNodes(g, "myrepo", "b.go"); len(nodes) != 1 || nodes[0].ID != "b.go::B" {
-		t.Fatalf("raw lookup should win: %#v", nodes)
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: key("a.go") + "::A", Kind: graph.KindFunction, Name: "A", FilePath: key("a.go")})
+	// The shadow: the repo's own tree carries a top-level directory named like
+	// the repo prefix, so "myrepo/a.go" is a well-formed path in BOTH domains —
+	// the git-relative spelling of this nested file, and the graph key of the
+	// top-level a.go above.
+	g.AddNode(&graph.Node{ID: key("myrepo/a.go") + "::Nested", Kind: graph.KindFunction, Name: "Nested", FilePath: key("myrepo/a.go")})
+
+	// A repo-relative path is prefixed unconditionally.
+	if nodes := JoinFileNodes(g, "myrepo", "a.go", RepoRelativePath); len(nodes) != 1 || nodes[0].ID != key("a.go")+"::A" {
+		t.Fatalf("repo-relative path must resolve through the prefix: %#v", nodes)
 	}
-	// Relative path retries with the prefix.
-	if nodes := JoinFileNodes(g, "myrepo", "a.go"); len(nodes) != 1 || nodes[0].ID != "myrepo/a.go::A" {
-		t.Fatalf("prefixed retry should hit: %#v", nodes)
+	// The shadow case: a repo-relative path that merely LOOKS prefixed still
+	// gets prefixed, so it resolves to the nested file it names — not to the
+	// same-named top-level file it would collide with.
+	if nodes := JoinFileNodes(g, "myrepo", "myrepo/a.go", RepoRelativePath); len(nodes) != 1 || nodes[0].ID != key("myrepo/a.go")+"::Nested" {
+		t.Fatalf("prefix-shadowed repo-relative path must resolve to the nested file: %#v", nodes)
 	}
-	// Already-prefixed input does not double-prefix.
-	if nodes := JoinFileNodes(g, "myrepo", "myrepo/a.go"); len(nodes) != 1 || nodes[0].ID != "myrepo/a.go::A" {
-		t.Fatalf("already-prefixed input should hit raw: %#v", nodes)
+	// A caller already holding a graph key says so, and it is used as-is.
+	if nodes := JoinFileNodes(g, "myrepo", key("a.go"), GraphKeyedPath); len(nodes) != 1 || nodes[0].ID != key("a.go")+"::A" {
+		t.Fatalf("graph-keyed path must be used verbatim: %#v", nodes)
 	}
-	// No prefix → raw only.
-	if nodes := JoinFileNodes(g, "", "a.go"); len(nodes) != 0 {
-		t.Fatalf("no-prefix miss should stay a miss: %#v", nodes)
+	// No prefix (standalone indexer): the path already is the key.
+	if nodes := JoinFileNodes(g, "", key("a.go"), RepoRelativePath); len(nodes) != 1 || nodes[0].ID != key("a.go")+"::A" {
+		t.Fatalf("empty prefix must not rewrite the key: %#v", nodes)
+	}
+	if nodes := JoinFileNodes(g, "myrepo", "missing.go", RepoRelativePath); len(nodes) != 0 {
+		t.Fatalf("a miss must stay a miss: %#v", nodes)
 	}
 }
 
-func TestJoinFilePath(t *testing.T) {
-	g := graph.New()
-	g.AddNode(&graph.Node{ID: "myrepo/a.go::A", Kind: graph.KindFunction, Name: "A", FilePath: "myrepo/a.go"})
-
-	if got := JoinFilePath(g, "myrepo", "a.go"); got != "myrepo/a.go" {
-		t.Fatalf("expected prefixed path, got %q", got)
-	}
-	if got := JoinFilePath(g, "myrepo", "myrepo/a.go"); got != "myrepo/a.go" {
-		t.Fatalf("already-prefixed path should pass through, got %q", got)
-	}
-	if got := JoinFilePath(g, "myrepo", "missing.go"); got != "missing.go" {
-		t.Fatalf("unresolvable path should pass through raw, got %q", got)
-	}
-	if got := JoinFilePath(g, "", "a.go"); got != "a.go" {
-		t.Fatalf("no prefix should pass through, got %q", got)
+func TestGraphKey(t *testing.T) {
+	native := func(rel string) string { return "myrepo/" + filepath.FromSlash(rel) }
+	for _, tc := range []struct {
+		name         string
+		prefix, path string
+		domain       PathDomain
+		want         string
+	}{
+		{"repo-relative gains the prefix", "myrepo", "a.go", RepoRelativePath, native("a.go")},
+		{"prefix-shadowed path still gains it", "myrepo", "myrepo/a.go", RepoRelativePath, native("myrepo/a.go")},
+		{"graph-keyed path is untouched", "myrepo", "myrepo/a.go", GraphKeyedPath, "myrepo/a.go"},
+		{"no prefix is a no-op", "", "a.go", RepoRelativePath, "a.go"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := GraphKey(tc.prefix, tc.path, tc.domain); got != tc.want {
+				t.Fatalf("GraphKey(%q, %q, %v) = %q, want %q", tc.prefix, tc.path, tc.domain, got, tc.want)
+			}
+		})
 	}
 }
 

@@ -563,7 +563,7 @@ func (s *Server) handleReview(ctx context.Context, req mcp.CallToolRequest) (*mc
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		rulepack = s.reviewRulepackMatches(ctx, diff.ChangedFiles, changedPathsRepoRelative, repoPrefix, allowedRepos)
+		rulepack = s.reviewRulepackMatches(ctx, diff.ChangedFiles, analysis.RepoRelativePath, repoPrefix, allowedRepos)
 		impact = s.reviewImpact(diff.ChangedSymbols)
 		changedFiles = diff.ChangedFiles
 	}
@@ -618,7 +618,7 @@ func (s *Server) handleReview(ctx context.Context, req mcp.CallToolRequest) (*mc
 //
 // domain declares which vocabulary changedFiles is spelled in, because the two
 // overlap and cannot be recovered by inspection — see reviewChangedGraphPaths.
-func (s *Server) reviewRulepackMatches(ctx context.Context, changedFiles []string, domain changedPathDomain, repoPrefix string, allowedRepos map[string]bool) []astquery.Match {
+func (s *Server) reviewRulepackMatches(ctx context.Context, changedFiles []string, domain analysis.PathDomain, repoPrefix string, allowedRepos map[string]bool) []astquery.Match {
 	bundle := astquery.DetectorsByCategory("review")
 	if len(bundle) == 0 {
 		return nil
@@ -678,24 +678,6 @@ func (s *Server) reviewRulepackMatches(ctx context.Context, changedFiles []strin
 	return kept
 }
 
-// changedPathDomain names the vocabulary a changed-file list is spelled in.
-// The review narrowing spans two, and they overlap, so the domain travels with
-// the data instead of being recovered from it.
-type changedPathDomain int
-
-const (
-	// changedPathsRepoRelative is git's spelling, relative to the working
-	// tree. This is what analysis.DiffResult.ChangedFiles carries: MapGitDiff
-	// documents it as keeping "the diff-relative paths (callers re-join them
-	// with git pathspecs)", and every production caller of
-	// reviewRulepackMatches passes exactly that field.
-	changedPathsRepoRelative changedPathDomain = iota
-	// changedPathsGraphKeyed is the graph's own spelling, "<prefix>/<rel>",
-	// for a caller that already holds node keys (e.g. a ChangedSymbol's
-	// FilePath) and must not have the prefix applied twice.
-	changedPathsGraphKeyed
-)
-
 // reviewChangedGraphPaths maps a changeset's file paths onto the vocabulary the
 // graph keys file nodes in. `git diff` names files relative to the working tree
 // while a multi-repo daemon keys every node "<prefix>/<rel>", so intersecting
@@ -714,7 +696,7 @@ const (
 // same-named `pkg/widget.go` also exists, that unchanged shadow is scanned in
 // its place. Admitting both candidate keys is not a fix either: it still lets
 // unchanged code be selected.
-func reviewChangedGraphPaths(changedFiles []string, domain changedPathDomain, repoPrefix string) map[string]bool {
+func reviewChangedGraphPaths(changedFiles []string, domain analysis.PathDomain, repoPrefix string) map[string]bool {
 	changed := make(map[string]bool, len(changedFiles))
 	for _, f := range changedFiles {
 		// Clean collapses "./" and "..", then Norm puts both vocabularies in
@@ -725,7 +707,7 @@ func reviewChangedGraphPaths(changedFiles []string, domain changedPathDomain, re
 		if f == "" || f == "." {
 			continue
 		}
-		if domain == changedPathsRepoRelative && repoPrefix != "" {
+		if domain == analysis.RepoRelativePath && repoPrefix != "" {
 			f = repoPrefix + "/" + f
 		}
 		changed[f] = true
@@ -1145,7 +1127,7 @@ func (s *Server) handleReviewPack(ctx context.Context, req mcp.CallToolRequest) 
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		rulepack = s.reviewRulepackMatches(ctx, diff.ChangedFiles, changedPathsRepoRelative, repoPrefix, allowedRepos)
+		rulepack = s.reviewRulepackMatches(ctx, diff.ChangedFiles, analysis.RepoRelativePath, repoPrefix, allowedRepos)
 		impact = s.reviewImpact(diff.ChangedSymbols)
 		for _, cs := range diff.ChangedSymbols {
 			if cs.ID != "" {

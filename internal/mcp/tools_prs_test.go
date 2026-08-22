@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"strconv"
 	"testing"
 
@@ -182,8 +183,13 @@ func TestGetPRImpact_RequiresNumber(t *testing.T) {
 // stay raw-first for unprefixed graphs, and never double-prefix.
 func TestChangedSymbolsForFiles_RepoPrefixJoin(t *testing.T) {
 	g := graph.New()
-	prefixedID := "myrepo/internal/auth/login.go::ValidateToken"
-	g.AddNode(&graph.Node{ID: prefixedID, Kind: graph.KindFunction, Name: "ValidateToken", FilePath: "myrepo/internal/auth/login.go", StartLine: 1, EndLine: 10})
+	// The graph keys a file as "<prefix>/" + the remainder in the indexing
+	// machine's native separators (see internal/graphpath), so the fixture is
+	// built that way. Hard-coding the '/'-joined form describes a key a
+	// Windows daemon never produces.
+	prefixedFile := "myrepo/" + filepath.FromSlash("internal/auth/login.go")
+	prefixedID := prefixedFile + "::ValidateToken"
+	g.AddNode(&graph.Node{ID: prefixedID, Kind: graph.KindFunction, Name: "ValidateToken", FilePath: prefixedFile, StartLine: 1, EndLine: 10})
 	srv := NewServer(query.NewEngine(g), g, nil, nil, zap.NewNop(), nil)
 
 	files, nodes := srv.changedSymbolsForFiles("myrepo", []string{"internal/auth/login.go"})
@@ -197,10 +203,16 @@ func TestChangedSymbolsForFiles_RepoPrefixJoin(t *testing.T) {
 	_, nodes = srv.changedSymbolsForFiles("", []string{"internal/auth/login.go"})
 	require.Empty(t, nodes)
 
-	// Already-prefixed input hits raw and is not double-prefixed.
+	// A forge file list is repo-relative, so a path that merely LOOKS
+	// prefixed is still prefixed: it names the nested file, not the
+	// same-named top-level one. Treating it as already-keyed used to
+	// resolve the wrong file — or, with no shadow present, nothing at all.
+	shadowFile := "myrepo/" + filepath.FromSlash("myrepo/internal/auth/login.go")
+	g.AddNode(&graph.Node{ID: shadowFile + "::Nested", Kind: graph.KindFunction, Name: "Nested", FilePath: shadowFile, StartLine: 1, EndLine: 10})
 	_, nodes = srv.changedSymbolsForFiles("myrepo", []string{"myrepo/internal/auth/login.go"})
 	require.Len(t, nodes, 1)
-	require.Equal(t, prefixedID, nodes[0].ID)
+	require.Equal(t, shadowFile+"::Nested", nodes[0].ID,
+		"a repo-relative path that looks prefixed must resolve to the nested file")
 }
 
 // --- list_prs: classification ----------------------------------------------
