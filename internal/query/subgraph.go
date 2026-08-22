@@ -2,6 +2,7 @@ package query
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -372,6 +373,39 @@ func (sg *SubGraph) FilterByMinTier(minTier string) {
 			MaxAvailableTier:  maxDroppedOrigin,
 		}
 	}
+}
+
+// SortEdgesForPage orders usage edges into the one stable global order
+// a row cap may consume: strongest evidence first (origin tier rank,
+// then confidence), with file/line/kind/from/to as deterministic
+// tie-breakers. Backends iterate in-edges differently (the memory
+// store by insertion, SQLite grouped by kind), so a page cut without
+// this sort would depend on which store served it and could evict an
+// lsp_resolved row in favor of an earlier weak one.
+func SortEdgesForPage(edges []*graph.Edge) {
+	sort.SliceStable(edges, func(i, j int) bool {
+		a, b := edges[i], edges[j]
+		ar, br := graph.OriginRank(effectiveOrigin(a)), graph.OriginRank(effectiveOrigin(b))
+		if ar != br {
+			return ar > br
+		}
+		if a.Confidence != b.Confidence {
+			return a.Confidence > b.Confidence
+		}
+		if a.FilePath != b.FilePath {
+			return a.FilePath < b.FilePath
+		}
+		if a.Line != b.Line {
+			return a.Line < b.Line
+		}
+		if a.Kind != b.Kind {
+			return a.Kind < b.Kind
+		}
+		if a.From != b.From {
+			return a.From < b.From
+		}
+		return a.To < b.To
+	})
 }
 
 // effectiveOrigin returns the edge's origin tier, backfilled for edges

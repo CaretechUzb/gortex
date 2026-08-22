@@ -3080,6 +3080,9 @@ func truncateUsageRows(sg *query.SubGraph, limit int, targetID string) {
 	}
 	sg.TotalEdges = len(sg.Edges)
 	sg.TotalNodes = len(sg.Nodes)
+	// One stable global order before the cut, so the kept subset is the
+	// strongest evidence and identical across store backends.
+	query.SortEdgesForPage(sg.Edges)
 	sg.Edges = sg.Edges[:limit]
 	referenced := map[string]struct{}{targetID: {}}
 	for _, e := range sg.Edges {
