@@ -73,6 +73,44 @@ func TestReposFamiliesRendersTheListing(t *testing.T) {
 	require.Contains(t, out, "view   git_ref:refs/heads/main")
 }
 
+func TestReposFamiliesRendersTheHeadOfEachCheckout(t *testing.T) {
+	cases := []struct {
+		name     string
+		headJSON string
+		want     string
+	}{
+		{
+			name:     "attached",
+			headJSON: `"head_ref":"refs/heads/x","head_commit":"1a46dd5e9c4b7f2013e5c6d7a8b9c0d1e2f30411"`,
+			want:     "head=refs/heads/x",
+		},
+		{
+			name:     "detached",
+			headJSON: `"head_commit":"1a46dd5e9c4b7f2013e5c6d7a8b9c0d1e2f30411"`,
+			want:     "head=detached@1a46dd5e9c4b",
+		},
+		{
+			name:     "unsampled",
+			headJSON: `"state":"checkout_ready"`,
+			want:     "head=(none)",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stubCheckoutsTool(t, func(_ string, _ string, _ map[string]any) (json.RawMessage, error) {
+				return json.RawMessage(`{"families":[{"family_id":"family-1",
+					"checkouts":[{"checkout_id":"c1","admin_name":"wt","root_path":"/repo/wt",
+						"effective_mode":"automatic","desired_mode":"automatic",` +
+					tc.headJSON + `}]}]}`), nil
+			})
+			cmd, buf := newCheckoutsTestCmd(t)
+			require.NoError(t, runReposFamilies(cmd, nil))
+			require.Contains(t, buf.String(), tc.want)
+		})
+	}
+}
+
 func TestReposFamiliesForwardsTheFilterAndJSON(t *testing.T) {
 	var gotArgs map[string]any
 	stubCheckoutsTool(t, func(_ string, _ string, args map[string]any) (json.RawMessage, error) {

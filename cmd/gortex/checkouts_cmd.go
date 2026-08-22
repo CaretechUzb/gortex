@@ -251,6 +251,7 @@ type checkoutPayload struct {
 	DesiredMode     string        `json:"desired_mode"`
 	EffectiveMode   string        `json:"effective_mode"`
 	HeadRef         string        `json:"head_ref"`
+	HeadCommit      string        `json:"head_commit"`
 	GraphID         string        `json:"graph_id"`
 	CoordinatorLive bool          `json:"coordinator_live"`
 	Intents         []string      `json:"intents"`
@@ -418,7 +419,7 @@ func renderFamilies(w io.Writer, payload familiesPayload) {
 func renderCheckoutRow(w io.Writer, checkout checkoutPayload) {
 	fmt.Fprintf(w, "  checkout %-20s %s/%s  %s\n",
 		checkout.AdminName, checkout.EffectiveMode, checkout.State, checkout.RootPath)
-	detail := []string{"head=" + orNone(checkout.HeadRef)}
+	detail := []string{"head=" + headCell(checkout.HeadRef, checkout.HeadCommit)}
 	if checkout.GraphID != "" {
 		detail = append(detail, "graph="+checkout.GraphID)
 	}
@@ -584,6 +585,19 @@ func unixCell(seconds int64) string {
 		return "(never)"
 	}
 	return time.Unix(seconds, 0).Local().Format("2006-01-02 15:04:05")
+}
+
+// headCell renders where a checkout's HEAD sits. A detached HEAD has no ref to
+// name, so the commit the sample resolved is its identity — reporting "(none)"
+// there would read as a checkout whose HEAD was never sampled at all.
+func headCell(ref, commit string) string {
+	if ref != "" {
+		return ref
+	}
+	if commit != "" {
+		return "detached@" + shortSHA(commit)
+	}
+	return "(none)"
 }
 
 // orNone renders an empty string as an explicit placeholder, so a blank column
