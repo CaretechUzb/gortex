@@ -1365,8 +1365,17 @@ func (e *Engine) bfs(nodeID string, opts QueryOptions, forward bool, edgeKinds [
 	// round-trip — no GetNode per edge, no meta decode. Bidirectional
 	// (cluster) walks and capability-less backends (the in-memory graph,
 	// whose reads are already O(1)) keep the per-node path.
+	//
+	// Post-fetch filters also force the per-node path: the expander caps
+	// RAW rows per call, so a filter (test exclusion, workspace scope)
+	// could discard an entire raw page while eligible rows sit beyond
+	// the cap — starving the result and reporting it untruncated. The
+	// per-node walk filters before any cap and fetches to true
+	// exhaustion; it is the correctness oracle, same as the
+	// BFSCapable gate above.
 	expander, batched := e.g.(graph.FrontierExpander)
-	batched = batched && !bidir && len(edgeKinds) > 0
+	batched = batched && !bidir && len(edgeKinds) > 0 &&
+		!opts.ExcludeTests && !opts.hasScopeFilter()
 
 	frontier := []string{nodeID}
 	for depth := 0; depth < opts.Depth && len(frontier) > 0 && len(allNodes) < opts.Limit; depth++ {

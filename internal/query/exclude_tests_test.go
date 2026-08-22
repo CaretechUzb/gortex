@@ -1,11 +1,14 @@
 package query
 
 import (
+	"fmt"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 )
 
 // TestFindUsagesScoped_ExcludeTestsCoversUnstampedKinds pins the
@@ -100,4 +103,45 @@ func TestFindUsagesScoped_ExcludeTestsCoversAnnotationOwnerChildren(t *testing.T
 
 	require.Len(t, sg.Edges, 1, "the stamped owner's param child must be excluded with it")
 	require.Equal(t, prodCaller.ID, sg.Edges[0].From)
+}
+
+// TestGetCallers_ExcludeTestsSurvivesRawPageOfTests pins the SQLite
+// starvation case: the batched frontier expansion caps RAW rows per
+// call, so when the first raw page is all test callers a post-fetch
+// filter used to discard the entire page and report zero production
+// callers with truncated=false — while a real production caller sat
+// beyond the cap. The filter must never consume the eligible-result
+// limit with rows it then drops.
+func TestGetCallers_ExcludeTestsSurvivesRawPageOfTests(t *testing.T) {
+	g, err := store_sqlite.Open(filepath.Join(t.TempDir(), "callers.sqlite"))
+	require.NoError(t, err)
+	defer g.Close()
+
+	target := &graph.Node{ID: "pkg/hot.go::Hot", Kind: graph.KindFunction, Name: "Hot", FilePath: "pkg/hot.go", StartLine: 1}
+	g.AddNode(target)
+	// Ten stamped test callers whose IDs sort ahead of the production
+	// caller, inserted first, so any raw page of five rows is all tests.
+	for i := 0; i < 10; i++ {
+		file := fmt.Sprintf("pkg/a%02d_test.go", i)
+		caller := &graph.Node{
+			ID: fmt.Sprintf("%s::TestUse%02d", file, i), Kind: graph.KindFunction,
+			Name: fmt.Sprintf("TestUse%02d", i), FilePath: file, StartLine: 3,
+			Meta: map[string]any{"is_test": true},
+		}
+		g.AddNode(caller)
+		g.AddEdge(&graph.Edge{From: caller.ID, To: target.ID, Kind: graph.EdgeCalls, FilePath: file, Line: 5})
+	}
+	prod := &graph.Node{ID: "pkg/z_prod.go::Run", Kind: graph.KindFunction, Name: "Run", FilePath: "pkg/z_prod.go", StartLine: 8}
+	g.AddNode(prod)
+	g.AddEdge(&graph.Edge{From: prod.ID, To: target.ID, Kind: graph.EdgeCalls, FilePath: "pkg/z_prod.go", Line: 9})
+
+	eng := NewEngine(g)
+	sg := eng.GetCallers(target.ID, QueryOptions{ExcludeTests: true, Limit: 5, Depth: 1})
+
+	froms := make(map[string]bool)
+	for _, e := range sg.Edges {
+		froms[e.From] = true
+	}
+	require.True(t, froms[prod.ID],
+		"the production caller must be found even when a raw page of test rows precedes it")
 }
