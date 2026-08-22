@@ -83,12 +83,19 @@ func (f *familyFixture) otherCheckout(exclude string) store_sqlite.Checkout {
 }
 
 // runCoordinator drives one checkout's coordinator through a cycle, so a test
-// never waits on the quiet window. The coordinator's own loop is live, so the
-// cycle is taken under the same lock the loop takes: two cycles at once would
-// race for the route and one of them would be rescheduled.
+// never waits on the quiet window.
+//
+// The loop is stopped first, and stays stopped. Its quiet window and its poll
+// are wall-clock timers, so a cycle it fires on its own lands at a moment
+// nothing in the test ordered — and over a working tree the test moved in
+// between, that cycle installs a route the assertions never asked for.
+// Stopping it leaves the coordinator in the registry, which is what the
+// lifecycle still hands out, signals and drops. The lock is still taken,
+// because a cycle already in flight runs to completion under it.
 func (f *lifecycleFixture) runCoordinator(checkoutID string) CheckoutCycle {
 	f.t.Helper()
 	coordinator := lifecycleCoordinator(f.t, f.lc, checkoutID)
+	require.NoError(f.t, coordinator.Close())
 	coordinator.cycleMu.Lock()
 	cycle := coordinator.reconcile(context.Background())
 	coordinator.cycleMu.Unlock()
