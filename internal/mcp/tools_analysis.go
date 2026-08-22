@@ -10,6 +10,7 @@ import (
 	"github.com/zzet/gortex/internal/analysis"
 	"github.com/zzet/gortex/internal/contracts"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphview"
 )
 
 func (s *Server) registerAnalysisTools() {
@@ -105,6 +106,10 @@ func (s *Server) handleGetCommunities(ctx context.Context, req mcp.CallToolReque
 	// probeable, and a community that straddles the boundary still has its
 	// foreign members dropped.
 	comms := s.communitiesInSessionScope(ctx, s.getCommunities())
+	// The partition is the server-wide one, computed over the base corpus
+	// rather than through this request's reader, so under a view every answer
+	// built from it describes the base.
+	annotateBaseScoped(ctx, graphview.CapSyntaxGraph)
 
 	// If id is provided, return the single community in detail.
 	if id := req.GetString("id", ""); id != "" {
@@ -196,6 +201,10 @@ func (s *Server) handleGetProcesses(ctx context.Context, req mcp.CallToolRequest
 	// Clamp before the id branch so an out-of-scope process id reports the
 	// same "not found" as a fabricated one.
 	procs := s.processesInSessionScope(ctx, s.getProcesses())
+	// Process discovery is the server-wide pass over the base corpus, not a
+	// walk of this request's reader, so under a view every answer built from
+	// it describes the base.
+	annotateBaseScoped(ctx, graphview.CapSyntaxGraph)
 
 	// If id is provided, return the single process in detail.
 	if id := req.GetString("id", ""); id != "" {

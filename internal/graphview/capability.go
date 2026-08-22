@@ -1,6 +1,10 @@
 package graphview
 
-import "slices"
+import (
+	"fmt"
+	"slices"
+	"strings"
+)
 
 // CapabilityID names one thing a view can answer. A view is rarely complete
 // all at once: source bytes are readable long before the syntax graph is
@@ -127,6 +131,38 @@ func (c Completeness) State(id CapabilityID) CapabilityState {
 // IsComplete reports whether id is fully served by this view.
 func (c Completeness) IsComplete(id CapabilityID) bool {
 	return c.State(id) == StateComplete
+}
+
+// CapabilityStatus pairs one capability with the state a view found it in. It
+// is what a caller reports for a capability that did not fail the request but
+// still shaped the answer.
+type CapabilityStatus struct {
+	Capability CapabilityID    `json:"capability"`
+	State      CapabilityState `json:"state"`
+}
+
+// Degraded reports which of caps this view does not serve completely, in the
+// order given and with the state each was found in. It is the optional half of
+// Evaluate: the same inspection, reported instead of refused.
+func (c Completeness) Degraded(caps []CapabilityID) []CapabilityStatus {
+	var out []CapabilityStatus
+	for _, id := range caps {
+		if st := c.State(id); st != StateComplete {
+			out = append(out, CapabilityStatus{Capability: id, State: st})
+		}
+	}
+	return out
+}
+
+// ParseCapability resolves a wire capability name, refusing anything outside
+// the vocabulary so a typo names itself instead of silently requiring nothing.
+func ParseCapability(name string) (CapabilityID, error) {
+	id := CapabilityID(strings.TrimSpace(name))
+	if !id.Valid() {
+		return "", NewViewError(CodeInvalidViewSelector,
+			fmt.Sprintf("%q is not a capability this server knows; see %v", name, knownCapabilities))
+	}
+	return id, nil
 }
 
 // Evaluate checks a request's capability requirements against the view.

@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
+	"sync"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"go.uber.org/zap"
@@ -40,6 +42,58 @@ type requestView struct {
 	// files is the committed-tree file surface a view with no working copy
 	// reads through. Nil for every view that has one.
 	files *refViewFiles
+
+	// mu guards the annotations the request collects while it runs. The
+	// capability evaluation writes before the handler starts, but a handler
+	// may annotate from a goroutine it fans out to.
+	mu sync.Mutex
+	// degraded lists capabilities this view does not serve completely that
+	// the request did not require. They never fail it — they ride back on
+	// the rider so a thin answer is legible as one.
+	degraded []graphview.CapabilityStatus
+	// baseScoped lists capabilities a base-scoped engine answered while
+	// this view served the request.
+	baseScoped []graphview.CapabilityID
+}
+
+// completeness is what the materialized view can answer, nil for a request
+// the base corpus serves.
+func (v *requestView) completeness() graphview.Completeness {
+	if v == nil || v.materialized == nil {
+		return nil
+	}
+	return v.materialized.Completeness
+}
+
+// noteDegraded records capabilities that shaped the answer without failing
+// the request.
+func (v *requestView) noteDegraded(statuses []graphview.CapabilityStatus) {
+	if v == nil || len(statuses) == 0 {
+		return
+	}
+	v.mu.Lock()
+	v.degraded = append(v.degraded, statuses...)
+	v.mu.Unlock()
+}
+
+// noteBaseScoped records capabilities a base-scoped engine answered.
+func (v *requestView) noteBaseScoped(caps []graphview.CapabilityID) {
+	if v == nil || len(caps) == 0 {
+		return
+	}
+	v.mu.Lock()
+	v.baseScoped = mergeCapabilities(v.baseScoped, caps)
+	v.mu.Unlock()
+}
+
+// annotations reports what the request collected, for the rider.
+func (v *requestView) annotations() ([]graphview.CapabilityStatus, []graphview.CapabilityID) {
+	if v == nil {
+		return nil, nil
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return slices.Clone(v.degraded), slices.Clone(v.baseScoped)
 }
 
 // routed reports whether a composed checkout view — rather than the base
@@ -452,6 +506,18 @@ func (s *Server) attachViewRider(ctx context.Context, res *mcp.CallToolResult) *
 	}
 	if view.rider.RetryAfter > 0 {
 		fields["retry_after"] = view.rider.RetryAfter
+	}
+	// The capability annotations: what the view served thinly, and what a
+	// base-scoped engine answered instead of the view. Both are omitted when
+	// empty, so a request that hit neither carries exactly the fields it did
+	// before either existed.
+	if degraded, baseScoped := view.annotations(); len(degraded) > 0 || len(baseScoped) > 0 {
+		if len(degraded) > 0 {
+			fields["degraded_capabilities"] = degraded
+		}
+		if len(baseScoped) > 0 {
+			fields["base_scoped"] = sortedCapabilityNames(baseScoped)
+		}
 	}
 	text, ok := singleTextContent(res)
 	if !ok || text == "" {

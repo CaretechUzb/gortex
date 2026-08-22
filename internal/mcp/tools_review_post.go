@@ -154,7 +154,7 @@ func (s *Server) postReviewFindingsFor(ctx context.Context, req mcp.CallToolRequ
 	report, err := review.Run(ctx, s.readerFor(ctx), nil, review.Options{
 		RepoRoot:        repoRoot,
 		RepoPrefix:      repoPrefix,
-		CoverageKnown:   s.coverageKnownForDiff(repoPrefix, changedFiles),
+		CoverageKnown:   s.coverageKnownForDiff(ctx, repoPrefix, changedFiles),
 		Scope:           scope,
 		BaseRef:         baseRef,
 		Diff:            diffText,

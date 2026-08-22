@@ -11,6 +11,7 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/zzet/gortex/internal/analysis"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphview"
 )
 
 // handleAnalyzeClusters returns the cached community-detection
@@ -63,12 +64,16 @@ func (s *Server) handleAnalyzeClusters(ctx context.Context, req mcp.CallToolRequ
 			fullGraphBurst = !incrStats.Incremental
 		} else {
 			// Leiden reads the whole corpus through the store's kind-scoped
-			// edge projection, which a request overlay view does not provide,
-			// so the partition is computed over the base corpus even when the
-			// call carries an overlay.
+			// edge projection, which a request view does not provide, so the
+			// partition is computed over the base corpus even when the call
+			// carries an overlay or a routed view.
 			cr = analysis.DetectCommunitiesLeidenWith(s.graph, analysis.LeidenOptions{Resolution: resolution})
 			fullGraphBurst = true
 		}
+		// Both Leiden arms partition the base corpus — the cached one is a
+		// per-server partition shared by every session, the uncached one runs
+		// over the store directly. Under a view that is a base-scoped answer.
+		annotateBaseScoped(ctx, graphview.CapSyntaxGraph)
 	case "louvain":
 		cr = analysis.DetectCommunitiesLouvain(s.readerFor(ctx))
 		fullGraphBurst = true

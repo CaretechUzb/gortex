@@ -11,6 +11,7 @@ import (
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/eval/quality"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/query"
 )
 
@@ -47,7 +48,12 @@ func boolPtrArg(args map[string]any, key string) *bool {
 func (s *Server) attachInPackSections(ctx context.Context, result map[string]any, sections config.SmartContextSections, symbols []*graph.Node) {
 	block := map[string]any{}
 	if sections.CallPaths {
-		if cp := s.inPackCallPaths(symbols); len(cp) > 0 {
+		// The annotation follows the engine, not its output: "no call path
+		// between these symbols" is a claim about the base corpus the
+		// traversal ran over just as much as a path is.
+		cp := s.inPackCallPaths(symbols)
+		annotateBaseScoped(ctx, graphview.CapSyntaxGraph, graphview.CapResolutionLocal)
+		if len(cp) > 0 {
 			block["call_paths"] = cp
 		}
 	}
@@ -459,7 +465,8 @@ func (s *Server) inPackCallPaths(symbols []*graph.Node) []map[string]any {
 	}
 	// callpath.New builds its traversal state over a graph.Store, so these
 	// paths are computed over the base corpus even when the request carries
-	// an overlay view.
+	// an overlay or a routed view; the caller attaching the section annotates
+	// the response for a view.
 	anchored := callpath.New(s.graph).PathsToAnchor(roots, anchor, callpath.Options{MaxDepth: 8})
 	if len(anchored) == 0 {
 		return nil

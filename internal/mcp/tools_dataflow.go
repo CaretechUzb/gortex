@@ -12,6 +12,7 @@ import (
 	"github.com/zzet/gortex/internal/callpath"
 	"github.com/zzet/gortex/internal/dataflow"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphview"
 )
 
 // registerDataflowTools wires the CPG-lite dataflow MCP surface.
@@ -86,9 +87,11 @@ func (s *Server) handleFlowBetween(ctx context.Context, req mcp.CallToolRequest)
 
 	// dataflow.New builds its traversal state over a graph.Store, so these
 	// paths are computed over the base corpus even when the request carries
-	// an overlay view.
+	// an overlay or a routed view. Under a view that is a base-scoped answer
+	// the caller has to be told about.
 	engine := dataflow.New(s.graph).WithRefiner(s.dataflowRefiner(ctx))
 	paths := engine.FlowBetweenWithTier(source, sink, maxDepth, maxPaths, minTier)
+	annotateBaseScoped(ctx, graphview.CapSyntaxGraph, graphview.CapResolutionLocal)
 
 	if s.isGCX(ctx, req) {
 		payload, err := encodeFlowBetween(source, sink, paths)
@@ -125,8 +128,9 @@ func (s *Server) handleTracePath(ctx context.Context, req mcp.CallToolRequest) (
 	}
 	// callpath.New builds its traversal state over a graph.Store, so this
 	// path is computed over the base corpus even when the request carries an
-	// overlay view.
+	// overlay or a routed view, and says so on the response under one.
 	res := callpath.New(s.graph).ShortestPath(source, sink, opts)
+	annotateBaseScoped(ctx, graphview.CapSyntaxGraph, graphview.CapResolutionLocal)
 
 	if s.isGCX(ctx, req) {
 		payload, encErr := encodeTracePath(res)
@@ -162,9 +166,11 @@ func (s *Server) handleTaintPaths(ctx context.Context, req mcp.CallToolRequest) 
 
 	// dataflow.New builds its traversal state over a graph.Store, so these
 	// findings are computed over the base corpus even when the request
-	// carries an overlay view.
+	// carries an overlay or a routed view, and say so on the response under
+	// one.
 	engine := dataflow.New(s.graph).WithRefiner(s.dataflowRefiner(ctx))
 	findings := engine.TaintPathsWithTier(src, sink, maxDepth, limit, minTier)
+	annotateBaseScoped(ctx, graphview.CapSyntaxGraph, graphview.CapResolutionLocal)
 
 	if s.isGCX(ctx, req) {
 		payload, err := encodeTaintPaths(srcRaw, sinkRaw, findings)

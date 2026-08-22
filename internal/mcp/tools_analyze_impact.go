@@ -420,10 +420,10 @@ func (s *Server) handleAnalyzeImpactComposite(ctx context.Context, req mcp.CallT
 	reader := s.readerFor(ctx)
 	// The published reach index is built over the base corpus and keyed off
 	// base node metadata, so it is consulted only when this request reads the
-	// base graph. Under a request overlay the fan-in collected here through
-	// the request's own reader is the depth-1 stand-in, exactly as it is when
-	// no reach record has been published.
-	overlayActive := OverlayViewFromContext(ctx) != nil
+	// base graph itself. Under a request overlay or a routed view the fan-in
+	// collected here through the request's own reader is the depth-1 stand-in,
+	// exactly as it is when no reach record has been published.
+	baseReach := baseReachUsable(ctx)
 	fanIn, _ := analysis.CollectFanCounts(reader, candidateIDs,
 		[]graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences},
 		nil,
@@ -503,7 +503,7 @@ func (s *Server) handleAnalyzeImpactComposite(ctx context.Context, req mcp.CallT
 		// accidental eager all-symbol reach build.
 		reachCount := fanIn[n.ID]
 		reachLowerBound := false
-		if d1, d2, d3, hit, bounded := s.impactReachCached(overlayActive, n.ID); hit {
+		if d1, d2, d3, hit, bounded := s.impactReachCached(baseReach, n.ID); hit {
 			observed := len(d1) + len(d2) + len(d3)
 			if observed > reachCount {
 				reachCount = observed
@@ -647,14 +647,23 @@ func (s *Server) handleAnalyzeImpactComposite(ctx context.Context, req mcp.CallT
 	return s.respondJSONOrTOON(ctx, req, resp)
 }
 
+// baseReachUsable reports whether this request may consult the published reach
+// index at all. The records are built and stamped on the base store's nodes,
+// so only a request that reads the base graph itself describes the corpus they
+// were built over: an overlay carries the caller's unsaved edits, and a routed
+// view answers about a checkout the base index never saw. Either way the
+// records belong to a different corpus than the one the caller asked about.
+func baseReachUsable(ctx context.Context) bool {
+	return OverlayViewFromContext(ctx) == nil && !requestViewFromContext(ctx).routed()
+}
+
 // impactReachCached reads an already-published transitive reach record for one
-// candidate. The record is built and stamped on the base store's nodes, so an
-// overlay-active request never reads it: the answer would describe the corpus
-// before the caller's unsaved edits. Reporting a miss instead sends the caller
-// back to the fan-in the request's own reader produced, which is the same
-// depth-1 stand-in used whenever no record has been published.
-func (s *Server) impactReachCached(overlayActive bool, id string) (d1, d2, d3 []reach.Entry, hit, truncated bool) {
-	if overlayActive {
+// candidate, and only for a request the records describe. Reporting a miss
+// instead sends the caller back to the fan-in the request's own reader
+// produced, which is the same depth-1 stand-in used whenever no record has
+// been published.
+func (s *Server) impactReachCached(usable bool, id string) (d1, d2, d3 []reach.Entry, hit, truncated bool) {
+	if !usable {
 		return nil, nil, nil, false, false
 	}
 	return reach.LookupCached(s.graph, id)

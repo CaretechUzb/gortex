@@ -23,6 +23,7 @@ import (
 	"github.com/zzet/gortex/internal/excludes"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graphpath"
+	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/persistence"
 	"github.com/zzet/gortex/internal/query"
@@ -5093,8 +5094,9 @@ func (s *Server) handleAuditAgentConfig(ctx context.Context, req mcp.CallToolReq
 
 	// The audit scans config files on disk against the indexed corpus, so its
 	// stale-ref verdicts are computed over the base corpus even when the
-	// request carries an overlay view.
+	// request carries an overlay or a routed view, and say so under one.
 	report := audit.Audit(s.graph, root, files)
+	annotateBaseScoped(ctx, graphview.CapSyntaxGraph)
 
 	if isCompact(req) {
 		var b strings.Builder

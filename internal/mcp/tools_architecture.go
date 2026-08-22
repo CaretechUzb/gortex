@@ -11,6 +11,7 @@ import (
 	"github.com/zzet/gortex/internal/contracts"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graphpath"
+	"github.com/zzet/gortex/internal/graphview"
 )
 
 // registerArchitectureTool wires get_architecture — the single-shot
@@ -110,6 +111,13 @@ func (s *Server) handleGetArchitecture(ctx context.Context, req mcp.CallToolRequ
 	// 5. Processes — analysis.DiscoverProcesses output, trimmed.
 	processes := architectureProcesses(s.getProcesses(), inScope, topProcesses)
 
+	// The communities, hotspots and processes sections come from the
+	// server-wide analysis caches, which are computed over the base corpus
+	// rather than through this request's reader. Under a view three of the
+	// snapshot's sections therefore describe the base, so the response says
+	// so instead of reading as a wholly view-scoped answer.
+	annotateBaseScoped(ctx, graphview.CapSyntaxGraph)
+
 	// 6. Cross-repo edges — rollup by (from_repo, to_repo, kind) so
 	// the architecture view shows which repos talk to which without
 	// dumping every individual call site.
@@ -133,7 +141,9 @@ func (s *Server) handleGetArchitecture(ctx context.Context, req mcp.CallToolRequ
 	// asks for a resolution tier, collapse the leaf graph to that tier
 	// so the response carries the architecture at the requested
 	// granularity (file / package / service / system) with no
-	// function-leaf nodes. Computed on demand from the base graph.
+	// function-leaf nodes. Computed on demand from the base graph, so it is
+	// base-scoped for the same reason the cached sections are and rides on
+	// the same annotation.
 	if hierarchy, errMsg := architectureHierarchy(s.graph, s.getCommunities(), req.GetString("resolution", "")); errMsg != "" {
 		return mcp.NewToolResultError(errMsg), nil
 	} else if hierarchy != nil {

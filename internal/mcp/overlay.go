@@ -127,6 +127,13 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		if selectorErr != nil {
 			return mcp.NewToolResultError(selectorErr.Error()), nil
 		}
+		// The capability contract travels on the same seam and for the same
+		// reason: what a caller needs the view to be able to answer is a
+		// property of the request, not a parameter of any one tool.
+		capabilities, capabilitiesErr := takeCapabilityRequest(&req)
+		if capabilitiesErr != nil {
+			return mcp.NewToolResultError(capabilitiesErr.Error()), nil
+		}
 		// Tolerate hallucinated / mistyped parameter names before the
 		// handler reads arguments (e.g. "symbol" accepted as "id").
 		s.reconcileToolParams(&req)
@@ -164,6 +171,12 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		// A write issued while reading a routed view would land in the
 		// canonical checkout, not the one the answer came from.
 		if refused := s.refuseRoutedViewMutation(ctx, req.Params.Name); refused != nil {
+			return refused, nil
+		}
+		// What the view can answer, checked against what this operation
+		// needs, before the handler runs — a thin view must refuse rather
+		// than answer thinly and look complete doing it.
+		if refused := s.evaluateRequestCapabilities(ctx, &req, capabilities); refused != nil {
 			return refused, nil
 		}
 		if injectOverlay {

@@ -88,7 +88,9 @@ func (s *Server) handleGenerateWiki(ctx context.Context, req mcp.CallToolRequest
 	// overlay-active caller documents its own buffers. The community,
 	// process, hotspot and cycle passes below build their own indexes over a
 	// graph.Store, so those four sections are computed over the base corpus
-	// even when the request carries an overlay view.
+	// even when the request carries an overlay view. A routed view never
+	// reaches here: the wiki writes files, so the mutation gate refuses it
+	// before the handler runs.
 	reader := s.readerFor(ctx)
 	communities := analysis.DetectCommunities(g)
 	processes := analysis.DiscoverProcesses(g)

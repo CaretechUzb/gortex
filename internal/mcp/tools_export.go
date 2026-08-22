@@ -57,7 +57,8 @@ func (s *Server) handleExportGraph(ctx context.Context, req mcp.CallToolRequest)
 	// The mermaid scopes run community detection and process discovery, which
 	// build their own indexes over a graph.Store, so those diagrams are
 	// rendered from the base corpus even when the request carries an overlay
-	// view.
+	// view. A routed view never reaches here: the export writes files, so the
+	// mutation gate refuses it before the handler runs.
 	g := s.graph
 	if g == nil {
 		return mcp.NewToolResultError("export: graph is not initialised"), nil

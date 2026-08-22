@@ -16,6 +16,7 @@ import (
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/gitcmd"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/llm"
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/review"
@@ -578,7 +579,7 @@ func (s *Server) handleReview(ctx context.Context, req mcp.CallToolRequest) (*mc
 	report, err := review.RunWithUsage(ctx, s.readerFor(ctx), gen, s.reviewPricing(), review.Options{
 		RepoRoot:        repoRoot,
 		RepoPrefix:      repoPrefix,
-		CoverageKnown:   s.coverageKnownForDiff(repoPrefix, changedFiles),
+		CoverageKnown:   s.coverageKnownForDiff(ctx, repoPrefix, changedFiles),
 		Scope:           scope,
 		BaseRef:         baseRef,
 		Diff:            diffText,
@@ -790,8 +791,12 @@ func nodeIsTestSymbol(n *graph.Node) bool {
 // An index config that excludes a language's test files (e.g. "**/*_test.go")
 // makes "no covering test" blindness, not a finding — the review then says
 // "coverage unknown" instead of "untested".
-func (s *Server) coverageKnownForDiff(repoPrefix string, changedFiles []string) bool {
+//
+// The probe behind it is per-repo and shared by every session, so the verdict
+// is the base corpus's; under a view the response says so.
+func (s *Server) coverageKnownForDiff(ctx context.Context, repoPrefix string, changedFiles []string) bool {
 	langs := s.testLangsIndexed(repoPrefix)
+	annotateBaseScoped(ctx, graphview.CapSyntaxGraph)
 	sawCode := false
 	for _, f := range changedFiles {
 		lang, ok := testLangByExt[strings.ToLower(filepath.Ext(f))]
@@ -1129,7 +1134,7 @@ func (s *Server) handleReviewPack(ctx context.Context, req mcp.CallToolRequest) 
 	report, err := review.RunWithUsage(ctx, s.readerFor(ctx), gen, s.reviewPricing(), review.Options{
 		RepoRoot:        repoRoot,
 		RepoPrefix:      repoPrefix,
-		CoverageKnown:   len(testTargets) > 0 || (diff != nil && s.coverageKnownForDiff(repoPrefix, diff.ChangedFiles)),
+		CoverageKnown:   len(testTargets) > 0 || (diff != nil && s.coverageKnownForDiff(ctx, repoPrefix, diff.ChangedFiles)),
 		Scope:           scope,
 		BaseRef:         baseRef,
 		Diff:            diffText,
