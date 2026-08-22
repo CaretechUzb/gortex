@@ -1,0 +1,670 @@
+package indexer
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"go.uber.org/zap"
+	"uuid"
+
+	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/gitstate"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/indexer/source"
+)
+
+// The ref-view manager.
+//
+// A ref view is a named view of one graph at a committed selector — a branch, a
+// tag, a commit id — that nobody has checked out. Serving it means holding a
+// generation whose payload describes that selector's tree, composed over the
+// graph's base corpus, and that is the whole of what this file arranges.
+//
+// Three properties shape it, and none of them is optional:
+//
+//   - Selection re-resolves, always. Nothing watches the refs a view names, so
+//     a branch that moved while nobody was asking is only ever noticed by the
+//     next selection. Idle movement therefore costs nothing: no watcher, no
+//     poll, no build. The cost is three git plumbing calls per selection.
+//
+//   - Two selections of one view share one build. The catalog's partial unique
+//     index on the in-flight builds is the lock, so the loser is handed the
+//     winner's build token rather than starting a second pass that would
+//     produce byte-identical payload.
+//
+//   - What a build produces is adopted only if the world still agrees with it.
+//     A build takes as long as it takes, and a ref can move twice in that
+//     window. The publish step re-resolves the selector and re-reads the view
+//     under the epoch the build captured; a tree that moved makes the finished
+//     generation superseded rather than active. The one movement that does NOT
+//     cost a rebuild is a new commit carrying the same tree — a rebase, an
+//     amend, an empty commit — because the payload is a function of the tree.
+//     That case adopts the generation and stamps the new commit beside it.
+
+const (
+	// refViewOwnerKind names who owns the generations a ref view's builds
+	// produce. It is not the checkout owner kind: these generations belong to
+	// no checkout, which is the whole point of a ref view.
+	refViewOwnerKind = "ref_view"
+
+	// refViewResolverVersion stamps the resolution contract a ref view's
+	// generations were built under. Raising it makes every stored ref-view
+	// generation miss, which is what a change in what resolution emits
+	// requires — the stored payload is not what this binary would produce.
+	refViewResolverVersion = "1"
+
+	// defaultEnrichmentProfile is the profile a request that names none is
+	// served under. The profile is part of the view's catalog key and part of
+	// its build fingerprint, so two profiles of one selector are two views
+	// with two payloads rather than one view served two ways.
+	defaultEnrichmentProfile = "default"
+
+	// refViewBuildLiveness is how long a claimed build may go without progress
+	// before the next selection may take it over.
+	//
+	// A claim outlives the process that made it: a daemon killed mid-build, or
+	// a request whose bookkeeping write never landed, leaves the coalescing
+	// row in the building state with nobody behind it. Every later selection
+	// of that tree would then be handed a dead build's token and answer
+	// "building" forever — and for a commit or tag selector the tree never
+	// moves, so nothing would ever break the tie. The window is generous
+	// because the cost of reclaiming a build that is merely slow is one
+	// duplicate pass, while the cost of not reclaiming a dead one is a view
+	// that never serves again.
+	refViewBuildLiveness = 10 * time.Minute
+)
+
+// RefViewRequest names one view of one graph.
+type RefViewRequest struct {
+	// GraphID is the dedicated graph whose corpus the view composes over.
+	GraphID string
+
+	// SelectorKind and SelectorValue are the committed state the view pins.
+	// Only the two resolvable kinds are accepted here: a worktree or base
+	// selector names something that already has a route.
+	SelectorKind  gitstate.ViewSelectorKind
+	SelectorValue string
+
+	// RepoDir is the repository the selector resolves against and the trees
+	// are read from. It is never written to and never checked out.
+	RepoDir string
+
+	// EnrichmentProfile is how deeply the view is enriched. Empty takes the
+	// default profile.
+	EnrichmentProfile string
+
+	// RepoPrefix, WorkspaceID and ProjectID are stamped onto the payload.
+	// They are the GRAPH's, not the view's: the layer composes over the
+	// graph's corpus, so its nodes have to live in the same namespace.
+	RepoPrefix  string
+	WorkspaceID string
+	ProjectID   string
+}
+
+// RefViewResult is what one EnsureRefView call decided.
+//
+// State is the answer: ready means GenerationID composes over the graph's
+// corpus into the view the caller asked for, building means somebody is
+// producing it and the caller should retry, and failed means the selector
+// could not be served at all — the error carries why.
+type RefViewResult struct {
+	RefViewID    string
+	GenerationID int64
+
+	// Resolved is what the selector named at the moment the call answered. For
+	// a ready view it is what the active generation's metadata was stamped
+	// with, so a caller can label the view with the commit it is really at.
+	Resolved gitstate.ResolvedSelector
+
+	State store_sqlite.RefViewState
+
+	// BuildToken identifies the in-flight attempt a building answer is waiting
+	// on. It is empty when the build that was in flight has just been
+	// superseded and the retry will claim a new one.
+	BuildToken string
+
+	// Built reports that this call ran a build pass. It is the difference
+	// between "the view was already current" and "the view was made current",
+	// and it stays true for a build whose result was superseded — the pass ran
+	// either way.
+	Built bool
+}
+
+// RefViewManagerConfig is what one manager needs.
+type RefViewManagerConfig struct {
+	// Store is any handle on the database. Generations are begun, published
+	// and superseded through it.
+	Store *store_sqlite.Store
+	// Builder builds the sparse generations. It must carry the index
+	// configuration the base corpus was indexed with.
+	Builder *SparseGenerationBuilder
+	// Config is the index configuration the generations are built under. Its
+	// digest is part of every build fingerprint, so a configuration change
+	// invalidates a view's payload instead of composing two payloads built
+	// under different rules.
+	Config config.IndexConfig
+	Logger *zap.Logger
+
+	// buildBarrier is a test seam: it runs between a build pass finishing and
+	// the publish step re-resolving the selector, which is exactly the window
+	// the revalidation exists to close. nil in production.
+	buildBarrier func()
+}
+
+// RefViewManager serves ref views of one store's graphs. It holds no
+// per-request state and is safe to use from many goroutines.
+type RefViewManager struct {
+	store   *store_sqlite.Store
+	catalog *store_sqlite.Catalog
+	builder *SparseGenerationBuilder
+	logger  *zap.Logger
+
+	configHash string
+	extractors string
+
+	buildBarrier func()
+}
+
+// NewRefViewManager builds a manager over one store.
+func NewRefViewManager(cfg RefViewManagerConfig) (*RefViewManager, error) {
+	switch {
+	case cfg.Store == nil:
+		return nil, errors.New("indexer: ref view manager needs a store")
+	case cfg.Builder == nil:
+		return nil, errors.New("indexer: ref view manager needs a generation builder")
+	}
+	logger := cfg.Logger
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	return &RefViewManager{
+		store:        cfg.Store,
+		catalog:      cfg.Store.Catalog(),
+		builder:      cfg.Builder,
+		logger:       logger,
+		configHash:   indexConfigHash(cfg.Config),
+		extractors:   extractorVersionsFingerprint(),
+		buildBarrier: cfg.buildBarrier,
+	}, nil
+}
+
+// EnsureRefView makes one view current and reports what serving it would read.
+//
+// The order is fixed: find or create the view's row so a failure has somewhere
+// to be recorded, resolve the selector, decide whether what the view is
+// already serving describes exactly that state, and only then claim a build.
+// Re-resolving on every selection is what makes idle movement free; deciding
+// against the fingerprint rather than against the ref is what makes a commit
+// that changed no tree free too.
+func (m *RefViewManager) EnsureRefView(ctx context.Context, req RefViewRequest) (RefViewResult, error) {
+	if err := m.validate(&req); err != nil {
+		return RefViewResult{}, err
+	}
+	base, err := m.base(ctx, req.GraphID)
+	if err != nil {
+		return RefViewResult{}, err
+	}
+	viewID := refViewID(req)
+	view, err := m.catalog.GetOrCreateRefView(ctx, store_sqlite.RefView{
+		RefViewID:         viewID,
+		GraphID:           req.GraphID,
+		SelectorKind:      string(req.SelectorKind),
+		SelectorValue:     req.SelectorValue,
+		EnrichmentProfile: req.EnrichmentProfile,
+		State:             store_sqlite.RefViewPending,
+		ExactView:         true,
+	})
+	if err != nil {
+		return RefViewResult{}, err
+	}
+
+	resolved, err := gitstate.ResolveViewSelector(ctx, req.RepoDir, req.SelectorKind, req.SelectorValue)
+	if err != nil {
+		return m.failed(ctx, view, err)
+	}
+
+	identity := m.identity(viewID, base, resolved.TreeOID)
+	fingerprint := refViewBuildFingerprint(identity, req.EnrichmentProfile)
+	current, err := m.activeIsCurrent(ctx, view, fingerprint)
+	if err != nil {
+		return RefViewResult{}, err
+	}
+
+	view, err = m.desire(ctx, view, resolved, fingerprint, current)
+	if err != nil {
+		return RefViewResult{}, err
+	}
+	if current {
+		return m.adoptMetadata(ctx, view, resolved)
+	}
+	return m.startBuild(ctx, req, view, base, resolved, identity, fingerprint)
+}
+
+// validate refuses a request that cannot name a view, and fills the one
+// default a caller may leave unset.
+func (m *RefViewManager) validate(req *RefViewRequest) error {
+	switch {
+	case m == nil:
+		return errors.New("indexer: nil ref view manager")
+	case req.GraphID == "":
+		return errors.New("indexer: ref view request needs a graph id")
+	case req.RepoDir == "":
+		return errors.New("indexer: ref view request needs a repository directory")
+	case req.SelectorValue == "":
+		return errors.New("indexer: ref view request needs a selector value")
+	}
+	switch req.SelectorKind {
+	case gitstate.ViewSelectorGitRef, gitstate.ViewSelectorCommit:
+	default:
+		return fmt.Errorf("indexer: selector kind %q names no committed state", string(req.SelectorKind))
+	}
+	if req.EnrichmentProfile == "" {
+		req.EnrichmentProfile = defaultEnrichmentProfile
+	}
+	return nil
+}
+
+// base resolves the corpus a view's layer sits on.
+func (m *RefViewManager) base(ctx context.Context, graphID string) (primaryBase, error) {
+	dedicated, found, err := m.catalog.GetDedicatedGraph(ctx, graphID)
+	if err != nil {
+		return primaryBase{}, err
+	}
+	if !found {
+		return primaryBase{}, fmt.Errorf("indexer: graph %s has no dedicated-graph row to build over", graphID)
+	}
+	return graphBase(ctx, m.catalog, dedicated)
+}
+
+// activeIsCurrent reports whether the generation the view already serves was
+// built from exactly these inputs and is still readable. A fingerprint match
+// settles the tree, the base and the extraction rules in one comparison; what
+// it deliberately says nothing about is the ref or the commit, which is what
+// makes a moved ref on an unchanged tree a metadata update.
+func (m *RefViewManager) activeIsCurrent(
+	ctx context.Context,
+	view store_sqlite.RefView,
+	fingerprint string,
+) (bool, error) {
+	if view.ActiveGenerationID <= 0 || view.ActiveBuildFingerprint != fingerprint {
+		return false, nil
+	}
+	row, found, err := m.catalog.GetViewGeneration(ctx, view.ActiveGenerationID)
+	if err != nil {
+		return false, err
+	}
+	return found && servableGeneration(row.State), nil
+}
+
+// desire records what this selection resolved to and re-reads the row.
+//
+// The re-read is not a convenience: the desire write bumps the view's epoch
+// exactly when the tree or the fingerprint moved, and the epoch a build
+// captures has to be the one that write left behind.
+func (m *RefViewManager) desire(
+	ctx context.Context,
+	view store_sqlite.RefView,
+	resolved gitstate.ResolvedSelector,
+	fingerprint string,
+	current bool,
+) (store_sqlite.RefView, error) {
+	state := store_sqlite.RefViewBuilding
+	if current {
+		state = store_sqlite.RefViewReady
+	}
+	now := time.Now().Unix()
+	err := m.catalog.UpdateRefViewDesire(ctx, store_sqlite.UpdateRefViewDesireRequest{
+		RefViewID:               view.RefViewID,
+		DesiredRef:              resolved.FullRef,
+		DesiredCommit:           resolved.CommitOID,
+		DesiredTree:             resolved.TreeOID,
+		DesiredBuildFingerprint: fingerprint,
+		State:                   state,
+		LastResolved:            now,
+		LastSelected:            now,
+	})
+	if err != nil {
+		return store_sqlite.RefView{}, err
+	}
+	stored, found, err := m.catalog.GetRefView(ctx, view.RefViewID)
+	if err != nil {
+		return store_sqlite.RefView{}, err
+	}
+	if !found {
+		return store_sqlite.RefView{}, fmt.Errorf("%w: ref view %s",
+			store_sqlite.ErrCatalogNotFound, view.RefViewID)
+	}
+	return stored, nil
+}
+
+// adoptMetadata answers a selection whose payload is already current. The
+// generation is untouched; only the ref and commit the selector resolves to
+// now are stamped beside it.
+//
+// A lost epoch guard is not an error here. It means another actor re-targeted
+// the view between the two writes, and that does not make the generation this
+// call is answering with any less correct — it was built for the tree this
+// selection resolved to.
+func (m *RefViewManager) adoptMetadata(
+	ctx context.Context,
+	view store_sqlite.RefView,
+	resolved gitstate.ResolvedSelector,
+) (RefViewResult, error) {
+	now := time.Now().Unix()
+	err := m.catalog.TouchRefViewSelection(ctx, store_sqlite.TouchRefViewSelectionRequest{
+		RefViewID:          view.RefViewID,
+		ExpectedRouteEpoch: view.RouteEpoch,
+		ActiveRef:          resolved.FullRef,
+		ActiveCommit:       resolved.CommitOID,
+		LastResolved:       now,
+		LastSelected:       now,
+	})
+	if err != nil && !errors.Is(err, store_sqlite.ErrCatalogStaleGuard) {
+		return RefViewResult{}, err
+	}
+	return RefViewResult{
+		RefViewID:    view.RefViewID,
+		GenerationID: view.ActiveGenerationID,
+		Resolved:     resolved,
+		State:        store_sqlite.RefViewReady,
+	}, nil
+}
+
+// startBuild claims the build for this state and runs it, or reports the
+// attempt already running it.
+func (m *RefViewManager) startBuild(
+	ctx context.Context,
+	req RefViewRequest,
+	view store_sqlite.RefView,
+	base primaryBase,
+	resolved gitstate.ResolvedSelector,
+	identity GenerationIdentity,
+	fingerprint string,
+) (RefViewResult, error) {
+	now := time.Now().Unix()
+	claimed, err := m.catalog.ClaimRefViewBuild(ctx, store_sqlite.RefViewBuild{
+		BuildID:            uuid.NewV7().String(),
+		RefViewID:          view.RefViewID,
+		DesiredRef:         resolved.FullRef,
+		DesiredCommit:      resolved.CommitOID,
+		DesiredTree:        resolved.TreeOID,
+		BaseGenerationID:   base.generationID,
+		EnrichmentProfile:  req.EnrichmentProfile,
+		BuildFingerprint:   fingerprint,
+		CapturedRouteEpoch: view.RouteEpoch,
+		State:              store_sqlite.ViewGenerationBuilding,
+		BuildToken:         uuid.NewV7().String(),
+		CreatedAt:          now,
+		LastProgress:       now,
+	}, now-int64(refViewBuildLiveness/time.Second))
+	if err != nil {
+		if errors.Is(err, store_sqlite.ErrRefViewBuildInFlight) {
+			return RefViewResult{
+				RefViewID:  view.RefViewID,
+				Resolved:   resolved,
+				State:      store_sqlite.RefViewBuilding,
+				BuildToken: claimed.BuildToken,
+			}, nil
+		}
+		return RefViewResult{}, err
+	}
+	return m.runBuild(ctx, req, view, claimed, base, resolved, identity)
+}
+
+// runBuild produces the generation and decides whether it may be adopted.
+func (m *RefViewManager) runBuild(
+	ctx context.Context,
+	req RefViewRequest,
+	view store_sqlite.RefView,
+	build store_sqlite.RefViewBuild,
+	base primaryBase,
+	resolved gitstate.ResolvedSelector,
+	identity GenerationIdentity,
+) (RefViewResult, error) {
+	generationID, report, buildErr := m.builder.BuildCommitLayer(ctx, CommitLayerRequest{
+		Identity:      identity,
+		Base:          m.store.AtGeneration(base.generationID),
+		RepoDir:       req.RepoDir,
+		BaseTreeOID:   base.treeOID,
+		TargetTreeOID: resolved.TreeOID,
+		RootPath:      req.RepoDir,
+		RepoPrefix:    req.RepoPrefix,
+		WorkspaceID:   req.WorkspaceID,
+		ProjectID:     req.ProjectID,
+	})
+	if m.buildBarrier != nil {
+		m.buildBarrier()
+	}
+	if buildErr != nil {
+		failure := classifyRefViewBuildError(buildErr)
+		m.completeBuild(ctx, build, store_sqlite.ViewGenerationFailed, 0, failure.Error())
+		result, err := m.failed(ctx, view, failure)
+		result.Built = true
+		return result, err
+	}
+	if report.ClosureTruncated {
+		m.logger.Warn("ref view manager: build closure truncated",
+			zap.String("ref_view", view.RefViewID), zap.Int64("generation", generationID),
+			zap.Int("cap", report.ClosureCap))
+	}
+
+	// Revalidation, git side: what does the selector name now? A tree that
+	// moved means the payload describes a state the view has left.
+	published, err := gitstate.ResolveViewSelector(ctx, req.RepoDir, req.SelectorKind, req.SelectorValue)
+	if err != nil {
+		m.supersede(ctx, build, generationID)
+		result, failErr := m.failed(ctx, view, err)
+		result.Built = true
+		return result, failErr
+	}
+	if published.TreeOID != resolved.TreeOID {
+		return m.superseded(ctx, build, generationID, view, published), nil
+	}
+
+	// Revalidation, catalog side: is the row still asking for what was built,
+	// at the epoch the build captured? The ref and commit stamped beside the
+	// generation are the ones current AT PUBLISH, which is how a commit that
+	// moved over an unchanged tree lands without a second pass.
+	now := time.Now().Unix()
+	err = m.catalog.AdoptRefViewGeneration(ctx, store_sqlite.AdoptRefViewGenerationRequest{
+		RefViewID:                       view.RefViewID,
+		ExpectedRouteEpoch:              build.CapturedRouteEpoch,
+		ExpectedDesiredTree:             resolved.TreeOID,
+		ExpectedDesiredBuildFingerprint: build.BuildFingerprint,
+		GenerationID:                    generationID,
+		ActiveRef:                       published.FullRef,
+		ActiveCommit:                    published.CommitOID,
+		ActiveTree:                      published.TreeOID,
+		ActiveBuildFingerprint:          build.BuildFingerprint,
+		ExactView:                       true,
+		LastResolved:                    now,
+		LastSelected:                    now,
+	})
+	if err != nil {
+		if errors.Is(err, store_sqlite.ErrCatalogStaleGuard) {
+			return m.superseded(ctx, build, generationID, view, published), nil
+		}
+		return RefViewResult{}, err
+	}
+	m.completeBuild(ctx, build, store_sqlite.ViewGenerationReady, generationID, "")
+	return RefViewResult{
+		RefViewID:    view.RefViewID,
+		GenerationID: generationID,
+		Resolved:     published,
+		State:        store_sqlite.RefViewReady,
+		Built:        true,
+	}, nil
+}
+
+// superseded takes a finished build out of the running and answers with a
+// retry. The view's active pointer is untouched: whatever it was serving is
+// still a legal thing to serve, and the next selection resolves the state the
+// selector actually moved to.
+func (m *RefViewManager) superseded(
+	ctx context.Context,
+	build store_sqlite.RefViewBuild,
+	generationID int64,
+	view store_sqlite.RefView,
+	published gitstate.ResolvedSelector,
+) RefViewResult {
+	m.supersede(ctx, build, generationID)
+	return RefViewResult{
+		RefViewID: view.RefViewID,
+		Resolved:  published,
+		State:     store_sqlite.RefViewBuilding,
+		Built:     true,
+	}
+}
+
+// supersede retires a generation nothing will adopt and closes its build.
+// Both writes are best effort: the caller's answer is "retry" either way, and
+// failing the selection because the bookkeeping failed would turn a retryable
+// answer into an error. Both are detached from the request for the reason
+// completeBuild gives — a cancellation is exactly when they matter most.
+func (m *RefViewManager) supersede(ctx context.Context, build store_sqlite.RefViewBuild, generationID int64) {
+	ctx = closingContext(ctx)
+	if generationID > 0 {
+		if err := m.store.MarkPayloadGenerationSuperseded(ctx, generationID); err != nil {
+			m.logger.Debug("ref view manager: could not supersede an unadopted generation",
+				zap.String("ref_view", build.RefViewID),
+				zap.Int64("generation", generationID), zap.Error(err))
+		}
+	}
+	m.completeBuild(ctx, build, store_sqlite.ViewGenerationSuperseded, generationID, "")
+}
+
+// completeBuild ends one attempt.
+//
+// It runs detached from the request. An attempt left in the building state
+// holds the coalescing claim, and the claim is what every later selection of
+// that tree waits on — so a request that was canceled while its build ran
+// still has to close the attempt it started, or it wedges the view until the
+// liveness window expires. A lost guard means the row went with its ref view.
+//
+// The write itself is still best effort: the answer this selection gives is
+// already decided by the time it runs, and a claim that outlives its worker is
+// reclaimable by the next claimant rather than permanent.
+func (m *RefViewManager) completeBuild(
+	ctx context.Context,
+	build store_sqlite.RefViewBuild,
+	state store_sqlite.ViewGenerationState,
+	generationID int64,
+	buildError string,
+) {
+	err := m.catalog.CompleteRefViewBuild(closingContext(ctx), store_sqlite.CompleteRefViewBuildRequest{
+		BuildID:      build.BuildID,
+		BuildToken:   build.BuildToken,
+		State:        state,
+		GenerationID: generationID,
+		LastProgress: time.Now().Unix(),
+		Error:        buildError,
+	})
+	if err != nil && !errors.Is(err, store_sqlite.ErrCatalogStaleGuard) {
+		m.logger.Warn("ref view manager: could not close a build attempt",
+			zap.String("build", build.BuildID), zap.Error(err))
+	}
+}
+
+// failed records why a selection could not be served and hands the cause back.
+// The active pointer is never touched: a view whose newest build failed keeps
+// serving what it was serving, and whoever reads it labels that inexact.
+func (m *RefViewManager) failed(
+	ctx context.Context,
+	view store_sqlite.RefView,
+	cause error,
+) (RefViewResult, error) {
+	err := m.catalog.FailRefView(closingContext(ctx), store_sqlite.FailRefViewRequest{
+		RefViewID:          view.RefViewID,
+		ExpectedRouteEpoch: view.RouteEpoch,
+		LastError:          cause.Error(),
+		LastResolved:       time.Now().Unix(),
+	})
+	if err != nil && !errors.Is(err, store_sqlite.ErrCatalogStaleGuard) {
+		m.logger.Warn("ref view manager: could not record a failed selection",
+			zap.String("ref_view", view.RefViewID), zap.Error(err))
+	}
+	return RefViewResult{
+		RefViewID: view.RefViewID,
+		State:     store_sqlite.RefViewFailed,
+	}, cause
+}
+
+// closingContext is what a selection's closing writes run under: the request's
+// values without its cancellation. Every one of them records something the
+// selection has already decided — the attempt is over, the generation is not
+// being adopted, the selector could not be served — and a canceled request
+// that skipped them would leave that state behind for the next caller to trip
+// over rather than saving any work.
+func closingContext(ctx context.Context) context.Context {
+	return context.WithoutCancel(ctx)
+}
+
+// identity is the catalog identity of the generation a ref view's build
+// produces.
+//
+// The commit is deliberately not part of it, exactly as it is not part of a
+// checkout's commit layer: two commits with the same tree produce the same
+// payload, and keying on the commit would rebuild for a rebase that changed
+// nothing a reader can see. Which commit the view is AT lives on the view's
+// row, where it can be re-stamped without touching the payload.
+func (m *RefViewManager) identity(viewID string, base primaryBase, targetTree string) GenerationIdentity {
+	return GenerationIdentity{
+		OwnerKind:            refViewOwnerKind,
+		GraphID:              base.graphID,
+		LayerID:              refViewLayerID(viewID),
+		GenerationKind:       CommitLayerGenerationKind,
+		BaseGenerationID:     base.generationID,
+		LowerViewFingerprint: base.treeOID,
+		TreeOID:              targetTree,
+		ConfigHash:           m.configHash,
+		ExtractorVersions:    m.extractors,
+		ResolverVersion:      refViewResolverVersion,
+	}
+}
+
+// refViewLayerID names a ref view's layer. It is derived rather than
+// generated so the catalog's in-flight generation coalescing can recognise two
+// builds of the same layer as the same build.
+func refViewLayerID(viewID string) string { return "refview-layer-" + viewID }
+
+// refViewID derives a view's catalog id from what makes it that view.
+//
+// Deriving rather than generating is what lets two processes that have never
+// spoken agree on which row a selector belongs to: both compute the same id,
+// and the second one's insert is declined instead of minting a duplicate the
+// UNIQUE selector key would have to refuse anyway.
+func refViewID(req RefViewRequest) string {
+	sum := sha256.Sum256([]byte(strings.Join([]string{
+		req.GraphID,
+		string(req.SelectorKind),
+		req.SelectorValue,
+		req.EnrichmentProfile,
+	}, "\x00")))
+	return "refview-" + hex.EncodeToString(sum[:16])
+}
+
+// refViewBuildFingerprint digests everything a ref view's payload is a
+// function of: the base generation and tree the layer sits on, the tree it
+// targets, the extraction rules it was produced under, and the enrichment
+// profile it is served at. Two selections that agree on it would produce the
+// same payload, which is what makes one able to wait on the other.
+func refViewBuildFingerprint(identity GenerationIdentity, profile string) string {
+	sum := sha256.Sum256([]byte(generationIdentityKey(identity) + profile))
+	return hex.EncodeToString(sum[:16])
+}
+
+// classifyRefViewBuildError re-types a build failure the local object store
+// caused. A tree that resolved a moment ago and cannot be read now was pruned
+// or was never fully fetched, and that is an availability answer the caller
+// can act on rather than an opaque build failure.
+func classifyRefViewBuildError(err error) error {
+	if errors.Is(err, source.ErrObjectMissing) {
+		return fmt.Errorf("%w: %w", gitstate.ErrRefNotAvailableLocally, err)
+	}
+	return err
+}

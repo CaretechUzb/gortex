@@ -853,6 +853,388 @@ func TestCatalogRefViewSelectorAndBuildCoalescing(t *testing.T) {
 	}
 }
 
+// seedRefView creates a view through GetOrCreateRefView and returns the row.
+func seedRefView(t *testing.T, catalog *Catalog, refViewID, graphID string) RefView {
+	t.Helper()
+	view, err := catalog.GetOrCreateRefView(context.Background(), RefView{
+		RefViewID: refViewID, GraphID: graphID, SelectorKind: "git_ref",
+		SelectorValue: "refs/heads/" + refViewID, EnrichmentProfile: "default",
+		State: RefViewPending, ExactView: true,
+	})
+	if err != nil {
+		t.Fatalf("GetOrCreateRefView: %v", err)
+	}
+	return view
+}
+
+func readRefView(t *testing.T, catalog *Catalog, refViewID string) RefView {
+	t.Helper()
+	view, found, err := catalog.GetRefView(context.Background(), refViewID)
+	if err != nil || !found {
+		t.Fatalf("GetRefView(%s) = %v, %v, %v", refViewID, view, found, err)
+	}
+	return view
+}
+
+// TestCatalogRefViewCreationIsIdempotent proves that a second selection of a
+// view does not reset the row the first one advanced: the create declines the
+// conflict and hands back what is stored.
+func TestCatalogRefViewCreationIsIdempotent(t *testing.T) {
+	store := openCatalogStore(t)
+	ctx := context.Background()
+	catalog := store.Catalog()
+
+	first := seedRefView(t, catalog, "rv-1", "graph-1")
+	if first.State != RefViewPending || first.RouteEpoch != 0 {
+		t.Fatalf("created view = %+v", first)
+	}
+
+	err := catalog.UpdateRefViewDesire(ctx, UpdateRefViewDesireRequest{
+		RefViewID: "rv-1", DesiredRef: "refs/heads/rv-1", DesiredCommit: "c1",
+		DesiredTree: "t1", DesiredBuildFingerprint: "fp-1",
+		State: RefViewBuilding, LastResolved: 10, LastSelected: 10,
+	})
+	if err != nil {
+		t.Fatalf("UpdateRefViewDesire: %v", err)
+	}
+
+	// A second creator arrives with a pristine row. It must change nothing.
+	second := seedRefView(t, catalog, "rv-1", "graph-1")
+	if second.DesiredTree != "t1" || second.State != RefViewBuilding || second.RouteEpoch != 1 {
+		t.Fatalf("a second create reset the row: %+v", second)
+	}
+}
+
+// TestCatalogRefViewDesireMovesTheEpochOnlyOnMovement is what makes two
+// concurrent selections of one view able to share a build: writing the same
+// desire twice must not invalidate the epoch the first one's build captured,
+// while re-targeting the view must.
+func TestCatalogRefViewDesireMovesTheEpochOnlyOnMovement(t *testing.T) {
+	store := openCatalogStore(t)
+	ctx := context.Background()
+	catalog := store.Catalog()
+	seedRefView(t, catalog, "rv-1", "graph-1")
+
+	desire := UpdateRefViewDesireRequest{
+		RefViewID: "rv-1", DesiredRef: "refs/heads/rv-1", DesiredCommit: "c1",
+		DesiredTree: "t1", DesiredBuildFingerprint: "fp-1",
+		State: RefViewBuilding, LastResolved: 10, LastSelected: 10,
+	}
+	if err := catalog.UpdateRefViewDesire(ctx, desire); err != nil {
+		t.Fatalf("first desire: %v", err)
+	}
+	if epoch := readRefView(t, catalog, "rv-1").RouteEpoch; epoch != 1 {
+		t.Fatalf("first desire left epoch %d, want 1", epoch)
+	}
+
+	// The same tree reached by a different commit — a rebase, an amend. The
+	// payload is unchanged, so the epoch must not move.
+	same := desire
+	same.DesiredCommit = "c2"
+	same.LastSelected = 20
+	if err := catalog.UpdateRefViewDesire(ctx, same); err != nil {
+		t.Fatalf("same-tree desire: %v", err)
+	}
+	view := readRefView(t, catalog, "rv-1")
+	if view.RouteEpoch != 1 {
+		t.Fatalf("a commit that changed no tree moved the epoch to %d", view.RouteEpoch)
+	}
+	if view.DesiredCommit != "c2" || view.LastSelected != 20 {
+		t.Fatalf("same-tree desire = %+v", view)
+	}
+
+	moved := desire
+	moved.DesiredTree, moved.DesiredBuildFingerprint = "t2", "fp-2"
+	if err := catalog.UpdateRefViewDesire(ctx, moved); err != nil {
+		t.Fatalf("moved desire: %v", err)
+	}
+	if epoch := readRefView(t, catalog, "rv-1").RouteEpoch; epoch != 2 {
+		t.Fatalf("re-targeting the view left epoch %d, want 2", epoch)
+	}
+}
+
+// TestCatalogRefViewAdoptionRevalidates proves the publish-side compare-and-
+// set: a generation is adopted only while the epoch, the tree and the
+// fingerprint the build captured all still stand.
+func TestCatalogRefViewAdoptionRevalidates(t *testing.T) {
+	store := openCatalogStore(t)
+	ctx := context.Background()
+	catalog := store.Catalog()
+	seedRefView(t, catalog, "rv-1", "graph-1")
+	generation := seedBuildingGeneration(t, catalog, "graph-1")
+
+	desire := UpdateRefViewDesireRequest{
+		RefViewID: "rv-1", DesiredRef: "refs/heads/rv-1", DesiredCommit: "c1",
+		DesiredTree: "t1", DesiredBuildFingerprint: "fp-1",
+		State: RefViewBuilding, LastResolved: 10, LastSelected: 10,
+	}
+	if err := catalog.UpdateRefViewDesire(ctx, desire); err != nil {
+		t.Fatalf("desire: %v", err)
+	}
+	captured := readRefView(t, catalog, "rv-1").RouteEpoch
+
+	adopt := AdoptRefViewGenerationRequest{
+		RefViewID: "rv-1", ExpectedRouteEpoch: captured,
+		ExpectedDesiredTree: "t1", ExpectedDesiredBuildFingerprint: "fp-1",
+		GenerationID: generation, ActiveRef: "refs/heads/rv-1", ActiveCommit: "c1",
+		ActiveTree: "t1", ActiveBuildFingerprint: "fp-1", ExactView: true,
+		LastResolved: 20, LastSelected: 20,
+	}
+
+	stale := []struct {
+		name   string
+		mutate func(*AdoptRefViewGenerationRequest)
+	}{
+		{"a lost epoch", func(r *AdoptRefViewGenerationRequest) { r.ExpectedRouteEpoch = captured + 1 }},
+		{"a moved tree", func(r *AdoptRefViewGenerationRequest) { r.ExpectedDesiredTree = "t2" }},
+		{"a changed fingerprint", func(r *AdoptRefViewGenerationRequest) { r.ExpectedDesiredBuildFingerprint = "fp-2" }},
+	}
+	for _, tc := range stale {
+		t.Run(tc.name, func(t *testing.T) {
+			req := adopt
+			tc.mutate(&req)
+			if err := catalog.AdoptRefViewGeneration(ctx, req); !errors.Is(err, ErrCatalogStaleGuard) {
+				t.Fatalf("adoption under %s = %v, want ErrCatalogStaleGuard", tc.name, err)
+			}
+			if view := readRefView(t, catalog, "rv-1"); view.ActiveGenerationID != 0 {
+				t.Fatalf("a refused adoption flipped the active pointer: %+v", view)
+			}
+		})
+	}
+
+	if err := catalog.AdoptRefViewGeneration(ctx, adopt); err != nil {
+		t.Fatalf("adoption: %v", err)
+	}
+	view := readRefView(t, catalog, "rv-1")
+	if view.ActiveGenerationID != generation || view.ActiveCommit != "c1" || view.State != RefViewReady {
+		t.Fatalf("adopted view = %+v", view)
+	}
+	if view.RouteEpoch != captured+1 {
+		t.Fatalf("adoption left epoch %d, want %d", view.RouteEpoch, captured+1)
+	}
+
+	// A second adoption carrying the epoch the first one consumed is exactly
+	// the losing build, and it must not overwrite the winner.
+	if err := catalog.AdoptRefViewGeneration(ctx, adopt); !errors.Is(err, ErrCatalogStaleGuard) {
+		t.Fatalf("replayed adoption = %v, want ErrCatalogStaleGuard", err)
+	}
+}
+
+// TestCatalogRefViewMetadataAndFailureLeaveTheActivePointer covers the two
+// writes that must never move what a view serves: stamping a moved ref, and
+// recording a failed selection.
+func TestCatalogRefViewMetadataAndFailureLeaveTheActivePointer(t *testing.T) {
+	store := openCatalogStore(t)
+	ctx := context.Background()
+	catalog := store.Catalog()
+	seedRefView(t, catalog, "rv-1", "graph-1")
+	generation := seedBuildingGeneration(t, catalog, "graph-1")
+
+	err := catalog.UpdateRefViewDesire(ctx, UpdateRefViewDesireRequest{
+		RefViewID: "rv-1", DesiredRef: "refs/heads/rv-1", DesiredCommit: "c1",
+		DesiredTree: "t1", DesiredBuildFingerprint: "fp-1",
+		State: RefViewBuilding, LastResolved: 10, LastSelected: 10,
+	})
+	if err != nil {
+		t.Fatalf("desire: %v", err)
+	}
+	epoch := readRefView(t, catalog, "rv-1").RouteEpoch
+	err = catalog.AdoptRefViewGeneration(ctx, AdoptRefViewGenerationRequest{
+		RefViewID: "rv-1", ExpectedRouteEpoch: epoch,
+		ExpectedDesiredTree: "t1", ExpectedDesiredBuildFingerprint: "fp-1",
+		GenerationID: generation, ActiveRef: "refs/heads/rv-1", ActiveCommit: "c1",
+		ActiveTree: "t1", ActiveBuildFingerprint: "fp-1", ExactView: true,
+		LastResolved: 20, LastSelected: 20,
+	})
+	if err != nil {
+		t.Fatalf("adoption: %v", err)
+	}
+	epoch = readRefView(t, catalog, "rv-1").RouteEpoch
+
+	touch := TouchRefViewSelectionRequest{
+		RefViewID: "rv-1", ExpectedRouteEpoch: epoch,
+		ActiveRef: "refs/heads/rv-1", ActiveCommit: "c2",
+		LastResolved: 30, LastSelected: 30,
+	}
+	if err := catalog.TouchRefViewSelection(ctx, touch); err != nil {
+		t.Fatalf("TouchRefViewSelection: %v", err)
+	}
+	view := readRefView(t, catalog, "rv-1")
+	if view.ActiveCommit != "c2" || view.ActiveGenerationID != generation || view.ActiveTree != "t1" {
+		t.Fatalf("touched view = %+v", view)
+	}
+	if view.RouteEpoch != epoch {
+		t.Fatalf("a metadata stamp moved the epoch to %d", view.RouteEpoch)
+	}
+
+	stale := touch
+	stale.ExpectedRouteEpoch = epoch + 1
+	stale.ActiveCommit = "c3"
+	if err := catalog.TouchRefViewSelection(ctx, stale); !errors.Is(err, ErrCatalogStaleGuard) {
+		t.Fatalf("stale touch = %v, want ErrCatalogStaleGuard", err)
+	}
+
+	err = catalog.FailRefView(ctx, FailRefViewRequest{
+		RefViewID: "rv-1", ExpectedRouteEpoch: epoch,
+		LastError: "ref is not available in the local object store", LastResolved: 40,
+	})
+	if err != nil {
+		t.Fatalf("FailRefView: %v", err)
+	}
+	failed := readRefView(t, catalog, "rv-1")
+	if failed.State != RefViewFailed || failed.LastError == "" {
+		t.Fatalf("failed view = %+v", failed)
+	}
+	if failed.ActiveGenerationID != generation || failed.ActiveCommit != "c2" {
+		t.Fatalf("a failed selection moved what the view serves: %+v", failed)
+	}
+}
+
+// TestCatalogRefViewBuildClaimHandsBackTheInFlightAttempt is the coalescing
+// contract from the claimant's side: the loser gets the winner's row rather
+// than a bare constraint failure, a base of zero coalesces like any other base,
+// and finishing the attempt frees the slot for the next one.
+func TestCatalogRefViewBuildClaimHandsBackTheInFlightAttempt(t *testing.T) {
+	store := openCatalogStore(t)
+	ctx := context.Background()
+	catalog := store.Catalog()
+	seedRefView(t, catalog, "rv-1", "graph-1")
+
+	// Base zero is the base corpus — the case a plainly indexed graph is in,
+	// and therefore the one coalescing has to cover.
+	build := RefViewBuild{
+		BuildID: "build-1", RefViewID: "rv-1", DesiredRef: "refs/heads/rv-1",
+		DesiredCommit: "c1", DesiredTree: "t1", BaseGenerationID: 0,
+		EnrichmentProfile: "default", BuildFingerprint: "fp-1",
+		CapturedRouteEpoch: 1, State: ViewGenerationBuilding,
+		BuildToken: "token-1", CreatedAt: 100, LastProgress: 100,
+	}
+	claimed, err := catalog.ClaimRefViewBuild(ctx, build, 0)
+	if err != nil {
+		t.Fatalf("ClaimRefViewBuild: %v", err)
+	}
+	if claimed.BuildToken != "token-1" {
+		t.Fatalf("claim = %+v, want the caller's own attempt", claimed)
+	}
+
+	racing := build
+	racing.BuildID, racing.BuildToken = "build-2", "token-2"
+	// A cutoff at the in-flight row's own progress stamp does not make it
+	// abandoned, so this collision is coalescing and nothing else.
+	inFlight, err := catalog.ClaimRefViewBuild(ctx, racing, build.LastProgress)
+	if !errors.Is(err, ErrRefViewBuildInFlight) {
+		t.Fatalf("second claim = %v, want ErrRefViewBuildInFlight", err)
+	}
+	if inFlight.BuildID != "build-1" || inFlight.BuildToken != "token-1" {
+		t.Fatalf("second claim returned %+v, want the in-flight attempt", inFlight)
+	}
+	if rows, err := catalog.ListRefViewBuilds(ctx, "rv-1"); err != nil || len(rows) != 1 {
+		t.Fatalf("ListRefViewBuilds = %+v, %v, want the one claimed attempt", rows, err)
+	}
+
+	// A build for a different tree is different work and claims its own slot.
+	other := build
+	other.BuildID, other.BuildToken = "build-3", "token-3"
+	other.DesiredTree, other.BuildFingerprint = "t2", "fp-2"
+	if _, err := catalog.ClaimRefViewBuild(ctx, other, 0); err != nil {
+		t.Fatalf("claim for a different tree: %v", err)
+	}
+
+	complete := CompleteRefViewBuildRequest{
+		BuildID: "build-1", BuildToken: "token-9", State: ViewGenerationReady,
+		GenerationID: 7, LastProgress: 200,
+	}
+	if err := catalog.CompleteRefViewBuild(ctx, complete); !errors.Is(err, ErrCatalogStaleGuard) {
+		t.Fatalf("completion with the wrong token = %v, want ErrCatalogStaleGuard", err)
+	}
+	complete.BuildToken = "token-1"
+	if err := catalog.CompleteRefViewBuild(ctx, complete); err != nil {
+		t.Fatalf("CompleteRefViewBuild: %v", err)
+	}
+	if err := catalog.CompleteRefViewBuild(ctx, complete); !errors.Is(err, ErrCatalogStaleGuard) {
+		t.Fatalf("second completion = %v, want ErrCatalogStaleGuard", err)
+	}
+
+	// The slot is free again now that the first attempt has left the building
+	// state, so the retry claims it outright.
+	retry, err := catalog.ClaimRefViewBuild(ctx, racing, 0)
+	if err != nil {
+		t.Fatalf("retry after the first attempt finished: %v", err)
+	}
+	if retry.BuildToken != "token-2" {
+		t.Fatalf("retry = %+v, want its own attempt", retry)
+	}
+	rows, err := catalog.ListRefViewBuilds(ctx, "rv-1")
+	if err != nil || len(rows) != 3 {
+		t.Fatalf("ListRefViewBuilds = %+v, %v, want three recorded attempts", rows, err)
+	}
+}
+
+// TestCatalogRefViewBuildClaimReclaimsAnAbandonedAttempt pins the liveness
+// rule. A claim outlives the worker that made it, so a row that stopped
+// reporting progress is wreckage rather than work in flight: the next claimant
+// fails it and takes the slot, instead of being handed a token nobody is
+// running and waiting on it forever.
+func TestCatalogRefViewBuildClaimReclaimsAnAbandonedAttempt(t *testing.T) {
+	store := openCatalogStore(t)
+	ctx := context.Background()
+	catalog := store.Catalog()
+	seedRefView(t, catalog, "rv-1", "graph-1")
+
+	abandoned := RefViewBuild{
+		BuildID: "build-dead", RefViewID: "rv-1", DesiredRef: "refs/heads/rv-1",
+		DesiredCommit: "c1", DesiredTree: "t1", BaseGenerationID: 0,
+		EnrichmentProfile: "default", BuildFingerprint: "fp-1",
+		CapturedRouteEpoch: 1, State: ViewGenerationBuilding,
+		BuildToken: "token-dead", CreatedAt: 100, LastProgress: 100,
+	}
+	if _, err := catalog.ClaimRefViewBuild(ctx, abandoned, 0); err != nil {
+		t.Fatalf("seed the abandoned attempt: %v", err)
+	}
+
+	successor := abandoned
+	successor.BuildID, successor.BuildToken = "build-live", "token-live"
+	successor.CreatedAt, successor.LastProgress = 900, 900
+	claimed, err := catalog.ClaimRefViewBuild(ctx, successor, 500)
+	if err != nil {
+		t.Fatalf("claim over an abandoned attempt: %v", err)
+	}
+	if claimed.BuildToken != "token-live" {
+		t.Fatalf("claim = %+v, want the successor's own attempt", claimed)
+	}
+
+	rows, err := catalog.ListRefViewBuilds(ctx, "rv-1")
+	if err != nil || len(rows) != 2 {
+		t.Fatalf("ListRefViewBuilds = %+v, %v, want both attempts recorded", rows, err)
+	}
+	byID := map[string]RefViewBuild{}
+	for _, row := range rows {
+		byID[row.BuildID] = row
+	}
+	if dead := byID["build-dead"]; dead.State != ViewGenerationFailed || dead.Error == "" {
+		t.Fatalf("the abandoned attempt = %+v, want it failed with a recorded cause", dead)
+	}
+	if dead := byID["build-dead"]; dead.LastProgress != successor.LastProgress {
+		t.Fatalf("the abandoned attempt's progress = %d, want the clock that reclaimed it (%d)",
+			dead.LastProgress, successor.LastProgress)
+	}
+	if live := byID["build-live"]; live.State != ViewGenerationBuilding {
+		t.Fatalf("the successor = %+v, want it in flight", live)
+	}
+
+	// The successor is live, so the next claimant coalesces on it rather than
+	// stealing it in turn.
+	racing := successor
+	racing.BuildID, racing.BuildToken = "build-racing", "token-racing"
+	inFlight, err := catalog.ClaimRefViewBuild(ctx, racing, successor.LastProgress)
+	if !errors.Is(err, ErrRefViewBuildInFlight) {
+		t.Fatalf("claim against a live attempt = %v, want ErrRefViewBuildInFlight", err)
+	}
+	if inFlight.BuildToken != "token-live" {
+		t.Fatalf("claim against a live attempt returned %+v, want the successor", inFlight)
+	}
+}
+
 // TestCatalogIntentTransitionIsSinglePerCheckout proves the UNIQUE(checkout_id)
 // contract: one transition at a time, the checkout points at it while it is in
 // flight, completing it frees the slot, and a stale completion is refused.
@@ -1663,5 +2045,73 @@ func TestCatalogListViewGenerationsCapsOneScan(t *testing.T) {
 	under, err := catalog.ListViewGenerations(ctx, ViewGenerationFilter{Limit: 7})
 	if err != nil || len(under) != 7 {
 		t.Fatalf("ListViewGenerations limit 7 = %d rows, %v", len(under), err)
+	}
+}
+
+// TestCatalogWithdrawProducer pins the withdrawal write: one producer of a
+// PUBLISHED generation moves to unavailable, its neighbours do not, and the
+// payload seal that refuses every payload write to such a generation does not
+// stand in the way — the row is control plane, not payload.
+func TestCatalogWithdrawProducer(t *testing.T) {
+	store := openCatalogStore(t)
+	ctx := context.Background()
+	catalog := store.Catalog()
+
+	generationID, handle, err := store.BeginPayloadGeneration(ctx, PayloadGenerationRequest{
+		OwnerKind: "ref_view", GraphID: "graph-withdraw", LayerID: "layer-withdraw",
+		GenerationKind: "commit", TreeOID: "tree-withdraw", CreatedAt: 10,
+	})
+	if err != nil {
+		t.Fatalf("BeginPayloadGeneration: %v", err)
+	}
+	for _, row := range []ProducerCompleteness{
+		{Producer: "source.snapshot", State: ProducerStateComplete},
+		{Producer: "graph.syntax", State: ProducerStateComplete},
+	} {
+		if err := handle.SetProducerState(row); err != nil {
+			t.Fatalf("SetProducerState %s: %v", row.Producer, err)
+		}
+	}
+	if err := store.PublishPayloadGeneration(ctx, generationID, 20); err != nil {
+		t.Fatalf("PublishPayloadGeneration: %v", err)
+	}
+
+	// The payload write path is sealed on a published generation, which is
+	// exactly why the withdrawal is a catalog write.
+	if err := handle.SetProducerState(ProducerCompleteness{
+		Producer: "source.snapshot", State: ProducerStateUnavailable,
+	}); !errors.Is(err, ErrPayloadGenerationSealed) {
+		t.Fatalf("SetProducerState on a published generation = %v, want it sealed", err)
+	}
+
+	if err := catalog.WithdrawProducer(ctx, generationID, "source.snapshot", "the blobs are gone"); err != nil {
+		t.Fatalf("WithdrawProducer: %v", err)
+	}
+	states := map[string]ProducerState{}
+	rows, err := handle.ProducerStates()
+	if err != nil {
+		t.Fatalf("ProducerStates: %v", err)
+	}
+	for _, row := range rows {
+		states[row.Producer] = row.State
+	}
+	if states["source.snapshot"] != ProducerStateUnavailable {
+		t.Errorf("source.snapshot = %q, want %q", states["source.snapshot"], ProducerStateUnavailable)
+	}
+	if states["graph.syntax"] != ProducerStateComplete {
+		t.Errorf("the withdrawal disturbed graph.syntax: %q", states["graph.syntax"])
+	}
+
+	// A second withdrawal changes nothing and says so, so a caller cannot read
+	// it as a fresh loss.
+	if err := catalog.WithdrawProducer(ctx, generationID, "source.snapshot", "again"); !errors.Is(err, ErrCatalogStaleGuard) {
+		t.Errorf("a repeat withdrawal = %v, want %v", err, ErrCatalogStaleGuard)
+	}
+	// A producer the generation never declared is the same no-op.
+	if err := catalog.WithdrawProducer(ctx, generationID, "search.vector", "never declared"); !errors.Is(err, ErrCatalogStaleGuard) {
+		t.Errorf("withdrawing an undeclared producer = %v, want %v", err, ErrCatalogStaleGuard)
+	}
+	if err := catalog.WithdrawProducer(ctx, 0, "source.snapshot", ""); !errors.Is(err, ErrCatalogInvalidValue) {
+		t.Errorf("withdrawing on generation 0 = %v, want %v", err, ErrCatalogInvalidValue)
 	}
 }

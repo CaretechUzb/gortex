@@ -234,6 +234,13 @@ var (
 	// ErrCatalogInvalidValue means a write carried a value outside the state
 	// vocabulary, or left a required identifier empty.
 	ErrCatalogInvalidValue = errors.New("store_sqlite: invalid catalog value")
+
+	// ErrRefViewBuildInFlight means another attempt is already building the
+	// same work — the same ref view, tree, base generation and fingerprint.
+	// It is the coalescing index reporting itself through ClaimRefViewBuild,
+	// and the caller's signal to wait on the attempt that is already running
+	// rather than start a second one that would produce the same payload.
+	ErrRefViewBuildInFlight = errors.New("store_sqlite: a build for this ref view is already in flight")
 )
 
 // RepositoryFamily is one physical repository object store — the identity a
@@ -462,6 +469,92 @@ type RefViewBuild struct {
 	CreatedAt          int64 // unix seconds
 	LastProgress       int64 // unix seconds
 	Error              string
+}
+
+// UpdateRefViewDesireRequest records what a selection just resolved the view's
+// selector to.
+//
+// The route epoch is not a guard here and not a parameter: the desire write
+// bumps it only when the tree or the fingerprint actually changed, so two
+// selections that resolve to the same state do not invalidate each other's
+// in-flight builds, while a selection that re-targets the view does exactly
+// that.
+type UpdateRefViewDesireRequest struct {
+	RefViewID string
+
+	DesiredRef              string
+	DesiredCommit           string
+	DesiredTree             string
+	DesiredBuildFingerprint string
+
+	State        RefViewState
+	LastResolved int64 // unix seconds
+	LastSelected int64 // unix seconds
+}
+
+// AdoptRefViewGenerationRequest points a ref view at the generation a finished
+// build produced.
+//
+// The three expectations are the compare-and-set: the route epoch the build
+// captured when it was claimed, plus the tree and fingerprint it was built
+// for. A view that was re-targeted while the build ran matches none of them,
+// so the adoption changes nothing and reports ErrCatalogStaleGuard rather than
+// serving a payload for a state the selector has left.
+type AdoptRefViewGenerationRequest struct {
+	RefViewID          string
+	ExpectedRouteEpoch int64
+
+	ExpectedDesiredTree             string
+	ExpectedDesiredBuildFingerprint string
+
+	GenerationID           int64
+	ActiveRef              string
+	ActiveCommit           string
+	ActiveTree             string
+	ActiveBuildFingerprint string
+
+	ExactView    bool
+	LastResolved int64 // unix seconds
+	LastSelected int64 // unix seconds
+}
+
+// TouchRefViewSelectionRequest re-stamps what a selection observed without
+// changing what the view serves: the ref and commit the selector resolves to
+// now, and the selection clock. It is the write behind a ref that moved to a
+// different commit carrying the same tree — the payload is unchanged, so only
+// the metadata moves.
+type TouchRefViewSelectionRequest struct {
+	RefViewID          string
+	ExpectedRouteEpoch int64
+
+	ActiveRef    string
+	ActiveCommit string
+	LastResolved int64 // unix seconds
+	LastSelected int64 // unix seconds
+}
+
+// FailRefViewRequest records why a selection could not be served. It never
+// touches the active pointer: a view whose newest build failed keeps serving
+// what it was serving, labelled inexact by whoever reads it.
+type FailRefViewRequest struct {
+	RefViewID          string
+	ExpectedRouteEpoch int64
+
+	LastError    string
+	LastResolved int64 // unix seconds
+}
+
+// CompleteRefViewBuildRequest ends one build attempt. BuildToken is the proof
+// that the caller still owns the attempt it started, and the building state is
+// the other half of the guard, so an attempt can only be completed once.
+type CompleteRefViewBuildRequest struct {
+	BuildID    string
+	BuildToken string
+
+	State        ViewGenerationState
+	GenerationID int64
+	LastProgress int64 // unix seconds
+	Error        string
 }
 
 // CleanupEntry is one unit of deferred deletion work.

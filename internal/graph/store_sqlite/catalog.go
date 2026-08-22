@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	sqlite "modernc.org/sqlite"
 )
 
 // Catalog is the accessor for the checkout-lifecycle control plane — the
@@ -1082,6 +1084,33 @@ UPDATE view_generations SET covered_files = ?, affected_files = ?, storage_bytes
 		coveredFiles, affectedFiles, storageBytes, generationID, string(ViewGenerationBuilding))
 }
 
+// WithdrawProducer marks one producer of a generation unavailable.
+//
+// It is the write behind a capability a view has stopped being able to serve
+// — the source bytes it was built from have left the object store, say. One
+// producer row moves and nothing else does, so everything the generation
+// already holds keeps answering; the read that discovered the loss is what
+// calls it, and a second discovery reports a stale guard rather than writing
+// the same verdict twice.
+//
+// It is a control-plane write on purpose. A published generation is sealed
+// against payload writes, and this has to go through on exactly such a
+// generation: the withdrawal is a statement about what the payload can no
+// longer produce, not a change to the payload.
+func (c *Catalog) WithdrawProducer(ctx context.Context, generationID int64, producer, reason string) error {
+	if generationID <= 0 {
+		return fmt.Errorf("%w: generation_id %d", ErrCatalogInvalidValue, generationID)
+	}
+	if err := requireCatalogID("producer", producer); err != nil {
+		return err
+	}
+	return c.execGuarded(ctx,
+		fmt.Sprintf("producer %s of generation %d is already unavailable or undeclared", producer, generationID), `
+UPDATE generation_producer_completeness SET state = ?, reason = ?
+ WHERE view_gen = ? AND producer = ? AND state != ?`,
+		string(ProducerStateUnavailable), reason, generationID, producer, string(ProducerStateUnavailable))
+}
+
 // ViewGenerationReferenced reports whether anything still points at a
 // generation. It asks exactly what DeleteViewGeneration's guard asks, so a
 // caller about to delete a generation's payload can refuse before it starts
@@ -1305,6 +1334,26 @@ const refViewColumns = `graph_id, selector_kind, selector_value, desired_ref, de
 	enrichment_profile, desired_build_fingerprint, active_build_fingerprint, route_epoch,
 	state, exact_view, last_resolved, last_selected, last_error`
 
+// insertRefViewSQL is the row insert both writers share: the upsert below adds
+// its conflict clause to it, and GetOrCreateRefView uses it as it stands.
+const insertRefViewSQL = `
+INSERT INTO ref_views (ref_view_id, ` + refViewColumns + `)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+
+// refViewInsertArgs renders a view in insertRefViewSQL's parameter order.
+func refViewInsertArgs(view RefView) []any {
+	return []any{
+		view.RefViewID, view.GraphID, view.SelectorKind, view.SelectorValue,
+		view.DesiredRef, view.DesiredCommit, view.DesiredTree,
+		catalogNullInt(view.ActiveGenerationID), catalogNullString(view.ActiveRef),
+		catalogNullString(view.ActiveCommit), catalogNullString(view.ActiveTree),
+		view.EnrichmentProfile, view.DesiredBuildFingerprint,
+		catalogNullString(view.ActiveBuildFingerprint), view.RouteEpoch,
+		string(view.State), catalogBoolInt(view.ExactView),
+		view.LastResolved, view.LastSelected, view.LastError,
+	}
+}
+
 // UpsertRefView writes one ref-view row. The UNIQUE selector key means a
 // second row for the same (graph, selector, profile) is a constraint failure,
 // not a duplicate view.
@@ -1312,9 +1361,7 @@ func (c *Catalog) UpsertRefView(ctx context.Context, view RefView) error {
 	if err := view.validate(); err != nil {
 		return err
 	}
-	_, err := c.exec(ctx, `
-INSERT INTO ref_views (ref_view_id, `+refViewColumns+`)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	_, err := c.exec(ctx, insertRefViewSQL+`
 ON CONFLICT(ref_view_id) DO UPDATE SET
   graph_id                  = excluded.graph_id,
   selector_kind             = excluded.selector_kind,
@@ -1335,15 +1382,132 @@ ON CONFLICT(ref_view_id) DO UPDATE SET
   last_resolved             = excluded.last_resolved,
   last_selected             = excluded.last_selected,
   last_error                = excluded.last_error`,
-		view.RefViewID, view.GraphID, view.SelectorKind, view.SelectorValue,
-		view.DesiredRef, view.DesiredCommit, view.DesiredTree,
-		catalogNullInt(view.ActiveGenerationID), catalogNullString(view.ActiveRef),
-		catalogNullString(view.ActiveCommit), catalogNullString(view.ActiveTree),
-		view.EnrichmentProfile, view.DesiredBuildFingerprint,
-		catalogNullString(view.ActiveBuildFingerprint), view.RouteEpoch,
-		string(view.State), catalogBoolInt(view.ExactView),
-		view.LastResolved, view.LastSelected, view.LastError)
+		refViewInsertArgs(view)...)
 	return err
+}
+
+// GetOrCreateRefView returns the stored row for a view, creating it from the
+// argument when the selector has never been asked for before.
+//
+// It is not UpsertRefView with a read after it: two selections of the same
+// view race, and an upsert would let the second one reset a row the first has
+// already advanced — its desire, its epoch, or the generation it is serving.
+// The insert declines the conflict instead, so an existing row is read back
+// exactly as it stands.
+func (c *Catalog) GetOrCreateRefView(ctx context.Context, view RefView) (RefView, error) {
+	if err := view.validate(); err != nil {
+		return RefView{}, err
+	}
+	err := c.withTx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, insertRefViewSQL+` ON CONFLICT DO NOTHING`, refViewInsertArgs(view)...)
+		return err
+	})
+	if err != nil {
+		return RefView{}, err
+	}
+	stored, found, err := c.GetRefView(ctx, view.RefViewID)
+	if err != nil {
+		return RefView{}, err
+	}
+	if !found {
+		// The insert was declined and the id is not there, so another row
+		// already owns this selector under a different id. That is a caller
+		// minting ids two ways for one view, not a race.
+		return RefView{}, fmt.Errorf("%w: selector %s=%s in graph %s is held by another ref view",
+			ErrCatalogInvalidValue, view.SelectorKind, view.SelectorValue, view.GraphID)
+	}
+	return stored, nil
+}
+
+// UpdateRefViewDesire stamps what a selection resolved the view's selector to.
+//
+// The epoch arithmetic is the whole point: route_epoch moves only when the
+// tree or the fingerprint changed. Two concurrent selections that resolve to
+// the same state write the same values and leave the epoch alone, so neither
+// invalidates a build the other captured; a selection that re-targets the view
+// bumps it, and every build captured under the old epoch loses its adoption.
+func (c *Catalog) UpdateRefViewDesire(ctx context.Context, req UpdateRefViewDesireRequest) error {
+	if err := requireCatalogID("ref_view_id", req.RefViewID); err != nil {
+		return err
+	}
+	if err := requireCatalogValue("state", req.State, refViewStates); err != nil {
+		return err
+	}
+	return c.execGuarded(ctx, fmt.Sprintf("ref view %s", req.RefViewID), `
+UPDATE ref_views
+   SET desired_ref = ?, desired_commit = ?, desired_tree = ?,
+       desired_build_fingerprint = ?, state = ?,
+       last_resolved = ?, last_selected = ?, last_error = '',
+       route_epoch = route_epoch +
+           (CASE WHEN desired_tree = ? AND desired_build_fingerprint = ? THEN 0 ELSE 1 END)
+ WHERE ref_view_id = ?`,
+		req.DesiredRef, req.DesiredCommit, req.DesiredTree,
+		req.DesiredBuildFingerprint, string(req.State),
+		req.LastResolved, req.LastSelected,
+		req.DesiredTree, req.DesiredBuildFingerprint, req.RefViewID)
+}
+
+// AdoptRefViewGeneration points a ref view at a finished build's generation.
+//
+// The guard is the epoch the build captured plus the tree and fingerprint it
+// was built for, so a view that moved while the build ran adopts nothing and
+// reports ErrCatalogStaleGuard. The epoch is bumped on success for the same
+// reason a route flip bumps it: whatever else was in flight against this view
+// has just been overtaken.
+func (c *Catalog) AdoptRefViewGeneration(ctx context.Context, req AdoptRefViewGenerationRequest) error {
+	if err := requireCatalogID("ref_view_id", req.RefViewID); err != nil {
+		return err
+	}
+	if req.GenerationID <= 0 {
+		return fmt.Errorf("%w: generation_id %d", ErrCatalogInvalidValue, req.GenerationID)
+	}
+	return c.execGuarded(ctx,
+		fmt.Sprintf("ref view %s at epoch %d", req.RefViewID, req.ExpectedRouteEpoch), `
+UPDATE ref_views
+   SET active_generation_id = ?, active_ref = ?, active_commit = ?, active_tree = ?,
+       active_build_fingerprint = ?, state = ?, exact_view = ?,
+       last_resolved = ?, last_selected = ?, last_error = '',
+       route_epoch = route_epoch + 1
+ WHERE ref_view_id = ? AND route_epoch = ?
+   AND desired_tree = ? AND desired_build_fingerprint = ?`,
+		req.GenerationID, catalogNullString(req.ActiveRef), catalogNullString(req.ActiveCommit),
+		catalogNullString(req.ActiveTree), catalogNullString(req.ActiveBuildFingerprint),
+		string(RefViewReady), catalogBoolInt(req.ExactView),
+		req.LastResolved, req.LastSelected,
+		req.RefViewID, req.ExpectedRouteEpoch,
+		req.ExpectedDesiredTree, req.ExpectedDesiredBuildFingerprint)
+}
+
+// TouchRefViewSelection re-stamps the ref and commit a selection observed, and
+// the selection clock, leaving the active generation exactly where it is. The
+// epoch guard keeps the stamp off a view another actor has just re-targeted;
+// it is not bumped, because nothing about what the view serves changed.
+func (c *Catalog) TouchRefViewSelection(ctx context.Context, req TouchRefViewSelectionRequest) error {
+	if err := requireCatalogID("ref_view_id", req.RefViewID); err != nil {
+		return err
+	}
+	return c.execGuarded(ctx,
+		fmt.Sprintf("ref view %s at epoch %d", req.RefViewID, req.ExpectedRouteEpoch), `
+UPDATE ref_views
+   SET active_ref = ?, active_commit = ?, last_resolved = ?, last_selected = ?
+ WHERE ref_view_id = ? AND route_epoch = ?`,
+		catalogNullString(req.ActiveRef), catalogNullString(req.ActiveCommit),
+		req.LastResolved, req.LastSelected, req.RefViewID, req.ExpectedRouteEpoch)
+}
+
+// FailRefView records why a selection could not be served. The active pointer
+// is deliberately absent from the statement: a failed resolution or build says
+// nothing about the payload the view was already serving.
+func (c *Catalog) FailRefView(ctx context.Context, req FailRefViewRequest) error {
+	if err := requireCatalogID("ref_view_id", req.RefViewID); err != nil {
+		return err
+	}
+	return c.execGuarded(ctx,
+		fmt.Sprintf("ref view %s at epoch %d", req.RefViewID, req.ExpectedRouteEpoch), `
+UPDATE ref_views SET state = ?, last_error = ?, last_resolved = ?
+ WHERE ref_view_id = ? AND route_epoch = ?`,
+		string(RefViewFailed), req.LastError, req.LastResolved,
+		req.RefViewID, req.ExpectedRouteEpoch)
 }
 
 // scanRefView reads the refViewColumns projection in order.
@@ -1432,6 +1596,29 @@ const refViewBuildColumns = `ref_view_id, desired_ref, desired_commit, desired_t
 	base_generation_id, enrichment_profile, build_fingerprint, generation_id,
 	captured_route_epoch, state, build_token, created_at, last_progress, error`
 
+// insertRefViewBuildSQL is the row insert both writers share.
+const insertRefViewBuildSQL = `
+INSERT INTO ref_view_builds (build_id, ` + refViewBuildColumns + `)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+
+// refViewBuildInsertArgs renders a build in insertRefViewBuildSQL's parameter
+// order.
+//
+// base_generation_id is written as a plain integer, zero included: zero is the
+// base corpus, which is a concrete layer to build over rather than an absent
+// one. Storing it as NULL would put every build over the base corpus outside
+// the coalescing index — SQLite compares NULLs as distinct — which is exactly
+// the case where two selections of one branch would otherwise race.
+func refViewBuildInsertArgs(build RefViewBuild) []any {
+	return []any{
+		build.BuildID, build.RefViewID, build.DesiredRef, build.DesiredCommit,
+		build.DesiredTree, build.BaseGenerationID, build.EnrichmentProfile,
+		build.BuildFingerprint, catalogNullInt(build.GenerationID),
+		build.CapturedRouteEpoch, string(build.State), build.BuildToken,
+		build.CreatedAt, build.LastProgress, build.Error,
+	}
+}
+
 // UpsertRefViewBuild writes one build attempt. While the row is in the
 // building state the partial unique index coalesces requests: a second attempt
 // for the same ref view, tree, base and fingerprint fails rather than racing
@@ -1440,9 +1627,7 @@ func (c *Catalog) UpsertRefViewBuild(ctx context.Context, build RefViewBuild) er
 	if err := build.validate(); err != nil {
 		return err
 	}
-	_, err := c.exec(ctx, `
-INSERT INTO ref_view_builds (build_id, `+refViewBuildColumns+`)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	_, err := c.exec(ctx, insertRefViewBuildSQL+`
 ON CONFLICT(build_id) DO UPDATE SET
   ref_view_id          = excluded.ref_view_id,
   desired_ref          = excluded.desired_ref,
@@ -1458,36 +1643,200 @@ ON CONFLICT(build_id) DO UPDATE SET
   created_at           = excluded.created_at,
   last_progress        = excluded.last_progress,
   error                = excluded.error`,
-		build.BuildID, build.RefViewID, build.DesiredRef, build.DesiredCommit,
-		build.DesiredTree, catalogNullInt(build.BaseGenerationID), build.EnrichmentProfile,
-		build.BuildFingerprint, catalogNullInt(build.GenerationID),
-		build.CapturedRouteEpoch, string(build.State), build.BuildToken,
-		build.CreatedAt, build.LastProgress, build.Error)
+		refViewBuildInsertArgs(build)...)
 	return err
 }
 
-// GetRefViewBuild returns one build attempt.
-func (c *Catalog) GetRefViewBuild(ctx context.Context, buildID string) (RefViewBuild, bool, error) {
-	build := RefViewBuild{BuildID: buildID}
+// abandonedRefViewBuildError is what a reclaimed attempt records as its cause.
+const abandonedRefViewBuildError = "abandoned: the worker holding this claim stopped reporting progress"
+
+// ClaimRefViewBuild starts one build attempt, or reports the attempt that is
+// already running the same work.
+//
+// The partial unique index is the lock. A second claimer of the same ref view,
+// tree, base generation and fingerprint has its insert refused by the index,
+// and the row it collided with is read back inside the same transaction and
+// returned alongside ErrRefViewBuildInFlight — so the loser gets the winner's
+// build token instead of a bare failure, and never needs to guess whether the
+// work it wanted is being done.
+//
+// A unique failure that no in-flight row explains is not coalescing: it is a
+// caller reusing a build id or a build token, and it comes back unchanged.
+//
+// abandonedBefore is the liveness cutoff, in unix seconds. A colliding row
+// whose last progress predates it is not a live claim but the wreckage of a
+// worker that died holding one — a killed daemon, a canceled request — so it
+// is failed and the new claim takes its place in the same transaction. Without
+// that, the index would hand every later claimant of that tree a build nobody
+// is running, forever. Zero disables the reclaim, and every collision
+// coalesces.
+func (c *Catalog) ClaimRefViewBuild(
+	ctx context.Context,
+	build RefViewBuild,
+	abandonedBefore int64,
+) (RefViewBuild, error) {
+	if err := build.validate(); err != nil {
+		return RefViewBuild{}, err
+	}
+	if build.State != ViewGenerationBuilding {
+		return RefViewBuild{}, fmt.Errorf("%w: state %q, want %q",
+			ErrCatalogInvalidValue, build.State, ViewGenerationBuilding)
+	}
+	var (
+		inFlight  RefViewBuild
+		coalesced bool
+	)
+	err := c.withTx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, insertRefViewBuildSQL, refViewBuildInsertArgs(build)...)
+		if err == nil {
+			return nil
+		}
+		if !isSQLiteUniqueViolation(err) {
+			return err
+		}
+		row := tx.QueryRowContext(ctx, `
+SELECT build_id, `+refViewBuildColumns+` FROM ref_view_builds
+ WHERE ref_view_id = ? AND desired_tree = ? AND base_generation_id = ?
+   AND build_fingerprint = ? AND state = ?`,
+			build.RefViewID, build.DesiredTree, build.BaseGenerationID,
+			build.BuildFingerprint, string(ViewGenerationBuilding))
+		switch lookupErr := scanRefViewBuild(row.Scan, &inFlight); {
+		case errors.Is(lookupErr, sql.ErrNoRows):
+			return err
+		case lookupErr != nil:
+			return lookupErr
+		}
+		if abandonedBefore > 0 && inFlight.LastProgress < abandonedBefore {
+			// Failing the dead attempt releases the index slot it held, so the
+			// retry is an ordinary insert. A second reclaimer racing this one
+			// collides with the fresh claim instead and coalesces on it.
+			if _, failErr := tx.ExecContext(ctx, `
+UPDATE ref_view_builds SET state = ?, last_progress = ?, error = ?
+ WHERE build_id = ? AND state = ?`,
+				string(ViewGenerationFailed), build.LastProgress, abandonedRefViewBuildError,
+				inFlight.BuildID, string(ViewGenerationBuilding)); failErr != nil {
+				return failErr
+			}
+			_, retryErr := tx.ExecContext(ctx, insertRefViewBuildSQL, refViewBuildInsertArgs(build)...)
+			return retryErr
+		}
+		coalesced = true
+		return nil
+	})
+	if err != nil {
+		return RefViewBuild{}, err
+	}
+	if coalesced {
+		return inFlight, fmt.Errorf("%w: ref view %s at tree %s",
+			ErrRefViewBuildInFlight, build.RefViewID, build.DesiredTree)
+	}
+	return build, nil
+}
+
+// CompleteRefViewBuild takes one attempt out of the building state. The token
+// and the building state together are the guard, so an attempt is completed by
+// its own worker and completed once; anything else reports ErrCatalogStaleGuard
+// and leaves the row alone.
+func (c *Catalog) CompleteRefViewBuild(ctx context.Context, req CompleteRefViewBuildRequest) error {
+	if err := requireCatalogID("build_id", req.BuildID); err != nil {
+		return err
+	}
+	if err := requireCatalogID("build_token", req.BuildToken); err != nil {
+		return err
+	}
+	if err := requireCatalogValue("state", req.State, viewGenerationStates); err != nil {
+		return err
+	}
+	if req.State == ViewGenerationBuilding {
+		return fmt.Errorf("%w: completing a build into state %q", ErrCatalogInvalidValue, req.State)
+	}
+	return c.execGuarded(ctx, fmt.Sprintf("ref view build %s", req.BuildID), `
+UPDATE ref_view_builds SET state = ?, generation_id = ?, last_progress = ?, error = ?
+ WHERE build_id = ? AND build_token = ? AND state = ?`,
+		string(req.State), catalogNullInt(req.GenerationID), req.LastProgress, req.Error,
+		req.BuildID, req.BuildToken, string(ViewGenerationBuilding))
+}
+
+// ListRefViewBuilds returns every attempt recorded for one ref view, oldest
+// first. A view's build history is otherwise reachable only through a build id
+// somebody is still holding, which the process that claimed the attempt stops
+// holding the moment it dies.
+func (c *Catalog) ListRefViewBuilds(ctx context.Context, refViewID string) ([]RefViewBuild, error) {
+	rows, err := c.store.db.QueryContext(ctx,
+		`SELECT build_id, `+refViewBuildColumns+` FROM ref_view_builds
+		  WHERE ref_view_id = ? ORDER BY created_at, build_id`, refViewID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []RefViewBuild
+	for rows.Next() {
+		var build RefViewBuild
+		if err := scanRefViewBuild(rows.Scan, &build); err != nil {
+			return nil, err
+		}
+		out = append(out, build)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// isSQLiteUniqueViolation reports whether err is SQLite refusing a write for a
+// uniqueness reason. The two extended codes are the only ones a duplicate row
+// can raise; every other constraint failure (a foreign key, a NOT NULL) is a
+// different bug and must not be read as coalescing.
+func isSQLiteUniqueViolation(err error) bool {
+	var sqliteErr *sqlite.Error
+	if !errors.As(err, &sqliteErr) {
+		return false
+	}
+	switch sqliteErr.Code() {
+	case sqliteConstraintUnique, sqliteConstraintPrimaryKey:
+		return true
+	default:
+		return false
+	}
+}
+
+// SQLite extended result codes for a duplicate row.
+const (
+	sqliteConstraintPrimaryKey = 1555
+	sqliteConstraintUnique     = 2067
+)
+
+// scanRefViewBuild reads a "build_id, refViewBuildColumns" projection in order.
+func scanRefViewBuild(scan func(...any) error, build *RefViewBuild) error {
 	var (
 		baseGeneration, generation sql.NullInt64
 		state                      string
 	)
-	err := c.store.db.QueryRowContext(ctx,
-		`SELECT `+refViewBuildColumns+` FROM ref_view_builds WHERE build_id = ?`, buildID).Scan(
-		&build.RefViewID, &build.DesiredRef, &build.DesiredCommit, &build.DesiredTree,
-		&baseGeneration, &build.EnrichmentProfile, &build.BuildFingerprint, &generation,
-		&build.CapturedRouteEpoch, &state, &build.BuildToken, &build.CreatedAt,
-		&build.LastProgress, &build.Error)
-	if err == sql.ErrNoRows {
+	if err := scan(
+		&build.BuildID, &build.RefViewID, &build.DesiredRef, &build.DesiredCommit,
+		&build.DesiredTree, &baseGeneration, &build.EnrichmentProfile,
+		&build.BuildFingerprint, &generation, &build.CapturedRouteEpoch, &state,
+		&build.BuildToken, &build.CreatedAt, &build.LastProgress, &build.Error); err != nil {
+		return err
+	}
+	build.BaseGenerationID = baseGeneration.Int64
+	build.GenerationID = generation.Int64
+	build.State = ViewGenerationState(state)
+	return nil
+}
+
+// GetRefViewBuild returns one build attempt.
+func (c *Catalog) GetRefViewBuild(ctx context.Context, buildID string) (RefViewBuild, bool, error) {
+	var build RefViewBuild
+	row := c.store.db.QueryRowContext(ctx,
+		`SELECT build_id, `+refViewBuildColumns+` FROM ref_view_builds WHERE build_id = ?`, buildID)
+	err := scanRefViewBuild(row.Scan, &build)
+	if errors.Is(err, sql.ErrNoRows) {
 		return RefViewBuild{}, false, nil
 	}
 	if err != nil {
 		return RefViewBuild{}, false, err
 	}
-	build.BaseGenerationID = baseGeneration.Int64
-	build.GenerationID = generation.Int64
-	build.State = ViewGenerationState(state)
 	return build, true, nil
 }
 
