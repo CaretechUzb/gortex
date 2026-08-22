@@ -1329,67 +1329,94 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 	if err != nil {
 		return mcp.NewToolResultError("path is required"), nil
 	}
-	absPath, relPath, resolveErr := s.resolveFilePath(rawPath)
-	if resolveErr != nil {
-		return mcp.NewToolResultError(resolveErr.Error()), nil
-	}
-	if guardErr := s.guardSymlinkWithinRepo(absPath); guardErr != nil {
-		return mcp.NewToolResultError(guardErr.Error()), nil
-	}
-	info, statErr := os.Stat(absPath)
-	if statErr != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("could not stat file: %v", statErr)), nil
-	}
-	if info.IsDir() {
-		return mcp.NewToolResultError(fmt.Sprintf("path %q is a directory", rawPath)), nil
-	}
-
 	physicalEvidenceRequested, evidenceErr := parsePhysicalEvidenceRequest(req)
 	if evidenceErr != nil {
 		return mcp.NewToolResultError(evidenceErr.Error()), nil
 	}
 
-	var diskContent []byte
-	var physicalEvidence physicalReadEvidence
-	if physicalEvidenceRequested {
-		var readErr error
-		read := readPhysicalFileEvidence
-		if s.physicalEvidenceOverride != nil {
-			read = s.physicalEvidenceOverride
+	var (
+		absPath, relPath  string
+		viewURI           string
+		content           []byte
+		diskContent       []byte
+		physicalEvidence  physicalReadEvidence
+		servedFromOverlay bool
+	)
+
+	if files := refViewFilesFor(ctx); files != nil {
+		// The view is a committed tree, so there is no file on disk to stat,
+		// hash or confine — the bytes come out of the object store and the
+		// location they came from is the view's own identity.
+		if physicalEvidenceRequested {
+			return mcp.NewToolResultError(
+				"physical_evidence describes a file on disk, and this request reads a committed tree " +
+					"that is not checked out anywhere"), nil
 		}
-		diskContent, physicalEvidence, readErr = read(absPath)
-		if readErr != nil {
-			return mcp.NewToolResultError(readErr.Error()), nil
+		bytes, rel, viewErr := readViewFile(ctx, files, rawPath)
+		if viewErr != nil {
+			return mcp.NewToolResultError(viewErr.Error()), nil
 		}
-		// Bind confinement to the resolved target that supplied the hashed
-		// bytes. Re-resolving only absPath is insufficient when a symlink is
-		// retargeted outside the repo for the read and restored afterward.
-		if guardErr := s.guardResolvedPathWithinRepo(absPath, physicalEvidence.resolvedPath); guardErr != nil {
-			return mcp.NewToolResultError(guardErr.Error()), nil
+		content = bytes
+		relPath = files.graphPath(rel)
+		viewURI = files.uri(rel)
+		// The URI stands in for the absolute path in the language probe: it
+		// carries the extension, and nothing can open it.
+		absPath = viewURI
+	} else {
+		var resolveErr error
+		absPath, relPath, resolveErr = s.resolveFilePath(rawPath)
+		if resolveErr != nil {
+			return mcp.NewToolResultError(resolveErr.Error()), nil
 		}
-		// Also reject a path retargeted outside after the evidence snapshot.
 		if guardErr := s.guardSymlinkWithinRepo(absPath); guardErr != nil {
 			return mcp.NewToolResultError(guardErr.Error()), nil
 		}
-	}
-
-	// Honour the editor-buffer overlay if one is active for this path. A
-	// drifted overlay is already rejected upstream by the overlay view
-	// guard; what reaches here is a live buffer, which we flag as such so
-	// the caller knows the bytes are an unsaved editor view, not disk.
-	var content []byte
-	servedFromOverlay := false
-	if buf, ok := s.overlayContentFor(ctx, absPath); ok {
-		content = []byte(buf)
-		servedFromOverlay = true
-	} else if physicalEvidenceRequested {
-		content = diskContent
-	} else {
-		b, rerr := os.ReadFile(absPath)
-		if rerr != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("could not read file: %v", rerr)), nil
+		info, statErr := os.Stat(absPath)
+		if statErr != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("could not stat file: %v", statErr)), nil
 		}
-		content = b
+		if info.IsDir() {
+			return mcp.NewToolResultError(fmt.Sprintf("path %q is a directory", rawPath)), nil
+		}
+
+		if physicalEvidenceRequested {
+			var readErr error
+			read := readPhysicalFileEvidence
+			if s.physicalEvidenceOverride != nil {
+				read = s.physicalEvidenceOverride
+			}
+			diskContent, physicalEvidence, readErr = read(absPath)
+			if readErr != nil {
+				return mcp.NewToolResultError(readErr.Error()), nil
+			}
+			// Bind confinement to the resolved target that supplied the hashed
+			// bytes. Re-resolving only absPath is insufficient when a symlink is
+			// retargeted outside the repo for the read and restored afterward.
+			if guardErr := s.guardResolvedPathWithinRepo(absPath, physicalEvidence.resolvedPath); guardErr != nil {
+				return mcp.NewToolResultError(guardErr.Error()), nil
+			}
+			// Also reject a path retargeted outside after the evidence snapshot.
+			if guardErr := s.guardSymlinkWithinRepo(absPath); guardErr != nil {
+				return mcp.NewToolResultError(guardErr.Error()), nil
+			}
+		}
+
+		// Honour the editor-buffer overlay if one is active for this path. A
+		// drifted overlay is already rejected upstream by the overlay view
+		// guard; what reaches here is a live buffer, which we flag as such so
+		// the caller knows the bytes are an unsaved editor view, not disk.
+		if buf, ok := s.overlayContentFor(ctx, absPath); ok {
+			content = []byte(buf)
+			servedFromOverlay = true
+		} else if physicalEvidenceRequested {
+			content = diskContent
+		} else {
+			b, rerr := os.ReadFile(absPath)
+			if rerr != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("could not read file: %v", rerr)), nil
+			}
+			content = b
+		}
 	}
 
 	originalBytes := len(content)
@@ -1497,6 +1524,13 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 	}
 	if servedFromOverlay {
 		result["served_from"] = "overlay"
+	}
+	if viewURI != "" {
+		// The file has no location outside the view, so the view's identity is
+		// the location: no absolute path is reported, and the one that is
+		// reported resolves only against this exact content.
+		result["served_from"] = "view"
+		result["view_uri"] = viewURI
 	}
 	if bodiesElided {
 		result["bodies_elided"] = true

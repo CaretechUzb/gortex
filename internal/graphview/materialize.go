@@ -166,7 +166,44 @@ func (m *Materializer) MaterializeCheckout(ctx context.Context, checkoutID strin
 		generations = append(generations, route.DirtyGenerationID)
 	}
 	lease := m.Leases.Acquire(generations...)
-	view, err := m.assemble(ctx, route, repoPrefix, generations, lease)
+	view, err := m.assemble(ctx, route.GraphID, repoPrefix, generations, lease)
+	if err != nil {
+		lease.Release()
+		return nil, err
+	}
+	return view, nil
+}
+
+// MaterializeRefView builds the view one ref-view generation serves.
+//
+// A ref view names committed state nobody has checked out, so its stack is one
+// layer and no more: the graph's indexed corpus with the generation describing
+// the selector's tree composed onto it. There is no working-tree slot to add —
+// the selector means the committed tree by definition — and no buffer layer,
+// which belongs to a session rather than to a view.
+//
+// Everything else is what MaterializeCheckout does: the lease is taken before
+// the generation is inspected, so the sweep cannot run between the check and
+// the pin, and completeness comes from the generation's own producer states.
+func (m *Materializer) MaterializeRefView(ctx context.Context, graphID string, generationID int64) (*RepoView, error) {
+	if err := m.validate(); err != nil {
+		return nil, err
+	}
+	switch {
+	case ctx == nil:
+		return nil, NewViewError(CodeInvalidViewSelector, "materialization needs a context")
+	case graphID == "":
+		return nil, NewViewError(CodeInvalidViewSelector, "materialization needs a graph id")
+	case generationID <= 0:
+		return nil, NewViewError(CodeViewBuilding, "the ref view has no published generation")
+	}
+	repoPrefix, err := m.repoPrefix(ctx, graphID)
+	if err != nil {
+		return nil, err
+	}
+	generations := []int64{generationID}
+	lease := m.Leases.Acquire(generations...)
+	view, err := m.assemble(ctx, graphID, repoPrefix, generations, lease)
 	if err != nil {
 		lease.Release()
 		return nil, err
@@ -231,14 +268,15 @@ func (m *Materializer) repoPrefix(ctx context.Context, graphID string) (string, 
 // a leased set of generations. It runs with the lease already held, so
 // every generation it reads is safe from the sweep.
 //
-// generations is the route's slots in order: the commit generation
-// first, the working-tree generation after it when the route names one.
-// The commit generation is composed onto the indexed corpus here and the
+// generations is the stack bottom first: the generation that names the
+// view's committed content, then any layer stacked over it — the
+// working-tree generation for a checkout, nothing at all for a ref view.
+// The bottom generation is composed onto the indexed corpus here and the
 // result is what ComposeRepoView receives as the base, so the identity's
 // base generation and the reader's base are the same content.
 func (m *Materializer) assemble(
 	ctx context.Context,
-	route store_sqlite.CheckoutRoute,
+	graphID string,
 	repoPrefix string,
 	generations []int64,
 	lease *Lease,
@@ -277,7 +315,7 @@ func (m *Materializer) assemble(
 		layerRefs = append(layerRefs, ref)
 	}
 
-	id, err := NewRepoViewID(repoPrefix, route.GraphID, generations[0], layerRefs...)
+	id, err := NewRepoViewID(repoPrefix, graphID, generations[0], layerRefs...)
 	if err != nil {
 		return nil, err
 	}

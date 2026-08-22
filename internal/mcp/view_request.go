@@ -37,17 +37,22 @@ type requestView struct {
 	// rider travels on the response whenever the caller named a view or
 	// something other than the base answered.
 	rider *graphview.ViewRider
+	// files is the committed-tree file surface a view with no working copy
+	// reads through. Nil for every view that has one.
+	files *refViewFiles
 }
 
 // routed reports whether a composed checkout view — rather than the base
 // corpus — answers this request.
 func (v *requestView) routed() bool { return v != nil && v.reader != nil }
 
-// close releases the generations the view leased. Idempotent and nil-safe.
+// close releases the generations the view leased and the git child its file
+// surface holds. Idempotent and nil-safe.
 func (v *requestView) close() {
 	if v == nil {
 		return
 	}
+	v.files.close()
 	v.materialized.Close()
 }
 
@@ -169,6 +174,8 @@ func (s *Server) resolveRequestView(ctx context.Context, selector graphview.Sele
 		return s.viewForWorktreeSelector(ctx, selector)
 	case graphview.SelectorBase:
 		return s.viewForBaseSelector(ctx, selector)
+	case graphview.SelectorGitRef, graphview.SelectorCommit:
+		return s.viewForRefSelector(ctx, selector)
 	default:
 		return nil, graphview.NewViewError(graphview.CodeCapabilityUnavailable,
 			fmt.Sprintf("a %s selector names a view no builder produces yet", string(selector.Kind)))
@@ -430,6 +437,21 @@ func (s *Server) attachViewRider(ctx context.Context, res *mcp.CallToolResult) *
 	}
 	if view.rider.FallbackReason != "" {
 		fields["fallback_reason"] = view.rider.FallbackReason
+	}
+	for name, value := range map[string]string{
+		"view_fingerprint": view.rider.ViewFingerprint,
+		"requested_ref":    view.rider.RequestedRef,
+		"resolved_ref":     view.rider.ResolvedRef,
+		"resolved_commit":  view.rider.ResolvedCommit,
+		"resolved_tree":    view.rider.ResolvedTree,
+		"build_token":      view.rider.BuildToken,
+	} {
+		if value != "" {
+			fields[name] = value
+		}
+	}
+	if view.rider.RetryAfter > 0 {
+		fields["retry_after"] = view.rider.RetryAfter
 	}
 	text, ok := singleTextContent(res)
 	if !ok || text == "" {

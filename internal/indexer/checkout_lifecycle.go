@@ -81,6 +81,9 @@ type CheckoutLifecycleConfig struct {
 	// nil makes the lifecycle own one; a caller that materializes views must
 	// pass the manager it materializes through.
 	ViewLeases *graphview.LeaseManager
+	// RefViews bounds how much ref-view payload the store keeps. A zero value
+	// takes the shipped defaults.
+	RefViews RefViewRetention
 }
 
 // CheckoutLifecycle is the single owner of checkout lifecycle side effects.
@@ -120,6 +123,13 @@ type CheckoutLifecycle struct {
 	// sweep retries them until the catalog stops refusing.
 	owed map[int64]struct{}
 
+	// refViewMu guards the per-repository ref-view manager cache alone. A
+	// manager holds no per-request state, so the lock covers only the map.
+	refViewMu sync.Mutex
+	refViews  map[string]*RefViewManager
+	// refViewRetention bounds how much ref-view payload survives a sweep.
+	refViewRetention RefViewRetention
+
 	// mu guards only the two late-bound collaborators. Neither is held
 	// across a saga: the hooks re-enter the lifecycle, and holding a lock
 	// over the indexer's own teardown would invert the lock order.
@@ -149,13 +159,14 @@ func NewCheckoutLifecycle(cfg CheckoutLifecycleConfig) (*CheckoutLifecycle, erro
 		now = time.Now
 	}
 	l := &CheckoutLifecycle{
-		mi:           cfg.MultiIndexer,
-		cfgMgr:       cfg.ConfigManager,
-		logger:       logger,
-		now:          now,
-		leases:       cfg.ViewLeases,
-		coordinators: map[string]*CheckoutCoordinator{},
-		owed:         map[int64]struct{}{},
+		mi:               cfg.MultiIndexer,
+		cfgMgr:           cfg.ConfigManager,
+		logger:           logger,
+		now:              now,
+		leases:           cfg.ViewLeases,
+		coordinators:     map[string]*CheckoutCoordinator{},
+		owed:             map[int64]struct{}{},
+		refViewRetention: cfg.RefViews.withDefaults(),
 	}
 	if l.leases == nil {
 		l.leases = graphview.NewLeaseManager()
@@ -865,6 +876,10 @@ type SweepReport struct {
 	// offer could not: the ones a coordinator's own retire was refused for,
 	// and the ones a checkout that stopped being served left behind.
 	Retired int
+	// RefViewsRetired counts ref-view generations the retention bounds
+	// collected. They are counted apart from Retired because nothing else
+	// would ever offer them: a ref view belongs to no checkout.
+	RefViewsRetired int
 }
 
 // Sweep resumes unfinished cleanups and reconciles every known family.
@@ -904,6 +919,7 @@ func (l *CheckoutLifecycle) Sweep(ctx context.Context) (SweepReport, error) {
 	}
 	out.Coordinators = l.liveCoordinators()
 	out.Retired = l.sweepRetirements(ctx)
+	out.RefViewsRetired = l.sweepRefViewRetention(ctx)
 	if out.Removed > 0 {
 		// The cleanup hooks drop the removed repositories from the in-memory
 		// configuration; without this the removal is forgotten on restart.

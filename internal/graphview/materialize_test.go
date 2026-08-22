@@ -130,6 +130,83 @@ func TestMaterializeCheckoutReadsTheRoutedStack(t *testing.T) {
 	assertReadersAgree(t, view.Reader, flat)
 }
 
+// TestMaterializeRefViewStacksOneLayer pins the shape of a view of committed
+// state: the graph's corpus with exactly one generation on it, named by that
+// generation and carrying no layer above it. A ref selector means the
+// committed tree, so there is no working-tree slot to add.
+func TestMaterializeRefViewStacksOneLayer(t *testing.T) {
+	store := openStackStore(t, "refview")
+	seedStackCorpus(t, store)
+	commit := writeStackCommitGeneration(t, store)
+	seedStackControlPlane(t, store)
+
+	materializer := newTestMaterializer(store)
+	view, err := materializer.MaterializeRefView(context.Background(), testGraphID, commit)
+	if err != nil {
+		t.Fatalf("MaterializeRefView: %v", err)
+	}
+	defer view.Close()
+
+	if got := view.Generations(); len(got) != 1 || got[0] != commit {
+		t.Fatalf("Generations() = %v, want the ref generation alone", got)
+	}
+	if len(view.ID.Layers) != 0 {
+		t.Errorf("identity names %d layers, want none", len(view.ID.Layers))
+	}
+	if view.ID.BaseGeneration != commit || view.ID.BaseGraphID != testGraphID || view.ID.RepoPrefix != stackRepo {
+		t.Errorf("identity = %+v, want %s/%s at %d", view.ID, stackRepo, testGraphID, commit)
+	}
+	if view.ID.Fingerprint() == "" {
+		t.Error("the view has no fingerprint to name its files by")
+	}
+	if !view.Completeness.IsComplete(CapSyntaxGraph) {
+		t.Errorf("%s = %q, want it complete", CapSyntaxGraph, view.Completeness.State(CapSyntaxGraph))
+	}
+	if len(view.GenerationSources()) != 1 {
+		t.Errorf("the search stack has %d corpora, want the one generation", len(view.GenerationSources()))
+	}
+
+	// The lease is the same one retirement consults, so the generation a live
+	// ref view reads cannot be swept out from under it.
+	if err := store.RetirePayloadGeneration(context.Background(), commit, materializer.Leases.InUse); err == nil {
+		t.Error("a leased ref-view generation was retired while a view still read it")
+	}
+}
+
+// TestMaterializeRefViewRefusesWhatItCannotName pins the guards: without a
+// graph or a published generation there is nothing to compose.
+func TestMaterializeRefViewRefusesWhatItCannotName(t *testing.T) {
+	store := openStackStore(t, "refview-guards")
+	seedStackCorpus(t, store)
+	commit := writeStackCommitGeneration(t, store)
+	seedStackControlPlane(t, store)
+	materializer := newTestMaterializer(store)
+
+	cases := []struct {
+		name         string
+		graphID      string
+		generationID int64
+		code         string
+	}{
+		{"no graph", "", commit, CodeInvalidViewSelector},
+		{"no generation", testGraphID, 0, CodeViewBuilding},
+		{"a generation the catalog has no row for", testGraphID, commit + 5000, CodeViewBuilding},
+		{"a graph the catalog has no row for", "graph-absent", commit, CodeCheckoutInaccessible},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			view, err := materializer.MaterializeRefView(context.Background(), tc.graphID, tc.generationID)
+			if err == nil {
+				view.Close()
+				t.Fatalf("MaterializeRefView succeeded, want %s", tc.code)
+			}
+			if got := CodeOf(err); got != tc.code {
+				t.Fatalf("code = %q, want %q (%v)", got, tc.code, err)
+			}
+		})
+	}
+}
+
 // TestMaterializeCheckoutCompletenessRunsBottomUp pins the union: the
 // corpus underneath contributes completeness for everything, and the one
 // capability the working-tree generation declares narrowed is the only

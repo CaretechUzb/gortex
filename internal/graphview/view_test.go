@@ -419,3 +419,49 @@ func TestWorkspaceValidateRejectsNonCanonicalOrder(t *testing.T) {
 		t.Errorf("CodeOf() = %q, want %q", got, CodeInvalidViewSelector)
 	}
 }
+
+// TestViewFileURI pins the identity a file location carries under a pinned
+// view. It stands in for an absolute path when the content the view serves
+// exists nowhere on disk, so it has to name the exact content and survive any
+// path a repository can contain.
+func TestViewFileURI(t *testing.T) {
+	tests := []struct {
+		name        string
+		fingerprint string
+		repoPrefix  string
+		relPath     string
+		want        string
+	}{
+		{"plain", "abc123", "repo", "internal/foo.go", "gortex-view://abc123/repo/internal/foo.go"},
+		{"no prefix", "abc123", "", "foo.go", "gortex-view://abc123/foo.go"},
+		{"space in a segment", "abc123", "repo", "a b/c.go", "gortex-view://abc123/repo/a%20b/c.go"},
+		{"hash in a segment", "abc123", "repo", "a#b.go", "gortex-view://abc123/repo/a%23b.go"},
+		{"question mark", "abc123", "repo", "a?b.go", "gortex-view://abc123/repo/a%3Fb.go"},
+		{"non-ascii", "abc123", "repo", "документ.go",
+			"gortex-view://abc123/repo/%D0%B4%D0%BE%D0%BA%D1%83%D0%BC%D0%B5%D0%BD%D1%82.go"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ViewFileURI(tc.fingerprint, tc.repoPrefix, tc.relPath); got != tc.want {
+				t.Fatalf("ViewFileURI() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestViewFileURIDistinguishesViews pins that the identity is a function of
+// the content: two views of the same path fingerprint differently, so a URI
+// from one never resolves against the other.
+func TestViewFileURIDistinguishesViews(t *testing.T) {
+	a, err := NewRepoViewID("repo", "graph-1", 7)
+	if err != nil {
+		t.Fatalf("NewRepoViewID: %v", err)
+	}
+	b, err := NewRepoViewID("repo", "graph-1", 8)
+	if err != nil {
+		t.Fatalf("NewRepoViewID: %v", err)
+	}
+	if ViewFileURI(a.Fingerprint(), "repo", "foo.go") == ViewFileURI(b.Fingerprint(), "repo", "foo.go") {
+		t.Fatal("two views of one path produced one URI")
+	}
+}

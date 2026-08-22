@@ -16,6 +16,17 @@ type ViewRider struct {
 	// ActualView.
 	GraphID    string `json:"graph_id,omitempty"`
 	CheckoutID string `json:"checkout_id,omitempty"`
+	// ViewFingerprint is the identity of the content that answered. It is the
+	// authority half of every gortex-view:// file URI in the same response.
+	ViewFingerprint string `json:"view_fingerprint,omitempty"`
+	// RequestedRef is the ref or object id the caller's selector named,
+	// verbatim. ResolvedRef, ResolvedCommit and ResolvedTree are what it
+	// resolved to when the request was served — the ref is empty for a commit
+	// selector, which names no ref.
+	RequestedRef   string `json:"requested_ref,omitempty"`
+	ResolvedRef    string `json:"resolved_ref,omitempty"`
+	ResolvedCommit string `json:"resolved_commit,omitempty"`
+	ResolvedTree   string `json:"resolved_tree,omitempty"`
 	// RequestedState and ActualState are the readiness the caller required and
 	// the readiness it got.
 	RequestedState string `json:"requested_state,omitempty"`

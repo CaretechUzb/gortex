@@ -489,10 +489,22 @@ func (c *CheckoutCoordinator) primaryBase(ctx context.Context) (primaryBase, err
 	if primary == nil {
 		return primaryBase{}, fmt.Errorf("indexer: family %s has no primary dedicated graph", c.familyID)
 	}
+	return graphBase(ctx, c.catalog, *primary)
+}
 
-	out := primaryBase{graphID: primary.GraphID}
-	if primary.ActiveGenerationID > 0 {
-		row, found, err := c.catalog.GetViewGeneration(ctx, primary.ActiveGenerationID)
+// graphBase resolves the corpus state a layer over one dedicated graph sits
+// on: the graph's published generation when it has one, and the tree its
+// owning checkout is committed at otherwise. Every layer built over a graph —
+// a checkout's commit layer, a ref view's — reads its base from here, so the
+// two cannot disagree about what "the corpus" is.
+func graphBase(
+	ctx context.Context,
+	catalog *store_sqlite.Catalog,
+	dedicated store_sqlite.DedicatedGraph,
+) (primaryBase, error) {
+	out := primaryBase{graphID: dedicated.GraphID}
+	if dedicated.ActiveGenerationID > 0 {
+		row, found, err := catalog.GetViewGeneration(ctx, dedicated.ActiveGenerationID)
 		if err != nil {
 			return primaryBase{}, err
 		}
@@ -502,13 +514,13 @@ func (c *CheckoutCoordinator) primaryBase(ctx context.Context) (primaryBase, err
 			return out, nil
 		}
 	}
-	owner, found, err := c.catalog.GetCheckout(ctx, primary.OwnerCheckoutID)
+	owner, found, err := catalog.GetCheckout(ctx, dedicated.OwnerCheckoutID)
 	if err != nil {
 		return primaryBase{}, err
 	}
 	if !found || owner.HeadTree == "" {
 		return primaryBase{}, fmt.Errorf(
-			"indexer: primary graph %s names no committed tree to build over", primary.GraphID)
+			"indexer: primary graph %s names no committed tree to build over", dedicated.GraphID)
 	}
 	out.treeOID = owner.HeadTree
 	return out, nil

@@ -593,11 +593,20 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 	// catalog when the backend has one and degrades to the plain
 	// index/watcher/config side effects when it does not.
 	if mi != nil {
+		if conf.Views.RetainInactive != "" && conf.Views.RetainInactiveDuration() == 0 {
+			logger.Warn("serverstack: views.retain_inactive is not a positive duration; using the shipped window",
+				zap.String("value", conf.Views.RetainInactive))
+		}
 		lifecycle, lerr := indexer.NewCheckoutLifecycle(indexer.CheckoutLifecycleConfig{
 			MultiIndexer:  mi,
 			ConfigManager: cm,
 			Graph:         g,
 			Logger:        logger,
+			RefViews: indexer.RefViewRetention{
+				RetainInactive:       conf.Views.RetainInactiveDuration(),
+				MaxCachedGenerations: conf.Views.MaxCachedGenerations,
+				MaxBytesPerGraph:     conf.Views.MaxBytesPerGraph,
+			},
 		})
 		if lerr != nil {
 			return nil, fmt.Errorf("build checkout lifecycle: %w", lerr)

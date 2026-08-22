@@ -15,6 +15,7 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/zzet/gortex/internal/elide"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/search/rerank"
@@ -527,9 +528,13 @@ func (s *Server) handleGetEditingContext(ctx context.Context, req mcp.CallToolRe
 	// through the tree-sitter elider so the agent gets signatures +
 	// structure in one call without paying the cost of raw bodies.
 	// Failures (no grammar, parse error) are swallowed — the caller
-	// still gets the structural sections that fired above.
+	// still gets the structural sections that fired above. A view that
+	// cannot produce the file's bytes is not: it is either the typed
+	// source_object_missing answer or an omission saying so.
 	var sourceCompressed string
 	var keptSymbols []string
+	var viewURI string
+	var viewReadFailure string
 	if req.GetBool("compress_bodies", false) {
 		var language string
 		if out.File != nil {
@@ -545,7 +550,25 @@ func (s *Server) handleGetEditingContext(ctx context.Context, req mcp.CallToolRe
 			// the file is indexed).
 			var fileBytes []byte
 			anchor := fileNodeForScope
-			if anchor != nil {
+			if files := refViewFilesFor(ctx); files != nil {
+				// A view of committed state has no working copy, so the whole
+				// file comes out of the tree it pins.
+				content, rel, viewErr := readViewFile(ctx, files, fp)
+				switch {
+				case viewErr == nil:
+					fileBytes = content
+					viewURI = files.uri(rel)
+				case errors.Is(viewErr, graphview.ErrSourceObjectMissing):
+					// The blob the view is pinned to is gone from the object
+					// store. Every other read surface answers that verbatim,
+					// and the read has already withdrawn the view's source
+					// capability, so degrading to the structural sections here
+					// would hide a view that can no longer serve bytes at all.
+					return mcp.NewToolResultError(viewErr.Error()), nil
+				default:
+					viewReadFailure = viewErr.Error()
+				}
+			} else if anchor != nil {
 				if absPath, rerr := s.resolveNodePath(anchor); rerr == nil {
 					if content, ok := s.overlayContentFor(ctx, absPath); ok {
 						fileBytes = []byte(content)
@@ -598,6 +621,12 @@ func (s *Server) handleGetEditingContext(ctx context.Context, req mcp.CallToolRe
 		omissions = append(omissions, omission("compressed",
 			"source_compressed replaces function and method bodies with elided stubs; signatures kept"))
 	}
+	if viewReadFailure != "" {
+		// Without this the caller cannot tell a file with nothing to compress
+		// from one whose bytes the view could not produce.
+		omissions = append(omissions, omission("source_unavailable",
+			"source_compressed is absent: the view could not produce this file's bytes — "+viewReadFailure))
+	}
 
 	if s.isGCX(ctx, req) {
 		return s.gcxResponseWithBudget(req)(encodeEditingContext(out.File, out.Defines, out.Imports, out.CalledBy, out.Calls, etag, omissionKindsCSV(omissions)))
@@ -618,6 +647,10 @@ func (s *Server) handleGetEditingContext(ctx context.Context, req mcp.CallToolRe
 		if len(keptSymbols) > 0 {
 			result["kept_symbols"] = keptSymbols
 		}
+	}
+	if viewURI != "" {
+		result["served_from"] = "view"
+		result["view_uri"] = viewURI
 	}
 	if len(omissions) > 0 {
 		result["omissions"] = omissions
@@ -936,17 +969,35 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 	// paths must never reach readLines: os.Open would resolve them
 	// against the daemon process cwd, which is unrelated to any repo
 	// and silently produces wrong results.
-	absPath, resolveErr := s.resolveNodePath(node)
-	if resolveErr != nil {
-		return mcp.NewToolResultError(resolveErr.Error()), nil
-	}
-	if guardErr := s.guardSymlinkWithinRepo(absPath); guardErr != nil {
-		return mcp.NewToolResultError(guardErr.Error()), nil
-	}
-
-	source, startLine, totalFileChars, err := s.readLinesForCtx(ctx, absPath, node.StartLine, node.EndLine, contextLines)
-	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("could not read source: %v", err)), nil
+	var (
+		source         string
+		startLine      int
+		totalFileChars int
+		viewURI        string
+	)
+	if files := refViewFilesFor(ctx); files != nil {
+		// The symbol's lines belong to the committed tree the view pins, not
+		// to whatever the canonical checkout has on disk at that path.
+		content, rel, viewErr := readViewFile(ctx, files, node.FilePath)
+		if viewErr != nil {
+			return mcp.NewToolResultError(viewErr.Error()), nil
+		}
+		viewURI = files.uri(rel)
+		source, startLine, totalFileChars, _ = extractLinesFromContent(
+			string(content), node.StartLine, node.EndLine, contextLines)
+	} else {
+		absPath, resolveErr := s.resolveNodePath(node)
+		if resolveErr != nil {
+			return mcp.NewToolResultError(resolveErr.Error()), nil
+		}
+		if guardErr := s.guardSymlinkWithinRepo(absPath); guardErr != nil {
+			return mcp.NewToolResultError(guardErr.Error()), nil
+		}
+		var err error
+		source, startLine, totalFileChars, err = s.readLinesForCtx(ctx, absPath, node.StartLine, node.EndLine, contextLines)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("could not read source: %v", err)), nil
+		}
 	}
 
 	compressBodies := req.GetBool("compress_bodies", false)
@@ -996,6 +1047,10 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 	}
 	if sig, ok := node.Meta["signature"]; ok {
 		result["signature"] = sig
+	}
+	if viewURI != "" {
+		result["served_from"] = "view"
+		result["view_uri"] = viewURI
 	}
 	if bodiesElided {
 		result["bodies_elided"] = true

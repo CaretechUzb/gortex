@@ -2,6 +2,7 @@ package graphview
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -44,8 +45,12 @@ type Selector struct {
 //     refs/tags/, or refs/remotes/. Short names ("main"), HEAD, and revision
 //     expressions ("main~1", "a..b", "x@{1}") are rejected: they resolve
 //     against ambient state, and a pinned view may not depend on ambient state.
+//     graphID is optional and names the graph whose corpus the ref composes
+//     over; omitting it leaves the choice to the server, which has to be able
+//     to make it unambiguously.
 //   - commit   — requires value: a full lowercase hex object id, 40 (SHA-1) or
 //     64 (SHA-256) characters. Abbreviated ids are ambiguous and rejected.
+//     graphID is optional, exactly as for git_ref.
 //
 // A missing required field or a malformed value fails with
 // CodeInvalidViewSelector; a field the kind does not use fails with
@@ -79,14 +84,14 @@ func ParseSelector(kind, graphID, checkoutID, value string) (Selector, error) {
 			return Selector{}, err
 		}
 	case SelectorGitRef:
-		if err := rejectUnused(s, "value"); err != nil {
+		if err := rejectUnused(s, "graph_id", "value"); err != nil {
 			return Selector{}, err
 		}
 		if err := validateFullRefName(value); err != nil {
 			return Selector{}, err
 		}
 	case SelectorCommit:
-		if err := rejectUnused(s, "value"); err != nil {
+		if err := rejectUnused(s, "graph_id", "value"); err != nil {
 			return Selector{}, err
 		}
 		if err := validateCommitOID(value); err != nil {
@@ -110,6 +115,9 @@ func (s Selector) String() string {
 	case SelectorWorktree:
 		return string(s.Kind) + ":" + s.CheckoutID
 	case SelectorGitRef, SelectorCommit:
+		if s.GraphID != "" {
+			return string(s.Kind) + ":" + s.GraphID + ":" + s.Value
+		}
 		return string(s.Kind) + ":" + s.Value
 	default:
 		return string(s.Kind)
@@ -117,8 +125,8 @@ func (s Selector) String() string {
 }
 
 // rejectUnused fails when a selector carries a field its kind does not use.
-// used names the single field the kind consumes ("" for auto).
-func rejectUnused(s Selector, used string) error {
+// used names the fields the kind consumes (none for auto).
+func rejectUnused(s Selector, used ...string) error {
 	fields := []struct {
 		name  string
 		value string
@@ -128,7 +136,7 @@ func rejectUnused(s Selector, used string) error {
 		{"value", s.Value},
 	}
 	for _, f := range fields {
-		if f.name == used || f.value == "" {
+		if f.value == "" || slices.Contains(used, f.name) {
 			continue
 		}
 		return NewViewError(CodeSelectorConflict,

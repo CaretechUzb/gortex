@@ -31,6 +31,8 @@ func TestParseSelectorAccepts(t *testing.T) {
 		{"sha1 commit", "commit", "", "", strings.Repeat("a", 40), Selector{Kind: SelectorCommit, Value: strings.Repeat("a", 40)}},
 		{"sha256 commit", "commit", "", "", strings.Repeat("0", 64), Selector{Kind: SelectorCommit, Value: strings.Repeat("0", 64)}},
 		{"mixed hex commit", "commit", "", "", "0123456789abcdef0123456789abcdef01234567", Selector{Kind: SelectorCommit, Value: "0123456789abcdef0123456789abcdef01234567"}},
+		{"branch in a named graph", "git_ref", "graph-1", "", "refs/heads/main", Selector{Kind: SelectorGitRef, GraphID: "graph-1", Value: "refs/heads/main"}},
+		{"commit in a named graph", "commit", "graph-1", "", strings.Repeat("a", 40), Selector{Kind: SelectorCommit, GraphID: "graph-1", Value: strings.Repeat("a", 40)}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -65,7 +67,6 @@ func TestParseSelectorRejects(t *testing.T) {
 		{"base with a value", "base", "graph-1", "", "refs/heads/main", CodeSelectorConflict},
 		{"worktree without a checkout id", "worktree", "", "", "", CodeInvalidViewSelector},
 		{"worktree with a graph id", "worktree", "graph-1", "wt-1", "", CodeSelectorConflict},
-		{"git_ref with a graph id", "git_ref", "graph-1", "", "refs/heads/main", CodeSelectorConflict},
 		{"git_ref with a checkout id", "git_ref", "", "wt-1", "refs/heads/main", CodeSelectorConflict},
 		{"commit with a checkout id", "commit", "", "wt-1", oid, CodeSelectorConflict},
 

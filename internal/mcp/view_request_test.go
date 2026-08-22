@@ -705,7 +705,11 @@ func TestUnreadableCWDBindingSaysItFellBack(t *testing.T) {
 	}
 }
 
-func TestUnbuildableSelectorsReportCapabilityUnavailable(t *testing.T) {
+// TestRefSelectorsFailLoudlyOnAGraphWithNothingToBuildOver pins that a
+// selector naming committed state the server cannot produce is refused rather
+// than quietly answered from the base corpus. This fixture's graph records no
+// committed tree, so there is nothing for a commit layer to diff against.
+func TestRefSelectorsFailLoudlyOnAGraphWithNothingToBuildOver(t *testing.T) {
 	stack := newViewStack(t)
 	for _, sel := range []map[string]any{
 		{"kind": "git_ref", "value": "refs/heads/main"},
@@ -716,8 +720,22 @@ func TestUnbuildableSelectorsReportCapabilityUnavailable(t *testing.T) {
 		if err != nil {
 			t.Fatalf("call %v: %v", sel, err)
 		}
-		assertToolError(t, res, graphview.CodeCapabilityUnavailable)
+		assertToolError(t, res, graphview.CodeCheckoutInaccessible)
 	}
+}
+
+// TestRefSelectorRefusesAnAmbiguousGraph pins that a session reaching several
+// repositories must name the one it means: the same branch name in two of them
+// is two different answers.
+func TestRefSelectorRefusesAnAmbiguousGraph(t *testing.T) {
+	stack := newViewStack(t)
+	res, err := stack.callWithView(t, "", "get_symbol",
+		map[string]any{"view": map[string]any{"kind": "git_ref", "value": "refs/heads/main"}},
+		captureReader(stack.srv, new(graph.Reader)))
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	assertToolError(t, res, graphview.CodeInvalidViewSelector)
 }
 
 func TestMalformedSelectorReportsInvalidViewSelector(t *testing.T) {

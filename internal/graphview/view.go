@@ -26,6 +26,8 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"net/url"
+	"path"
 	"slices"
 	"strings"
 )
@@ -299,4 +301,32 @@ func (v WorkspaceViewID) canonical() []byte {
 func hashCanonical(b []byte) string {
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
+}
+
+// ViewFileScheme is the URI scheme a file location under a pinned view is
+// reported with.
+const ViewFileScheme = "gortex-view"
+
+// ViewFileURI names one file inside one view:
+// gortex-view://<view-fingerprint>/<repo-prefix>/<percent-encoded-path>.
+//
+// A view built from a committed tree has no filesystem root, so there is no
+// absolute path to report and reporting one from the canonical checkout would
+// name bytes the view never read. The fingerprint is what makes the location
+// resolvable: it identifies the exact content, and the path is relative to the
+// repository inside it. Every path segment is percent-encoded, so a name
+// carrying a slash-adjacent character survives the round trip.
+func ViewFileURI(fingerprint, repoPrefix, relPath string) string {
+	var b strings.Builder
+	b.WriteString(ViewFileScheme)
+	b.WriteString("://")
+	b.WriteString(url.PathEscape(fingerprint))
+	for _, segment := range strings.Split(path.Join(repoPrefix, relPath), "/") {
+		if segment == "" {
+			continue
+		}
+		b.WriteByte('/')
+		b.WriteString(url.PathEscape(segment))
+	}
+	return b.String()
 }
