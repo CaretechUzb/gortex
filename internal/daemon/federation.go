@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -133,7 +135,7 @@ func (f *Federator) Augment(ctx context.Context, tool string, body, localResult 
 
 	results, meta := f.fanOut(ctx, tool, body, remotes)
 
-	merged, origins := f.merge(tool, localTool, results)
+	merged, origins := f.merge(tool, body, localTool, results)
 	meta.Origins = origins
 
 	// Opt-in name-keyed fallback (OFF by default): a bare-name
@@ -269,10 +271,14 @@ func (f *Federator) fanOut(ctx context.Context, tool string, body []byte, remote
 
 // merge dispatches to the per-tool adapter and returns the merged tool
 // JSON plus the origins map.
-func (f *Federator) merge(tool string, local []byte, remotes []remoteResult) ([]byte, map[string]string) {
+func (f *Federator) merge(tool string, body, local []byte, remotes []remoteResult) ([]byte, map[string]string) {
+	// Fan-out results arrive in goroutine completion order; sort by slug
+	// so the merged result — and any post-merge cap cut from it — is
+	// deterministic across runs.
+	sort.Slice(remotes, func(i, j int) bool { return remotes[i].slug < remotes[j].slug })
 	switch tool {
 	case "find_usages", "get_callers", "get_call_chain", "get_dependents":
-		return mergeSubGraph(local, remotes)
+		return mergeSubGraph(tool, body, local, remotes)
 	case "search_symbols":
 		return mergeKeyedList(local, remotes, "results")
 	case "find_implementations":
@@ -284,15 +290,33 @@ func (f *Federator) merge(tool string, local []byte, remotes []remoteResult) ([]
 	}
 }
 
+// subGraphMergeArgs are the request args the post-merge recap needs:
+// the queried node (kept through node pruning) and the caller's limit.
+type subGraphMergeArgs struct {
+	ID    string `json:"id"`
+	Limit *int   `json:"limit"`
+}
+
 // mergeSubGraph merges query.SubGraph responses: nodes deduped by string
-// ID (local wins), edges by (From,To,Kind). Origins keys each node ID to
-// "local" or "remote:<slug>".
-func mergeSubGraph(local []byte, remotes []remoteResult) ([]byte, map[string]string) {
+// ID (local wins), edges by (From,To,Kind,FilePath,Line) so distinct
+// call sites of the same pair stay distinct rows. Origins keys each
+// node ID to "local" or "remote:<slug>".
+//
+// Each daemon applied the caller's limit to its own page, so the merged
+// row set must honor the contract once, globally: the limit is
+// reapplied after a deterministic merge, truncation from any source
+// propagates, and — because a source that discarded its tail makes the
+// exact deduplicated total unknowable — the merged totals are an
+// explicit floor (lower_bound) in that case.
+func mergeSubGraph(tool string, body, local []byte, remotes []remoteResult) ([]byte, map[string]string) {
 	origins := map[string]string{}
 	var sg query.SubGraph
 	if err := json.Unmarshal(local, &sg); err != nil {
 		return local, origins
 	}
+	anySourceTruncated := sg.Truncated
+	totalEdgesFloor := sg.TotalEdges
+	totalNodesFloor := sg.TotalNodes
 	seen := make(map[string]bool, len(sg.Nodes))
 	for _, n := range sg.Nodes {
 		if n != nil {
@@ -311,6 +335,11 @@ func mergeSubGraph(local []byte, remotes []remoteResult) ([]byte, map[string]str
 		if err := json.Unmarshal(rr.toolJSON, &rsg); err != nil {
 			continue
 		}
+		if rsg.Truncated {
+			anySourceTruncated = true
+		}
+		totalEdgesFloor = max(totalEdgesFloor, rsg.TotalEdges)
+		totalNodesFloor = max(totalNodesFloor, rsg.TotalNodes)
 		for _, n := range rsg.Nodes {
 			if n == nil || seen[n.ID] {
 				continue // local wins on collision
@@ -331,8 +360,57 @@ func mergeSubGraph(local []byte, remotes []remoteResult) ([]byte, map[string]str
 			sg.Edges = append(sg.Edges, e)
 		}
 	}
-	sg.TotalNodes = len(sg.Nodes)
-	sg.TotalEdges = len(sg.Edges)
+	// Totals: exact deduplicated counts when every source was complete;
+	// otherwise the best available floor — never smaller than any single
+	// source's own full count or the merged set itself.
+	sg.TotalEdges = max(totalEdgesFloor, len(sg.Edges))
+	sg.TotalNodes = max(totalNodesFloor, len(sg.Nodes))
+	sg.Truncated = anySourceTruncated
+	sg.LowerBound = sg.LowerBound || anySourceTruncated
+
+	var args subGraphMergeArgs
+	_ = json.Unmarshal(body, &args)
+	limit := 50
+	if args.Limit != nil {
+		limit = *args.Limit
+	}
+	if limit > 0 {
+		switch tool {
+		case "find_usages":
+			// Usage rows page by edges: one stable global order (the
+			// same the local row cap consumes), then the cap, once.
+			query.SortEdgesForPage(sg.Edges)
+			if len(sg.Edges) > limit {
+				sg.Edges = sg.Edges[:limit]
+				sg.Truncated = true
+				keep := map[string]bool{args.ID: true}
+				for _, e := range sg.Edges {
+					keep[e.From] = true
+					keep[e.To] = true
+				}
+				pruneMergedNodes(&sg, origins, keep)
+			}
+		default:
+			// BFS-shaped tools cap nodes; the merge order (local first,
+			// then slug-sorted remotes) is the deterministic page order.
+			if len(sg.Nodes) > limit {
+				keep := make(map[string]bool, limit)
+				sg.Nodes = sg.Nodes[:limit]
+				for _, n := range sg.Nodes {
+					keep[n.ID] = true
+				}
+				kept := sg.Edges[:0]
+				for _, e := range sg.Edges {
+					if keep[e.From] && keep[e.To] {
+						kept = append(kept, e)
+					}
+				}
+				sg.Edges = kept
+				sg.Truncated = true
+				pruneMergedNodes(&sg, origins, keep)
+			}
+		}
+	}
 	out, err := json.Marshal(sg)
 	if err != nil {
 		return local, origins
@@ -340,8 +418,26 @@ func mergeSubGraph(local []byte, remotes []remoteResult) ([]byte, map[string]str
 	return out, origins
 }
 
+// pruneMergedNodes drops nodes (and their origins entries) that the
+// post-merge cap removed from the response.
+func pruneMergedNodes(sg *query.SubGraph, origins map[string]string, keep map[string]bool) {
+	nodes := sg.Nodes[:0]
+	for _, n := range sg.Nodes {
+		if n != nil && keep[n.ID] {
+			nodes = append(nodes, n)
+		}
+	}
+	sg.Nodes = nodes
+	for id := range origins {
+		if !keep[id] {
+			delete(origins, id)
+		}
+	}
+}
+
 func edgeKey(e *graph.Edge) string {
-	return e.From + "\x00" + e.To + "\x00" + string(e.Kind)
+	return e.From + "\x00" + e.To + "\x00" + string(e.Kind) +
+		"\x00" + e.FilePath + "\x00" + strconv.Itoa(e.Line)
 }
 
 // idKeyedTools are the SubGraph traversals whose primary query keys on a
