@@ -247,6 +247,44 @@ func TestFindUsages_GroupByFileHonorsLimit(t *testing.T) {
 	require.Equal(t, 6, resp.TotalEdges, "a truncated grouped page must carry the full total")
 }
 
+// TestFindUsages_CappedCompactCarriesFullTotal pins the capped-response
+// contract on the compact format: a capped page must be legible as
+// partial, so the edges footer names both the page size and the full
+// row count. (JSON and GCX are pinned by the limit tests above.)
+func TestFindUsages_CappedCompactCarriesFullTotal(t *testing.T) {
+	srv, hotID := usagesLimitServer(t, 6)
+	out := findUsagesText(t, srv, map[string]any{"id": hotID, "limit": 2, "compact": true})
+	require.Contains(t, out, "edges: 2 of 6 total",
+		"a capped compact response must name the full row count, not label the page as the total")
+
+	full := findUsagesText(t, srv, map[string]any{"id": hotID, "limit": 0, "compact": true})
+	require.Contains(t, full, "edges: 6 total", "the uncapped compact footer keeps its wire shape")
+}
+
+// TestFindUsages_CappedTOONCarriesFullTotal pins the same contract on
+// the TOON wire: truncated rides with the full edge total.
+func TestFindUsages_CappedTOONCarriesFullTotal(t *testing.T) {
+	srv, hotID := usagesLimitServer(t, 6)
+	out := findUsagesText(t, srv, map[string]any{"id": hotID, "limit": 2, "format": "toon"})
+	require.Contains(t, out, "truncated: true")
+	require.Contains(t, out, "total_edges: 6", "a capped TOON response must carry the full edge total")
+
+	full := findUsagesText(t, srv, map[string]any{"id": hotID, "limit": 0, "format": "toon"})
+	require.NotContains(t, full, "total_edges", "the uncapped TOON response keeps its wire shape")
+}
+
+// TestFindUsages_CompactHonorsByteBudget pins max_bytes on the compact
+// path, including the compact-over-gcx-default composition: routing a
+// budgeted request to the compact renderer must not shed the budget.
+func TestFindUsages_CompactHonorsByteBudget(t *testing.T) {
+	srv, hotID := usagesLimitServer(t, 55)
+	out := findUsagesText(t, srv, map[string]any{
+		"id": hotID, "limit": 0, "compact": true, "format": "gcx", "max_bytes": 300,
+	})
+	require.LessOrEqual(t, len(out), 300, "compact output must respect max_bytes")
+	require.Contains(t, out, "trimmed", "a budget-trimmed compact response must say so")
+}
+
 // TestFindUsages_CompactWinsOverGCX pins the `compact` option against
 // the GCX format path: compact is an explicit caller choice, so it
 // takes precedence exactly as it does in the shared returnSubGraph

@@ -113,17 +113,37 @@ type toonCallerNoteRow struct {
 }
 
 // toonSubGraphResult wraps nodes and edges for TOON tabular output.
+// toonZeroEdgeCaveat mirrors graph.ZeroEdgeCaveat with a plain string
+// class: toon-go rejects the named ZeroEdgeClass string type, and the
+// silent JSON fallback that error triggered meant a caveat-bearing
+// subgraph never actually rendered as TOON.
+type toonZeroEdgeCaveat struct {
+	Class   string `toon:"class"`
+	Message string `toon:"message"`
+}
+
+func toonCaveat(c *graph.ZeroEdgeCaveat) *toonZeroEdgeCaveat {
+	if c == nil {
+		return nil
+	}
+	return &toonZeroEdgeCaveat{Class: string(c.Class), Message: c.Message}
+}
+
 type toonSubGraphResult struct {
-	Nodes                 []toonNodeRow         `toon:"nodes"`
-	Edges                 []toonEdgeRow         `toon:"edges"`
-	Total                 int                   `toon:"total"`
-	Truncated             bool                  `toon:"truncated"`
-	Caveat                *graph.ZeroEdgeCaveat `toon:"caveat,omitempty"`
-	TextMatchedSuppressed int                   `toon:"text_matched_suppressed,omitempty"`
-	SuppressionCaveat     string                `toon:"suppression_caveat,omitempty"`
-	RelatedTools          string                `toon:"related_tools,omitempty"`
-	CallerNotes           []toonCallerNoteRow   `toon:"caller_notes,omitempty"`
-	UsageSummary          *query.UsageSummary   `toon:"usage_summary,omitempty"`
+	Nodes     []toonNodeRow `toon:"nodes"`
+	Edges     []toonEdgeRow `toon:"edges"`
+	Total     int           `toon:"total"`
+	Truncated bool          `toon:"truncated"`
+	// TotalEdges carries the full row count when a row cap cut the edge
+	// list; zero (and omitted) otherwise, so untrimmed responses and
+	// node-truncated BFS results keep their wire shape.
+	TotalEdges            int                 `toon:"total_edges,omitempty"`
+	Caveat                *toonZeroEdgeCaveat `toon:"caveat,omitempty"`
+	TextMatchedSuppressed int                 `toon:"text_matched_suppressed,omitempty"`
+	SuppressionCaveat     string              `toon:"suppression_caveat,omitempty"`
+	RelatedTools          string              `toon:"related_tools,omitempty"`
+	CallerNotes           []toonCallerNoteRow `toon:"caller_notes,omitempty"`
+	UsageSummary          *query.UsageSummary `toon:"usage_summary,omitempty"`
 }
 
 // toonSearchResult wraps search results for TOON tabular output.
@@ -208,7 +228,15 @@ func (s *Server) returnSubGraph(ctx context.Context, req mcp.CallToolRequest, sg
 		return mcp.NewToolResultText(sg.ToDot()), nil
 	}
 	if isCompact(req) {
-		return mcp.NewToolResultText(compactSubGraph(sg)), nil
+		// Compact is a caller-facing renderer, not an escape hatch from
+		// the byte/token budget: a request routed here (including
+		// compact over a gcx session default) keeps the same
+		// effectiveBudget cap every other format path enforces.
+		text := compactSubGraph(sg)
+		if budget := effectiveBudget(req); budget > 0 && len(text) > budget {
+			text = trimTextToBudget(text, budget)
+		}
+		return mcp.NewToolResultText(text), nil
 	}
 	if s.isGCX(ctx, req) {
 		tool := requestToolName(req)
@@ -221,6 +249,27 @@ func (s *Server) returnSubGraph(ctx context.Context, req mcp.CallToolRequest, sg
 		return subGraphToTOON(sg)
 	}
 	return s.respondJSONOrTOON(ctx, req, sg)
+}
+
+// trimTextToBudget cuts a line-oriented text payload to at most budget
+// bytes, breaking at a line boundary and closing with a marker line so
+// the cut is legible. The marker's own bytes count against the budget.
+func trimTextToBudget(text string, budget int) string {
+	const marker = "... trimmed to byte budget; pass max_bytes:0 for the full result\n"
+	keep := budget - len(marker)
+	if keep < 0 {
+		keep = 0
+	}
+	if keep > len(text) {
+		keep = len(text)
+	}
+	cut := strings.LastIndexByte(text[:keep], '\n')
+	if cut < 0 {
+		cut = 0
+	} else {
+		cut++
+	}
+	return text[:cut] + marker
 }
 
 // requestToolName extracts the MCP tool name from a CallToolRequest.
@@ -344,12 +393,15 @@ func subGraphToTOON(sg *query.SubGraph) (*mcp.CallToolResult, error) {
 		Edges:                 edgeRows,
 		Total:                 sg.TotalNodes,
 		Truncated:             sg.Truncated,
-		Caveat:                sg.Caveat,
+		Caveat:                toonCaveat(sg.Caveat),
 		TextMatchedSuppressed: sg.TextMatchedSuppressed,
 		SuppressionCaveat:     sg.SuppressionCaveat,
 		RelatedTools:          sg.RelatedTools,
 		CallerNotes:           callerNotesToTOONRows(sg.CallerNotes),
 		UsageSummary:          sg.UsageSummary,
+	}
+	if sg.TotalEdges > len(sg.Edges) {
+		result.TotalEdges = sg.TotalEdges
 	}
 	data, err := toon.Marshal(result)
 	if err != nil {
@@ -859,7 +911,14 @@ func compactSubGraph(sg *query.SubGraph) string {
 			}
 			counts[label]++
 		}
-		fmt.Fprintf(&b, "edges: %d total", len(sg.Edges))
+		// A row-capped page names both the page size and the full row
+		// count, so "total" never mislabels a partial result. The
+		// uncapped footer keeps its wire shape.
+		if sg.TotalEdges > len(sg.Edges) {
+			fmt.Fprintf(&b, "edges: %d of %d total", len(sg.Edges), sg.TotalEdges)
+		} else {
+			fmt.Fprintf(&b, "edges: %d total", len(sg.Edges))
+		}
 		for _, label := range []string{"EXTRACTED", "INFERRED", "AMBIGUOUS"} {
 			if c := counts[label]; c > 0 {
 				fmt.Fprintf(&b, ", %d %s", c, label)
