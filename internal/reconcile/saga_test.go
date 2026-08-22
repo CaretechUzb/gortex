@@ -57,6 +57,29 @@ func TestForgetCheckoutRunsItsPhasesInOrder(t *testing.T) {
 	}
 }
 
+// TestForgetCheckoutOutlivesARouteWrittenByTheStoppingBuilder pins the order
+// the purge and the route withdrawal run in.
+//
+// The purge is what stops the coordinator, and a cycle already in flight
+// installs its route as that stop waits for it. A withdrawal that ran before
+// the stop therefore deletes a row that is written again a moment later, and
+// the checkout delete — whose route is the one child that does not cascade —
+// is refused by the foreign key.
+func TestForgetCheckoutOutlivesARouteWrittenByTheStoppingBuilder(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, Default())
+	f.seedPrimaryGraph("graph-primary")
+	f.seedCheckout("co-1", "inc-1", "wt", store_sqlite.CheckoutModeAutomatic)
+	f.seedRoute("co-1", "graph-primary")
+	f.seedIntent("co-1")
+	f.hooks.onPurge = func(checkoutID string) { f.seedRoute(checkoutID, "graph-primary") }
+
+	if err := f.rec.ForgetCheckout(ctx, "co-1", "inc-1"); err != nil {
+		t.Fatalf("ForgetCheckout: %v", err)
+	}
+	f.assertNoCheckoutRows("co-1")
+}
+
 func TestForgetCheckoutIsANoOpOnReentry(t *testing.T) {
 	ctx := context.Background()
 	f := newFixture(t, Default())

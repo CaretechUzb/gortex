@@ -67,16 +67,18 @@ const (
 
 // sagaPhases is the ordered plan of each saga.
 //
-// Order is the whole design. A route is withdrawn before the layers it points
-// at are purged, layers go before the rows describing them, and the checkout
-// row goes last because everything else references it. The plans are fixed
-// lists rather than computed ones so a resume from an old journal entry walks
-// exactly the sequence that entry was written against.
+// Order is the whole design. The layers go first, because purging them is what
+// stops the builder that writes this checkout's route — withdrawing while it is
+// still running deletes a row the last cycle installs again. Then the route,
+// then the rows describing the layers, and the checkout row last because
+// everything else references it. The plans are fixed lists rather than computed
+// ones so a resume from an old journal entry walks exactly the sequence that
+// entry was written against.
 var sagaPhases = map[sagaKind][]sagaPhase{
 	sagaPurgeLayers: {phasePurgeLayers},
 	sagaForgetCheckout: {
-		phaseWithdrawRoute,
 		phasePurgeLayers,
+		phaseWithdrawRoute,
 		phaseDeleteRefViews,
 		phaseReleaseGraph,
 		phaseDeleteCheckoutRow,
@@ -359,7 +361,9 @@ func (r *Reconciler) runPhase(ctx context.Context, target sagaTarget) error {
 }
 
 // withdrawRoute removes the route row. It is the one child of a checkout that
-// does not cascade, so it has to go first or the checkout delete is refused.
+// does not cascade, so it has to go before the checkout delete or that delete
+// is refused — and after the purge that stopped the only writer of it, or the
+// row comes back between the two.
 func (r *Reconciler) withdrawRoute(ctx context.Context, checkoutID string) error {
 	if checkoutID == "" {
 		return nil

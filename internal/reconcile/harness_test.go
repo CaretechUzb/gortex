@@ -40,12 +40,20 @@ type recordingHooks struct {
 	calls       []string
 	failPurge   int
 	failRelease int
+	// onPurge runs inside the purge, which is where the layer owner stops the
+	// builder that has been routing for this checkout. The cycle that builder
+	// was already running finishes during the stop, so this is the one place a
+	// test can put the catalog write that stop is racing.
+	onPurge func(checkoutID string)
 }
 
 func (h *recordingHooks) PurgeCheckoutLayers(_ context.Context, checkoutID, incarnation string) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.calls = append(h.calls, "purge:"+checkoutID+":"+incarnation)
+	if h.onPurge != nil {
+		h.onPurge(checkoutID)
+	}
 	if h.failPurge > 0 {
 		h.failPurge--
 		return errHookFailed
