@@ -170,7 +170,9 @@ func (f *coordinatorFixture) coordinator(t *testing.T, cfg CheckoutCoordinatorCo
 	cfg.WorkspaceID = builderRepoPrefix
 	cfg.ProjectID = builderRepoPrefix
 	cfg.Store = f.store
-	cfg.Builder = builderNewBuilder(f.store)
+	if cfg.Builder == nil {
+		cfg.Builder = builderNewBuilder(f.store)
+	}
 	cfg.Leases = f.leases
 	cfg.Config = config.Default().Index
 	cfg.Logger = zap.NewNop()

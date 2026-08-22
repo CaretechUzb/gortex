@@ -42,6 +42,10 @@ type requestView struct {
 	// files is the committed-tree file surface a view with no working copy
 	// reads through. Nil for every view that has one.
 	files *refViewFiles
+	// viewRoot is the working copy this view's content is on disk at: the
+	// routed checkout's root. Empty for a view of a committed tree, which is
+	// the whole difference a filesystem-backed capability turns on.
+	viewRoot string
 
 	// mu guards the annotations the request collects while it runs. The
 	// capability evaluation writes before the handler starts, but a handler
@@ -352,7 +356,12 @@ func (s *Server) materializeRequestView(
 	rider.MarkExact(requested.String())
 	rider.GraphID = view.ID.BaseGraphID
 	rider.CheckoutID = checkout.CheckoutID
-	routed := &requestView{reader: view.Reader, materialized: view, rider: rider}
+	routed := &requestView{
+		reader:       view.Reader,
+		materialized: view,
+		rider:        rider,
+		viewRoot:     checkout.RootPath,
+	}
 	routed.bindSources(view.GenerationSources(), s.graph)
 	return routed, nil
 }

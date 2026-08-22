@@ -20,6 +20,7 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/graphview"
+	"github.com/zzet/gortex/internal/search/trigram"
 )
 
 // The per-checkout coordinator.
@@ -227,6 +228,15 @@ type CheckoutCoordinator struct {
 	// reason is the last signal's reason, carried into the cycle's logging so
 	// a build can be traced back to what asked for it.
 	reason string
+	// dirtyFingerprint is the working tree the last cycle sampled. It is what
+	// the checkout's text searcher is keyed by — see checkout_text_search.go.
+	dirtyFingerprint string
+
+	// textMu guards the checkout's own trigram searcher and is held across the
+	// build, so concurrent searches on one checkout pay for one index.
+	textMu    sync.Mutex
+	textIndex *trigram.Searcher
+	textKey   string
 
 	cycleDone    func(CheckoutCycle)
 	dirtyBarrier func()
@@ -342,6 +352,7 @@ func (c *CheckoutCoordinator) Close() error {
 	}
 	c.once.Do(func() { close(c.stop) })
 	<-c.done
+	c.releaseTextSearcher()
 	return nil
 }
 
@@ -907,6 +918,7 @@ func (c *CheckoutCoordinator) reconcileDirtySlot(
 	if err != nil {
 		return fmt.Errorf("indexer: sample %s: %w", c.root, err)
 	}
+	c.noteDirtyFingerprint(sample.Fingerprint)
 	if route.DirtyGenerationID > 0 {
 		row, found, err := c.catalog.GetViewGeneration(ctx, route.DirtyGenerationID)
 		if err != nil {

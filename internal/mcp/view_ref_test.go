@@ -498,6 +498,20 @@ func TestRefViewResolutionFailuresSurfaceVerbatim(t *testing.T) {
 	}
 }
 
+// refProducerStates reads one generation's producer declarations by name.
+func refProducerStates(t *testing.T, stack *refStack, generationID int64) map[string]store_sqlite.ProducerState {
+	t.Helper()
+	rows, err := stack.store.AtGeneration(generationID).ProducerStates()
+	if err != nil {
+		t.Fatalf("read producer states: %v", err)
+	}
+	out := make(map[string]store_sqlite.ProducerState, len(rows))
+	for _, row := range rows {
+		out[row.Producer] = row.State
+	}
+	return out
+}
+
 // TestRefViewPrunedObjectWithdrawsTheSourceCapability pins the withdrawal: a
 // read that finds the blob gone answers source_object_missing, the view stops
 // claiming it can serve bytes, and everything the generation already holds
@@ -508,6 +522,7 @@ func TestRefViewPrunedObjectWithdrawsTheSourceCapability(t *testing.T) {
 		t.Fatalf("warm the view: %v", err)
 	}
 	generationID := stack.refViewGeneration(t)
+	before := refProducerStates(t, stack, generationID)
 
 	blob := refGit(t, stack.repo, "rev-parse", "refs/heads/feature:edit.go")
 	loose := filepath.Join(stack.repo, ".git", "objects", blob[:2], blob[2:])
@@ -523,25 +538,19 @@ func TestRefViewPrunedObjectWithdrawsTheSourceCapability(t *testing.T) {
 		t.Fatalf("want %s, got: %s", graphview.CodeSourceObjectMissing, text)
 	}
 
-	rows, err := stack.store.AtGeneration(generationID).ProducerStates()
-	if err != nil {
-		t.Fatalf("read producer states: %v", err)
+	// The withdrawal moves exactly one producer. Comparing against what the
+	// build declared is what makes that a claim about the withdrawal rather
+	// than about which states a ref view happens to be born in.
+	after := refProducerStates(t, stack, generationID)
+	if after[string(graphview.CapSourceSnapshot)] != store_sqlite.ProducerStateUnavailable {
+		t.Fatalf("the source snapshot capability was not withdrawn: %+v", after)
 	}
-	withdrawn := false
-	for _, row := range rows {
-		if row.Producer != string(graphview.CapSourceSnapshot) {
+	for producer, state := range after {
+		if producer == string(graphview.CapSourceSnapshot) {
 			continue
 		}
-		withdrawn = row.State == store_sqlite.ProducerStateUnavailable
-	}
-	if !withdrawn {
-		t.Fatalf("the source snapshot capability was not withdrawn: %+v", rows)
-	}
-	for _, row := range rows {
-		if strings.HasPrefix(row.Producer, "graph.") || strings.HasPrefix(row.Producer, "search.") {
-			if row.State == store_sqlite.ProducerStateUnavailable {
-				t.Errorf("the withdrawal disturbed %s", row.Producer)
-			}
+		if state != before[producer] {
+			t.Errorf("the withdrawal disturbed %s: %s -> %s", producer, before[producer], state)
 		}
 	}
 

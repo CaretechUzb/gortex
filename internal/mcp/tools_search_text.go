@@ -70,7 +70,16 @@ func (s *Server) handleSearchText(ctx context.Context, req mcp.CallToolRequest) 
 	scopedMultiGrep := s.multiIndexer != nil && (resolved.RepoAllow != nil || len(pathFilter) > 0)
 	var matches []trigram.Match
 	needsFinalLimit := false
-	if useRegexp {
+	if view := requestViewFromContext(ctx); view.routed() {
+		// A request reading through a view answers out of that view's own
+		// working copy, or not at all. The canonical searchers below are built
+		// over a different tree.
+		viewMatches, refusal := s.searchTextInView(ctx, view, query, useRegexp, limit)
+		if refusal != nil {
+			return refusal, nil
+		}
+		matches = viewMatches
+	} else if useRegexp {
 		var err error
 		if scopedMultiGrep {
 			matches, err = s.multiIndexer.GrepRegexpForRepos(query, "", resolved.RepoAllow, limit)

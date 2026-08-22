@@ -19,6 +19,7 @@ import (
 	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/indexer/source"
 	"github.com/zzet/gortex/internal/parser"
+	"github.com/zzet/gortex/internal/semantic"
 )
 
 // The sparse generation builder.
@@ -176,11 +177,52 @@ type BuildRequest struct {
 	WorkspaceID string
 	ProjectID   string
 
+	// Enrich, when set, asks the build to run the semantic enrichment stage
+	// over its own payload before the masks are written. Only a routed
+	// checkout's working-tree build sets it — that is the only generation
+	// whose RootPath is a working copy a language server can be rooted at.
+	Enrich *EnrichmentStage
+
 	// PrePublish runs after the payload, the masks and the producer states are
 	// written and before the generation is published. Returning an error aborts
 	// the publish and supersedes the generation, so a build whose inputs moved
 	// underneath it never becomes readable. nil skips the step.
 	PrePublish func(ctx context.Context, generationID int64) error
+}
+
+// EnrichmentStage names the checkout a build's enrichment pass describes.
+type EnrichmentStage struct {
+	// CheckoutID is the checkout whose working copy the pass reads, and the
+	// dimension its completion marker is scoped by so one worktree's
+	// enrichment never speaks for the primary's.
+	CheckoutID string
+	// Fingerprint identifies the working-tree state the pass ran over. It is
+	// what the marker records in place of a commit sha, because a tree with
+	// uncommitted edits in it is a state no commit names.
+	Fingerprint string
+}
+
+// EnrichmentOutcome is what a build's enrichment stage did. It is the evidence
+// behind the generation's lsp.* capability states, so every field is something
+// the generation has to be able to say about itself rather than a metric.
+type EnrichmentOutcome struct {
+	// Requested reports that the build asked for the stage at all. A commit
+	// layer and a ref view never do.
+	Requested bool
+	// Ran lists the languages a provider enriched, sorted.
+	Ran []string
+	// Starved lists the languages the global workspace cap could not admit,
+	// sorted. They are not failures: the next build over this checkout asks
+	// again, and by then a slot may have come free.
+	Starved []string
+	// Partial reports that a provider that ran was cut short at its deadline.
+	Partial bool
+	// Disabled reports that enrichment is switched off rather than unable to
+	// run — the difference between waiting being pointless and waiting being
+	// the fix.
+	Disabled bool
+	// Reason says why the stage did not enrich everything it could have.
+	Reason string
 }
 
 // BuildReport is what one build did — and, as importantly, what it could not
@@ -246,6 +288,10 @@ type BuildReport struct {
 	// Producers is exactly what was declared for the generation.
 	Producers []store_sqlite.ProducerCompleteness
 
+	// Enrichment is what the semantic enrichment stage did, zero when the
+	// build did not ask for it.
+	Enrichment EnrichmentOutcome
+
 	// Duration is the wall time of the whole build.
 	Duration time.Duration
 }
@@ -274,6 +320,10 @@ type SparseGenerationBuilder struct {
 	// Embedder is the optional embedding provider. nil declares the vector
 	// capability disabled for the generation rather than leaving it unstated.
 	Embedder embedding.Provider
+	// Semantic runs the language-server enrichment stage for the builds that
+	// ask for one. nil declares the lsp.* capabilities disabled for the
+	// generation rather than leaving them unstated.
+	Semantic *semantic.Manager
 }
 
 // Build produces one sparse payload generation and publishes it.
@@ -334,6 +384,10 @@ func (b *SparseGenerationBuilder) Build(ctx context.Context, req BuildRequest) (
 	if err := b.runPass(ctx, req, plan, handle, &report); err != nil {
 		return generationID, report, err
 	}
+	// Enrichment runs before the masks so anything it adds to the payload is
+	// covered by the claims derived from it, and before the producer states so
+	// what it did is what they describe.
+	b.runEnrichment(req, handle, &report)
 	if err := b.writeMasks(req, plan, handle, &report); err != nil {
 		return generationID, report, err
 	}
@@ -516,6 +570,55 @@ func (b *SparseGenerationBuilder) runPass(
 		report.EdgeCount = result.EdgeCount
 	}
 	return nil
+}
+
+// runEnrichment runs the semantic enrichment stage over the generation's own
+// payload, against the checkout root the build read its bytes from.
+//
+// It records what happened and never fails the build. The payload is whole
+// with or without it: enrichment adds facts on top of a generation that is
+// already complete as a description of the tree, so a language server that
+// could not be started, a workspace the global cap refused and a pass that
+// broke all cost the generation the same thing — a capability it must not
+// claim. Losing the whole build over that would be a worse answer than a
+// published generation that says its lsp.* facts are not there yet.
+//
+// The graph it enriches is the generation handle, not the corpus. Reads
+// through it are generation-scoped, so the census that picks languages sees
+// only what this build carries and the edges the providers land are written
+// into the generation rather than into the tree everyone else reads.
+func (b *SparseGenerationBuilder) runEnrichment(
+	req BuildRequest,
+	handle *store_sqlite.Store,
+	report *BuildReport,
+) {
+	if req.Enrich == nil || !enrichesWorkingCopy(req.Identity) {
+		return
+	}
+	out := &report.Enrichment
+	out.Requested = true
+	if b.Semantic == nil {
+		out.Disabled = true
+		out.Reason = "no semantic enrichment manager is installed"
+		return
+	}
+	pass, err := b.Semantic.EnrichCheckout(handle, semantic.CheckoutEnrichRequest{
+		RepoPrefix:       req.RepoPrefix,
+		CheckoutID:       req.Enrich.CheckoutID,
+		Root:             req.RootPath,
+		Fingerprint:      req.Enrich.Fingerprint,
+		MinLanguageNodes: semantic.EnrichmentAdmissionFloor(),
+	})
+	if err != nil {
+		out.Reason = err.Error()
+		b.Logger.Warn("indexer: the generation's enrichment stage failed",
+			zap.String("checkout", req.Enrich.CheckoutID),
+			zap.String("root", req.RootPath),
+			zap.Error(err))
+		return
+	}
+	out.Ran, out.Starved = pass.Ran, pass.Starved
+	out.Partial, out.Disabled, out.Reason = pass.Partial, pass.Disabled, pass.Reason
 }
 
 // writeMasks derives the generation's ownership claims from the payload it
@@ -751,6 +854,21 @@ func (b *SparseGenerationBuilder) declareProducers(
 			"a sparse generation ranks them against its file set"
 	}
 
+	// Literal and regex search is answered over a working copy on disk rather
+	// than out of the generation: the checkout's coordinator builds a trigram
+	// index over its checkout root and searches that. A generation describing
+	// a checkout therefore serves the capability whole, and one describing a
+	// committed tree nobody has checked out cannot serve it at all — there is
+	// no root to index, and the canonical checkout holds a different tree.
+	text := store_sqlite.ProducerCompleteness{
+		Producer: string(graphview.CapSearchText),
+		State:    store_sqlite.ProducerStateComplete,
+	}
+	if !servesTextSearch(req.Identity) {
+		text.State = store_sqlite.ProducerStateUnavailable
+		text.Reason = "a committed tree has no working copy to run a text search over"
+	}
+
 	rows := []store_sqlite.ProducerCompleteness{
 		{Producer: string(graphview.CapSourceSnapshot), State: store_sqlite.ProducerStateComplete},
 		{Producer: string(graphview.CapSourceConfig), State: store_sqlite.ProducerStateComplete, Reason: configReason},
@@ -761,30 +879,20 @@ func (b *SparseGenerationBuilder) declareProducers(
 		{Producer: string(graphview.CapSearchContent), State: store_sqlite.ProducerStateComplete},
 		vector,
 		similarity,
+		text,
 		{
 			Producer: string(graphview.CapResolutionCrossRepo),
 			State:    store_sqlite.ProducerStateIncomplete,
 			Reason:   "a sparse generation is resolved within one repository",
 		},
-		{
-			// The trigram index lives in the Indexer that built it and is not a
-			// generation-keyed sidecar, so this build leaves nothing behind for
-			// it. Literal and regex search over a composed view answers from the
-			// layer below, which does not carry this generation's content.
-			Producer: string(graphview.CapSearchText),
-			State:    store_sqlite.ProducerStateIncomplete,
-			Reason:   "the trigram index is not built per generation",
-		},
 	}
+	lsp := lspProducerRow(req.Identity, report.Enrichment)
 	for _, capability := range []graphview.CapabilityID{
 		graphview.CapLSPReferences, graphview.CapLSPDiagnostics, graphview.CapLSPHover,
 		graphview.CapLSPRename, graphview.CapLSPCodeActions,
 	} {
-		rows = append(rows, store_sqlite.ProducerCompleteness{
-			Producer: string(capability),
-			State:    store_sqlite.ProducerStateDisabledByConfig,
-			Reason:   "language-server enrichment does not run in a sparse generation build",
-		})
+		lsp.Producer = string(capability)
+		rows = append(rows, lsp)
 	}
 	if report.ClosureTruncated {
 		// The syntax and resolution the generation carries are whole for the
@@ -856,6 +964,80 @@ func (b *SparseGenerationBuilder) supersede(ctx context.Context, generationID in
 func derivedGenerationTarget(g graph.Store) bool {
 	scoped, ok := g.(interface{ ViewGeneration() int64 })
 	return ok && scoped.ViewGeneration() > 0
+}
+
+// lspProducerRow is what a generation says about the language-server
+// capabilities, from what its enrichment stage actually did.
+//
+// The one state that is never reachable here is a false complete: every case
+// that did not enrich the whole payload lands on incomplete or
+// disabled_by_config, and the two are not interchangeable — disabled means
+// waiting will not help, incomplete with a reason means the next working-tree
+// build over this checkout tries again.
+//
+// A starved or evicted checkout takes the incomplete arm rather than building.
+// A generation with a producer still building cannot be published at all (the
+// catalog refuses it, and rightly: nothing would ever settle the row on a
+// sealed payload), so building would cost the checkout its whole view instead
+// of one capability. What incomplete says is also what is true of the composed
+// view: the layers below carry the primary's enrichment, so an lsp query still
+// answers for every file this build did not claim and answers thinly for the
+// ones it did.
+func lspProducerRow(
+	identity GenerationIdentity, out EnrichmentOutcome,
+) store_sqlite.ProducerCompleteness {
+	disabled := func(reason string) store_sqlite.ProducerCompleteness {
+		return store_sqlite.ProducerCompleteness{
+			State: store_sqlite.ProducerStateDisabledByConfig, Reason: reason,
+		}
+	}
+	incomplete := func(reason string) store_sqlite.ProducerCompleteness {
+		return store_sqlite.ProducerCompleteness{
+			State:  store_sqlite.ProducerStateIncomplete,
+			Reason: reason + "; the next build over this checkout runs it again",
+		}
+	}
+	switch {
+	case !enrichesWorkingCopy(identity):
+		return disabled("a committed tree has no working copy for a language server to be rooted at")
+	case !out.Requested:
+		return disabled("language-server enrichment does not run in a sparse generation build")
+	case out.Disabled:
+		return disabled(out.Reason)
+	case len(out.Ran) == 0:
+		return incomplete("no language server enriched this checkout: " + enrichmentReason(out))
+	case out.Partial:
+		return incomplete("a language server was cut short before it finished this checkout")
+	case len(out.Starved) > 0:
+		return incomplete("the language-server workspace cap refused " + strings.Join(out.Starved, ", "))
+	default:
+		return store_sqlite.ProducerCompleteness{State: store_sqlite.ProducerStateComplete}
+	}
+}
+
+// enrichmentReason renders why a stage that ran nothing ran nothing, so the
+// producer row names a cause rather than only an absence.
+func enrichmentReason(out EnrichmentOutcome) string {
+	if out.Reason != "" {
+		return out.Reason
+	}
+	return "no provider covered its languages"
+}
+
+// enrichesWorkingCopy reports whether a generation describes a working copy a
+// language server can be rooted at. A checkout's layers do — the coordinator
+// builds them from a directory on disk; a ref view describes a committed tree
+// nobody has checked out, so there is no root to enrich from.
+func enrichesWorkingCopy(identity GenerationIdentity) bool {
+	return identity.OwnerKind != refViewOwnerKind
+}
+
+// servesTextSearch reports whether a generation describes a state some working
+// copy holds on disk. A checkout's layers describe a checkout, whose
+// coordinator indexes its root; a ref view describes a committed tree nobody
+// has checked out, and nothing on disk holds it.
+func servesTextSearch(identity GenerationIdentity) bool {
+	return identity.OwnerKind != refViewOwnerKind
 }
 
 // builderGraphPath prefixes a repo-relative slash path into the graph

@@ -1310,6 +1310,10 @@ func (l *CheckoutLifecycle) buildCoordinator(
 			Logger:     l.logger,
 			Admissions: idx,
 			Embedder:   l.mi.embedder,
+			// The daemon's one enrichment manager, so every checkout's
+			// language servers are admitted against the same global cap
+			// rather than one cap per coordinator.
+			Semantic: l.mi.semanticMgr,
 		},
 		Leases: l.leases,
 		Config: index,
@@ -1355,7 +1359,24 @@ func (l *CheckoutLifecycle) dropCoordinator(checkoutID string) {
 	if coordinator != nil {
 		_ = coordinator.Close()
 		l.oweRetirement(coordinator.DrainRetirements()...)
+		l.stopCheckoutWorkspaces(coordinator.root)
 	}
+}
+
+// stopCheckoutWorkspaces stops the language servers a checkout's enrichment
+// stage left rooted at its working copy.
+//
+// It runs after Close, which is what makes the pairs reclaimable: the in-flight
+// cycle has finished, so the pass that held them has released them. A checkout
+// loses its coordinator when it is forgotten, expires, or has its directory
+// removed — which is when a server rooted there stops having anything to answer
+// about, so leaving reclamation to the router's idle reaper would keep a
+// subprocess alive over a directory nobody can read for the length of its TTL.
+func (l *CheckoutLifecycle) stopCheckoutWorkspaces(root string) {
+	if l == nil || l.mi == nil || root == "" {
+		return
+	}
+	l.mi.semanticMgr.CheckoutWorkspaces().EvictRoot(root)
 }
 
 // oweRetirement records generations the lifecycle has to collect because no

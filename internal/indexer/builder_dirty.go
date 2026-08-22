@@ -115,6 +115,15 @@ func (b *SparseGenerationBuilder) BuildDirtyLayer(
 		RepoPrefix:  req.RepoPrefix,
 		WorkspaceID: req.WorkspaceID,
 		ProjectID:   req.ProjectID,
+		// The working-tree layer is the one generation whose root is a
+		// directory a language server can be rooted at, and the one whose
+		// content nothing else on disk holds. Whether the stage actually runs
+		// is the enrichment manager's call — the build only says it has a
+		// working copy to offer.
+		Enrich: &EnrichmentStage{
+			CheckoutID:  identity.CheckoutID,
+			Fingerprint: before.Fingerprint,
+		},
 		PrePublish: func(ctx context.Context, generationID int64) error {
 			if req.buildBarrier != nil {
 				req.buildBarrier()
