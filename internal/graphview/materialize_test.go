@@ -207,6 +207,123 @@ func TestMaterializeRefViewRefusesWhatItCannotName(t *testing.T) {
 	}
 }
 
+// writeProducerGeneration publishes one generation whose only content is
+// the producer states it declares, so a completeness test is not also a
+// test of what the layer masks.
+func writeProducerGeneration(
+	t *testing.T,
+	store *store_sqlite.Store,
+	kind, layerID string,
+	baseGeneration, createdAt int64,
+	rows ...store_sqlite.ProducerCompleteness,
+) int64 {
+	t.Helper()
+	ctx := context.Background()
+	generationID, handle, err := store.BeginPayloadGeneration(ctx, store_sqlite.PayloadGenerationRequest{
+		OwnerKind:        "dedicated_graph",
+		GraphID:          testGraphID,
+		LayerID:          layerID,
+		CheckoutID:       testCheckoutID,
+		GenerationKind:   kind,
+		BaseGenerationID: baseGeneration,
+		TreeOID:          "tree-" + kind,
+		CreatedAt:        createdAt,
+	})
+	if err != nil {
+		t.Fatalf("BeginPayloadGeneration(%s): %v", kind, err)
+	}
+	for _, row := range rows {
+		if err := handle.SetProducerState(row); err != nil {
+			t.Fatalf("SetProducerState(%s, %s): %v", kind, row.Producer, err)
+		}
+	}
+	if err := store.PublishPayloadGeneration(ctx, generationID, createdAt+1); err != nil {
+		t.Fatalf("PublishPayloadGeneration(%s): %v", kind, err)
+	}
+	return generationID
+}
+
+// TestMaterializeCheckoutCompletenessTakesTheWorstState pins the direction
+// of the union: a generation stacked on top cannot repair a capability the
+// generation below it declared narrowed, so the view reports the worst
+// state any generation in the stack declares.
+//
+// The first case is the one a live daemon served: the commit generation
+// truncated its closure and declared incoming edges incomplete, the
+// working-tree generation built its own small change whole and declared
+// them complete, and a last-writer-wins union reported a knowingly partial
+// view as complete — so require_complete and a required-capability request
+// both passed on it.
+func TestMaterializeCheckoutCompletenessTakesTheWorstState(t *testing.T) {
+	cases := []struct {
+		name   string
+		commit store_sqlite.ProducerState
+		dirty  store_sqlite.ProducerState
+		want   CapabilityState
+	}{
+		{
+			name:   "the lower generation narrows",
+			commit: store_sqlite.ProducerStateIncomplete,
+			dirty:  store_sqlite.ProducerStateComplete,
+			want:   StateIncomplete,
+		},
+		{
+			name:   "the upper generation narrows",
+			commit: store_sqlite.ProducerStateComplete,
+			dirty:  store_sqlite.ProducerStateIncomplete,
+			want:   StateIncomplete,
+		},
+		{
+			name:   "a terminal denial outranks a partial one",
+			commit: store_sqlite.ProducerStateDisabledByConfig,
+			dirty:  store_sqlite.ProducerStateIncomplete,
+			want:   StateDisabledByConfig,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := openStackStore(t, "worst-state")
+			seedStackControlPlane(t, store)
+			commit := writeProducerGeneration(t, store, "commit", stackCommitLayerID, 0, 1000,
+				store_sqlite.ProducerCompleteness{
+					Producer: string(CapIncomingEdges),
+					State:    tc.commit,
+					Reason:   "the commit closure stopped at the file budget",
+				})
+			dirty := writeProducerGeneration(t, store, "dirty", stackDirtyLayerID, commit, 3000,
+				store_sqlite.ProducerCompleteness{
+					Producer: string(CapIncomingEdges),
+					State:    tc.dirty,
+					Reason:   "the working-tree build covered everything it touched",
+				})
+			routeStack(t, store, commit, dirty, store_sqlite.RouteActive)
+
+			view, err := newTestMaterializer(store).MaterializeCheckout(context.Background(), testCheckoutID)
+			if err != nil {
+				t.Fatalf("MaterializeCheckout: %v", err)
+			}
+			defer view.Close()
+
+			if got := view.Completeness.State(CapIncomingEdges); got != tc.want {
+				t.Fatalf("%s = %q, want %q", CapIncomingEdges, got, tc.want)
+			}
+			err = view.Completeness.Evaluate([]CapabilityID{CapIncomingEdges}, nil)
+			wantCode := CodeRequiredCapabilityIncomplete
+			if tc.want.Terminal() {
+				wantCode = CodeCapabilityUnavailable
+			}
+			if code := CodeOf(err); code != wantCode {
+				t.Fatalf("Evaluate(%s) = %v, want %s", CapIncomingEdges, err, wantCode)
+			}
+			// A capability no generation narrowed still evaluates, so the
+			// union narrows what the stack declared and nothing else.
+			if err := view.Completeness.Evaluate([]CapabilityID{CapSyntaxGraph}, nil); err != nil {
+				t.Errorf("a capability nothing narrowed did not evaluate: %v", err)
+			}
+		})
+	}
+}
+
 // TestMaterializeCheckoutCompletenessRunsBottomUp pins the union: the
 // corpus underneath contributes completeness for everything, and the one
 // capability the working-tree generation declares narrowed is the only

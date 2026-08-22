@@ -468,9 +468,12 @@ func dirtyLayerRef(row store_sqlite.ViewGeneration) (LayerRef, error) {
 	return ref, nil
 }
 
-// completeness unions the producer states of the whole stack, bottom
-// generation first, so the topmost generation that declares a producer
-// decides the view's state for it.
+// completeness unions the producer states of the whole stack, taking the
+// worst state any generation declares for a capability: a generation
+// stacked on top answers for the files it built and cannot repair what a
+// generation below it left partial, so a stack whose commit generation
+// truncated its closure stays incomplete no matter how whole the
+// working-tree build on top of it was.
 //
 // The union starts from the base corpus, which declares nothing and is
 // complete for everything. That is not an omission: a producer row is
@@ -504,7 +507,7 @@ func (m *Materializer) completeness(generations []*store_sqlite.Store) (Complete
 			if !id.Valid() || !state.Valid() {
 				continue
 			}
-			out[id] = state
+			out[id] = out[id].worst(state)
 		}
 	}
 	return out, nil

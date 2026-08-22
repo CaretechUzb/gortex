@@ -114,6 +114,47 @@ func (s CapabilityState) Terminal() bool {
 	return s == StateUnavailable || s == StateDisabledByConfig
 }
 
+// denialRank orders the states by how hard a denial each one is. It is the
+// lattice a union over several declarations resolves a disagreement in: the
+// hardest denial any of them names is the one the caller has to be told
+// about, because the softer one would promise something the view cannot keep.
+//
+// complete denies nothing and ranks lowest. building is the softest denial —
+// it is the one a caller clears by waiting. incomplete outranks it because a
+// build that finishes cannot repair data another declaration already truncated,
+// so answering "building" over "incomplete" would sell a retry that never pays
+// off. Both terminal states outrank both of those for the reason Evaluate
+// already prefers them: no amount of waiting clears them, and a caller told to
+// retry a capability that is switched off retries forever. Between the two,
+// disabled_by_config wins over unavailable because it names a cause the caller
+// can act on, which a bare "cannot serve" would erase.
+//
+// A state outside the vocabulary ranks with unavailable, matching what
+// Completeness.State reports for one: a view never serves a capability it
+// cannot vouch for.
+func (s CapabilityState) denialRank() int {
+	switch s {
+	case StateComplete:
+		return 0
+	case StateBuilding:
+		return 1
+	case StateIncomplete:
+		return 2
+	case StateDisabledByConfig:
+		return 4
+	default: // StateUnavailable and anything unrecognised
+		return 3
+	}
+}
+
+// worst returns whichever of s and other is the harder denial.
+func (s CapabilityState) worst(other CapabilityState) CapabilityState {
+	if other.denialRank() > s.denialRank() {
+		return other
+	}
+	return s
+}
+
 // Completeness is what a view can currently answer. A capability absent from
 // the map counts as StateUnavailable: a view never serves a capability it has
 // not declared.

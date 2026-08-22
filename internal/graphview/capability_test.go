@@ -87,6 +87,38 @@ func TestCapabilityStateValidAndTerminal(t *testing.T) {
 	}
 }
 
+// TestCapabilityStateWorst pins the severity lattice a union resolves a
+// disagreement in: the hardest denial wins, in either argument order, and
+// an unrecognised state is no softer than unavailable.
+func TestCapabilityStateWorst(t *testing.T) {
+	tests := []struct {
+		a, b CapabilityState
+		want CapabilityState
+	}{
+		{StateComplete, StateComplete, StateComplete},
+		{StateComplete, StateBuilding, StateBuilding},
+		{StateBuilding, StateIncomplete, StateIncomplete},
+		{StateIncomplete, StateUnavailable, StateUnavailable},
+		{StateIncomplete, StateDisabledByConfig, StateDisabledByConfig},
+		{StateBuilding, StateDisabledByConfig, StateDisabledByConfig},
+		{StateUnavailable, StateDisabledByConfig, StateDisabledByConfig},
+		{StateComplete, CapabilityState("nonsense"), CapabilityState("nonsense")},
+		{StateDisabledByConfig, CapabilityState("nonsense"), StateDisabledByConfig},
+	}
+	for _, tc := range tests {
+		t.Run(string(tc.a)+"+"+string(tc.b), func(t *testing.T) {
+			if got := tc.a.worst(tc.b); got != tc.want {
+				t.Errorf("%q.worst(%q) = %q, want %q", tc.a, tc.b, got, tc.want)
+			}
+			// The lattice is symmetric: which side a declaration arrives
+			// on cannot change which denial a caller is told about.
+			if got := tc.b.worst(tc.a); got.denialRank() != tc.want.denialRank() {
+				t.Errorf("%q.worst(%q) = %q, want a denial as hard as %q", tc.b, tc.a, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestCompletenessStateDefaultsToUnavailable(t *testing.T) {
 	c := Completeness{
 		CapSyntaxGraph:    StateComplete,
