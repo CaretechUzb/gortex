@@ -557,11 +557,51 @@ func (s *Server) refuseRoutedViewMutation(ctx context.Context, tool string) *mcp
 // block every view-relevant answer already carries. It is the same rider
 // channel, extended — a second block would let a client read one and miss the
 // other.
+//
+// The payload's wire format decides where the block can land, and every format
+// has to get one: a routed answer that says nothing about its view is
+// indistinguishable from a base answer. A JSON object gets the fields merged
+// in. A GCX payload gets them in the header's own meta channel — gcx is the
+// session default for every known agent client, so merging into JSON alone
+// left the tools those clients call carrying no provenance at all. The formats
+// with no structural home for a rider — TOON, the one-line text shape, a
+// diagram — carry it on the response envelope, which every shape has.
 func (s *Server) attachViewRider(ctx context.Context, res *mcp.CallToolResult) *mcp.CallToolResult {
 	view := requestViewFromContext(ctx)
 	if view == nil || view.rider == nil {
 		return res
 	}
+	fields := viewRiderFields(view)
+	res = mergeResultMeta(res, map[string]any{"freshness": fields})
+	text, ok := singleTextContent(res)
+	if !ok || text == "" {
+		return res
+	}
+	if body, isGCX := injectGCXHeaderMeta(text, fields); isGCX {
+		return rebuildTextResult(res, body)
+	}
+	var asObj map[string]any
+	if json.Unmarshal([]byte(text), &asObj) != nil {
+		return res
+	}
+	rider, _ := asObj["freshness"].(map[string]any)
+	if rider == nil {
+		rider = make(map[string]any, len(fields))
+	}
+	for name, value := range fields {
+		rider[name] = value
+	}
+	asObj["freshness"] = rider
+	body, err := json.Marshal(asObj)
+	if err != nil {
+		return res
+	}
+	return rebuildTextResult(res, string(body))
+}
+
+// viewRiderFields renders the rider as response fields. An empty value is
+// omitted so a request carries exactly what it has something to say about.
+func viewRiderFields(view *requestView) map[string]any {
 	fields := map[string]any{
 		"requested_view": view.rider.RequestedView,
 		"actual_view":    view.rider.ActualView,
@@ -597,25 +637,5 @@ func (s *Server) attachViewRider(ctx context.Context, res *mcp.CallToolResult) *
 			fields["base_scoped"] = sortedCapabilityNames(baseScoped)
 		}
 	}
-	text, ok := singleTextContent(res)
-	if !ok || text == "" {
-		return res
-	}
-	var asObj map[string]any
-	if json.Unmarshal([]byte(text), &asObj) != nil {
-		return res
-	}
-	rider, _ := asObj["freshness"].(map[string]any)
-	if rider == nil {
-		rider = make(map[string]any, len(fields))
-	}
-	for name, value := range fields {
-		rider[name] = value
-	}
-	asObj["freshness"] = rider
-	body, err := json.Marshal(asObj)
-	if err != nil {
-		return res
-	}
-	return rebuildTextResult(res, string(body))
+	return fields
 }

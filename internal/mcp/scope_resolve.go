@@ -370,17 +370,7 @@ func decorateResultWithScope(res *mcp.CallToolResult, scope ResolvedScope) *mcp.
 		"scope_applied":    scopeApplied(scope),
 		"scope_widen_hint": `to widen: pass repo:"*" or project:<name> or scope:<name>`,
 	}
-	if res.Meta == nil {
-		res.Meta = mcp.NewMetaFromMap(fields)
-		return res
-	}
-	if res.Meta.AdditionalFields == nil {
-		res.Meta.AdditionalFields = map[string]any{}
-	}
-	for k, v := range fields {
-		res.Meta.AdditionalFields[k] = v
-	}
-	return res
+	return mergeResultMeta(res, fields)
 }
 
 // scopeZeroNote is the body-visible variant of the scope disclosure for a
