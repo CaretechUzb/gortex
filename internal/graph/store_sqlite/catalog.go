@@ -8,6 +8,8 @@ import (
 	"strings"
 
 	sqlite "modernc.org/sqlite"
+
+	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
 // Catalog is the accessor for the checkout-lifecycle control plane — the
@@ -1170,27 +1172,66 @@ UPDATE generation_producer_completeness SET state = ?, reason = ?
 		string(ProducerStateUnavailable), reason, generationID, producer, string(ProducerStateUnavailable))
 }
 
+// ViewGenerationReferences is which kinds of pointer still name a generation.
+// It is the reference guard's verdict broken out by holder, so a refused
+// retirement can say why it was refused instead of only that it was.
+type ViewGenerationReferences struct {
+	// Routed is a checkout route naming the generation in either slot.
+	Routed bool
+	// RefViewed is a ref view serving it as its active generation.
+	RefViewed bool
+	// Based is another generation naming it as the layer beneath.
+	Based bool
+	// GraphActive is a dedicated graph's active pointer.
+	GraphActive bool
+}
+
+// Any reports whether any pointer names the generation. It is the boolean the
+// delete guard enforces.
+func (r ViewGenerationReferences) Any() bool {
+	return r.Routed || r.RefViewed || r.Based || r.GraphActive
+}
+
 // ViewGenerationReferenced reports whether anything still points at a
 // generation. It asks exactly what DeleteViewGeneration's guard asks, so a
 // caller about to delete a generation's payload can refuse before it starts
 // instead of after.
 func (c *Catalog) ViewGenerationReferenced(ctx context.Context, generationID int64) (bool, error) {
-	if generationID <= 0 {
-		return false, fmt.Errorf("%w: generation_id %d", ErrCatalogInvalidValue, generationID)
-	}
-	var referenced bool
-	err := c.store.db.QueryRowContext(ctx, viewGenerationReferencedSQL,
-		generationID, generationID, generationID, generationID, generationID).Scan(&referenced)
-	return referenced, err
+	refs, err := c.ViewGenerationReferences(ctx, generationID)
+	return refs.Any(), err
 }
 
-// viewGenerationReferencedSQL is the reference guard shared by
-// ViewGenerationReferenced and DeleteViewGeneration.
+// ViewGenerationReferences reports which pointers still name a generation, in
+// one query. It is the same set of EXISTS clauses the delete guard runs, kept
+// apart rather than OR-ed together so the caller can classify the refusal.
+func (c *Catalog) ViewGenerationReferences(
+	ctx context.Context, generationID int64,
+) (ViewGenerationReferences, error) {
+	var refs ViewGenerationReferences
+	if generationID <= 0 {
+		return refs, fmt.Errorf("%w: generation_id %d", ErrCatalogInvalidValue, generationID)
+	}
+	err := c.store.db.QueryRowContext(ctx, viewGenerationReferencesSQL,
+		generationID, generationID, generationID, generationID, generationID,
+	).Scan(&refs.Routed, &refs.RefViewed, &refs.Based, &refs.GraphActive)
+	return refs, err
+}
+
+// viewGenerationReferencedSQL is the reference guard DeleteViewGeneration
+// enforces inside its own transaction.
 const viewGenerationReferencedSQL = `
 SELECT EXISTS(SELECT 1 FROM checkout_routes WHERE commit_generation_id = ? OR dirty_generation_id = ?)
     OR EXISTS(SELECT 1 FROM ref_views WHERE active_generation_id = ?)
     OR EXISTS(SELECT 1 FROM view_generations WHERE base_generation_id = ?)
     OR EXISTS(SELECT 1 FROM dedicated_graphs WHERE active_generation_id = ?)`
+
+// viewGenerationReferencesSQL is the same guard with its clauses kept apart,
+// so one round trip answers both "is it referenced" and "by what".
+const viewGenerationReferencesSQL = `
+SELECT EXISTS(SELECT 1 FROM checkout_routes WHERE commit_generation_id = ? OR dirty_generation_id = ?),
+       EXISTS(SELECT 1 FROM ref_views WHERE active_generation_id = ?),
+       EXISTS(SELECT 1 FROM view_generations WHERE base_generation_id = ?),
+       EXISTS(SELECT 1 FROM dedicated_graphs WHERE active_generation_id = ?)`
 
 // DeleteViewGeneration removes a generation nothing points at. SQLite's own
 // foreign keys already refuse a delete under a route, a ref view, or another
@@ -1744,6 +1785,7 @@ func (c *Catalog) ClaimRefViewBuild(
 	var (
 		inFlight  RefViewBuild
 		coalesced bool
+		reclaimed bool
 	)
 	err := c.withTx(ctx, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, insertRefViewBuildSQL, refViewBuildInsertArgs(build)...)
@@ -1776,14 +1818,24 @@ UPDATE ref_view_builds SET state = ?, last_progress = ?, error = ?
 				inFlight.BuildID, string(ViewGenerationBuilding)); failErr != nil {
 				return failErr
 			}
-			_, retryErr := tx.ExecContext(ctx, insertRefViewBuildSQL, refViewBuildInsertArgs(build)...)
-			return retryErr
+			if _, retryErr := tx.ExecContext(ctx, insertRefViewBuildSQL, refViewBuildInsertArgs(build)...); retryErr != nil {
+				return retryErr
+			}
+			reclaimed = true
+			return nil
 		}
 		coalesced = true
 		return nil
 	})
 	if err != nil {
 		return RefViewBuild{}, err
+	}
+	if reclaimed {
+		// Counted after the commit, and only here: the caller is handed a
+		// plain claim either way, so a claim that took over a dead worker's
+		// slot is invisible everywhere else — and it is the signal that a
+		// build died holding one.
+		viewmetrics.Count(viewmetrics.RefViewSelectionTotal, viewmetrics.RefViewReclaimed)
 	}
 	if coalesced {
 		return inFlight, fmt.Errorf("%w: ref view %s at tree %s",

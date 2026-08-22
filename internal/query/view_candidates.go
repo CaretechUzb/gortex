@@ -5,6 +5,7 @@ import (
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/search"
+	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
 // ViewLayerSource is one generation of a composed view's stack as candidate
@@ -71,7 +72,30 @@ func (e *Engine) viewTextCandidates(query string, limit int, base []search.Searc
 		sources = append(sources, layer.Search.Search(query, limit))
 	}
 	e.composeViewSources(sources)
+	RecordViewSearchSources(viewmetrics.CorpusSymbol, sources)
 	return MergeRankedSources(sources, func(r search.SearchResult) string { return r.ID })
+}
+
+// RecordViewSearchSources counts one composite search and how many of the
+// stack's corpora survived composition with something to contribute.
+//
+// The pair is what makes "which layers served a query" answerable: the query
+// counter is the denominator, the source counter the numerator, and their
+// ratio says whether a routed view's generations are actually being read or
+// whether every answer is coming out of the indexed corpus underneath them.
+// Neither carries a stack position — a per-layer label would be a generation
+// id by another name — so this counts contributing sources, not which ones.
+func RecordViewSearchSources[T any](corpus string, sources [][]T) {
+	viewmetrics.Count(viewmetrics.SearchQueryTotal, corpus)
+	contributing := 0
+	for _, source := range sources {
+		if len(source) > 0 {
+			contributing++
+		}
+	}
+	if contributing > 0 {
+		viewmetrics.Add(viewmetrics.SearchSourceTotal, int64(contributing), corpus)
+	}
 }
 
 // composeViewSources applies masking and cross-source dedup to the per-source

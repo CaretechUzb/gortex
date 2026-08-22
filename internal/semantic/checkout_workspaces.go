@@ -6,6 +6,8 @@ import (
 	"sync"
 
 	"go.uber.org/zap"
+
+	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
 // Per-checkout language-server workspaces.
@@ -167,18 +169,25 @@ func (w *CheckoutWorkspaces) admit(ref CheckoutWorkspaceRef) (func(), []func(), 
 		entry.held++
 		w.clock++
 		entry.used = w.clock
+		viewmetrics.Count(viewmetrics.LSPWorkspaceTotal, viewmetrics.WorkspaceReused)
 		return w.releaseFor(ref), nil, true
 	}
 	var stops []func()
 	for len(w.live) >= w.cap {
 		stop, evicted := w.evictOldestLocked()
 		if !evicted {
+			// Every live pair is held by an in-flight pass, so the cap cannot
+			// make room and this admission is starved. It is the one outcome
+			// that costs a stage rather than a subprocess.
+			viewmetrics.Count(viewmetrics.LSPWorkspaceTotal, viewmetrics.WorkspaceStarved)
 			return nil, stops, false
 		}
+		viewmetrics.Count(viewmetrics.LSPWorkspaceTotal, viewmetrics.WorkspaceEvicted)
 		stops = append(stops, stop)
 	}
 	w.clock++
 	w.live[ref] = &checkoutWorkspace{held: 1, used: w.clock}
+	viewmetrics.Count(viewmetrics.LSPWorkspaceTotal, viewmetrics.WorkspaceAcquired)
 	return w.releaseFor(ref), stops, true
 }
 
@@ -206,6 +215,7 @@ func (w *CheckoutWorkspaces) EvictRoot(root string) int {
 		stops = append(stops, w.stopLocked(ref, "the checkout it served went away"))
 	}
 	w.mu.Unlock()
+	viewmetrics.Add(viewmetrics.LSPWorkspaceTotal, int64(len(stops)), viewmetrics.WorkspaceEvicted)
 	stopEvicted(stops)
 	return len(stops)
 }

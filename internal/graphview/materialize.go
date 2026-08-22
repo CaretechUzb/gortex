@@ -5,8 +5,11 @@ import (
 	"fmt"
 	"sync"
 
+	"go.uber.org/zap"
+
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
 // Materializer turns a checkout's route into a readable view.
@@ -27,6 +30,12 @@ type Materializer struct {
 	// consults the same manager, so a generation under a live view
 	// cannot be swept.
 	Leases *LeaseManager
+	// Logger records the failures. A materialization that could not be
+	// assembled is the one moment the caller sees an error code and
+	// nothing else; the log line beside it carries the generations the
+	// stack was being built from, which is what makes the code
+	// diagnosable. nil silences it.
+	Logger *zap.Logger
 }
 
 // GenerationSource is one persisted generation of a view's stack seen by
@@ -137,8 +146,16 @@ func (v *RepoView) Close() {
 // ready once the lease is held stays ready; checking first and leasing
 // afterwards would leave a window in which the sweep runs between the
 // two.
-func (m *Materializer) MaterializeCheckout(ctx context.Context, checkoutID string) (*RepoView, error) {
-	if err := m.validate(); err != nil {
+func (m *Materializer) MaterializeCheckout(ctx context.Context, checkoutID string) (view *RepoView, err error) {
+	var (
+		graphID     string
+		generations []int64
+	)
+	defer func() {
+		m.recordMaterialization(viewmetrics.ViewWorktree, graphID, checkoutID, view, generations, err)
+	}()
+
+	if err = m.validate(); err != nil {
 		return nil, err
 	}
 	if ctx == nil {
@@ -152,6 +169,7 @@ func (m *Materializer) MaterializeCheckout(ctx context.Context, checkoutID strin
 	if err != nil {
 		return nil, err
 	}
+	graphID = route.GraphID
 	repoPrefix, err := m.repoPrefix(ctx, route.GraphID)
 	if err != nil {
 		return nil, err
@@ -161,12 +179,12 @@ func (m *Materializer) MaterializeCheckout(ctx context.Context, checkoutID strin
 			fmt.Sprintf("checkout %q has no published commit generation", checkoutID))
 	}
 
-	generations := []int64{route.CommitGenerationID}
+	generations = []int64{route.CommitGenerationID}
 	if route.DirtyGenerationID > 0 {
 		generations = append(generations, route.DirtyGenerationID)
 	}
 	lease := m.Leases.Acquire(generations...)
-	view, err := m.assemble(ctx, route.GraphID, repoPrefix, generations, lease)
+	view, err = m.assemble(ctx, route.GraphID, repoPrefix, generations, lease)
 	if err != nil {
 		lease.Release()
 		return nil, err
@@ -185,8 +203,15 @@ func (m *Materializer) MaterializeCheckout(ctx context.Context, checkoutID strin
 // Everything else is what MaterializeCheckout does: the lease is taken before
 // the generation is inspected, so the sweep cannot run between the check and
 // the pin, and completeness comes from the generation's own producer states.
-func (m *Materializer) MaterializeRefView(ctx context.Context, graphID string, generationID int64) (*RepoView, error) {
-	if err := m.validate(); err != nil {
+func (m *Materializer) MaterializeRefView(
+	ctx context.Context, graphID string, generationID int64,
+) (view *RepoView, err error) {
+	var generations []int64
+	defer func() {
+		m.recordMaterialization(viewmetrics.ViewRef, graphID, "", view, generations, err)
+	}()
+
+	if err = m.validate(); err != nil {
 		return nil, err
 	}
 	switch {
@@ -201,14 +226,55 @@ func (m *Materializer) MaterializeRefView(ctx context.Context, graphID string, g
 	if err != nil {
 		return nil, err
 	}
-	generations := []int64{generationID}
+	generations = []int64{generationID}
 	lease := m.Leases.Acquire(generations...)
-	view, err := m.assemble(ctx, graphID, repoPrefix, generations, lease)
+	view, err = m.assemble(ctx, graphID, repoPrefix, generations, lease)
 	if err != nil {
 		lease.Release()
 		return nil, err
 	}
 	return view, nil
+}
+
+// recordMaterialization counts one materialization attempt and, when it
+// failed, logs what it was assembling.
+//
+// The counter is aggregate by construction — kind and outcome, nothing that
+// names a checkout — so the log line is the only place the ids live: the
+// stack's generation ids and the graph and checkout they were routed for, plus
+// the fingerprint of the view when one was composed. That pairing is the whole
+// contract: a rise in the error counter says a view stopped materializing, and
+// the log says which one and over what.
+func (m *Materializer) recordMaterialization(
+	kind, graphID, checkoutID string,
+	view *RepoView,
+	generations []int64,
+	err error,
+) {
+	if err == nil {
+		viewmetrics.Count(viewmetrics.MaterializationTotal, kind, viewmetrics.OutcomeOK)
+		return
+	}
+	viewmetrics.Count(viewmetrics.MaterializationTotal, kind, viewmetrics.OutcomeError)
+	if m == nil || m.Logger == nil {
+		return
+	}
+	fields := []zap.Field{
+		zap.String("view_kind", kind),
+		zap.String("code", CodeOf(err)),
+		zap.Int64s("generations", generations),
+		zap.Error(err),
+	}
+	if graphID != "" {
+		fields = append(fields, zap.String("graph", graphID))
+	}
+	if checkoutID != "" {
+		fields = append(fields, zap.String("checkout", checkoutID))
+	}
+	if view != nil {
+		fields = append(fields, zap.String("view_fingerprint", view.ID.Fingerprint()))
+	}
+	m.Logger.Warn("graph view: materialization failed", fields...)
 }
 
 // validate refuses a Materializer that cannot do its job, so a missing

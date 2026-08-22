@@ -16,6 +16,7 @@ import (
 	"github.com/zzet/gortex/internal/gitstate"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/indexer/source"
+	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
 // The ref-view manager.
@@ -367,6 +368,7 @@ func (m *RefViewManager) adoptMetadata(
 	if err != nil && !errors.Is(err, store_sqlite.ErrCatalogStaleGuard) {
 		return RefViewResult{}, err
 	}
+	viewmetrics.Count(viewmetrics.RefViewSelectionTotal, viewmetrics.RefViewReady)
 	return RefViewResult{
 		RefViewID:    view.RefViewID,
 		GenerationID: view.ActiveGenerationID,
@@ -404,6 +406,12 @@ func (m *RefViewManager) startBuild(
 	}, now-int64(refViewBuildLiveness/time.Second))
 	if err != nil {
 		if errors.Is(err, store_sqlite.ErrRefViewBuildInFlight) {
+			viewmetrics.Count(viewmetrics.RefViewSelectionTotal, viewmetrics.RefViewCoalesced)
+			// The build token is the id the caller polls on, so it is what
+			// makes two selections of one tree legible as one build.
+			m.logger.Debug("ref view manager: selection coalesced onto a running build",
+				zap.String("ref_view", view.RefViewID),
+				zap.String("build_token", claimed.BuildToken))
 			return RefViewResult{
 				RefViewID:  view.RefViewID,
 				Resolved:   resolved,
@@ -492,6 +500,7 @@ func (m *RefViewManager) runBuild(
 		return RefViewResult{}, err
 	}
 	m.completeBuild(ctx, build, store_sqlite.ViewGenerationReady, generationID, "")
+	viewmetrics.Count(viewmetrics.RefViewSelectionTotal, viewmetrics.RefViewAdopted)
 	return RefViewResult{
 		RefViewID:    view.RefViewID,
 		GenerationID: generationID,
@@ -513,6 +522,7 @@ func (m *RefViewManager) superseded(
 	published gitstate.ResolvedSelector,
 ) RefViewResult {
 	m.supersede(ctx, build, generationID)
+	viewmetrics.Count(viewmetrics.RefViewSelectionTotal, viewmetrics.RefViewBuilding)
 	return RefViewResult{
 		RefViewID: view.RefViewID,
 		Resolved:  published,
@@ -588,6 +598,7 @@ func (m *RefViewManager) failed(
 		m.logger.Warn("ref view manager: could not record a failed selection",
 			zap.String("ref_view", view.RefViewID), zap.Error(err))
 	}
+	viewmetrics.Count(viewmetrics.RefViewSelectionTotal, viewmetrics.RefViewFailed)
 	return RefViewResult{
 		RefViewID: view.RefViewID,
 		State:     store_sqlite.RefViewFailed,

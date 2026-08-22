@@ -32,9 +32,12 @@ import (
 	"time"
 	"uuid"
 
+	"go.uber.org/zap"
+
 	"github.com/zzet/gortex/internal/gitstate"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/graphview"
+	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
 // ErrInvalidConfig reports a Reconciler that cannot be built: a missing
@@ -147,6 +150,17 @@ func WithHEADSampler(fn HEADSamplerFunc) Option {
 	}
 }
 
+// WithLogger installs the logger the pass records its classifications on. A
+// nil logger — the default — silences them; nothing about a decision depends
+// on it.
+func WithLogger(logger *zap.Logger) Option {
+	return func(r *Reconciler) {
+		if logger != nil {
+			r.logger = logger
+		}
+	}
+}
+
 // Reconciler drives the checkout lifecycle against one catalog.
 //
 // It holds no state of its own: everything durable lives in catalog rows, so
@@ -161,6 +175,7 @@ type Reconciler struct {
 	inventory  InventoryFunc
 	samplePath PathSamplerFunc
 	sampleHEAD HEADSamplerFunc
+	logger     *zap.Logger
 }
 
 // New builds a Reconciler over a catalog handle.
@@ -182,6 +197,7 @@ func New(catalog *store_sqlite.Catalog, hooks CleanupHooks, cfg Config, opts ...
 		inventory:  gitstate.Inventory,
 		samplePath: gitstate.SamplePathEvidence,
 		sampleHEAD: gitstate.SampleHEAD,
+		logger:     zap.NewNop(),
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -222,13 +238,23 @@ func (r *Reconciler) ReconcileFamily(ctx context.Context, familyID, probeDir str
 		return FamilyReport{}, fmt.Errorf("%w: family %s", store_sqlite.ErrCatalogNotFound, familyID)
 	}
 
+	started := time.Now()
 	inv, invErr := r.inventory(ctx, probeDir)
+	elapsed := time.Since(started)
 	pass := &familyPass{
 		family:       family,
 		inventory:    inv,
 		inventoryErr: ValidateInventory(inv, invErr, family.CommonDirIdentity),
 		now:          r.now(),
 	}
+	// The inventory is the pass's one unbounded cost — a git plumbing call
+	// against a directory that may be on a sleeping volume — so it is timed
+	// separately from everything the pass then decides.
+	inventoryOutcome := viewmetrics.OutcomeOK
+	if pass.inventoryErr != nil {
+		inventoryOutcome = viewmetrics.OutcomeError
+	}
+	viewmetrics.Observe(viewmetrics.FamilyInventorySeconds, elapsed, inventoryOutcome)
 
 	graphs, err := r.catalog.ListDedicatedGraphs(ctx, familyID)
 	if err != nil {
@@ -311,6 +337,7 @@ func (r *Reconciler) reconcileKnown(
 	}
 	fresh := SampledPathEvidence(r.samplePath(root))
 	class := Classify(pass.inventoryErr, record, StoredPathEvidence(storedRow), fresh)
+	r.recordClassification(pass, existing, record, fresh, class)
 
 	entry := CheckoutReport{
 		AdminName:      existing.AdminName,
@@ -328,6 +355,7 @@ func (r *Reconciler) reconcileKnown(
 	// removal clock from disturbing the availability clock and vice versa.
 	req := observationFrom(existing)
 	req.LastSeen = pass.now.Unix()
+	observeDiscoveryLag(pass.now, existing.LastSeen)
 
 	switch class.Disposition {
 	case DispositionPresent:
@@ -352,6 +380,7 @@ func (r *Reconciler) reconcileKnown(
 		if gone {
 			// The rows are gone; there is nothing left to write to.
 			entry.State = ""
+			recordTransition(existing.State, "", class)
 			return entry, nil
 		}
 	}
@@ -367,6 +396,7 @@ func (r *Reconciler) reconcileKnown(
 		return entry, err
 	}
 	entry.State = req.State
+	recordTransition(existing.State, req.State, class)
 
 	if class.Disposition == DispositionPresent {
 		row := fresh.CatalogRow(existing.CheckoutID, pass.now.Unix(), storedRow.SampleGeneration+1)
@@ -568,7 +598,109 @@ func (r *Reconciler) observeNew(
 	entry.Action = ActionIdentityAllocated
 	entry.State = checkout.State
 	entry.Detail = "first sighting in a family that has a primary dedicated graph"
+	recordTransition("", checkout.State, entry.Classification)
 	return entry, nil
+}
+
+// observeDiscoveryLag records how stale the daemon's knowledge of one checkout
+// was when this pass reached it: the gap between the last observation written
+// for it and the one being written now.
+//
+// It is the answer to "how long can a worktree move before anything notices",
+// which is the same window a checkout is created in and the same window a view
+// can be stale for. A checkout with no prior observation contributes nothing —
+// there is no gap to measure against a first sighting.
+func observeDiscoveryLag(now time.Time, lastSeen int64) {
+	if lastSeen <= 0 {
+		return
+	}
+	viewmetrics.Observe(viewmetrics.FamilyDiscoveryLagSeconds, now.Sub(time.Unix(lastSeen, 0)))
+}
+
+// recordTransition counts one checkout's move between lifecycle states.
+//
+// Only a real move is counted: a pass that confirms a ready checkout is still
+// ready is the common case and would drown the series it shares with the rare
+// moves that matter. The empty state on either side is a checkout that did not
+// exist yet or no longer does, and is recorded under its own bounded name
+// rather than as an empty label.
+func recordTransition(from, to store_sqlite.CheckoutState, class Classification) {
+	if from == to {
+		return
+	}
+	viewmetrics.Count(viewmetrics.CheckoutTransitionTotal,
+		transitionState(from), transitionState(to), evidenceClass(class))
+}
+
+// transitionState renders a lifecycle state as a metric label.
+func transitionState(state store_sqlite.CheckoutState) string {
+	if state == "" {
+		return viewmetrics.StateNone
+	}
+	return string(state)
+}
+
+// evidenceClass renders a classification as the bounded evidence label: which
+// of the classifier's five verdicts decided this checkout.
+func evidenceClass(class Classification) string {
+	switch class.Disposition {
+	case DispositionPresent:
+		return viewmetrics.EvidencePresent
+	case DispositionInaccessible:
+		return viewmetrics.EvidenceInaccessible
+	case DispositionRemoved:
+		switch class.Evidence {
+		case EvidenceAuthoritativeOmission:
+			return viewmetrics.EvidenceAuthoritativeOmission
+		case EvidencePrunableConfirmed:
+			return viewmetrics.EvidencePrunableConfirmed
+		}
+	}
+	return viewmetrics.EvidenceNone
+}
+
+// recordClassification logs which evidence decided one checkout, with the
+// probe results the verdict was read off.
+//
+// The counter beside it carries the class alone; this carries the identity and
+// the raw observations — what git said about the record, whether the root
+// answered a fresh stat, and whether the ancestor's volume token still matches
+// the one recorded while the root existed. That triple is the whole of the
+// prunable-confirmed proof, so a removal that surprises someone can be argued
+// with from the log rather than guessed at.
+//
+// It is a Debug line and it is per checkout per pass. That is deliberate: the
+// pass runs on the janitor's schedule, not per request, and a classification
+// nobody can reconstruct is the failure mode this exists to prevent.
+func (r *Reconciler) recordClassification(
+	pass *familyPass,
+	existing store_sqlite.Checkout,
+	record *gitstate.WorktreeRecord,
+	fresh PathEvidence,
+	class Classification,
+) {
+	if r.logger == nil {
+		return
+	}
+	fields := []zap.Field{
+		zap.String("family", pass.family.FamilyID),
+		zap.String("checkout", existing.CheckoutID),
+		zap.String("admin_name", existing.AdminName),
+		zap.String("root", existing.RootPath),
+		zap.String("state", string(existing.State)),
+		zap.String("disposition", string(class.Disposition)),
+		zap.String("evidence", evidenceClass(class)),
+		zap.String("detail", class.Detail),
+		zap.Bool("probe_root_exists", fresh.RootExists),
+		zap.Bool("probe_ancestor_volume_usable", fresh.ancestorVolumeUsable()),
+		zap.Bool("listed_by_git", record != nil),
+	}
+	if record != nil {
+		fields = append(fields,
+			zap.Bool("git_root_accessible", record.RootAccessible),
+			zap.Bool("git_prunable", record.Prunable))
+	}
+	r.logger.Debug("checkout reconcile: classified", fields...)
 }
 
 // headFor reads HEAD out of a reachable working tree, falling back to what the

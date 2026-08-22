@@ -382,6 +382,13 @@ type StatusResponse struct {
 	// router is wired (`semantic.enabled: false` in `.gortex.yaml`).
 	LSPRouter *LSPRouterStatus `json:"lsp_router,omitempty"`
 
+	// Views is the checkout-view lifecycle census: how many families,
+	// checkouts, generations, leases and ref views exist and what state
+	// they are in. Nil on a daemon with no view catalog, and on one whose
+	// catalog could not be read — a status answer is never failed over a
+	// block that is a report rather than a fact the caller asked for.
+	Views *ViewsStatus `json:"views,omitempty"`
+
 	// BinaryStale is true when the file at the daemon's os.Executable()
 	// path no longer matches the image the daemon is running (size or
 	// mtime differ) — the signature of a package-manager upgrade that
@@ -494,6 +501,37 @@ type TrigramCacheStats struct {
 	IdleTTLMs int64 `json:"idle_ttl_ms"`
 	BuildsOff bool  `json:"builds_off,omitempty"`
 	Evictions int64 `json:"evictions,omitempty"`
+}
+
+// ViewsStatus is the checkout-view lifecycle census in `daemon status`.
+//
+// It carries counts and states, never identities: the per-worktree picture —
+// which checkout, which route, which generation — is what `gortex checkouts`
+// renders, and duplicating it here would make a status poll grow with the
+// number of worktrees a user keeps. Read the levels here, then go there for
+// the one that looks wrong.
+type ViewsStatus struct {
+	// Families is how many checkout families the catalog holds.
+	Families int `json:"families"`
+	// Checkouts counts working copies by lifecycle state, so a checkout in
+	// an availability or removal grace window is visible as a level rather
+	// than only as a log line.
+	Checkouts map[string]int `json:"checkouts,omitempty"`
+	// Coordinators is how many checkout build loops this daemon runs.
+	Coordinators int `json:"coordinators"`
+	// Generations counts payload generations by state.
+	Generations map[string]int `json:"generations,omitempty"`
+	// Leases is how many generations live views currently pin. A generation
+	// cannot retire while it is leased, so this is the level to read when
+	// retiring generations are not going away.
+	Leases int `json:"leases"`
+	// RefViews counts named views of committed state by state.
+	RefViews map[string]int `json:"ref_views,omitempty"`
+	// Counters is the view-lifecycle metric registry flattened to series key
+	// and value, zero-valued series omitted. Every label in a key comes from
+	// a fixed vocabulary, so the map's size is a property of the build rather
+	// than of the workload.
+	Counters map[string]int64 `json:"counters,omitempty"`
 }
 
 // SearchBackendStats identifies which search backend is currently

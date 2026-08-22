@@ -8,6 +8,7 @@ import (
 
 	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/search/trigram"
+	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
 // Text search over a routed checkout.
@@ -83,12 +84,18 @@ func (c *CheckoutCoordinator) textSearcher(ctx context.Context) (*trigram.Search
 	if c.textIndex != nil && c.textKey == key {
 		return c.textIndex, nil
 	}
+	if c.textIndex != nil {
+		// A cached index keyed to a tree that has moved: the working copy was
+		// edited under it, which is the only thing that invalidates one.
+		viewmetrics.Count(viewmetrics.CheckoutSearcherInvalidatedTotal)
+	}
 	paths, err := c.textCorpus(ctx)
 	if err != nil {
 		return nil, err
 	}
 	c.textIndex = trigram.Build(c.root, paths)
 	c.textKey = key
+	viewmetrics.Count(viewmetrics.CheckoutSearcherBuiltTotal)
 	return c.textIndex, nil
 }
 

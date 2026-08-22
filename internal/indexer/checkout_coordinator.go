@@ -21,6 +21,7 @@ import (
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/search/trigram"
+	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
 // The per-checkout coordinator.
@@ -413,6 +414,7 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 	c.cycleMu.Lock()
 	out := c.reconcile(ctx)
 	c.cycleMu.Unlock()
+	recordCoordinatorCycle(out)
 	switch {
 	case out.Err != nil:
 		c.logger.Warn("checkout coordinator: reconcile failed",
@@ -427,6 +429,33 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 	}
 	if c.cycleDone != nil {
 		c.cycleDone(out)
+	}
+}
+
+// recordCoordinatorCycle counts what one cycle did.
+//
+// A cycle can settle both slots, so it can carry more than one outcome; the
+// counter reads as "how often did a cycle do this", not as a partition of the
+// cycles. The rescheduled case is deliberately silent here — a lost route flip
+// and a working tree that moved under two builds share the field but are
+// different failures, so each is counted where it is decided.
+func recordCoordinatorCycle(out CheckoutCycle) {
+	switch {
+	case out.Err != nil:
+		viewmetrics.Count(viewmetrics.CoordinatorCycleTotal, viewmetrics.OutcomeFailed)
+	case out.Rescheduled:
+	case out.CommitBuilt || out.CommitReused || out.DirtyBuilt:
+		if out.CommitBuilt {
+			viewmetrics.Count(viewmetrics.CoordinatorCycleTotal, viewmetrics.OutcomeBuiltCommit)
+		}
+		if out.CommitReused {
+			viewmetrics.Count(viewmetrics.CoordinatorCycleTotal, viewmetrics.OutcomeAdoptedCommit)
+		}
+		if out.DirtyBuilt {
+			viewmetrics.Count(viewmetrics.CoordinatorCycleTotal, viewmetrics.OutcomeBuiltDirty)
+		}
+	default:
+		viewmetrics.Count(viewmetrics.CoordinatorCycleTotal, viewmetrics.OutcomeSkipped)
 	}
 }
 
@@ -457,7 +486,7 @@ func (c *CheckoutCoordinator) reconcile(ctx context.Context) CheckoutCycle {
 	if err != nil {
 		if errors.Is(err, errRouteMoved) {
 			out.Rescheduled = true
-			c.Signal("route moved under the graph reset")
+			c.rescheduleOnLostRoute("route moved under the graph reset")
 			return out
 		}
 		out.Err = err
@@ -468,7 +497,7 @@ func (c *CheckoutCoordinator) reconcile(ctx context.Context) CheckoutCycle {
 	if err != nil {
 		if errors.Is(err, errRouteMoved) {
 			out.Rescheduled = true
-			c.Signal("route moved under the commit flip")
+			c.rescheduleOnLostRoute("route moved under the commit flip")
 			return out
 		}
 		out.Err = err
@@ -479,12 +508,23 @@ func (c *CheckoutCoordinator) reconcile(ctx context.Context) CheckoutCycle {
 	if err := c.reconcileDirtySlot(ctx, commitGeneration, &route, &out); err != nil {
 		if errors.Is(err, errRouteMoved) {
 			out.Rescheduled = true
-			c.Signal("route moved under the dirty flip")
+			c.rescheduleOnLostRoute("route moved under the dirty flip")
 			return out
 		}
 		out.Err = err
 	}
 	return out
+}
+
+// rescheduleOnLostRoute records a compare-and-set this cycle lost and signals
+// the retry. It is the cas_lost half of a rescheduled cycle: another actor
+// moved the route, which is a different condition from a working tree that
+// would not settle, and the two must not add up to one number.
+func (c *CheckoutCoordinator) rescheduleOnLostRoute(reason string) {
+	viewmetrics.Count(viewmetrics.CoordinatorCycleTotal, viewmetrics.OutcomeCASLost)
+	c.logger.Debug("checkout coordinator: route flip lost",
+		zap.String("checkout", c.checkoutID), zap.String("reason", reason))
+	c.Signal(reason)
 }
 
 // RehomeTo rebuilds this checkout's whole stack over another dedicated graph
@@ -795,6 +835,7 @@ func (c *CheckoutCoordinator) resolveCommitLayer(
 	if cached, ok := c.cachedCommit(ctx, generationIdentityKey(identity)); ok {
 		return cached, true, nil
 	}
+	started := time.Now()
 	generationID, report, err := c.builder.BuildCommitLayer(ctx, CommitLayerRequest{
 		Identity:      identity,
 		Base:          c.store.AtGeneration(0),
@@ -806,6 +847,7 @@ func (c *CheckoutCoordinator) resolveCommitLayer(
 		WorkspaceID:   c.workspaceID,
 		ProjectID:     c.projectID,
 	})
+	viewmetrics.Observe(viewmetrics.CoordinatorBuildSeconds, time.Since(started), viewmetrics.SlotCommit)
 	if err != nil {
 		return 0, false, err
 	}
@@ -947,6 +989,7 @@ func (c *CheckoutCoordinator) reconcileDirtySlot(
 		// The route still names the last coherent state, which is the point: a
 		// stale view of a real state beats a torn view of a state that never was.
 		out.Rescheduled = true
+		viewmetrics.Count(viewmetrics.CoordinatorCycleTotal, viewmetrics.OutcomeRescheduled)
 		c.Signal("the working tree moved under two builds")
 		return nil
 	}
@@ -983,6 +1026,7 @@ func (c *CheckoutCoordinator) buildDirtyLayerOver(
 	}
 	identity := c.dirtyIdentity(graphID, commitGeneration)
 	for attempt := 0; attempt < 2; attempt++ {
+		started := time.Now()
 		generationID, _, err := c.builder.BuildDirtyLayer(ctx, DirtyLayerRequest{
 			Identity:     identity,
 			Base:         dirtyBase,
@@ -992,6 +1036,7 @@ func (c *CheckoutCoordinator) buildDirtyLayerOver(
 			ProjectID:    c.projectID,
 			buildBarrier: c.dirtyBarrier,
 		})
+		viewmetrics.Observe(viewmetrics.CoordinatorBuildSeconds, time.Since(started), viewmetrics.SlotDirty)
 		if err == nil {
 			return generationID, nil
 		}
@@ -1077,6 +1122,7 @@ func (c *CheckoutCoordinator) supersede(ctx context.Context, generationID int64)
 	if generationID <= 0 {
 		return
 	}
+	viewmetrics.Count(viewmetrics.CoordinatorCycleTotal, viewmetrics.OutcomeSuperseded)
 	if err := c.store.MarkPayloadGenerationSuperseded(ctx, generationID); err != nil {
 		c.logger.Debug("checkout coordinator: could not supersede an unrouted generation",
 			zap.String("checkout", c.checkoutID),
@@ -1212,10 +1258,30 @@ func (c *CheckoutCoordinator) offerRetire(ctx context.Context, generationID int6
 		}
 		c.mu.Lock()
 		c.backlog[generationID] = struct{}{}
+		held := len(c.backlog)
 		c.mu.Unlock()
+		// The blocking reason and how many generations this coordinator is
+		// now owing a retirement for: together they say whether one holder is
+		// stuck or the backlog is growing.
 		c.logger.Debug("checkout coordinator: generation retirement deferred",
 			zap.String("checkout", c.checkoutID),
-			zap.Int64("generation", generationID), zap.Error(err))
+			zap.Int64("generation", generationID),
+			zap.String("blocked_by", retireBlockReason(err)),
+			zap.Int("backlog", held), zap.Error(err))
+	}
+}
+
+// retireBlockReason names what refused a retirement, in the same bounded
+// vocabulary the metric label uses. The error carries the id; this carries the
+// class, so a log line and a counter can be read against each other.
+func retireBlockReason(err error) string {
+	switch {
+	case errors.Is(err, store_sqlite.ErrPayloadGenerationInUse):
+		return viewmetrics.RefusedLeased
+	case errors.Is(err, store_sqlite.ErrCatalogGenerationReferenced):
+		return viewmetrics.RefusedRouted
+	default:
+		return viewmetrics.RefusedError
 	}
 }
 
@@ -1241,6 +1307,7 @@ func (c *CheckoutCoordinator) SweepRetirements(ctx context.Context) int {
 			continue
 		}
 		retired++
+		viewmetrics.Count(viewmetrics.GenerationSweepCollectedTotal, viewmetrics.SweepCheckout)
 		c.mu.Lock()
 		delete(c.backlog, generationID)
 		c.mu.Unlock()

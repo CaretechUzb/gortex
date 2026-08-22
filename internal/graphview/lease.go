@@ -4,6 +4,8 @@ import (
 	"context"
 	"slices"
 	"sync"
+
+	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
 // LeaseManager refcounts the graph generations that in-flight requests are
@@ -58,10 +60,30 @@ func (m *LeaseManager) Acquire(ids ...int64) *Lease {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.initLocked()
+	pinned := 0
 	for _, id := range l.ids {
+		if m.counts[id] == 0 {
+			// The gauge counts generations under a lease, not lease holders:
+			// a second reader of the same generation adds no new thing that
+			// retirement has to refuse.
+			pinned++
+		}
 		m.counts[id]++
 	}
+	viewmetrics.AddGauge(viewmetrics.LeasesHeld, int64(pinned))
 	return l
+}
+
+// Held reports how many payload generations currently have a live lease. It
+// is the level the LeasesHeld gauge tracks, read directly for a status
+// payload that wants the number rather than the counter's history.
+func (m *LeaseManager) Held() int {
+	if m == nil {
+		return 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.counts)
 }
 
 // InUse reports whether any live lease pins id.
@@ -125,6 +147,7 @@ func (m *LeaseManager) release(ids []int64) {
 	defer m.mu.Unlock()
 	m.initLocked()
 	drained := false
+	released := 0
 	for _, id := range ids {
 		switch n := m.counts[id]; {
 		case n <= 0:
@@ -133,10 +156,12 @@ func (m *LeaseManager) release(ids []int64) {
 		case n == 1:
 			delete(m.counts, id)
 			drained = true
+			released++
 		default:
 			m.counts[id] = n - 1
 		}
 	}
+	viewmetrics.AddGauge(viewmetrics.LeasesHeld, -int64(released))
 	if drained {
 		m.cond.Broadcast()
 	}

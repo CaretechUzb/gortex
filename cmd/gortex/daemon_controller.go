@@ -875,6 +875,11 @@ func (c *realController) Status(ctx context.Context) (daemon.StatusResponse, err
 	// wedge track / untrack / reload behind a dead NFS handle.
 	configRepos, repoMissing := c.trackedRepoLiveness()
 
+	// The view census is catalog listings bounded by the number of families,
+	// graphs and generations, so it belongs in the slow half rather than
+	// under the mutex the coordinators contend for.
+	views := c.collectViewsStatus(ctx)
+
 	// Everything above is the slow half and c.mu below is the contended half.
 	// Re-check between them: a caller whose budget expired during the scans
 	// must not go on to queue behind a mutex held by a minutes-long track.
@@ -1115,6 +1120,7 @@ func (c *realController) Status(ctx context.Context) (daemon.StatusResponse, err
 		LocalServerSlug:    c.localServerSlug(),
 		LSPRouter:          c.collectLSPRouterStatus(),
 		Enrichment:         c.collectEnrichmentProgress(),
+		Views:              views,
 	}
 	if c.toolSurface != nil {
 		resp.ToolPreset, resp.ToolPresetMode, resp.LearnedTools = c.toolSurface()
@@ -1272,6 +1278,38 @@ func (c *realController) collectLSPRouterStatus() *daemon.LSPRouterStatus {
 		})
 	}
 	return out
+}
+
+// collectViewsStatus reflects the checkout-view lifecycle census into the
+// status payload.
+//
+// It runs before the controller mutex is taken, like every other listing
+// Status assembles, and it is skipped outright once the caller's budget has
+// expired — the block is a report, and a status call that is already out of
+// time should not spend its last milliseconds on one. A catalog that cannot
+// be read yields nil for the same reason: the rest of the answer is still
+// true, and an omitted block reads as "not available" while a zeroed one
+// would read as "nothing exists".
+func (c *realController) collectViewsStatus(ctx context.Context) *daemon.ViewsStatus {
+	if c == nil || c.lifecycle == nil || ctx.Err() != nil {
+		return nil
+	}
+	health, err := c.lifecycle.ViewsHealth(ctx)
+	if err != nil {
+		if c.logger != nil {
+			c.logger.Debug("daemon: view lifecycle census unavailable", zap.Error(err))
+		}
+		return nil
+	}
+	return &daemon.ViewsStatus{
+		Families:     health.Families,
+		Checkouts:    health.Checkouts,
+		Coordinators: health.Coordinators,
+		Generations:  health.Generations,
+		Leases:       health.Leases,
+		RefViews:     health.RefViews,
+		Counters:     health.Counters,
+	}
 }
 
 // collectEnrichmentProgress reflects the semantic manager's per-(repo,

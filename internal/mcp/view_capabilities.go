@@ -11,6 +11,7 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 
 	"github.com/zzet/gortex/internal/graphview"
+	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
 // Capability requirements are request context in the same sense the view
@@ -317,6 +318,10 @@ func (s *Server) evaluateRequestCapabilities(
 
 	completeness := view.completeness()
 	if err := completeness.Evaluate(required, annotate); err != nil {
+		// The code says which of the two refusals it was — the view cannot
+		// serve the capability at all, or it is still producing it — which is
+		// the difference between a configuration problem and a wait.
+		viewmetrics.Count(viewmetrics.CapabilityRefusedTotal, graphview.CodeOf(err))
 		return mcp.NewToolResultError(fmt.Sprintf("%s: %s", req.Params.Name, err.Error()))
 	}
 	view.noteDegraded(completeness.Degraded(annotate))

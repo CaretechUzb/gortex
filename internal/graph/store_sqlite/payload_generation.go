@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+
+	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
 // The payload-generation lifecycle: begin, publish, route, retire.
@@ -218,7 +220,8 @@ func (s *Store) PublishPayloadGeneration(ctx context.Context, generationID, publ
 		return fmt.Errorf("%w: generation_id %d", ErrCatalogInvalidValue, generationID)
 	}
 	catalog := s.Catalog()
-	if _, found, err := catalog.GetViewGeneration(ctx, generationID); err != nil {
+	row, found, err := catalog.GetViewGeneration(ctx, generationID)
+	if err != nil {
 		return err
 	} else if !found {
 		return fmt.Errorf("%w: generation %d", ErrCatalogNotFound, generationID)
@@ -233,7 +236,31 @@ func (s *Store) PublishPayloadGeneration(ctx context.Context, generationID, publ
 		s.setPayloadSeal(generationID, payloadSealUnknown)
 		return err
 	}
+	viewmetrics.Count(viewmetrics.GenerationPublishedTotal, generationOwner(row.OwnerKind))
 	return nil
+}
+
+// Owner kinds a payload generation's catalog row can carry. They mirror the
+// owner_kind strings the coordinator and the ref-view manager stamp; only the
+// metric mapping below reads them, so the writers stay the authority on the
+// values themselves.
+const (
+	checkoutGenerationOwnerKind = "dedicated_graph"
+	refViewGenerationOwnerKind  = "ref_view"
+)
+
+// generationOwner maps a catalog owner kind onto the bounded metric label. An
+// owner this build does not know collapses to the registry's other bucket
+// rather than minting a series.
+func generationOwner(ownerKind string) string {
+	switch ownerKind {
+	case checkoutGenerationOwnerKind:
+		return viewmetrics.OwnerCheckout
+	case refViewGenerationOwnerKind:
+		return viewmetrics.OwnerRefView
+	default:
+		return viewmetrics.LabelOther
+	}
 }
 
 // drainPayloadWriters waits out every write that passed the write gate before
@@ -354,7 +381,16 @@ func (s *Store) MarkPayloadGenerationSuperseded(ctx context.Context, generationI
 	if ctx == nil {
 		return fmt.Errorf("%w: nil context", ErrCatalogInvalidValue)
 	}
-	return s.Catalog().SetViewGenerationState(ctx, generationID, ViewGenerationSuperseded, ViewGenerationReady)
+	catalog := s.Catalog()
+	if err := catalog.SetViewGenerationState(ctx, generationID, ViewGenerationSuperseded, ViewGenerationReady); err != nil {
+		return err
+	}
+	// The owner is read after the transition, not before: a supersede that
+	// lost its guard is not a supersession and must not be counted as one.
+	if row, found, err := catalog.GetViewGeneration(ctx, generationID); err == nil && found {
+		viewmetrics.Count(viewmetrics.GenerationSupersededTotal, generationOwner(row.OwnerKind))
+	}
+	return nil
 }
 
 // payloadGenerationSweepBatch bounds the rows one delete statement removes, so
@@ -404,39 +440,65 @@ func (s *Store) RetirePayloadGeneration(ctx context.Context, generationID int64,
 		return fmt.Errorf("%w: generation_id %d", ErrCatalogInvalidValue, generationID)
 	}
 	catalog := s.Catalog()
-	if _, found, err := catalog.GetViewGeneration(ctx, generationID); err != nil {
-		return err
-	} else if !found {
-		return fmt.Errorf("%w: generation %d", ErrCatalogNotFound, generationID)
-	}
-	referenced, err := catalog.ViewGenerationReferenced(ctx, generationID)
+	row, found, err := catalog.GetViewGeneration(ctx, generationID)
 	if err != nil {
 		return err
+	} else if !found {
+		viewmetrics.Count(viewmetrics.GenerationRetireRefusedTotal, viewmetrics.RefusedMissing)
+		return fmt.Errorf("%w: generation %d", ErrCatalogNotFound, generationID)
 	}
-	if referenced {
+	owner := generationOwner(row.OwnerKind)
+	refs, err := catalog.ViewGenerationReferences(ctx, generationID)
+	if err != nil {
+		viewmetrics.Count(viewmetrics.GenerationRetireRefusedTotal, viewmetrics.RefusedError)
+		return err
+	}
+	if refs.Any() {
+		viewmetrics.Count(viewmetrics.GenerationRetireRefusedTotal, refusalReason(refs))
 		return fmt.Errorf("%w: generation %d", ErrCatalogGenerationReferenced, generationID)
 	}
 	if inUse != nil && inUse(generationID) {
+		viewmetrics.Count(viewmetrics.GenerationRetireRefusedTotal, viewmetrics.RefusedLeased)
 		return fmt.Errorf("%w: generation %d", ErrPayloadGenerationInUse, generationID)
 	}
 	if err := catalog.SetViewGenerationState(ctx, generationID, ViewGenerationRetiring); err != nil {
+		viewmetrics.Count(viewmetrics.GenerationRetireRefusedTotal, viewmetrics.RefusedError)
 		return err
 	}
 	s.setPayloadSeal(generationID, payloadSealSealed)
 	// A write admitted before the seal closed would otherwise commit rows into
 	// a generation the sweep has already walked past.
 	if err := s.drainPayloadWriters(ctx); err != nil {
+		viewmetrics.Count(viewmetrics.GenerationRetireRefusedTotal, viewmetrics.RefusedError)
 		return err
 	}
 
 	if err := s.sweepPayloadGeneration(ctx, generationID); err != nil {
+		viewmetrics.Count(viewmetrics.GenerationRetireRefusedTotal, viewmetrics.RefusedError)
 		return err
 	}
 	if err := catalog.DeleteViewGeneration(ctx, generationID); err != nil {
+		viewmetrics.Count(viewmetrics.GenerationRetireRefusedTotal, viewmetrics.RefusedError)
 		return err
 	}
 	s.payloadSeals.Delete(generationID)
+	viewmetrics.Count(viewmetrics.GenerationRetiredTotal, owner)
 	return nil
+}
+
+// refusalReason names the holder a refused retirement lost to. A generation
+// can be held by more than one pointer at once; the order here is the order
+// the guard itself checks in, so the reason a reader sees is the first thing
+// that would have to be released.
+func refusalReason(refs ViewGenerationReferences) string {
+	switch {
+	case refs.Routed, refs.RefViewed, refs.GraphActive:
+		return viewmetrics.RefusedRouted
+	case refs.Based:
+		return viewmetrics.RefusedBased
+	default:
+		return viewmetrics.LabelOther
+	}
 }
 
 // sweepPayloadGeneration deletes every payload row a generation owns, in

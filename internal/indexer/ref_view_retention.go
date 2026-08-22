@@ -9,6 +9,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
 // Ref-view retention.
@@ -88,6 +89,10 @@ type refViewCandidate struct {
 	// exactly what eviction means: the next selection of that selector
 	// resolves it again and rebuilds.
 	refViewID string
+	// reason is which of the three bounds decided this candidate: it aged out
+	// of the retention window, or it was over the count or byte budget. It is
+	// the eviction's class, and the only thing about it a metric may carry.
+	reason string
 }
 
 // sweepRefViewRetention collects the ref-view generations the bounds no longer
@@ -125,6 +130,8 @@ func (l *CheckoutLifecycle) sweepRefViewRetention(ctx context.Context) int {
 			switch {
 			case err == nil, errors.Is(err, store_sqlite.ErrCatalogNotFound):
 				retired++
+				viewmetrics.Count(viewmetrics.RefViewEvictedTotal, candidate.reason)
+				viewmetrics.Count(viewmetrics.GenerationSweepCollectedTotal, viewmetrics.SweepRefView)
 			default:
 				// Leased, based-upon, or re-adopted between the two writes. The
 				// generation stays and the next sweep asks again.
@@ -214,8 +221,15 @@ func (l *CheckoutLifecycle) refViewEvictions(
 	var out []refViewCandidate
 	for _, candidate := range candidates {
 		stale := candidate.selected < cutoff
-		if !stale && overCount <= 0 && overBytes <= 0 {
-			break
+		switch {
+		case stale:
+			candidate.reason = viewmetrics.EvictedStale
+		case overCount > 0:
+			candidate.reason = viewmetrics.EvictedOverCount
+		case overBytes > 0:
+			candidate.reason = viewmetrics.EvictedOverBytes
+		default:
+			return out
 		}
 		out = append(out, candidate)
 		overCount--

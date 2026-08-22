@@ -7,6 +7,7 @@ import (
 	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/search"
+	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
 // A composed view reads its nodes and edges through one reader, but its search
@@ -75,6 +76,7 @@ func (v *viewContentSearcher) SearchContent(text, repoPrefix string, limit int) 
 		}
 		sources = append(sources, v.visible(i, hits))
 	}
+	query.RecordViewSearchSources(viewmetrics.CorpusContent, sources)
 	merged := query.MergeRankedSources(sources, func(h graph.ContentHit) string { return h.NodeID })
 	if len(merged) > limit {
 		merged = merged[:limit]

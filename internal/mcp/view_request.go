@@ -16,6 +16,7 @@ import (
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/reconcile"
+	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
 // requestViewCtxKey carries the view decision made for one `tools/call`.
@@ -218,6 +219,74 @@ func takeViewSelector(req *mcp.CallToolRequest) (graphview.Selector, error) {
 // epoch as the key — a route flip has to invalidate the cached stack — and
 // that is the optimization this deliberately leaves for later.
 func (s *Server) resolveRequestView(ctx context.Context, selector graphview.Selector) (*requestView, error) {
+	view, err := s.selectRequestView(ctx, selector)
+	s.recordRequestView(view, err)
+	return view, err
+}
+
+// recordRequestView counts what answered this request, and logs the ones that
+// did not answer what was asked for.
+//
+// The counter is by view kind and — for an inexact answer — by the code that
+// explains the substitution; neither carries a checkout, a ref or a
+// fingerprint. The log line beside a fallback carries all three, because "the
+// worktree lane fell back to base 40 times" is only actionable once you know
+// which worktree and which generation stack it was trying to reach.
+func (s *Server) recordRequestView(view *requestView, err error) {
+	if err != nil {
+		return
+	}
+	viewmetrics.Count(viewmetrics.RequestServedTotal, requestViewKind(view))
+	if view == nil || view.rider == nil || view.rider.Exact {
+		return
+	}
+	reason := viewmetrics.FallbackReasonCode(view.rider.FallbackReason)
+	viewmetrics.Count(viewmetrics.RequestFallbackTotal, reason)
+	if s.logger == nil {
+		return
+	}
+	fields := []zap.Field{
+		zap.String("requested_view", view.rider.RequestedView),
+		zap.String("actual_view", view.rider.ActualView),
+		zap.String("reason", reason),
+		zap.String("detail", view.rider.FallbackReason),
+	}
+	if view.rider.GraphID != "" {
+		fields = append(fields, zap.String("graph", view.rider.GraphID))
+	}
+	if view.rider.CheckoutID != "" {
+		fields = append(fields, zap.String("checkout", view.rider.CheckoutID))
+	}
+	if view.rider.ViewFingerprint != "" {
+		fields = append(fields, zap.String("view_fingerprint", view.rider.ViewFingerprint))
+	}
+	if view.materialized != nil {
+		fields = append(fields, zap.Int64s("generations", view.materialized.Generations()))
+	}
+	if view.rider.BuildToken != "" {
+		fields = append(fields, zap.String("build_token", view.rider.BuildToken))
+	}
+	s.logger.Debug("view routing: served a fallback view", fields...)
+}
+
+// requestViewKind names the shape of view that answered: the indexed corpus,
+// a routed working copy, or a committed tree. The file surface is what tells
+// the last two apart — only a view with no working copy reads its bytes out of
+// the object store.
+func requestViewKind(view *requestView) string {
+	switch {
+	case view == nil || view.reader == nil:
+		return viewmetrics.ViewBase
+	case view.files != nil:
+		return viewmetrics.ViewRef
+	default:
+		return viewmetrics.ViewWorktree
+	}
+}
+
+// selectRequestView is resolveRequestView's decision, split out so the
+// recording above wraps every path through it exactly once.
+func (s *Server) selectRequestView(ctx context.Context, selector graphview.Selector) (*requestView, error) {
 	if s == nil || s.materializer == nil {
 		if selector.Kind == graphview.SelectorAuto {
 			return nil, nil

@@ -13,6 +13,7 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/pathkey"
+	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
 // probeView is the graph one path-scoped control probe reads through, plus
@@ -63,6 +64,32 @@ const probeReconcileDebounce = 30 * time.Second
 // shared lane — has a composed view, and only when its route names both
 // generations. Anything short of that is reported rather than approximated.
 func (c *realController) resolveProbeView(ctx context.Context, path string) probeView {
+	view := c.selectProbeView(ctx, path)
+	recordProbeAnswer(view.answer)
+	return view
+}
+
+// recordProbeAnswer counts one path-scoped probe by the kind of view that
+// answered and whether that view was the path's own.
+//
+// A probe that names no view at all — a daemon with no view catalog — is not
+// counted: it has no view model to have an opinion with, and folding it into
+// the base bucket would make a daemon without routed views look like one whose
+// worktrees keep falling back.
+func recordProbeAnswer(answer *daemon.ProbeView) {
+	if answer == nil {
+		return
+	}
+	exact := viewmetrics.AnswerFallback
+	if answer.Exact {
+		exact = viewmetrics.AnswerExact
+	}
+	viewmetrics.Count(viewmetrics.ProbeAnswerTotal, answer.Kind, exact)
+}
+
+// selectProbeView is resolveProbeView's decision, split out so every path
+// through it is counted exactly once.
+func (c *realController) selectProbeView(ctx context.Context, path string) probeView {
 	base := probeView{servable: true, release: noopRelease}
 	if c == nil || path == "" || c.lifecycle == nil || c.viewMaterializer == nil {
 		// No view catalog is wired, so there are no composed views to route to

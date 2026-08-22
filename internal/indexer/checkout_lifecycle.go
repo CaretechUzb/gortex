@@ -22,6 +22,7 @@ import (
 	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/reconcile"
+	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
 // Tracking-intent sources, re-exported so an entry point does not have to
@@ -207,7 +208,8 @@ func NewCheckoutLifecycle(cfg CheckoutLifecycleConfig) (*CheckoutLifecycle, erro
 	if rcfg.AvailabilityGrace <= 0 || rcfg.RemovalGrace <= 0 {
 		rcfg = reconcile.Default()
 	}
-	rec, err := reconcile.New(l.catalog, cleanupHooks{l: l}, rcfg, reconcile.WithClock(now))
+	rec, err := reconcile.New(l.catalog, cleanupHooks{l: l}, rcfg,
+		reconcile.WithClock(now), reconcile.WithLogger(l.logger))
 	if err != nil {
 		return nil, fmt.Errorf("indexer: build checkout reconciler: %w", err)
 	}
@@ -1056,6 +1058,7 @@ func (l *CheckoutLifecycle) Sweep(ctx context.Context) (SweepReport, error) {
 	out.Coordinators = l.liveCoordinators()
 	out.Retired = l.sweepRetirements(ctx)
 	out.RefViewsRetired = l.sweepRefViewRetention(ctx)
+	recordSweepGauges(out)
 	if out.Removed > 0 {
 		// The cleanup hooks drop the removed repositories from the in-memory
 		// configuration; without this the removal is forgotten on restart.
@@ -1063,6 +1066,30 @@ func (l *CheckoutLifecycle) Sweep(ctx context.Context) (SweepReport, error) {
 		l.notifyTrackedSetChanged()
 	}
 	return out, errors.Join(errs...)
+}
+
+// recordSweepGauges sets the levels only a whole-population pass can know.
+//
+// The two grace clocks are the ones that matter operationally: a checkout in
+// availability grace is one whose layers are about to be purged, and one in
+// removal grace is one about to be forgotten. Both are counted from the states
+// the pass just wrote, so the gauge is as current as the sweep that set it and
+// never drifts the way an incrementally maintained level would.
+func recordSweepGauges(report SweepReport) {
+	availability, removal := 0, 0
+	for _, family := range report.Reports {
+		for _, checkout := range family.Checkouts {
+			switch checkout.Action {
+			case reconcile.ActionAvailabilityGraceStarted, reconcile.ActionAvailabilityHeld:
+				availability++
+			case reconcile.ActionRemovalGraceStarted, reconcile.ActionRemovalHeld:
+				removal++
+			}
+		}
+	}
+	viewmetrics.SetGauge(viewmetrics.Families, int64(report.Families))
+	viewmetrics.SetGauge(viewmetrics.AvailabilityClocks, int64(availability))
+	viewmetrics.SetGauge(viewmetrics.RemovalClocks, int64(removal))
 }
 
 // reconcileFamilyNow reconciles one family and applies the coordinator
@@ -1336,6 +1363,11 @@ func (l *CheckoutLifecycle) installCoordinator(checkoutID string, coordinator *C
 		return false
 	}
 	l.coordinators[checkoutID] = coordinator
+	// Published under coordMu, so the gauge write is ordered with the
+	// registry mutation it reports. Emitting it after the unlock lets two
+	// racing transitions apply their levels in the opposite order and leave
+	// the gauge stale until the next install or drop.
+	viewmetrics.SetGauge(viewmetrics.Coordinators, int64(len(l.coordinators)))
 	l.coordMu.Unlock()
 	return true
 }
@@ -1355,6 +1387,9 @@ func (l *CheckoutLifecycle) dropCoordinator(checkoutID string) {
 	l.coordMu.Lock()
 	coordinator := l.coordinators[checkoutID]
 	delete(l.coordinators, checkoutID)
+	// Under coordMu for the same reason as the install side: the level and
+	// the registry it counts move together.
+	viewmetrics.SetGauge(viewmetrics.Coordinators, int64(len(l.coordinators)))
 	l.coordMu.Unlock()
 	if coordinator != nil {
 		_ = coordinator.Close()

@@ -677,6 +677,7 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 			Store:   store,
 			Catalog: store.Catalog(),
 			Leases:  leases,
+			Logger:  logger,
 		})
 	}
 	srv.SetArchitecture(conf.Architecture)
