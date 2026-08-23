@@ -47,7 +47,13 @@ type EdgeProvenanceUpdate struct {
 // that boundary when non-negative; -1 means the backend intentionally skipped
 // a pre-count and the consumer must derive the diagnostic count while paging.
 type UnresolvedEdgeScan struct {
-	HighWaterID   int64
+	HighWaterID int64
+	// LowWaterID is the first row the pass may consider, 0 when the whole
+	// frontier is the pass's own. A backend that keeps several payload
+	// generations in one table sets it to the pinned generation's own first
+	// row, so a sparse generation's pass is bounded by what it carries
+	// instead of by how much unresolved work the corpus beneath it holds.
+	LowWaterID    int64
 	PendingBefore int
 	// SkipTerminal, when set by the consumer between Begin and the first
 	// Read, asks the pager to exclude edges carrying a live durable

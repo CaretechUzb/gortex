@@ -52,6 +52,19 @@ func (s *Store) ScanUnresolvedEdgeIdentitiesBatched(
 	}
 }
 
+// unresolvedIdentityPageSQL is one keyset page of the attribution pass's
+// enumeration. The generation binds first so a pinned handle seeks into its own
+// rows; the base corpus keeps the raw rowid walk it owns.
+func unresolvedIdentityPageSQL(source, generation string, kinds int) string {
+	return `SELECT id, from_id, to_id, kind, file_path, line
+	FROM ` + source + `
+	WHERE ` + generation + ` AND id > ? AND id <= ? AND kind IN (` + inPlaceholders(kinds) + `)
+	  AND (substr(to_id, 1, 12) = 'unresolved::'
+	       OR instr(to_id, '::unresolved::') > 0)
+	ORDER BY id
+	LIMIT ?`
+}
+
 func (s *Store) unresolvedEdgeIdentityPage(
 	kinds []string,
 	after, highWater int64,
@@ -60,19 +73,13 @@ func (s *Store) unresolvedEdgeIdentityPage(
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
-	query := `SELECT id, from_id, to_id, kind, file_path, line
-	FROM edges NOT INDEXED
-	WHERE id > ? AND id <= ? AND kind IN (` + inPlaceholders(len(kinds)) + `)
-	  AND (substr(to_id, 1, 12) = 'unresolved::'
-	       OR instr(to_id, '::unresolved::') > 0)
-	  AND view_gen = ?
-	ORDER BY id
-	LIMIT ?`
+	source, generation := s.unresolvedScanSource(unresolvedIdentityBaseSource)
 	args := make([]any, 0, len(kinds)+4)
-	args = append(args, after, highWater)
+	args = append(args, s.viewGen, after, highWater)
 	args = append(args, toAnyArgs(kinds)...)
-	args = append(args, s.viewGen, limit)
-	rows, err := s.queryActiveWriteLocked(context.Background(), query, args...)
+	args = append(args, limit)
+	rows, err := s.queryActiveWriteLocked(
+		context.Background(), unresolvedIdentityPageSQL(source, generation, len(kinds)), args...)
 	if err != nil {
 		panicOnFatal(err)
 		return nil, after, false
