@@ -287,10 +287,13 @@ func TestReview_PrefixShadowAttributesOnlyTheChangedFile(t *testing.T) {
 		require.Equal(t, changed, filepath.ToSlash(c.File),
 			"a finding was attributed to %q; only %q changed", c.File, changed)
 	}
-	for _, fr := range out.FileRisk {
-		require.NotEqual(t, shadow, filepath.ToSlash(fr.File),
-			"file risk must not be attributed to the unchanged shadow %q", shadow)
-	}
+	// Exactly one row: NotEqual(shadow) would still pass if the run
+	// produced BOTH a graph-prefixed row and a repo-relative one for the
+	// same file, which is what a domain collision in rankFileRisk does.
+	require.Len(t, out.FileRisk, 1,
+		"exactly one risk row for the one changed file: %+v", out.FileRisk)
+	require.Equal(t, changed, filepath.ToSlash(out.FileRisk[0].File),
+		"the risk row must name the changed file, not the unchanged shadow %q", shadow)
 }
 
 // TestReviewPack_PrefixShadowAttributesOnlyTheChangedFile covers the packaged
@@ -321,8 +324,11 @@ func TestReviewPack_PrefixShadowAttributesOnlyTheChangedFile(t *testing.T) {
 		require.Equal(t, changed, filepath.ToSlash(f.File),
 			"a finding was attributed to %q; only %q changed", f.File, changed)
 	}
-	for _, fr := range out.FileRisk {
-		require.NotEqual(t, shadow, filepath.ToSlash(fr.File),
-			"file risk must not be attributed to the unchanged shadow %q", shadow)
-	}
+	// Exactly one row: NotEqual(shadow) would still pass if the run
+	// produced BOTH a graph-prefixed row and a repo-relative one for the
+	// same file, which is what a domain collision in rankFileRisk does.
+	require.Len(t, out.FileRisk, 1,
+		"exactly one risk row for the one changed file: %+v", out.FileRisk)
+	require.Equal(t, changed, filepath.ToSlash(out.FileRisk[0].File),
+		"the risk row must name the changed file, not the unchanged shadow %q", shadow)
 }

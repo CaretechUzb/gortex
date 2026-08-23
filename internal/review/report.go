@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/zzet/gortex/internal/analysis"
+	"github.com/zzet/gortex/internal/graphpath"
 )
 
 // ReviewReport is the output of the hybrid review flow: a worst-of verdict over
@@ -136,13 +137,20 @@ func rankFileRisk(diff *analysis.DiffResult, impact map[string]*analysis.ImpactR
 	// file — `repo-a/pkg/widget.go` becomes `pkg/widget.go` — and attributes the
 	// risk to that unchanged shadow.
 	fromGraphKey := func(file string) string {
-		file = cleanPath(file)
+		// Normalize to the '/' comparison form BEFORE removing the prefix.
+		// cleanPath ends in filepath.Clean, so on Windows the graph key
+		// "repo-a/repo-a\widget.go" becomes "repo-a\repo-a\widget.go" and the
+		// '/'-joined prefix no longer matches: the row keeps its prefix while
+		// the repo-relative side produces a second row for the same file.
+		file = graphpath.Norm(cleanPath(file))
 		if repoPrefix != "" {
 			file = strings.TrimPrefix(file, repoPrefix+"/")
 		}
 		return file
 	}
-	fromRepoRel := func(file string) string { return cleanPath(file) }
+	// Both domains leave here in the documented repo-relative '/' spelling —
+	// the one the rule globs, the risk rows and the forge comment API speak.
+	fromRepoRel := func(file string) string { return graphpath.Norm(cleanPath(file)) }
 
 	byFile := map[string]string{}
 	findingCount := map[string]int{}
