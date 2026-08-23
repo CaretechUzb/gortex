@@ -3968,8 +3968,13 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			// InvalidateIndex call bumps the build counter so any
 			// stale stamps from a prior build (e.g. snapshot reload
 			// before a partial mutation) no longer shadow the live
-			// graph state.
-			reach.InvalidateIndex()
+			// graph state. A generation-pinned pass wrote none of the
+			// corpus those stamps describe, and runs outside the
+			// topology writer, so retiring them here would move the
+			// counter under a concurrent reader for nothing.
+			if reach.WritesBaseTopology(idx.graph) {
+				reach.InvalidateIndex()
+			}
 		}
 	}
 
