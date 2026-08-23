@@ -177,6 +177,9 @@ type RefViewManagerConfig struct {
 	// under different rules.
 	Config config.IndexConfig
 	Logger *zap.Logger
+	// Gate holds a claimed build's pass while the daemon warms up. nil admits
+	// every build at once, which is what a manager outside a warmup has.
+	Gate *ViewBuildGate
 
 	// buildBarrier is a test seam: it runs between a build pass finishing and
 	// the publish step re-resolving the selector, which is exactly the window
@@ -199,6 +202,7 @@ type RefViewManager struct {
 	catalog *store_sqlite.Catalog
 	builder *SparseGenerationBuilder
 	logger  *zap.Logger
+	gate    *ViewBuildGate
 
 	configHash string
 	extractors string
@@ -227,6 +231,7 @@ func NewRefViewManager(cfg RefViewManagerConfig) (*RefViewManager, error) {
 		catalog:        cfg.Store.Catalog(),
 		builder:        cfg.Builder,
 		logger:         logger,
+		gate:           cfg.Gate,
 		configHash:     indexConfigHash(cfg.Config),
 		extractors:     extractorVersionsFingerprint(),
 		buildBarrier:   cfg.buildBarrier,
@@ -484,6 +489,12 @@ func (m *RefViewManager) startBuild(
 // the claim, so killing it wedges the view until the liveness window expires.
 // What the request keeps is the wait: past the grace it answers with the token
 // and the build publishes for whoever selects next.
+//
+// A build the warmup gate is holding is that same shape with the wait removed.
+// The pass parks before it starts, so it looks to everything else exactly like
+// a slow one: the claim is held and heartbeaten, later selections coalesce
+// onto its token, and the publish happens when builds are admitted. What the
+// selection does not do is sit out a grace no build can finish inside.
 func (m *RefViewManager) runDetached(
 	ctx context.Context,
 	req RefViewRequest,
@@ -504,10 +515,17 @@ func (m *RefViewManager) runDetached(
 	go func() {
 		stop := m.heartbeat(buildCtx, build)
 		defer stop()
+		m.awaitBuildAdmission()
 		result, err := m.runBuild(buildCtx, req, view, build, base, resolved, identity)
 		done <- outcome{result: result, err: err}
 	}()
 
+	if !m.gate.Admitted() {
+		viewmetrics.Count(viewmetrics.RefViewSelectionTotal, viewmetrics.RefViewDeferred)
+		m.logger.Debug("ref view manager: build deferred until the daemon has warmed up",
+			zap.String("ref_view", view.RefViewID), zap.String("build_token", build.BuildToken))
+		return m.building(view, build, resolved), nil
+	}
 	grace := time.NewTimer(m.buildGrace)
 	defer grace.Stop()
 	select {
@@ -519,12 +537,35 @@ func (m *RefViewManager) runDetached(
 	viewmetrics.Count(viewmetrics.RefViewSelectionTotal, viewmetrics.RefViewBuilding)
 	m.logger.Debug("ref view manager: selection answered while its build runs on",
 		zap.String("ref_view", view.RefViewID), zap.String("build_token", build.BuildToken))
+	return m.building(view, build, resolved), nil
+}
+
+// awaitBuildAdmission parks a claimed build until builds are admitted.
+//
+// It waits on the gate alone. The build context carries no cancellation by
+// design — the pass outlives its request — and abandoning the wait on anything
+// else would leave the claim held by nobody, which is the one state every
+// later selection of that tree has to wait a liveness window out of.
+func (m *RefViewManager) awaitBuildAdmission() {
+	if m.gate.Admitted() {
+		return
+	}
+	<-m.gate.Opened()
+}
+
+// building is the answer a selection gives when the pass it claimed is still
+// running: the token to poll, and the state the selector resolved to.
+func (m *RefViewManager) building(
+	view store_sqlite.RefView,
+	build store_sqlite.RefViewBuild,
+	resolved gitstate.ResolvedSelector,
+) RefViewResult {
 	return RefViewResult{
 		RefViewID:  view.RefViewID,
 		Resolved:   resolved,
 		State:      store_sqlite.RefViewBuilding,
 		BuildToken: build.BuildToken,
-	}, nil
+	}
 }
 
 // heartbeat re-stamps a running build's claim, until the returned stop is

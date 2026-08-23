@@ -108,6 +108,7 @@ func (l *CheckoutLifecycle) refViewManager(repoPrefix string, idx *Indexer) (*Re
 		},
 		Config: index,
 		Logger: l.logger,
+		Gate:   l.buildGate(),
 	})
 	if err != nil {
 		return nil, err

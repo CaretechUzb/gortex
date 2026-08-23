@@ -148,12 +148,15 @@ type CheckoutLifecycle struct {
 	// refuse. A test seam; nil in production.
 	routeBarrier func(context.Context, string) error
 
-	// mu guards only the two late-bound collaborators. Neither is held
+	// mu guards only the late-bound collaborators. None of them is held
 	// across a saga: the hooks re-enter the lifecycle, and holding a lock
 	// over the indexer's own teardown would invert the lock order.
 	mu        sync.RWMutex
 	watcherFn func() RepoWatcher
 	notifier  LifecycleNotifier
+	// gate defers build work while the daemon warms up. nil admits every
+	// build, which is what every surface that has no warmup runs with.
+	gate *ViewBuildGate
 	// batchDepth / batchPending coalesce the fan-out across a multi-repo
 	// operation. Rerunning the whole-graph analysis once per repository in a
 	// reload of twenty of them would cost twenty whole-graph passes to reach
@@ -238,6 +241,33 @@ func (l *CheckoutLifecycle) SetNotifier(n LifecycleNotifier) {
 	l.mu.Lock()
 	l.notifier = n
 	l.mu.Unlock()
+}
+
+// SetBuildGate installs the gate that holds view build work while the daemon
+// warms up.
+//
+// It is read when a coordinator or a ref-view manager is built, so it has to
+// be installed before anything starts one — the daemon does it before warmup,
+// which is before the seeding that brings the first coordinator up. Nothing
+// else is gated: registering a checkout, seeding the catalog, reading a route
+// and serving a published generation all run exactly as they do without it.
+func (l *CheckoutLifecycle) SetBuildGate(gate *ViewBuildGate) {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	l.gate = gate
+	l.mu.Unlock()
+}
+
+// buildGate reads the installed gate, nil when nothing gates builds here.
+func (l *CheckoutLifecycle) buildGate() *ViewBuildGate {
+	if l == nil {
+		return nil
+	}
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.gate
 }
 
 // Reconciler returns the lifecycle's reconciler, nil when the store has no
@@ -1345,6 +1375,7 @@ func (l *CheckoutLifecycle) buildCoordinator(
 		Leases: l.leases,
 		Config: index,
 		Logger: l.logger,
+		Gate:   l.buildGate(),
 		// The watcher's own debounce is the quiet window: both coalesce the
 		// same event storms, and a checkout whose watch configuration says how
 		// long to wait means it for its views too.

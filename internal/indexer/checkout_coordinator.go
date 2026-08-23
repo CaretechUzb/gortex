@@ -135,6 +135,9 @@ type CheckoutCoordinatorConfig struct {
 	// different rules.
 	Config config.IndexConfig
 	Logger *zap.Logger
+	// Gate holds the loop's build cycles while the daemon warms up. nil admits
+	// every cycle at once, which is what a coordinator outside a warmup has.
+	Gate *ViewBuildGate
 
 	// Debounce is the quiet window; <= 0 takes defaultCheckoutQuietWindow.
 	Debounce time.Duration
@@ -174,6 +177,10 @@ type CheckoutCycle struct {
 	// a lost route flip, or a working tree that moved under two builds in a
 	// row. The route is left exactly as the cycle found it.
 	Rescheduled bool
+	// Deferred reports that the cycle never ran: the warmup gate is holding
+	// build work, and the loop will run this cycle when it opens. Nothing was
+	// read and nothing was written, so every other field is zero.
+	Deferred bool
 	// Err is what stopped the cycle, nil when it settled both slots.
 	Err error
 }
@@ -195,6 +202,7 @@ type CheckoutCoordinator struct {
 	builder *SparseGenerationBuilder
 	leases  *graphview.LeaseManager
 	logger  *zap.Logger
+	gate    *ViewBuildGate
 
 	quiet      time.Duration
 	poll       time.Duration
@@ -297,6 +305,7 @@ func NewCheckoutCoordinator(cfg CheckoutCoordinatorConfig) (*CheckoutCoordinator
 		builder:      cfg.Builder,
 		leases:       cfg.Leases,
 		logger:       logger,
+		gate:         cfg.Gate,
 		quiet:        cfg.Debounce,
 		poll:         cfg.PollInterval,
 		retain:       cfg.Retain,
@@ -360,6 +369,13 @@ func (c *CheckoutCoordinator) Close() error {
 // run is the loop. It owns the quiet-window timer and the poll ticker, so
 // there is exactly one goroutine per coordinator and closing it stops
 // everything it armed.
+//
+// The warmup gate is a fourth wake. A window that closes while builds are
+// deferred spends the claim it was armed for — the checkout is dirty and
+// nothing is going to say so again, because the signal that said it has been
+// consumed — so the loop remembers the claim and runs it when the gate opens.
+// Waiting for the gate inside the window instead would hold a wake the loop
+// still has to answer for stop and for signals.
 func (c *CheckoutCoordinator) run() {
 	defer close(c.done)
 
@@ -374,6 +390,10 @@ func (c *CheckoutCoordinator) run() {
 		pollC = ticker.C
 	}
 
+	// nil once builds are admitted: an open gate's channel is always ready,
+	// and selecting on it would spin the loop.
+	admitted := c.admissionWait()
+	claimed := false
 	var armed <-chan time.Time
 	for {
 		select {
@@ -389,8 +409,44 @@ func (c *CheckoutCoordinator) run() {
 			c.Signal("poll")
 		case <-armed:
 			armed = nil
+			if admitted != nil {
+				claimed = true
+				c.deferCycle()
+				continue
+			}
+			c.cycle(context.Background())
+		case <-admitted:
+			admitted = nil
+			if !claimed {
+				continue
+			}
+			claimed = false
 			c.cycle(context.Background())
 		}
+	}
+}
+
+// admissionWait is the channel the loop waits for build admission on, nil when
+// builds are already admitted.
+func (c *CheckoutCoordinator) admissionWait() <-chan struct{} {
+	if c.gate.Admitted() {
+		return nil
+	}
+	return c.gate.Opened()
+}
+
+// deferCycle records a cycle the warmup gate held back. Nothing is read and
+// nothing is written: the route keeps serving what the last run published, and
+// the claim this window spent is carried to the gate's own wake.
+func (c *CheckoutCoordinator) deferCycle() {
+	c.mu.Lock()
+	reason := c.reason
+	c.mu.Unlock()
+	viewmetrics.Count(viewmetrics.CoordinatorCycleTotal, viewmetrics.OutcomeDeferred)
+	c.logger.Debug("checkout coordinator: build deferred until the daemon has warmed up",
+		zap.String("checkout", c.checkoutID), zap.String("reason", reason))
+	if c.cycleDone != nil {
+		c.cycleDone(CheckoutCycle{Deferred: true})
 	}
 }
 

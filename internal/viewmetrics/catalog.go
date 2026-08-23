@@ -168,6 +168,11 @@ const (
 	OutcomeCASLost       = "cas_lost"
 	OutcomeHeadMoved     = "head_moved"
 	OutcomeFailed        = "failed"
+	// OutcomeDeferred counts the cycles the warmup gate held back. They are
+	// not skipped work: each one is a claim the coordinator runs once builds
+	// are admitted, so a count that keeps rising after warmup is a gate that
+	// never opened.
+	OutcomeDeferred = "deferred"
 )
 
 // Build slots.
@@ -199,13 +204,18 @@ const (
 )
 
 // Ref-view selection outcomes. Every selection reports exactly one of ready,
-// adopted, building, coalesced or failed; reclaimed is the extra note a
-// selection makes when it took over a build claim a dead worker left behind,
-// and is followed by whichever of the five that selection went on to be.
+// adopted, building, deferred, coalesced or failed; reclaimed is the extra
+// note a selection makes when it took over a build claim a dead worker left
+// behind, and is followed by whichever of the six that selection went on to be.
+//
+// Deferred is a building answer with a cause: the pass the selection claimed
+// is waiting for the warmup gate rather than running, so the token is worth
+// polling but nothing is producing payload for it yet.
 const (
 	RefViewReady     = "ready"
 	RefViewAdopted   = "adopted"
 	RefViewBuilding  = "building"
+	RefViewDeferred  = "deferred"
 	RefViewCoalesced = "coalesced"
 	RefViewReclaimed = "reclaimed"
 	RefViewFailed    = "failed"

@@ -247,6 +247,19 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 	}
 	applyStandingMemoryLimit(logger, daemonMemLimit)
 
+	// View builds wait for warmup. A restart finds the graph, the routes and
+	// every ref view already stored, and building them again would run through
+	// the same store writer and the same topology gate the warmup tail is
+	// holding — which is how a restart over a persisted graph ends up costing
+	// more than the cold index that produced it. Installed here, before the
+	// janitor and before the seeding that brings the first coordinator up, so
+	// no build can start ahead of the gate.
+	//
+	// Nothing else is held: tracking a repository, seeding the catalog,
+	// reading a route and serving a published generation never consult it.
+	viewBuilds := indexer.NewViewBuildGate()
+	state.lifecycle.SetBuildGate(viewBuilds)
+
 	controller := &realController{
 		graph:         state.graph,
 		indexer:       state.indexer,
@@ -588,6 +601,10 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		}
 		elapsed := time.Since(start)
 		controller.MarkEnriched(elapsed)
+		// The warmup tail is done, so the view builds that were competing with
+		// it are admitted. Every coordinator holding a cycle and every ref-view
+		// build parked on a claim starts here, without being asked again.
+		viewBuilds.Open()
 		logger.Info("daemon: enrichment complete", zap.Duration("warmup", elapsed))
 		publishReadinessPhase(state, "enrichment_complete", true, map[string]any{
 			"enriched":       true,
