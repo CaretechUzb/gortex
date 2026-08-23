@@ -386,11 +386,37 @@ func TestFindUsages_OverlayOwnerClassifiesChildren(t *testing.T) {
 		"the overlay-stamped owner's child must classify as a test ref through the overlay view")
 }
 
+// TestFindUsages_OverlayOnlySymbolZeroEdgeCaveat pins the zero-edge
+// caveat under an overlay session: a symbol the request's own view
+// resolved is not a mistyped id, so its empty result classifies
+// through the deeper extraction-gap path, never the not-found message.
+func TestFindUsages_OverlayOnlySymbolZeroEdgeCaveat(t *testing.T) {
+	base := graph.New()
+	layer := graph.NewOverlayLayer()
+	fresh := &graph.Node{ID: "src/new.go::FreshFn", Kind: graph.KindFunction, Name: "FreshFn", FilePath: "src/new.go", StartLine: 1}
+	layer.AddNode("src/new.go", fresh)
+
+	eng := query.NewEngine(base)
+	eng.SetSearch(search.NewNull())
+	srv := NewServer(eng, base, nil, nil, zap.NewNop(), nil)
+	ctx := WithOverlayView(context.Background(), graph.NewOverlaidView(base, layer))
+
+	req := mcplib.CallToolRequest{}
+	req.Params.Name = "find_usages"
+	req.Params.Arguments = map[string]any{"id": fresh.ID}
+	res, err := srv.handleFindUsages(ctx, req)
+	require.NoError(t, err)
+	require.False(t, res.IsError)
+	out := res.Content[0].(mcplib.TextContent).Text
+	require.NotContains(t, out, "mistyped",
+		"a symbol the overlay view resolved must not be classified as a mistyped id")
+}
+
 // TestFindUsages_TOONRowsClassifyTheRightNode pins the TOON is_test
 // join: nodesToTOONRows skips File/Import nodes, so classification must
-// join rows to nodes by ID — indexing the filtered rows with unfiltered
-// node positions shifted every classification after a skipped node and
-// let a production function inherit a skipped test file's flag.
+// join rows to nodes by ID — positional indexing would shift every
+// classification after a skipped node and hand a production function a
+// skipped test file's flag.
 func TestFindUsages_TOONRowsClassifyTheRightNode(t *testing.T) {
 	g := graph.New()
 	target := &graph.Node{ID: "src/hot.go::Hot", Kind: graph.KindFunction, Name: "Hot", FilePath: "src/hot.go", StartLine: 1}
@@ -433,9 +459,8 @@ func TestFindUsages_TOONRowsClassifyTheRightNode(t *testing.T) {
 // ceiling at every size: the marker itself must fit inside the budget,
 // including budgets smaller than the marker.
 func TestTrimTextToBudget_Boundaries(t *testing.T) {
-	const marker = "... trimmed to byte budget; pass max_bytes:0 for the full result\n"
 	text := strings.Repeat("row line here\n", 40)
-	for _, budget := range []int{1, len(marker) - 1, len(marker), len(marker) + 1, 100} {
+	for _, budget := range []int{0, 1, len(trimBudgetMarker) - 1, len(trimBudgetMarker), len(trimBudgetMarker) + 1, 100} {
 		out := trimTextToBudget(text, budget)
 		require.LessOrEqual(t, len(out), budget, "budget %d is a hard ceiling", budget)
 	}

@@ -395,7 +395,7 @@ func SortEdgesForPage(edges []*graph.Edge) {
 		// Edge.Confidence is excluded from JSON, so rows that crossed a
 		// serialization boundary (federation peers) read zero and carry
 		// only the label — the sortable rank that survives the wire.
-		if ar, br := confidenceLabelRank(a.ConfidenceLabel), confidenceLabelRank(b.ConfidenceLabel); ar != br {
+		if ar, br := graph.ConfidenceLabelRank(a.ConfidenceLabel), graph.ConfidenceLabelRank(b.ConfidenceLabel); ar != br {
 			return ar > br
 		}
 		if a.FilePath != b.FilePath {
@@ -414,19 +414,40 @@ func SortEdgesForPage(edges []*graph.Edge) {
 	})
 }
 
-// confidenceLabelRank orders the coarse confidence labels
-// (graph.ConfidenceLabelFor) for tie-breaking; unlabeled rows rank
-// lowest.
-func confidenceLabelRank(label string) int {
-	switch label {
-	case "EXTRACTED":
-		return 3
-	case "INFERRED":
-		return 2
-	case "AMBIGUOUS":
-		return 1
+// UsageSummaryOf computes the completeness rollup over a usage
+// SubGraph: total references, distinct files (per-edge path with a
+// from-node fallback), and test-originated references via the shared
+// classifier (graph.NodeIsTest — the same authority order the
+// exclude_tests filter applies, so the rollup never disagrees with the
+// rows). g resolves child-node owners; nil skips only that hop. Nil
+// for an empty result — the zero-edge caveat explains that case.
+func UsageSummaryOf(sg *SubGraph, g graph.NodeGetter) *UsageSummary {
+	if sg == nil || len(sg.Edges) == 0 {
+		return nil
 	}
-	return 0
+	nodeByID := make(map[string]*graph.Node, len(sg.Nodes))
+	for _, n := range sg.Nodes {
+		if n != nil {
+			nodeByID[n.ID] = n
+		}
+	}
+	files := make(map[string]struct{}, len(sg.Edges))
+	testRefs := 0
+	for _, e := range sg.Edges {
+		from := nodeByID[e.From]
+		file := e.FilePath
+		if file == "" && from != nil {
+			file = from.FilePath
+		}
+		if file == "" {
+			file = "(unknown)"
+		}
+		files[file] = struct{}{}
+		if graph.NodeIsTest(g, from) {
+			testRefs++
+		}
+	}
+	return &UsageSummary{NRefs: len(sg.Edges), NFiles: len(files), NTestRefs: testRefs}
 }
 
 // effectiveOrigin returns the edge's origin tier, backfilled for edges

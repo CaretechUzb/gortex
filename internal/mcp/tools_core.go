@@ -251,17 +251,25 @@ func (s *Server) returnSubGraph(ctx context.Context, req mcp.CallToolRequest, sg
 	return s.respondJSONOrTOON(ctx, req, sg)
 }
 
+// trimBudgetMarker closes a budget-trimmed compact payload; package
+// level so the boundary tests exercise the exact marker the trimmer
+// emits.
+const trimBudgetMarker = "... trimmed to byte budget; pass max_bytes:0 for the full result\n"
+
 // trimTextToBudget cuts a line-oriented text payload to at most budget
 // bytes, breaking at a line boundary and closing with a marker line so
 // the cut is legible. The marker's own bytes count against the budget.
 func trimTextToBudget(text string, budget int) string {
-	const marker = "... trimmed to byte budget; pass max_bytes:0 for the full result\n"
-	// The budget is a hard ceiling even below the marker's own size: a
-	// tiny budget gets a truncated marker, never a payload above it.
-	if budget <= len(marker) {
-		return marker[:budget]
+	// The budget is a hard ceiling at every size: a non-positive budget
+	// yields nothing, a budget below the marker's own size gets a
+	// truncated marker, never a payload above it.
+	if budget <= 0 {
+		return ""
 	}
-	keep := budget - len(marker)
+	if budget <= len(trimBudgetMarker) {
+		return trimBudgetMarker[:budget]
+	}
+	keep := budget - len(trimBudgetMarker)
 	if keep > len(text) {
 		keep = len(text)
 	}
@@ -271,7 +279,7 @@ func trimTextToBudget(text string, budget int) string {
 	} else {
 		cut++
 	}
-	return text[:cut] + marker
+	return text[:cut] + trimBudgetMarker
 }
 
 // requestToolName extracts the MCP tool name from a CallToolRequest.
@@ -396,12 +404,7 @@ func subGraphToTOON(sg *query.SubGraph, g graph.NodeGetter) (*mcp.CallToolResult
 	// path); pure listing tools keep the raw stamp. Joined by node ID —
 	// the row builder skips File/Import nodes, so row positions do not
 	// line up with sg.Nodes positions.
-	nodeByID := make(map[string]*graph.Node, len(sg.Nodes))
-	for _, n := range sg.Nodes {
-		if n != nil {
-			nodeByID[n.ID] = n
-		}
-	}
+	nodeByID := indexNodes(sg.Nodes)
 	for i := range nodeRows {
 		if n := nodeByID[nodeRows[i].ID]; n != nil {
 			nodeRows[i].IsTest = graph.NodeIsTest(g, n)
@@ -2512,8 +2515,13 @@ func (s *Server) handleGetCallers(ctx context.Context, req mcp.CallToolRequest) 
 		// already recorded why, and the caller's own min_tier is what
 		// removed them. Classifying on top would double-report it, and
 		// now that classification weighs provenance it would report the
-		// very tier the caller asked to exclude.
-		sg.Caveat = graph.CaveatForZeroEdge(s.graph, id)
+		// very tier the caller asked to exclude. A symbol the request's
+		// view resolved (overlay-served included) is never a mistyped id.
+		if eng.GetSymbol(id) != nil {
+			sg.Caveat = graph.CaveatForZeroEdgeResolved(s.graph, id)
+		} else {
+			sg.Caveat = graph.CaveatForZeroEdge(s.graph, id)
+		}
 	} else if len(sg.Edges) > 0 && graph.WeakUsageEvidenceOnly(sg.Edges) {
 		// Populated, but every caller is a bare-name match — the shape a
 		// common method name (`Get`, `Run`, `Close`) produces. Left
@@ -2735,6 +2743,10 @@ func (s *Server) handleFindUsages(ctx context.Context, req mcp.CallToolRequest) 
 		return errResult, nil
 	}
 	eng := s.engineFor(ctx)
+	// One request-scoped node lookup, resolved once and handed to every
+	// classification/flavor surface below, so none can drift back to the
+	// base graph while the query runs on an overlay view.
+	getter := s.nodeGetterFor(ctx)
 	// Barrel re-export resolve-through: a public import path that names a
 	// forwarded binding (`src/middleware.ts::persist`) may have no node of its
 	// own (an unresolved / over-cap / wildcard barrel) — map it to the
@@ -2798,12 +2810,18 @@ func (s *Server) handleFindUsages(ctx context.Context, req mcp.CallToolRequest) 
 	// structural flavor (the enclosing owner type for a type flavor; the
 	// FROM node's own ui_component for `component`). Orphan nodes left
 	// with no incident edge are pruned.
-	s.filterUsagesByFlavor(s.nodeGetterFor(ctx), sg, id, strings.TrimSpace(req.GetString("flavor", "")))
+	filterUsagesByFlavor(getter, sg, id, strings.TrimSpace(req.GetString("flavor", "")))
 	if len(sg.Edges) == 0 && sg.TierFiltered == nil {
 		// A tier_filtered emptiness is not "no usages" — FilterByMinTier
 		// already recorded why. Only reach for the extraction-gap / unused
 		// classification when the emptiness was NOT caused by min_tier.
-		sg.Caveat = graph.CaveatForZeroEdge(s.graph, id)
+		// A node the request's view resolved (an overlay-served symbol
+		// among them) is never a mistyped id.
+		if node != nil {
+			sg.Caveat = graph.CaveatForZeroEdgeResolved(s.graph, id)
+		} else {
+			sg.Caveat = graph.CaveatForZeroEdge(s.graph, id)
+		}
 	} else if len(sg.Edges) > 0 && graph.WeakUsageEvidenceOnly(sg.Edges) {
 		// Populated, but every usage is a bare-name match — the shape a
 		// common symbol name produces. Left uncaveated this reads as proof
@@ -2815,7 +2833,7 @@ func (s *Server) handleFindUsages(ctx context.Context, req mcp.CallToolRequest) 
 	// tell at a glance whether the usage list already covers tests instead
 	// of re-grepping *_test.go files. Rides every wire format below; nil
 	// for an empty result (the Caveat above covers that case).
-	sg.UsageSummary = usageSummaryOf(sg, s.nodeGetterFor(ctx))
+	sg.UsageSummary = query.UsageSummaryOf(sg, getter)
 	// Proactive discovery cue: when the target is dispatch-heavy, point at
 	// find_implementations (once per session). Additive — the only response
 	// content the diet adds.
@@ -2834,7 +2852,7 @@ func (s *Server) handleFindUsages(ctx context.Context, req mcp.CallToolRequest) 
 	// compact is an explicit caller choice, so it beats the session's
 	// gcx default — the same precedence returnSubGraph applies.
 	if s.isGCX(ctx, req) && !isCompact(req) {
-		res, err := s.gcxResponseWithBudget(req)(encodeFindUsages(sg, s.nodeGetterFor(ctx)))
+		res, err := s.gcxResponseWithBudget(req)(encodeFindUsages(sg, getter))
 		return withScopeResult(res, err, resolved)
 	}
 	// Plain JSON gets curated usage rows that promote the resolved
@@ -2844,7 +2862,7 @@ func (s *Server) handleFindUsages(ctx context.Context, req mcp.CallToolRequest) 
 	format := req.GetString("format", "")
 	if !s.isTOON(ctx, req) && !isCompact(req) && format != "mermaid" && format != "dot" {
 		sg.Nodes = s.withAbsPaths(sg.Nodes)
-		return s.respondScopedJSONOrTOON(ctx, req, newUsageResponse(sg, s.nodeGetterFor(ctx)), resolved)
+		return s.respondScopedJSONOrTOON(ctx, req, newUsageResponse(sg, getter), resolved)
 	}
 	return s.returnScopedSubGraph(ctx, req, sg, resolved)
 }
@@ -3036,7 +3054,7 @@ func usageFromFlavor(g graph.NodeGetter, fromID string, fromNode *graph.Node) (t
 // resolve to a matching structural flavor, then prunes nodes left with
 // no incident edge (the queried target is always kept). An empty flavor
 // argument is a no-op.
-func (s *Server) filterUsagesByFlavor(g graph.NodeGetter, sg *query.SubGraph, targetID, flavorArg string) {
+func filterUsagesByFlavor(g graph.NodeGetter, sg *query.SubGraph, targetID, flavorArg string) {
 	flavors := splitFlavors(flavorArg)
 	if sg == nil || len(flavors) == 0 {
 		return
@@ -3175,46 +3193,6 @@ func truncateUsageRows(sg *query.SubGraph, limit int, targetID string) {
 	}
 	sg.Nodes = nodes
 	sg.Truncated = true
-}
-
-// usageSummaryOf computes the compact completeness rollup attached to a
-// find_usages response: the total reference count, the number of
-// distinct files those references live in, and how many originate in
-// test files. It reuses the shared test classifier (graph.NodeIsTest —
-// the same authority order the exclude_tests filter and the
-// from_is_test column apply) and the same file resolution as the
-// per-usage rows, so the rollup never disagrees with the edges it
-// summarizes. Returns nil for an empty result — the zero-edge Caveat
-// already explains that case, and an all-zero summary would be noise.
-func usageSummaryOf(sg *query.SubGraph, g graph.NodeGetter) *query.UsageSummary {
-	if sg == nil || len(sg.Edges) == 0 {
-		return nil
-	}
-	nodeByID := make(map[string]*graph.Node, len(sg.Nodes))
-	for _, n := range sg.Nodes {
-		nodeByID[n.ID] = n
-	}
-	files := make(map[string]struct{}, len(sg.Edges))
-	testRefs := 0
-	for _, e := range sg.Edges {
-		from := nodeByID[e.From]
-		file := e.FilePath
-		if file == "" && from != nil {
-			file = from.FilePath
-		}
-		if file == "" {
-			file = "(unknown)"
-		}
-		files[file] = struct{}{}
-		if graph.NodeIsTest(g, from) {
-			testRefs++
-		}
-	}
-	return &query.UsageSummary{
-		NRefs:     len(sg.Edges),
-		NFiles:    len(files),
-		NTestRefs: testRefs,
-	}
 }
 
 func (s *Server) handleGetCluster(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {

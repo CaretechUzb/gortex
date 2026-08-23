@@ -376,6 +376,14 @@ func CaveatForZeroEdge(g Store, symbolID string) *ZeroEdgeCaveat {
 	if g != nil && symbolID != "" && g.GetNode(symbolID) == nil {
 		return &ZeroEdgeCaveat{Class: ZeroEdgePossibleExtractionGap, Message: zeroEdgeNotFoundMessage}
 	}
+	return CaveatForZeroEdgeResolved(g, symbolID)
+}
+
+// CaveatForZeroEdgeResolved is CaveatForZeroEdge for callers whose
+// request-scoped view already resolved symbolID: an overlay-served
+// symbol is absent from the base graph, so the mistyped-id fast path
+// would mislabel it. Classification goes straight to the deeper path.
+func CaveatForZeroEdgeResolved(g Store, symbolID string) *ZeroEdgeCaveat {
 	class := ClassifyZeroEdge(g, symbolID)
 	if class == ZeroEdgeNone {
 		return nil
