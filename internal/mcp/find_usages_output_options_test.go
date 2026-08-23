@@ -1,12 +1,14 @@
 package mcp
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	mcplib "github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
@@ -333,6 +335,120 @@ func TestFindUsages_TestLabelsMatchTheFilter(t *testing.T) {
 			require.NotContains(t, line, "\ttrue", "the production row must stay from_is_test=false: %s", line)
 		}
 	}
+}
+
+// TestFindUsages_OverlayOwnerClassifiesChildren pins that the output
+// classifiers read the same request-scoped graph view as the query: an
+// annotation test that exists only in the session overlay stamps its
+// owner there, so the owner hop for its param child must go through
+// the overlay reader — resolving against the base graph classifies the
+// child as production while the filter (running on the overlay engine)
+// would exclude it.
+func TestFindUsages_OverlayOwnerClassifiesChildren(t *testing.T) {
+	base := graph.New()
+	target := &graph.Node{ID: "src/widget.rs::Widget", Kind: graph.KindType, Name: "Widget", FilePath: "src/widget.rs", StartLine: 3}
+	prod := &graph.Node{ID: "src/main.rs::run", Kind: graph.KindFunction, Name: "run", FilePath: "src/main.rs", StartLine: 10}
+	base.AddNode(target)
+	base.AddNode(prod)
+	base.AddEdge(&graph.Edge{From: prod.ID, To: target.ID, Kind: graph.EdgeCalls, FilePath: "src/main.rs", Line: 12})
+
+	layer := graph.NewOverlayLayer()
+	owner := &graph.Node{
+		ID: "src/lib.rs::check_widget", Kind: graph.KindFunction, Name: "check_widget",
+		FilePath: "src/lib.rs", StartLine: 40, Meta: map[string]any{"is_test": true, "test_role": "test"},
+	}
+	child := &graph.Node{
+		ID: "src/lib.rs::check_widget#param:w", Kind: graph.KindParam, Name: "w",
+		FilePath: "src/lib.rs", StartLine: 40,
+	}
+	layer.AddNode("src/lib.rs", owner)
+	layer.AddNode("src/lib.rs", child)
+	layer.AddEdge(&graph.Edge{From: child.ID, To: target.ID, Kind: graph.EdgeReferences, FilePath: "src/lib.rs", Line: 40})
+
+	eng := query.NewEngine(base)
+	eng.SetSearch(search.NewNull())
+	srv := NewServer(eng, base, nil, nil, zap.NewNop(), nil)
+	ctx := WithOverlayView(context.Background(), graph.NewOverlaidView(base, layer))
+
+	req := mcplib.CallToolRequest{}
+	req.Params.Name = "find_usages"
+	req.Params.Arguments = map[string]any{"id": target.ID}
+	res, err := srv.handleFindUsages(ctx, req)
+	require.NoError(t, err)
+	require.False(t, res.IsError)
+	var resp struct {
+		UsageSummary *query.UsageSummary `json:"usage_summary"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(res.Content[0].(mcplib.TextContent).Text), &resp))
+	require.NotNil(t, resp.UsageSummary)
+	require.Equal(t, 2, resp.UsageSummary.NRefs)
+	require.Equal(t, 1, resp.UsageSummary.NTestRefs,
+		"the overlay-stamped owner's child must classify as a test ref through the overlay view")
+}
+
+// TestFindUsages_TOONRowsClassifyTheRightNode pins the TOON is_test
+// join: nodesToTOONRows skips File/Import nodes, so classification must
+// join rows to nodes by ID — indexing the filtered rows with unfiltered
+// node positions shifted every classification after a skipped node and
+// let a production function inherit a skipped test file's flag.
+func TestFindUsages_TOONRowsClassifyTheRightNode(t *testing.T) {
+	g := graph.New()
+	target := &graph.Node{ID: "src/hot.go::Hot", Kind: graph.KindFunction, Name: "Hot", FilePath: "src/hot.go", StartLine: 1}
+	// The file node sorts first by ID (capital T), is a test path, and
+	// is skipped by the TOON row builder.
+	testFile := &graph.Node{
+		ID: `Test\Suite_Tests.cs`, Kind: graph.KindFile,
+		Name: "Suite_Tests.cs", FilePath: `Test\Suite_Tests.cs`,
+		Meta: map[string]any{"is_test_file": true},
+	}
+	prod := &graph.Node{ID: "src/a.go::ProdUse", Kind: graph.KindFunction, Name: "ProdUse", FilePath: "src/a.go", StartLine: 3}
+	testFn := &graph.Node{
+		ID: "src/z_test.go::TestUse", Kind: graph.KindFunction, Name: "TestUse", FilePath: "src/z_test.go", StartLine: 5,
+		Meta: map[string]any{"is_test": true},
+	}
+	for _, n := range []*graph.Node{target, testFile, prod, testFn} {
+		g.AddNode(n)
+	}
+	g.AddEdge(&graph.Edge{From: testFile.ID, To: target.ID, Kind: graph.EdgeImports, FilePath: testFile.FilePath, Line: 1})
+	g.AddEdge(&graph.Edge{From: prod.ID, To: target.ID, Kind: graph.EdgeCalls, FilePath: "src/a.go", Line: 4})
+	g.AddEdge(&graph.Edge{From: testFn.ID, To: target.ID, Kind: graph.EdgeCalls, FilePath: "src/z_test.go", Line: 6})
+	eng := query.NewEngine(g)
+	eng.SetSearch(search.NewNull())
+	srv := NewServer(eng, g, nil, nil, zap.NewNop(), nil)
+
+	out := findUsagesText(t, srv, map[string]any{"id": target.ID, "format": "toon"})
+	// Node rows carry the kind + name columns; edge rows carry from/to
+	// ids only, so gate on the node-row shape.
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, ",function,ProdUse,") {
+			require.NotContains(t, line, "true", "the production row must not inherit a skipped node's test flag: %s", line)
+		}
+		if strings.Contains(line, ",function,TestUse,") {
+			require.Contains(t, line, "true", "the stamped test row keeps its flag: %s", line)
+		}
+	}
+}
+
+// TestTrimTextToBudget_Boundaries pins that the budget is a hard
+// ceiling at every size: the marker itself must fit inside the budget,
+// including budgets smaller than the marker.
+func TestTrimTextToBudget_Boundaries(t *testing.T) {
+	const marker = "... trimmed to byte budget; pass max_bytes:0 for the full result\n"
+	text := strings.Repeat("row line here\n", 40)
+	for _, budget := range []int{1, len(marker) - 1, len(marker), len(marker) + 1, 100} {
+		out := trimTextToBudget(text, budget)
+		require.LessOrEqual(t, len(out), budget, "budget %d is a hard ceiling", budget)
+	}
+}
+
+// TestFindUsages_CompactHonorsTinyTokenBudget pins the same ceiling
+// through the handler on the token axis.
+func TestFindUsages_CompactHonorsTinyTokenBudget(t *testing.T) {
+	srv, hotID := usagesLimitServer(t, 55)
+	out := findUsagesText(t, srv, map[string]any{
+		"id": hotID, "limit": 0, "compact": true, "max_tokens": 1,
+	})
+	require.LessOrEqual(t, len(out), tokensToBytes(1), "max_tokens:1 must bound compact output")
 }
 
 // TestFindUsages_CompactWinsOverGCX pins the `compact` option against

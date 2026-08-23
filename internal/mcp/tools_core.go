@@ -243,10 +243,10 @@ func (s *Server) returnSubGraph(ctx context.Context, req mcp.CallToolRequest, sg
 		if tool == "" {
 			tool = "subgraph"
 		}
-		return s.gcxResponseWithBudget(req)(encodeSubGraph(tool, sg, s.graph))
+		return s.gcxResponseWithBudget(req)(encodeSubGraph(tool, sg, s.nodeGetterFor(ctx)))
 	}
 	if s.isTOON(ctx, req) {
-		return subGraphToTOON(sg, s.graph)
+		return subGraphToTOON(sg, s.nodeGetterFor(ctx))
 	}
 	return s.respondJSONOrTOON(ctx, req, sg)
 }
@@ -256,10 +256,12 @@ func (s *Server) returnSubGraph(ctx context.Context, req mcp.CallToolRequest, sg
 // the cut is legible. The marker's own bytes count against the budget.
 func trimTextToBudget(text string, budget int) string {
 	const marker = "... trimmed to byte budget; pass max_bytes:0 for the full result\n"
-	keep := budget - len(marker)
-	if keep < 0 {
-		keep = 0
+	// The budget is a hard ceiling even below the marker's own size: a
+	// tiny budget gets a truncated marker, never a payload above it.
+	if budget <= len(marker) {
+		return marker[:budget]
 	}
+	keep := budget - len(marker)
 	if keep > len(text) {
 		keep = len(text)
 	}
@@ -367,7 +369,7 @@ func (s *Server) respondJSONOrTOON(ctx context.Context, req mcp.CallToolRequest,
 }
 
 // subGraphToTOON converts a SubGraph to a TOON-encoded text result.
-func subGraphToTOON(sg *query.SubGraph, g graph.Store) (*mcp.CallToolResult, error) {
+func subGraphToTOON(sg *query.SubGraph, g graph.NodeGetter) (*mcp.CallToolResult, error) {
 	var edgeRows []toonEdgeRow
 	for _, e := range sg.Edges {
 		label := e.ConfidenceLabel
@@ -391,9 +393,17 @@ func subGraphToTOON(sg *query.SubGraph, g graph.Store) (*mcp.CallToolResult, err
 	nodeRows := nodesToTOONRows(sg.Nodes)
 	// Subgraph rows ride next to the exclude_tests filter, so their
 	// is_test column uses the same shared classifier (stamp → owner →
-	// path); pure listing tools keep the raw stamp.
-	for i, n := range sg.Nodes {
-		if i < len(nodeRows) {
+	// path); pure listing tools keep the raw stamp. Joined by node ID —
+	// the row builder skips File/Import nodes, so row positions do not
+	// line up with sg.Nodes positions.
+	nodeByID := make(map[string]*graph.Node, len(sg.Nodes))
+	for _, n := range sg.Nodes {
+		if n != nil {
+			nodeByID[n.ID] = n
+		}
+	}
+	for i := range nodeRows {
+		if n := nodeByID[nodeRows[i].ID]; n != nil {
 			nodeRows[i].IsTest = graph.NodeIsTest(g, n)
 		}
 	}
@@ -2788,7 +2798,7 @@ func (s *Server) handleFindUsages(ctx context.Context, req mcp.CallToolRequest) 
 	// structural flavor (the enclosing owner type for a type flavor; the
 	// FROM node's own ui_component for `component`). Orphan nodes left
 	// with no incident edge are pruned.
-	s.filterUsagesByFlavor(sg, id, strings.TrimSpace(req.GetString("flavor", "")))
+	s.filterUsagesByFlavor(s.nodeGetterFor(ctx), sg, id, strings.TrimSpace(req.GetString("flavor", "")))
 	if len(sg.Edges) == 0 && sg.TierFiltered == nil {
 		// A tier_filtered emptiness is not "no usages" — FilterByMinTier
 		// already recorded why. Only reach for the extraction-gap / unused
@@ -2805,7 +2815,7 @@ func (s *Server) handleFindUsages(ctx context.Context, req mcp.CallToolRequest) 
 	// tell at a glance whether the usage list already covers tests instead
 	// of re-grepping *_test.go files. Rides every wire format below; nil
 	// for an empty result (the Caveat above covers that case).
-	sg.UsageSummary = usageSummaryOf(sg, s.graph)
+	sg.UsageSummary = usageSummaryOf(sg, s.nodeGetterFor(ctx))
 	// Proactive discovery cue: when the target is dispatch-heavy, point at
 	// find_implementations (once per session). Additive — the only response
 	// content the diet adds.
@@ -2824,7 +2834,7 @@ func (s *Server) handleFindUsages(ctx context.Context, req mcp.CallToolRequest) 
 	// compact is an explicit caller choice, so it beats the session's
 	// gcx default — the same precedence returnSubGraph applies.
 	if s.isGCX(ctx, req) && !isCompact(req) {
-		res, err := s.gcxResponseWithBudget(req)(encodeFindUsages(sg, s.graph))
+		res, err := s.gcxResponseWithBudget(req)(encodeFindUsages(sg, s.nodeGetterFor(ctx)))
 		return withScopeResult(res, err, resolved)
 	}
 	// Plain JSON gets curated usage rows that promote the resolved
@@ -2834,7 +2844,7 @@ func (s *Server) handleFindUsages(ctx context.Context, req mcp.CallToolRequest) 
 	format := req.GetString("format", "")
 	if !s.isTOON(ctx, req) && !isCompact(req) && format != "mermaid" && format != "dot" {
 		sg.Nodes = s.withAbsPaths(sg.Nodes)
-		return s.respondScopedJSONOrTOON(ctx, req, newUsageResponse(sg, s.graph), resolved)
+		return s.respondScopedJSONOrTOON(ctx, req, newUsageResponse(sg, s.nodeGetterFor(ctx)), resolved)
 	}
 	return s.returnScopedSubGraph(ctx, req, sg, resolved)
 }
@@ -2927,7 +2937,7 @@ func (s *Server) suppressionMayBeStale(id string) bool {
 
 // newUsageResponse resolves the from_* fields for each node (pure read
 // — never mutates the graph) and wraps the SubGraph for JSON output.
-func newUsageResponse(sg *query.SubGraph, g graph.Store) *usageResponse {
+func newUsageResponse(sg *query.SubGraph, g graph.NodeGetter) *usageResponse {
 	wrapped := make([]usageNode, 0, len(sg.Nodes))
 	for _, n := range sg.Nodes {
 		tf, uc := usageFromFlavor(g, n.ID, n)
@@ -3000,7 +3010,7 @@ func annotateAndFilterReturnUsage(sg *query.SubGraph, usageFilter string) {
 // node's enclosing owner type, because callers are functions / methods
 // that never carry type_flavor themselves. Nil-safe: a FROM node absent
 // from both the supplied lookup and the graph yields empty strings.
-func usageFromFlavor(g graph.Store, fromID string, fromNode *graph.Node) (typeFlavor, uiComponent string) {
+func usageFromFlavor(g graph.NodeGetter, fromID string, fromNode *graph.Node) (typeFlavor, uiComponent string) {
 	if fromNode == nil && g != nil {
 		fromNode = g.GetNode(fromID)
 	}
@@ -3026,7 +3036,7 @@ func usageFromFlavor(g graph.Store, fromID string, fromNode *graph.Node) (typeFl
 // resolve to a matching structural flavor, then prunes nodes left with
 // no incident edge (the queried target is always kept). An empty flavor
 // argument is a no-op.
-func (s *Server) filterUsagesByFlavor(sg *query.SubGraph, targetID, flavorArg string) {
+func (s *Server) filterUsagesByFlavor(g graph.NodeGetter, sg *query.SubGraph, targetID, flavorArg string) {
 	flavors := splitFlavors(flavorArg)
 	if sg == nil || len(flavors) == 0 {
 		return
@@ -3037,7 +3047,7 @@ func (s *Server) filterUsagesByFlavor(sg *query.SubGraph, targetID, flavorArg st
 	}
 	kept := sg.Edges[:0]
 	for _, e := range sg.Edges {
-		tf, uc := usageFromFlavor(s.graph, e.From, nodeByID[e.From])
+		tf, uc := usageFromFlavor(g, e.From, nodeByID[e.From])
 		if flavorMatchesResolved(tf, uc, flavors) {
 			kept = append(kept, e)
 		}
@@ -3176,7 +3186,7 @@ func truncateUsageRows(sg *query.SubGraph, limit int, targetID string) {
 // per-usage rows, so the rollup never disagrees with the edges it
 // summarizes. Returns nil for an empty result — the zero-edge Caveat
 // already explains that case, and an all-zero summary would be noise.
-func usageSummaryOf(sg *query.SubGraph, g graph.Store) *query.UsageSummary {
+func usageSummaryOf(sg *query.SubGraph, g graph.NodeGetter) *query.UsageSummary {
 	if sg == nil || len(sg.Edges) == 0 {
 		return nil
 	}

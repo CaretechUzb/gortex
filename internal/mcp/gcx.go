@@ -454,7 +454,7 @@ func tierFilteredCaveatMeta(c *graph.TierFilteredCaveat) []string {
 // encodeFindUsages emits one row per usage edge. Each row names the
 // caller symbol, its location, the edge kind, and the origin tier so
 // agents can filter without a second call.
-func encodeFindUsages(sg *query.SubGraph, g graph.Store) ([]byte, error) {
+func encodeFindUsages(sg *query.SubGraph, g graph.NodeGetter) ([]byte, error) {
 	var buf bytes.Buffer
 	meta := []string{"edges", fmt.Sprintf("%d", len(sg.Edges))}
 	// Truncation meta rides only on a capped result so an uncapped
@@ -533,7 +533,7 @@ func encodeFindUsages(sg *query.SubGraph, g graph.Store) ([]byte, error) {
 // third caller_notes section when get_callers attached concurrency
 // annotations. The third section is omitted entirely when empty so the
 // other traversal tools' wire output is byte-identical to before.
-func encodeSubGraph(tool string, sg *query.SubGraph, g graph.Store) ([]byte, error) {
+func encodeSubGraph(tool string, sg *query.SubGraph, g graph.NodeGetter) ([]byte, error) {
 	var buf bytes.Buffer
 	nodes := make([]*graph.Node, 0, len(sg.Nodes))
 	for _, n := range sg.Nodes {

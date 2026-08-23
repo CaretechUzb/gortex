@@ -169,6 +169,18 @@ func (s *Server) readerFor(ctx context.Context) graph.Reader {
 // Cheap: WithReader is a shallow clone (one struct copy, shares
 // search provider and rerank pipeline). Safe to call inside hot
 // tool-handler paths.
+// nodeGetterFor returns the request-scoped node lookup: the session
+// overlay view when one rides the context, the base graph otherwise.
+// Output classification (is_test labels, usage summary, flavor
+// resolution) must read the same view engineFor's query ran on, or an
+// overlay-only owner classifies differently in the filter and the rows.
+func (s *Server) nodeGetterFor(ctx context.Context) graph.NodeGetter {
+	if v := OverlayViewFromContext(ctx); v != nil {
+		return v
+	}
+	return s.graph
+}
+
 func (s *Server) engineFor(ctx context.Context) *query.Engine {
 	if s == nil || s.engine == nil {
 		return nil
