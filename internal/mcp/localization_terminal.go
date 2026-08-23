@@ -914,52 +914,78 @@ func localizationRecoveryEvidenceAlignedWithLead(task, lead, requested, operatio
 }
 
 // localizationRecoveryCorroborated is the terminality gate for an accepted
-// recovery call. A recovery may land anywhere in the repository, so its result
-// has to agree with something before it can be called an answer: either it
-// returns evidence the retained page already ranked, or its own identities
-// carry the request's anchor terms. A page that agrees with neither is a new
-// unrelated location, and stamping it terminal converts a miss into a
-// confident wrong answer.
+// recovery call. Corroboration requires the recovery to have taught the page
+// something: at least one row the frozen baseline did not already hold by
+// symbol ID, and that novel row must land in a baseline file or carry the
+// request's anchor terms. A result that is a subset of the retained rows adds
+// no information whatever its overlap looks like — treating a same-page
+// sibling as proof stops a session on a candidate the page had already ranked
+// and rejected.
 func localizationRecoveryCorroborated(
 	task, lead, requested, operation string,
 	rows []localizationDigestRow,
-	retained *localizationEvidenceDigest,
+	baseline *localizationEvidenceDigest,
 ) bool {
-	if len(rows) == 0 {
+	novel := localizationNovelRecoveryRows(rows, baseline)
+	if len(novel) == 0 {
 		return false
 	}
-	if localizationRowsIntersectRetained(rows, retained) {
+	if localizationRowsShareBaselineFile(novel, baseline) {
 		return true
 	}
-	return localizationRecoveryEvidenceAlignedWithLead(task, lead, requested, operation, rows)
+	return localizationRecoveryEvidenceAlignedWithLead(task, lead, requested, operation, novel)
 }
 
-// localizationRowsIntersectRetained reports whether a permitted call returned a
-// symbol or a file the contract had already retained.
-func localizationRowsIntersectRetained(rows []localizationDigestRow, retained *localizationEvidenceDigest) bool {
-	if len(rows) == 0 || retained == nil || len(retained.Evidence) == 0 {
+// localizationNovelRecoveryRows keeps the rows the frozen baseline did not
+// already carry. Identity is the symbol ID: a row the page already ranked is
+// not evidence the recovery produced.
+func localizationNovelRecoveryRows(
+	rows []localizationDigestRow, baseline *localizationEvidenceDigest,
+) []localizationDigestRow {
+	if len(rows) == 0 {
+		return nil
+	}
+	if baseline == nil || len(baseline.Evidence) == 0 {
+		return rows
+	}
+	retained := make(map[string]struct{}, len(baseline.Evidence))
+	for _, row := range baseline.Evidence {
+		if id := strings.TrimSpace(row.ID); id != "" {
+			retained[id] = struct{}{}
+		}
+	}
+	novel := make([]localizationDigestRow, 0, len(rows))
+	for _, row := range rows {
+		if _, alreadyRanked := retained[strings.TrimSpace(row.ID)]; alreadyRanked {
+			continue
+		}
+		novel = append(novel, row)
+	}
+	return novel
+}
+
+// localizationRowsShareBaselineFile reports whether a novel row landed in a
+// file the ranked page already carried. The page located the file; the recovery
+// located a declaration in it that the page did not have.
+func localizationRowsShareBaselineFile(
+	rows []localizationDigestRow, baseline *localizationEvidenceDigest,
+) bool {
+	if len(rows) == 0 || baseline == nil || len(baseline.Evidence) == 0 {
 		return false
 	}
-	ids := make(map[string]struct{}, len(retained.Evidence))
-	files := make(map[string]struct{}, len(retained.Evidence))
-	for _, row := range retained.Evidence {
-		if id := strings.TrimSpace(row.ID); id != "" {
-			ids[id] = struct{}{}
-		}
+	files := make(map[string]struct{}, len(baseline.Evidence))
+	for _, row := range baseline.Evidence {
 		if file := strings.TrimSpace(row.File); file != "" {
 			files[strings.ToLower(file)] = struct{}{}
 		}
 	}
 	for _, row := range rows {
-		if id := strings.TrimSpace(row.ID); id != "" {
-			if _, exists := ids[id]; exists {
-				return true
-			}
+		file := strings.TrimSpace(row.File)
+		if file == "" {
+			continue
 		}
-		if file := strings.TrimSpace(row.File); file != "" {
-			if _, exists := files[strings.ToLower(file)]; exists {
-				return true
-			}
+		if _, exists := files[strings.ToLower(file)]; exists {
+			return true
 		}
 	}
 	return false

@@ -701,25 +701,29 @@ func TestPlannedRecoveryEmptyResultReAllowsThenTerminatesUnconfirmed(t *testing.
 }
 
 // A recovery page whose identities say nothing about the request can still be
-// the right location — when it lands on evidence the ranked page already
-// carried. Nothing else in the row corroborates, so the file overlap is what
-// separates the two outcomes.
-func TestRecoveryTerminalizesOnlyWhenItLandsOnRetainedEvidence(t *testing.T) {
-	retained := mergeLocalizationEvidenceDigest([]localizationDigestRow{
-		captureTestRow("fixture/storage/flush.go::Storage.Flush", "fixture/storage/flush.go"),
-	}, nil)
+// the right location — when it contributes a declaration the page did not have
+// in a file the page already located. A row the page already ranked contributes
+// nothing: re-returning it is the recovery agreeing with itself.
+func TestRecoveryTerminalizesOnlyWhenItContributesAlignedNovelEvidence(t *testing.T) {
+	ranked := captureTestRow("fixture/storage/flush.go::Storage.Flush", "fixture/storage/flush.go")
+	retained := mergeLocalizationEvidenceDigest([]localizationDigestRow{ranked}, nil)
 	tests := []struct {
 		name  string
 		row   localizationDigestRow
 		state string
 	}{
 		{
-			name: "retained file",
+			name: "novel declaration in a retained file",
 			row: localizationDigestRow{
 				ID: "fixture/storage/flush.go::Storage.helper", Name: "helper",
 				Kind: "method", File: "fixture/storage/flush.go",
 			},
 			state: localizationStateAnswerReady,
+		},
+		{
+			name:  "row the page already ranked",
+			row:   ranked,
+			state: localizationStateNeedsRecovery,
 		},
 		{
 			name: "unrelated file",
@@ -748,6 +752,52 @@ func TestRecoveryTerminalizesOnlyWhenItLandsOnRetainedEvidence(t *testing.T) {
 			if test.state == localizationStateAnswerReady &&
 				!strings.HasPrefix(result.FinalResponse, localizationAnswerHeading) {
 				t.Fatalf("corroborated terminal did not emit the proven page: %q", result.FinalResponse)
+			}
+		})
+	}
+}
+
+// The page ranks several declarations from one file. A recovery that returns
+// those same siblings has narrowed nothing, and terminalizing on them stops a
+// session on a candidate the ranking had already offered and the caller had
+// already passed over.
+func TestRecoveryReturningOnlyRankedSiblingsDoesNotTerminalize(t *testing.T) {
+	siblings := []localizationDigestRow{
+		captureTestRow("fixture/storage/flush.go::Storage.Flush", "fixture/storage/flush.go"),
+		captureTestRow("fixture/storage/flush.go::Storage.Sync", "fixture/storage/flush.go"),
+	}
+	baseline := mergeLocalizationEvidenceDigest(siblings, nil)
+	newcomer := localizationDigestRow{
+		ID: "fixture/storage/flush.go::Storage.drain", Name: "drain",
+		Kind: "method", File: "fixture/storage/flush.go",
+	}
+	tests := []struct {
+		name  string
+		rows  []localizationDigestRow
+		state string
+	}{
+		{name: "ranked siblings only", rows: siblings, state: localizationStateNeedsRecovery},
+		{name: "one ranked sibling", rows: siblings[1:], state: localizationStateNeedsRecovery},
+		{
+			name:  "ranked siblings plus a novel declaration",
+			rows:  append(append([]localizationDigestRow(nil), siblings...), newcomer),
+			state: localizationStateAnswerReady,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			state := newLocalizationTerminalState()
+			completion := newLocalizationRecoveryCompletion()
+			completion.digest = baseline
+			state.armForTask(completion, "Storage writes stall during commit")
+
+			blocked, token := state.authorizeWithToken("search", "symbols", map[string]any{"query": "storage"})
+			if blocked != nil || token == 0 {
+				t.Fatalf("recovery authorization = (%#v, %d)", blocked, token)
+			}
+			result := state.finishReservedReadTokenWithDigest(token, true, test.rows, true)
+			if result.State != test.state {
+				t.Fatalf("recovery completion = %#v, want state %q", result, test.state)
 			}
 		})
 	}
