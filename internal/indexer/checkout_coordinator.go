@@ -366,6 +366,25 @@ func (c *CheckoutCoordinator) Close() error {
 	return nil
 }
 
+// Running reports whether the loop goroutine is still there.
+//
+// It is what the administrative surfaces mean by a live coordinator, and it is
+// not the same question as whether the lifecycle's registry holds one: a
+// coordinator built for a transition runs a whole rebuild before anything
+// registers it, and one being dropped keeps running until its in-flight cycle
+// ends.
+func (c *CheckoutCoordinator) Running() bool {
+	if c == nil {
+		return false
+	}
+	select {
+	case <-c.done:
+		return false
+	default:
+		return true
+	}
+}
+
 // run is the loop. It owns the quiet-window timer and the poll ticker, so
 // there is exactly one goroutine per coordinator and closing it stops
 // everything it armed.

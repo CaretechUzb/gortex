@@ -41,7 +41,9 @@ const (
 	CoordinatorCycleTotal = "views_coordinator_cycle_total"
 	// CoordinatorBuildSeconds is how long one slot's build took.
 	CoordinatorBuildSeconds = "views_coordinator_build_seconds"
-	// Coordinators is how many checkout coordinators are live.
+	// Coordinators is how many checkout coordinators the registry holds. A
+	// coordinator a transition is driving a rebuild with is running and not
+	// registered; the administrative surfaces count those, this level does not.
 	Coordinators = "views_coordinators"
 
 	// GenerationPublishedTotal, GenerationSupersededTotal and

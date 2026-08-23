@@ -761,6 +761,78 @@ func TestCheckoutLifecycleRegistrationBringsUpCoordinators(t *testing.T) {
 		"a dedicated checkout is read from its own corpus, so it keeps no coordinator")
 }
 
+// coordinatorReported reads one checkout's coordinator flag off the
+// administrative census — the answer 'gortex repos families' renders.
+func (f *lifecycleFixture) coordinatorReported(checkoutID string) bool {
+	f.t.Helper()
+	overview, err := f.lc.FamiliesOverview(context.Background(), "")
+	require.NoError(f.t, err)
+	for _, family := range overview.Families {
+		for _, checkout := range family.Checkouts {
+			if checkout.CheckoutID == checkoutID {
+				return checkout.CoordinatorLive
+			}
+		}
+	}
+	f.t.Fatalf("checkout %s is not in the census", checkoutID)
+	return false
+}
+
+// TestCoordinatorLivenessFollowsTheLoopNotTheRegistry states what the
+// administrative surfaces mean by a live coordinator: this process is running
+// the checkout's build loop.
+//
+// The registry is not that. Every transition builds its replacement, drives a
+// whole rebuild with it and registers it only once that rebuild has landed, so
+// a census taken across a restart-sized build reads a daemon whose loops are
+// running as one running none — the opposite of what the operator asking is
+// looking for, and exactly when they are asking.
+func TestCoordinatorLivenessFollowsTheLoopNotTheRegistry(t *testing.T) {
+	f := newFamilyFixture(t, "liveness")
+	defer f.close()
+	ctx := context.Background()
+
+	// The daemon's restart path: a fresh stack over the same store, the tracked
+	// set re-registered the way warmup re-tracks it, and the seeding that
+	// reconciles every family it touched — which is what brings the automatic
+	// checkouts' coordinators back up.
+	f.restart()
+	_, err := f.mi.TrackRepoCtx(ctx, config.RepoEntry{Path: f.main, Name: f.mainPrefix})
+	require.NoError(t, err)
+	require.NoError(t, f.lc.Seed(ctx))
+	require.True(t, f.coordinatorReported(f.automatic.CheckoutID),
+		"the restart's own reconciliation brought no coordinator back")
+	require.Equal(t, 1, f.lc.liveCoordinators(""))
+
+	// The window every transition opens: the registered coordinator is dropped
+	// first, and nothing is running for the checkout until the replacement is
+	// built.
+	f.lc.dropCoordinator(f.automatic.CheckoutID)
+	require.False(t, f.coordinatorReported(f.automatic.CheckoutID),
+		"a dropped coordinator is still reported live")
+	require.Zero(t, f.lc.liveCoordinators(""))
+
+	checkout, found, err := f.catalog.GetCheckout(ctx, f.automatic.CheckoutID)
+	require.NoError(t, err)
+	require.True(t, found)
+	coordinator, err := f.lc.buildCoordinator(ctx, f.primaryGraph, checkout)
+	require.NoError(t, err)
+	require.NotNil(t, coordinator)
+
+	assert.True(t, f.coordinatorReported(f.automatic.CheckoutID),
+		"a running build loop is reported as no coordinator at all")
+	assert.Equal(t, 1, f.lc.liveCoordinators(""),
+		"the reconcile verb counts a running build loop as none")
+	assert.Equal(t, 1, f.lc.liveCoordinators(f.familyID))
+	assert.Zero(t, f.lc.liveCoordinators("another-family"),
+		"a family that runs nothing is counted a coordinator")
+
+	require.NoError(t, coordinator.Close())
+	assert.False(t, f.coordinatorReported(f.automatic.CheckoutID),
+		"a stopped coordinator is reported live")
+	assert.Zero(t, f.lc.liveCoordinators(""))
+}
+
 // TestCheckoutLifecycleAdminNameIdentity states the identity rule the whole
 // lifecycle rests on: a checkout is keyed by (family, administrative name),
 // so the main worktree and a linked one of the same repository are two

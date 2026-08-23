@@ -129,6 +129,15 @@ type CheckoutLifecycle struct {
 	// watcher and notifier lookup for the length of an index pass.
 	coordMu      sync.Mutex
 	coordinators map[string]*CheckoutCoordinator
+	// started holds every coordinator this process has started and not yet
+	// seen stop, keyed by checkout. The registry is what can be handed a
+	// cycle; this is what is running. They come apart for the length of a
+	// build: every transition drops the registered coordinator, drives a whole
+	// rebuild with the replacement and registers it only afterwards, and a
+	// report that read the registry there would call a daemon whose build
+	// loops are running one that runs none. Entries are dropped lazily, on the
+	// next read or start for the same checkout.
+	started map[string][]*CheckoutCoordinator
 	// owed holds generations no coordinator is left to retire: the backlog a
 	// dropped one handed over, the commit layers its reuse cache was holding,
 	// and the two slots of a checkout whose route is being withdrawn. The
@@ -186,6 +195,7 @@ func NewCheckoutLifecycle(cfg CheckoutLifecycleConfig) (*CheckoutLifecycle, erro
 		now:              now,
 		leases:           cfg.ViewLeases,
 		coordinators:     map[string]*CheckoutCoordinator{},
+		started:          map[string][]*CheckoutCoordinator{},
 		owed:             map[int64]struct{}{},
 		refViewRetention: cfg.RefViews.withDefaults(),
 		indexBarrier:     cfg.indexBarrier,
@@ -1085,7 +1095,7 @@ func (l *CheckoutLifecycle) Sweep(ctx context.Context) (SweepReport, error) {
 		}
 		l.applyCoordinators(ctx, report)
 	}
-	out.Coordinators = l.liveCoordinators()
+	out.Coordinators = l.liveCoordinators("")
 	out.Retired = l.sweepRetirements(ctx)
 	out.RefViewsRetired = l.sweepRefViewRetention(ctx)
 	recordSweepGauges(out)
@@ -1352,7 +1362,7 @@ func (l *CheckoutLifecycle) buildCoordinator(
 		repoCfg := l.cfgMgr.GetRepoConfig(primary.RepoPrefix)
 		index, watch = repoCfg.Index, repoCfg.Watch
 	}
-	return NewCheckoutCoordinator(CheckoutCoordinatorConfig{
+	coordinator, err := NewCheckoutCoordinator(CheckoutCoordinatorConfig{
 		CheckoutID:   checkout.CheckoutID,
 		CheckoutRoot: checkout.RootPath,
 		FamilyID:     checkout.FamilyID,
@@ -1381,6 +1391,45 @@ func (l *CheckoutLifecycle) buildCoordinator(
 		// long to wait means it for its views too.
 		Debounce: time.Duration(watch.DebounceMs) * time.Millisecond,
 	})
+	if err != nil {
+		return nil, err
+	}
+	// Recorded here rather than at registration: the loop is already running
+	// when the constructor returns, and the transitions register only once the
+	// rebuild they drive with it has landed.
+	l.trackStarted(checkout.CheckoutID, coordinator)
+	return coordinator, nil
+}
+
+// trackStarted records a coordinator whose loop is running, and forgets the
+// ones started earlier for the same checkout that have since stopped.
+func (l *CheckoutLifecycle) trackStarted(checkoutID string, coordinator *CheckoutCoordinator) {
+	l.coordMu.Lock()
+	defer l.coordMu.Unlock()
+	l.started[checkoutID] = append(stillRunning(l.started[checkoutID]), coordinator)
+}
+
+// runningLocked reports whether a coordinator started for one checkout is
+// still looping, and drops the stopped ones. The caller holds coordMu.
+func (l *CheckoutLifecycle) runningLocked(checkoutID string) bool {
+	running := stillRunning(l.started[checkoutID])
+	if len(running) == 0 {
+		delete(l.started, checkoutID)
+		return false
+	}
+	l.started[checkoutID] = running
+	return true
+}
+
+// stillRunning keeps the coordinators whose loop has not returned.
+func stillRunning(coordinators []*CheckoutCoordinator) []*CheckoutCoordinator {
+	out := make([]*CheckoutCoordinator, 0, len(coordinators))
+	for _, coordinator := range coordinators {
+		if coordinator.Running() {
+			out = append(out, coordinator)
+		}
+	}
+	return out
 }
 
 // installCoordinator puts a coordinator in the registry, and reports whether
@@ -1551,11 +1600,40 @@ func (l *CheckoutLifecycle) Close() error {
 	return errors.Join(errs...)
 }
 
-// liveCoordinators counts the coordinators currently running.
-func (l *CheckoutLifecycle) liveCoordinators() int {
+// LiveCoordinators counts the checkouts this process is running a build loop
+// for. An empty familyID counts every family the daemon holds.
+func (l *CheckoutLifecycle) LiveCoordinators(familyID string) int {
+	return l.liveCoordinators(familyID)
+}
+
+// liveCoordinators counts the checkouts whose build loop is running, whether or
+// not the registry holds them yet. An empty familyID counts every family.
+func (l *CheckoutLifecycle) liveCoordinators(familyID string) int {
+	if l == nil {
+		return 0
+	}
 	l.coordMu.Lock()
 	defer l.coordMu.Unlock()
-	return len(l.coordinators)
+	live := make(map[string]struct{}, len(l.coordinators))
+	for checkoutID, coordinator := range l.coordinators {
+		if familyID == "" || coordinator.familyID == familyID {
+			live[checkoutID] = struct{}{}
+		}
+	}
+	for checkoutID, coordinators := range l.started {
+		running := stillRunning(coordinators)
+		if len(running) == 0 {
+			delete(l.started, checkoutID)
+			continue
+		}
+		l.started[checkoutID] = running
+		// Every coordinator started for one checkout carries that checkout's
+		// family, so the first one answers for the whole entry.
+		if familyID == "" || running[0].familyID == familyID {
+			live[checkoutID] = struct{}{}
+		}
+	}
+	return len(live)
 }
 
 // sweepRetirements retries the generations whose retirement was refused when

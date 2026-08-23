@@ -213,6 +213,10 @@ func (s *Server) handleReconcileCheckouts(ctx context.Context, req mcp.CallToolR
 		return s.respondJSONOrTOON(ctx, req, map[string]any{
 			"status":   "reconciled",
 			"families": []map[string]any{renderFamilyReport(report)},
+			// Counted for the family that was asked about, the way the
+			// whole-daemon scope counts every family. Leaving it out renders a
+			// family whose build loops are running as one running none.
+			"coordinators": s.lifecycle.LiveCoordinators(familyID),
 		})
 	}
 

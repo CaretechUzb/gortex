@@ -259,10 +259,17 @@ func (l *CheckoutLifecycle) rehomeCheckout(
 	return nil
 }
 
-// hasCoordinator reports whether one checkout has a live coordinator.
+// hasCoordinator reports whether this process is running one checkout's build
+// loop — the registered coordinator, or the one a transition is driving a
+// rebuild with before it registers anything.
 func (l *CheckoutLifecycle) hasCoordinator(checkoutID string) bool {
+	if l == nil {
+		return false
+	}
 	l.coordMu.Lock()
 	defer l.coordMu.Unlock()
-	_, live := l.coordinators[checkoutID]
-	return live
+	if _, registered := l.coordinators[checkoutID]; registered {
+		return true
+	}
+	return l.runningLocked(checkoutID)
 }

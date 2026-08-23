@@ -345,6 +345,30 @@ func TestReconcileCheckoutsReportsWhatItDecided(t *testing.T) {
 	assert.Equal(t, family.FamilyID, one.Families[0].FamilyID)
 }
 
+// TestReconcileOneFamilyReportsItsLiveCoordinators pins the count the verb
+// renders as "%d coordinators live". A scope that leaves it out of the answer
+// renders a daemon running build loops as one running none.
+func TestReconcileOneFamilyReportsItsLiveCoordinators(t *testing.T) {
+	f := newCheckoutAdminFixture(t)
+	family := f.families(t, map[string]any{}).Families[0]
+
+	var all struct {
+		Coordinators int `json:"coordinators"`
+	}
+	require.NoError(t, json.Unmarshal(
+		callAdminTool(t, f.srv.handleReconcileCheckouts, map[string]any{}), &all))
+	require.Positive(t, all.Coordinators, "the linked worktree runs no coordinator to count")
+
+	var one struct {
+		Coordinators int `json:"coordinators"`
+	}
+	require.NoError(t, json.Unmarshal(
+		callAdminTool(t, f.srv.handleReconcileCheckouts,
+			map[string]any{"family": family.FamilyID}), &one))
+	assert.Equal(t, all.Coordinators, one.Coordinators,
+		"the family holding every live coordinator reports none")
+}
+
 // explainView runs the diagnostic for one path.
 func explainView(t *testing.T, srv *Server, path string) indexer.ViewBinding {
 	t.Helper()

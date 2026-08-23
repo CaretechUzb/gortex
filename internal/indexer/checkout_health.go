@@ -61,7 +61,7 @@ func (l *CheckoutLifecycle) ViewsHealth(ctx context.Context) (ViewsHealth, error
 	if l == nil || l.catalog == nil {
 		return out, errNoCatalog
 	}
-	out.Coordinators = l.liveCoordinators()
+	out.Coordinators = l.liveCoordinators("")
 	out.Leases = l.leases.Held()
 
 	families, err := l.catalog.ListRepositoryFamilies(ctx)
