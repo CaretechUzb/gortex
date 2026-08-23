@@ -122,15 +122,32 @@ const (
 // unconditionally — never conditionally on how it happens to be spelled — so a
 // path that merely looks prefixed cannot be resolved against the wrong file.
 func GraphKey(repoPrefix, path string, domain PathDomain) string {
-	if domain == GraphKeyedPath || repoPrefix == "" {
+	if domain == GraphKeyedPath {
 		return path
 	}
-	// The key is "<prefix>/" + the remainder in the indexing machine's native
-	// separators (see internal/graphpath), so a git path — always '/'-spelled —
-	// is converted on the way in. FromSlash is the identity on POSIX; on
-	// Windows the stored key reads `repo/dirile.go`, and a '/'-joined key
-	// misses every file below the repo root.
-	return repoPrefix + "/" + filepath.FromSlash(path)
+	// A repo-relative path is always converted, prefix or not. The key's shape
+	// is "<prefix>/" + the remainder in the indexing machine's native
+	// separators (see internal/graphpath); with no prefix the remainder IS the
+	// key, and a '/'-spelled git or forge path still misses a key stored with
+	// native separators on Windows. FromSlash is the identity on POSIX.
+	key := filepath.FromSlash(path)
+	if repoPrefix == "" {
+		return key
+	}
+	return repoPrefix + "/" + key
+}
+
+// RepoRelPath is GraphKey's inverse: the repo-relative '/' spelling that
+// CODEOWNERS rules, forge comment APIs and report rows speak. Stripping the
+// prefix is safe here and only here, because a GraphKeyedPath carries it by
+// construction — the same strip applied to a repo-relative path is the
+// prefix-shadow bug.
+func RepoRelPath(repoPrefix, path string, domain PathDomain) string {
+	rel := filepath.ToSlash(path)
+	if domain == GraphKeyedPath && repoPrefix != "" {
+		rel = strings.TrimPrefix(rel, repoPrefix+"/")
+	}
+	return rel
 }
 
 // JoinFileNodes maps one changed-file path to the graph nodes its file

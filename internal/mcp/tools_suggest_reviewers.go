@@ -85,7 +85,13 @@ func (s *Server) handleSuggestReviewers(ctx context.Context, req mcp.CallToolReq
 	codeownerFiles := map[string][]string{}
 	if coFound {
 		for _, f := range changedFiles {
-			owners := codeowners.MatchFile(relForRepo(f, repoRoot), coRules)
+			// CODEOWNERS rules are written against repo-relative paths, and a
+			// root-anchored rule (`/pkg/auth/`) only matches that spelling. In
+			// ids mode the changed files are graph keys, so relForRepo — which
+			// only strips an absolute repo root — would leave the repo prefix
+			// on and silently match nothing.
+			rel := analysis.RepoRelPath(repoPrefix, f, fileDomain)
+			owners := codeowners.MatchFile(relForRepo(rel, repoRoot), coRules)
 			for _, owner := range owners {
 				name := normalizeReviewer(owner)
 				if name == "" {
@@ -93,7 +99,9 @@ func (s *Server) handleSuggestReviewers(ctx context.Context, req mcp.CallToolReq
 				}
 				codeownerCounts[name]++
 				codeownerKinds[name] = classifyReviewer(owner)
-				codeownerFiles[name] = appendUnique(codeownerFiles[name], f)
+				// matched_files is reported to the caller, so it carries the
+				// repo-relative spelling too, not the graph key.
+				codeownerFiles[name] = appendUnique(codeownerFiles[name], rel)
 			}
 		}
 	}

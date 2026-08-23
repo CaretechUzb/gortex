@@ -281,7 +281,11 @@ func TestSuggestReviewers_IdsOnPrefixedGraphKeepsAllSignals(t *testing.T) {
 	}
 	write("pkg/auth/login.go", "package auth\n\nfunc Login() error { return nil }\n")
 	write("pkg/util/util.go", "package util\n\nfunc Helper() error { return nil }\n")
-	write(".github/CODEOWNERS", "pkg/auth/ @org/secteam\n")
+	// Root-anchored on purpose: `/pkg/auth/` matches only the repo-relative
+	// spelling. An unanchored `pkg/auth/` rule would also match
+	// `repo-a/pkg/auth/login.go`, masking a graph-keyed path reaching
+	// CODEOWNERS in ids mode.
+	write(".github/CODEOWNERS", "/pkg/auth/ @org/secteam\n")
 
 	srv, prefix := prefixedServerOver(t, dir, "repo-a")
 	require.Equal(t, "repo-a", prefix)

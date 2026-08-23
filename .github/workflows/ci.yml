@@ -118,7 +118,7 @@ jobs:
       - name: Test native-separator store path comparisons
         run: >
           go test -timeout=10m -count=1
-          -run 'NativeSeparator|MixedSeparator|ImportAdjacency|ParseDiffGitPaths|ParseDiffLinesNewSide|FeedbackDir|ReviewRulepack|PrefixedGraphReportsRulepack|GraphKey|JoinFileNodes|ChangedSymbolsForFiles|PrefixShadow|IdsOnPrefixedGraph|RankFileRisk'
+          -run 'NativeSeparator|MixedSeparator|ImportAdjacency|ParseDiffGitPaths|ParseDiffLinesNewSide|FeedbackDir|ReviewRulepack|PrefixedGraphReportsRulepack|GraphKey|JoinFileNodes|ChangedSymbolsForFiles|PrefixShadow|IdsOnPrefixedGraph|RankFileRisk|PrefixedDeleteAndRename'
           ./internal/analysis ./internal/graph/store_sqlite
           ./internal/mcp ./internal/resolver ./internal/persistence
           ./internal/review

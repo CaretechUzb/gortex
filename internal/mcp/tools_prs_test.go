@@ -25,12 +25,18 @@ import (
 func prToolsTestServer(t *testing.T) (*Server, string) {
 	t.Helper()
 	g := graph.New()
+	// `file` is the forge/git spelling a caller supplies; `stored` is what the
+	// indexer writes, which uses native separators even with no repo prefix.
+	// Hard-coding the '/' form as the graph key describes an index a Windows
+	// daemon never produces, and the join contract then cannot be observed.
 	file := "internal/auth/login.go"
-	hubID := file + "::ValidateToken"
-	g.AddNode(&graph.Node{ID: hubID, Kind: graph.KindFunction, Name: "ValidateToken", FilePath: file, StartLine: 1, EndLine: 10})
+	stored := filepath.FromSlash(file)
+	hubID := stored + "::ValidateToken"
+	g.AddNode(&graph.Node{ID: hubID, Kind: graph.KindFunction, Name: "ValidateToken", FilePath: stored, StartLine: 1, EndLine: 10})
+	callerFile := filepath.FromSlash("pkg/c.go")
 	for i := 0; i < 12; i++ {
-		cid := "pkg/c.go::caller" + strconv.Itoa(i)
-		g.AddNode(&graph.Node{ID: cid, Kind: graph.KindFunction, Name: "caller" + strconv.Itoa(i), FilePath: "pkg/c.go"})
+		cid := callerFile + "::caller" + strconv.Itoa(i)
+		g.AddNode(&graph.Node{ID: cid, Kind: graph.KindFunction, Name: "caller" + strconv.Itoa(i), FilePath: callerFile})
 		g.AddEdge(&graph.Edge{From: cid, To: hubID, Kind: graph.EdgeCalls})
 	}
 	srv := NewServer(query.NewEngine(g), g, nil, nil, zap.NewNop(), nil)
