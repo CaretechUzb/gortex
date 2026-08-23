@@ -392,6 +392,12 @@ func SortEdgesForPage(edges []*graph.Edge) {
 		if a.Confidence != b.Confidence {
 			return a.Confidence > b.Confidence
 		}
+		// Edge.Confidence is excluded from JSON, so rows that crossed a
+		// serialization boundary (federation peers) read zero and carry
+		// only the label — the sortable rank that survives the wire.
+		if ar, br := confidenceLabelRank(a.ConfidenceLabel), confidenceLabelRank(b.ConfidenceLabel); ar != br {
+			return ar > br
+		}
 		if a.FilePath != b.FilePath {
 			return a.FilePath < b.FilePath
 		}
@@ -406,6 +412,21 @@ func SortEdgesForPage(edges []*graph.Edge) {
 		}
 		return a.To < b.To
 	})
+}
+
+// confidenceLabelRank orders the coarse confidence labels
+// (graph.ConfidenceLabelFor) for tie-breaking; unlabeled rows rank
+// lowest.
+func confidenceLabelRank(label string) int {
+	switch label {
+	case "EXTRACTED":
+		return 3
+	case "INFERRED":
+		return 2
+	case "AMBIGUOUS":
+		return 1
+	}
+	return 0
 }
 
 // effectiveOrigin returns the edge's origin tier, backfilled for edges

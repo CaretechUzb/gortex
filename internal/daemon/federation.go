@@ -297,6 +297,23 @@ type subGraphMergeArgs struct {
 	Limit *int   `json:"limit"`
 }
 
+// subGraphArgsFromBody extracts the tool args from the routed request
+// body. Production stdio and streamable MCP dispatch nest them under
+// "arguments" (the same envelope bareNameFromBody reads); a flat body
+// is accepted as a fallback so an internal caller that skips the
+// envelope cannot silently lose its limit.
+func subGraphArgsFromBody(body []byte) subGraphMergeArgs {
+	var env struct {
+		Arguments *subGraphMergeArgs `json:"arguments"`
+	}
+	if err := json.Unmarshal(body, &env); err == nil && env.Arguments != nil {
+		return *env.Arguments
+	}
+	var flat subGraphMergeArgs
+	_ = json.Unmarshal(body, &flat)
+	return flat
+}
+
 // mergeSubGraph merges query.SubGraph responses: nodes deduped by string
 // ID (local wins), edges by (From,To,Kind,FilePath,Line) so distinct
 // call sites of the same pair stay distinct rows. Origins keys each
@@ -340,6 +357,22 @@ func mergeSubGraph(tool string, body, local []byte, remotes []remoteResult) ([]b
 		}
 		totalEdgesFloor = max(totalEdgesFloor, rsg.TotalEdges)
 		totalNodesFloor = max(totalNodesFloor, rsg.TotalNodes)
+		// Remote completeness metadata: a peer's floor makes the merged
+		// result a floor; its epistemic boundaries and caller notes are
+		// evidence about rows now in the merged set.
+		sg.LowerBound = sg.LowerBound || rsg.LowerBound
+		sg.Boundaries = appendBoundaries(sg.Boundaries, rsg.Boundaries)
+		sg.DynamicBoundaries = append(sg.DynamicBoundaries, rsg.DynamicBoundaries...)
+		if len(rsg.CallerNotes) > 0 {
+			if sg.CallerNotes == nil {
+				sg.CallerNotes = make(map[string]*graph.ConcurrencyAnnotation, len(rsg.CallerNotes))
+			}
+			for id, note := range rsg.CallerNotes {
+				if _, exists := sg.CallerNotes[id]; !exists { // local wins
+					sg.CallerNotes[id] = note
+				}
+			}
+		}
 		for _, n := range rsg.Nodes {
 			if n == nil || seen[n.ID] {
 				continue // local wins on collision
@@ -367,9 +400,15 @@ func mergeSubGraph(tool string, body, local []byte, remotes []remoteResult) ([]b
 	sg.TotalNodes = max(totalNodesFloor, len(sg.Nodes))
 	sg.Truncated = anySourceTruncated
 	sg.LowerBound = sg.LowerBound || anySourceTruncated
+	// The summary is a whole-set rollup, so recompute it over the merged
+	// deduplicated rows before any recap — exact when every source was
+	// complete, a floor (with lower_bound set) otherwise. Only attached
+	// where the local response carried one (find_usages).
+	if sg.UsageSummary != nil {
+		sg.UsageSummary = mergedUsageSummary(&sg)
+	}
 
-	var args subGraphMergeArgs
-	_ = json.Unmarshal(body, &args)
+	args := subGraphArgsFromBody(body)
 	limit := 50
 	if args.Limit != nil {
 		limit = *args.Limit
@@ -416,6 +455,64 @@ func mergeSubGraph(tool string, body, local []byte, remotes []remoteResult) ([]b
 		return local, origins
 	}
 	return out, origins
+}
+
+// appendBoundaries appends remote epistemic boundaries, deduplicated by
+// (seed, target, edge kind) and capped at the same 50 the BFS walk
+// applies, so a many-peer merge cannot grow the section without bound.
+func appendBoundaries(dst, src []graph.EpistemicBoundary) []graph.EpistemicBoundary {
+	const boundaryCap = 50
+	seen := make(map[string]bool, len(dst))
+	for _, b := range dst {
+		seen[b.SeedID+"\x00"+b.Target+"\x00"+b.EdgeKind] = true
+	}
+	for _, b := range src {
+		if len(dst) >= boundaryCap {
+			break
+		}
+		k := b.SeedID + "\x00" + b.Target + "\x00" + b.EdgeKind
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		dst = append(dst, b)
+	}
+	return dst
+}
+
+// mergedUsageSummary recomputes the find_usages completeness rollup
+// over the merged rows, mirroring the local usageSummaryOf shape:
+// per-edge file resolution with a from-node fallback, and the shared
+// test classifier on the serialized node stamps (no owner hop — the
+// remote graph is not reachable here, and its stamped rows carry the
+// flag in meta).
+func mergedUsageSummary(sg *query.SubGraph) *query.UsageSummary {
+	if len(sg.Edges) == 0 {
+		return nil
+	}
+	nodeByID := make(map[string]*graph.Node, len(sg.Nodes))
+	for _, n := range sg.Nodes {
+		if n != nil {
+			nodeByID[n.ID] = n
+		}
+	}
+	files := make(map[string]struct{}, len(sg.Edges))
+	testRefs := 0
+	for _, e := range sg.Edges {
+		from := nodeByID[e.From]
+		file := e.FilePath
+		if file == "" && from != nil {
+			file = from.FilePath
+		}
+		if file == "" {
+			file = "(unknown)"
+		}
+		files[file] = struct{}{}
+		if graph.NodeIsTest(nil, from) {
+			testRefs++
+		}
+	}
+	return &query.UsageSummary{NRefs: len(sg.Edges), NFiles: len(files), NTestRefs: testRefs}
 }
 
 // pruneMergedNodes drops nodes (and their origins entries) that the

@@ -2,66 +2,82 @@ package daemon
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 )
 
-// TestFederator_MergeReappliesUsageLimit pins the global row cap: each
-// daemon applies limit:N independently, so the merged find_usages
-// result must be re-capped once after the merge instead of growing to
-// N times the daemon count. The discarded peer tails make the exact
-// deduplicated total unknowable, so the merged totals are explicitly a
-// floor (lower_bound) and the response is marked truncated.
-func TestFederator_MergeReappliesUsageLimit(t *testing.T) {
-	remote := fakeRemote(t, fakeRemoteOpts{indexed: true, toolJSON: `{
-		"nodes":[{"id":"r/a.go::RUse1"},{"id":"r/b.go::RUse2"},{"id":"pkg/hot.go::Hot"}],
-		"edges":[
-			{"from":"r/a.go::RUse1","to":"pkg/hot.go::Hot","kind":"calls","file_path":"r/a.go","line":3},
-			{"from":"r/b.go::RUse2","to":"pkg/hot.go::Hot","kind":"calls","file_path":"r/b.go","line":4}
-		],
-		"total_nodes":3,"total_edges":3,"truncated":true}`})
-	local := envelope(`{
-		"nodes":[{"id":"l/a.go::LUse1"},{"id":"l/b.go::LUse2"},{"id":"pkg/hot.go::Hot"}],
-		"edges":[
-			{"from":"l/a.go::LUse1","to":"pkg/hot.go::Hot","kind":"calls","file_path":"l/a.go","line":5},
-			{"from":"l/b.go::LUse2","to":"pkg/hot.go::Hot","kind":"calls","file_path":"l/b.go","line":6}
-		],
-		"total_nodes":3,"total_edges":4,"truncated":true}`)
-
-	out := testFederator().Augment(context.Background(), "find_usages",
-		[]byte(`{"id":"pkg/hot.go::Hot","limit":2}`),
-		local, []ServerEntry{{Slug: "r2", URL: remote.URL}})
-
-	m := decodeFederated(t, out)
-	edges, _ := m["edges"].([]any)
-	if len(edges) != 2 {
-		t.Fatalf("limit:2 must hold globally after the merge, got %d edges", len(edges))
+// fedUsageBodies builds a local result with nLocal edges and a remote
+// result with nRemote edges (disjoint from-sites, one file per edge),
+// in the shape the daemons actually serialize.
+func fedUsageBodies(nLocal, nRemote int, localTruncated, remoteTruncated bool) (local []byte, remoteJSON string) {
+	rows := func(prefix string, n int) (nodes, edges []string) {
+		nodes = append(nodes, `{"id":"pkg/hot.go::Hot"}`)
+		for i := 0; i < n; i++ {
+			id := fmt.Sprintf("%s/u%02d.go::Use%02d", prefix, i, i)
+			nodes = append(nodes, fmt.Sprintf(`{"id":%q}`, id))
+			edges = append(edges, fmt.Sprintf(
+				`{"from":%q,"to":"pkg/hot.go::Hot","kind":"calls","file_path":"%s/u%02d.go","line":5,"origin":"ast_resolved","confidence_label":"EXTRACTED"}`,
+				id, prefix, i))
+		}
+		return nodes, edges
 	}
-	if m["truncated"] != true {
-		t.Errorf("a re-capped merged result must be truncated")
+	ln, le := rows("l", nLocal)
+	rn, re := rows("r", nRemote)
+	local = envelope(fmt.Sprintf(`{"nodes":[%s],"edges":[%s],"total_nodes":%d,"total_edges":%d,"truncated":%v}`,
+		strings.Join(ln, ","), strings.Join(le, ","), len(ln), nLocal, localTruncated))
+	remoteJSON = fmt.Sprintf(`{"nodes":[%s],"edges":[%s],"total_nodes":%d,"total_edges":%d,"truncated":%v}`,
+		strings.Join(rn, ","), strings.Join(re, ","), len(rn), nRemote, remoteTruncated)
+	return local, remoteJSON
+}
+
+// productionBody is the request shape the stdio and streamable MCP
+// dispatch actually route: tool args nested under "arguments".
+func productionBody(args string) []byte {
+	return []byte(fmt.Sprintf(`{"name":"find_usages","arguments":%s}`, args))
+}
+
+// TestFederator_MergeReappliesUsageLimit_ProductionShape pins the
+// global row cap through the request shape production routes: each
+// daemon applied limit independently, so the merge must re-cap once,
+// reading the limit from the arguments envelope. Covers omitted, 0,
+// explicit small, and greater-than-default limits.
+func TestFederator_MergeReappliesUsageLimit_ProductionShape(t *testing.T) {
+	cases := []struct {
+		name      string
+		args      string
+		nLocal    int
+		nRemote   int
+		wantEdges int
+	}{
+		{"explicit small limit", `{"id":"pkg/hot.go::Hot","limit":2}`, 2, 2, 2},
+		{"omitted limit defaults to 50", `{"id":"pkg/hot.go::Hot"}`, 30, 30, 50},
+		{"limit zero opts out", `{"id":"pkg/hot.go::Hot","limit":0}`, 30, 30, 60},
+		{"limit above row count", `{"id":"pkg/hot.go::Hot","limit":120}`, 30, 30, 60},
 	}
-	if m["lower_bound"] != true {
-		t.Errorf("with peer tails discarded the merged totals are a floor; lower_bound must be set")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			local, remoteJSON := fedUsageBodies(tc.nLocal, tc.nRemote, true, true)
+			remote := fakeRemote(t, fakeRemoteOpts{indexed: true, toolJSON: remoteJSON})
+			out := testFederator().Augment(context.Background(), "find_usages",
+				productionBody(tc.args), local, []ServerEntry{{Slug: "r2", URL: remote.URL}})
+			m := decodeFederated(t, out)
+			edges, _ := m["edges"].([]any)
+			if len(edges) != tc.wantEdges {
+				t.Fatalf("want %d merged edges, got %d", tc.wantEdges, len(edges))
+			}
+		})
 	}
 }
 
 // TestFederator_RemoteOnlyTruncationPropagates pins that a complete
 // local result merged with a truncated remote page cannot claim the
-// merged result is complete: the remote's discarded tail must surface
-// as truncated + lower_bound on the merged response.
+// merged result is complete or its totals exact.
 func TestFederator_RemoteOnlyTruncationPropagates(t *testing.T) {
-	remote := fakeRemote(t, fakeRemoteOpts{indexed: true, toolJSON: `{
-		"nodes":[{"id":"r/a.go::RUse1"}],
-		"edges":[{"from":"r/a.go::RUse1","to":"pkg/hot.go::Hot","kind":"calls","file_path":"r/a.go","line":3}],
-		"total_nodes":1,"total_edges":10,"truncated":true}`})
-	local := envelope(`{
-		"nodes":[{"id":"l/a.go::LUse1"}],
-		"edges":[{"from":"l/a.go::LUse1","to":"pkg/hot.go::Hot","kind":"calls","file_path":"l/a.go","line":5}],
-		"total_nodes":1,"total_edges":1,"truncated":false}`)
-
+	local, remoteJSON := fedUsageBodies(1, 1, false, true)
+	remote := fakeRemote(t, fakeRemoteOpts{indexed: true, toolJSON: remoteJSON})
 	out := testFederator().Augment(context.Background(), "find_usages",
-		[]byte(`{"id":"pkg/hot.go::Hot","limit":50}`),
-		local, []ServerEntry{{Slug: "r2", URL: remote.URL}})
-
+		productionBody(`{"id":"pkg/hot.go::Hot","limit":50}`), local, []ServerEntry{{Slug: "r2", URL: remote.URL}})
 	m := decodeFederated(t, out)
 	if m["truncated"] != true {
 		t.Errorf("remote-only truncation must propagate to the merged result")
@@ -72,8 +88,8 @@ func TestFederator_RemoteOnlyTruncationPropagates(t *testing.T) {
 }
 
 // TestFederator_DistinctCallSitesSurviveMerge pins the merge dedup key:
-// two usages of the same (from, to, kind) at different file/line call
-// sites are distinct rows and must both survive the merge.
+// two usages of the same (from, to, kind) at different lines are
+// distinct rows and must both survive.
 func TestFederator_DistinctCallSitesSurviveMerge(t *testing.T) {
 	remote := fakeRemote(t, fakeRemoteOpts{indexed: true, toolJSON: `{
 		"nodes":[{"id":"l/a.go::LUse1"}],
@@ -83,14 +99,88 @@ func TestFederator_DistinctCallSitesSurviveMerge(t *testing.T) {
 		"nodes":[{"id":"l/a.go::LUse1"}],
 		"edges":[{"from":"l/a.go::LUse1","to":"pkg/hot.go::Hot","kind":"calls","file_path":"l/a.go","line":5}],
 		"total_nodes":1,"total_edges":1,"truncated":false}`)
-
 	out := testFederator().Augment(context.Background(), "find_usages",
-		[]byte(`{"id":"pkg/hot.go::Hot","limit":50}`),
-		local, []ServerEntry{{Slug: "r2", URL: remote.URL}})
-
+		productionBody(`{"id":"pkg/hot.go::Hot","limit":50}`), local, []ServerEntry{{Slug: "r2", URL: remote.URL}})
 	m := decodeFederated(t, out)
 	edges, _ := m["edges"].([]any)
 	if len(edges) != 2 {
 		t.Fatalf("distinct call sites (same from/to/kind, different line) must both survive, got %d", len(edges))
 	}
+}
+
+// TestFederator_MergeRanksByConfidenceLabel pins the sortable rank the
+// federation boundary actually carries: Edge.Confidence is excluded
+// from JSON, so every peer confidence reads zero after unmarshalling
+// and only confidence_label survives. With limit:1, an EXTRACTED row
+// must displace an AMBIGUOUS row of the same origin even when the
+// file/line tie-breakers favor the weaker row.
+func TestFederator_MergeRanksByConfidenceLabel(t *testing.T) {
+	remote := fakeRemote(t, fakeRemoteOpts{indexed: true, toolJSON: `{
+		"nodes":[{"id":"z/strong.go::Strong"}],
+		"edges":[{"from":"z/strong.go::Strong","to":"pkg/hot.go::Hot","kind":"calls","file_path":"z/strong.go","line":9,"origin":"ast_inferred","confidence_label":"EXTRACTED"}],
+		"total_nodes":1,"total_edges":1,"truncated":false}`})
+	local := envelope(`{
+		"nodes":[{"id":"a/weak.go::Weak"}],
+		"edges":[{"from":"a/weak.go::Weak","to":"pkg/hot.go::Hot","kind":"calls","file_path":"a/weak.go","line":5,"origin":"ast_inferred","confidence_label":"AMBIGUOUS"}],
+		"total_nodes":1,"total_edges":1,"truncated":false}`)
+	out := testFederator().Augment(context.Background(), "find_usages",
+		productionBody(`{"id":"pkg/hot.go::Hot","limit":1}`), local, []ServerEntry{{Slug: "r2", URL: remote.URL}})
+	m := decodeFederated(t, out)
+	edges, _ := m["edges"].([]any)
+	if len(edges) != 1 {
+		t.Fatalf("limit:1 must keep exactly one row, got %d", len(edges))
+	}
+	row, _ := edges[0].(map[string]any)
+	if row["from"] != "z/strong.go::Strong" {
+		t.Fatalf("the EXTRACTED row must win the capped slot, got %v", row["from"])
+	}
+}
+
+// TestFederator_RemoteCompletenessMetadataPropagates pins aggregation
+// of the remote completeness fields the merge previously discarded:
+// lower_bound, boundaries, caller notes, and the usage summary.
+func TestFederator_RemoteCompletenessMetadataPropagates(t *testing.T) {
+	t.Run("lower_bound and boundaries on a call chain", func(t *testing.T) {
+		remote := fakeRemote(t, fakeRemoteOpts{indexed: true, toolJSON: `{
+			"nodes":[{"id":"r/a.go::RFn"}],
+			"edges":[],
+			"total_nodes":1,"total_edges":0,"truncated":false,
+			"lower_bound":true,
+			"boundaries":[{"seed_id":"r/a.go::RFn","target":"handler","edge_kind":"calls","reason":"dynamic_dispatch","direction":"callees"}]}`})
+		local := envelope(`{"nodes":[{"id":"l/a.go::LFn"}],"edges":[],"total_nodes":1,"total_edges":0,"truncated":false}`)
+		out := testFederator().Augment(context.Background(), "get_call_chain",
+			productionBody(`{"id":"pkg/hot.go::Hot"}`), local, []ServerEntry{{Slug: "r2", URL: remote.URL}})
+		m := decodeFederated(t, out)
+		if m["lower_bound"] != true {
+			t.Errorf("a remote lower_bound result must not merge into a falsely exhaustive one")
+		}
+		bounds, _ := m["boundaries"].([]any)
+		if len(bounds) != 1 {
+			t.Errorf("remote epistemic boundaries must survive the merge, got %v", m["boundaries"])
+		}
+	})
+	t.Run("caller notes and usage summary", func(t *testing.T) {
+		remote := fakeRemote(t, fakeRemoteOpts{indexed: true, toolJSON: `{
+			"nodes":[{"id":"r/a.go::RUse","meta":{"is_test":true}}],
+			"edges":[{"from":"r/a.go::RUse","to":"pkg/hot.go::Hot","kind":"calls","file_path":"r/a.go","line":3,"confidence_label":"EXTRACTED"}],
+			"total_nodes":1,"total_edges":1,"truncated":false,
+			"caller_notes":{"r/a.go::RUse":{"sync_guarded":true}},
+			"usage_summary":{"n_refs":1,"n_files":1,"n_test_refs":1}}`})
+		local := envelope(`{
+			"nodes":[{"id":"l/a.go::LUse"}],
+			"edges":[{"from":"l/a.go::LUse","to":"pkg/hot.go::Hot","kind":"calls","file_path":"l/a.go","line":5,"confidence_label":"EXTRACTED"}],
+			"total_nodes":1,"total_edges":1,"truncated":false,
+			"usage_summary":{"n_refs":1,"n_files":1,"n_test_refs":0}}`)
+		out := testFederator().Augment(context.Background(), "find_usages",
+			productionBody(`{"id":"pkg/hot.go::Hot","limit":50}`), local, []ServerEntry{{Slug: "r2", URL: remote.URL}})
+		m := decodeFederated(t, out)
+		notes, _ := m["caller_notes"].(map[string]any)
+		if _, ok := notes["r/a.go::RUse"]; !ok {
+			t.Errorf("remote caller notes must survive the merge, got %v", m["caller_notes"])
+		}
+		summary, _ := m["usage_summary"].(map[string]any)
+		if summary["n_refs"] != float64(2) || summary["n_test_refs"] != float64(1) {
+			t.Errorf("the merged summary must describe the merged rows, got %v", m["usage_summary"])
+		}
+	})
 }
