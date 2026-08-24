@@ -14,6 +14,7 @@ import (
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/query"
+	"github.com/zzet/gortex/internal/respbudget"
 )
 
 // federationReadTools is the allowlist of read traversal tools eligible
@@ -133,6 +134,16 @@ func (f *Federator) Augment(ctx context.Context, tool string, body, localResult 
 
 	localTool, wrapped := unwrapToolJSON(localResult)
 
+	// Renderings that cannot round-trip as JSON (compact, gcx, toon,
+	// mermaid, dot) have no merge adapter: fanning out would silently
+	// discard every remote row behind a local-only body. Skip the
+	// fan-out entirely and make the partiality explicit instead —
+	// merging the canonical graph before rendering is the deeper fix,
+	// but until then a labeled local answer beats an unlabeled one.
+	if !json.Valid(localTool) || len(localTool) == 0 || (localTool[0] != '{' && localTool[0] != '[') {
+		return annotateLocalOnlyFormat(localResult, wrapped, len(remotes))
+	}
+
 	results, meta := f.fanOut(ctx, tool, body, remotes)
 
 	merged, origins := f.merge(tool, body, localTool, results)
@@ -157,11 +168,123 @@ func (f *Federator) Augment(ctx context.Context, tool string, body, localResult 
 			len(meta.RemotesFailed), remoteOnlyOrPartial(meta))
 	}
 
+	// The caller's byte/token budget binds the FINAL representation:
+	// each daemon budgeted only its own page, so a multi-peer merge can
+	// overshoot every source's cap combined. Same arithmetic and
+	// truncation meta as the per-daemon budget layer (respbudget), so
+	// a trimmed merge is legible the same way a trimmed page is.
 	mergedWithMeta := attachFederation(merged, meta)
+	mergedWithMeta = budgetMergedJSON(mergedWithMeta, respbudget.EffectiveFromArgs(argsMapFromBody(body)))
 	if !wrapped {
 		return mergedWithMeta
 	}
 	return rewrapToolJSON(localResult, mergedWithMeta)
+}
+
+// budgetMergedJSON applies the caller's effective budget to the merged
+// representation with the same structural trim (and truncation meta)
+// the per-daemon budget layer uses. The generic trim bounds the
+// top-level lists; the federation origins map scales with the node set
+// — a coupling the shape-agnostic trim cannot know — so origins are
+// re-pruned to the surviving nodes and the trim re-run until the
+// result fits or nothing further can shrink.
+func budgetMergedJSON(raw []byte, budget int) []byte {
+	if budget <= 0 || len(raw) <= budget {
+		return raw
+	}
+	var generic map[string]any
+	if err := json.Unmarshal(raw, &generic); err != nil {
+		return raw // non-JSON body: some other layer's contract
+	}
+	for pass := 0; pass < 3; pass++ {
+		trimmed, _ := respbudget.Apply(generic, budget)
+		m, ok := trimmed.(map[string]any)
+		if !ok {
+			break
+		}
+		generic = m
+		pruneOriginsToNodes(generic)
+		out, err := json.Marshal(generic)
+		if err != nil {
+			return raw
+		}
+		if len(out) <= budget {
+			return out
+		}
+	}
+	out, err := json.Marshal(generic)
+	if err != nil {
+		return raw
+	}
+	return out
+}
+
+// pruneOriginsToNodes drops origins entries whose node the budget trim
+// removed — an origin annotates a returned row (attachFederation puts
+// the map at top level, beside the rows), so one keyed to a trimmed
+// node is dead weight against the budget.
+func pruneOriginsToNodes(m map[string]any) {
+	origins, ok := m["origins"].(map[string]any)
+	if !ok {
+		return
+	}
+	keep := make(map[string]bool)
+	if nodes, ok := m["nodes"].([]any); ok {
+		for _, n := range nodes {
+			if nm, ok := n.(map[string]any); ok {
+				if id, ok := nm["id"].(string); ok {
+					keep[id] = true
+				}
+			}
+		}
+	}
+	for id := range origins {
+		if !keep[id] {
+			delete(origins, id)
+		}
+	}
+}
+
+// argsMapFromBody extracts the tool arguments map from the routed
+// request body's production envelope ({"arguments":{...}}, the shape
+// subGraphArgsFromBody and bareNameFromBody parse). Nil when absent.
+func argsMapFromBody(body []byte) map[string]any {
+	var env struct {
+		Arguments map[string]any `json:"arguments"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil {
+		return nil
+	}
+	return env.Arguments
+}
+
+// annotateLocalOnlyFormat appends an explicit local-only note to a
+// non-mergeable-format response as a second content item, leaving the
+// primary rendering byte-for-byte intact. Error results and unwrapped
+// bodies pass through unchanged — an error is already explicit, and a
+// bare body has no envelope to carry the note.
+func annotateLocalOnlyFormat(localResult []byte, wrapped bool, peerCount int) []byte {
+	if !wrapped {
+		return localResult
+	}
+	var m map[string]any
+	if err := json.Unmarshal(localResult, &m); err != nil {
+		return localResult
+	}
+	if m["isError"] == true || m["is_error"] == true {
+		return localResult
+	}
+	content, ok := m["content"].([]any)
+	if !ok {
+		return localResult
+	}
+	note := fmt.Sprintf("note: local results only — %d enabled federation peer(s) were not queried because this response format cannot be merged; use the JSON format for federated results.", peerCount)
+	m["content"] = append(content, map[string]any{"type": "text", "text": note})
+	out, err := json.Marshal(m)
+	if err != nil {
+		return localResult
+	}
+	return out
 }
 
 func remoteOnlyOrPartial(meta FederationMeta) string {
@@ -278,6 +401,12 @@ func (f *Federator) merge(tool string, body, local []byte, remotes []remoteResul
 	sort.Slice(remotes, func(i, j int) bool { return remotes[i].slug < remotes[j].slug })
 	switch tool {
 	case "find_usages", "get_callers", "get_call_chain", "get_dependents":
+		// group_by:"file" renders a grouped shape, not a SubGraph —
+		// round-tripping it through the flat merge would discard every
+		// grouped field and answer with an empty subgraph.
+		if tool == "find_usages" && groupByFileRequested(body) {
+			return mergeGroupedUsages(body, local, remotes)
+		}
 		return mergeSubGraph(tool, body, local, remotes)
 	case "search_symbols":
 		return mergeKeyedList(local, remotes, "results")
@@ -311,6 +440,165 @@ func subGraphArgsFromBody(body []byte) subGraphMergeArgs {
 	return subGraphMergeArgs{}
 }
 
+// groupByFileRequested mirrors the handler's group_by:"file" gate on
+// the routed body, so the merge dispatch and the render agree on when
+// the grouped shape is in play.
+func groupByFileRequested(body []byte) bool {
+	gb, _ := argsMapFromBody(body)["group_by"].(string)
+	return strings.EqualFold(strings.TrimSpace(gb), "file")
+}
+
+// The wire shape of a group_by:"file" find_usages response, as
+// groupUsagesByFile serializes it on every daemon.
+type groupedUsagesWire struct {
+	GroupedBy  string            `json:"grouped_by"`
+	FileCount  int               `json:"file_count"`
+	TotalUses  int               `json:"total_uses"`
+	Groups     []*usageGroupWire `json:"groups"`
+	Truncated  bool              `json:"truncated"`
+	TotalEdges int               `json:"total_edges,omitempty"`
+}
+
+type usageGroupWire struct {
+	File  string         `json:"file"`
+	Count int            `json:"count"`
+	Uses  []usageRowWire `json:"uses"`
+}
+
+type usageRowWire struct {
+	Line        int    `json:"line"`
+	EdgeKind    string `json:"edge_kind"`
+	Context     string `json:"context,omitempty"`
+	ReturnUsage string `json:"return_usage,omitempty"`
+	SymbolID    string `json:"symbol_id,omitempty"`
+	SymbolName  string `json:"symbol_name,omitempty"`
+}
+
+// mergeGroupedUsages merges group_by:"file" find_usages responses
+// group-wise: rows dedupe on (file, line, kind, symbol), counts and
+// totals are recomputed over the union, and the caller's limit is
+// reapplied once, globally, mirroring the flat merge's contract.
+func mergeGroupedUsages(body, local []byte, remotes []remoteResult) ([]byte, map[string]string) {
+	origins := map[string]string{}
+	var lg groupedUsagesWire
+	if err := json.Unmarshal(local, &lg); err != nil || lg.GroupedBy == "" {
+		return local, origins
+	}
+	byFile := make(map[string]*usageGroupWire, len(lg.Groups))
+	order := make([]string, 0, len(lg.Groups))
+	rowSeen := map[string]bool{}
+	rowKey := func(file string, u usageRowWire) string {
+		return file + "\x00" + strconv.Itoa(u.Line) + "\x00" + u.EdgeKind + "\x00" + u.SymbolID
+	}
+	addRows := func(g *usageGroupWire) {
+		dst := byFile[g.File]
+		if dst == nil {
+			dst = &usageGroupWire{File: g.File}
+			byFile[g.File] = dst
+			order = append(order, g.File)
+		}
+		for _, u := range g.Uses {
+			k := rowKey(g.File, u)
+			if rowSeen[k] {
+				continue
+			}
+			rowSeen[k] = true
+			dst.Uses = append(dst.Uses, u)
+		}
+	}
+	for _, g := range lg.Groups {
+		if g != nil {
+			addRows(g)
+		}
+	}
+	// A source that already capped or trimmed its page makes the merged
+	// totals a floor; total_edges falls back to total_uses for sources
+	// that answered complete (they omit the explicit floor).
+	anyTruncated := lg.Truncated || budgetTrimmed(local)
+	totalEdgesFloor := max(lg.TotalEdges, lg.TotalUses)
+	for _, rr := range remotes {
+		var rg groupedUsagesWire
+		if err := json.Unmarshal(rr.toolJSON, &rg); err != nil || rg.GroupedBy == "" {
+			continue
+		}
+		anyTruncated = anyTruncated || rg.Truncated || budgetTrimmed(rr.toolJSON)
+		totalEdgesFloor = max(totalEdgesFloor, max(rg.TotalEdges, rg.TotalUses))
+		for _, g := range rg.Groups {
+			if g != nil {
+				addRows(g)
+			}
+		}
+	}
+	// One deterministic global order before any cut: rows within a
+	// group by (line, kind, symbol), groups by count desc then path —
+	// the same order the local renderer emits.
+	groups := make([]*usageGroupWire, 0, len(order))
+	mergedRows := 0
+	for _, file := range order {
+		g := byFile[file]
+		sort.Slice(g.Uses, func(i, j int) bool {
+			a, b := g.Uses[i], g.Uses[j]
+			if a.Line != b.Line {
+				return a.Line < b.Line
+			}
+			if a.EdgeKind != b.EdgeKind {
+				return a.EdgeKind < b.EdgeKind
+			}
+			return a.SymbolID < b.SymbolID
+		})
+		g.Count = len(g.Uses)
+		mergedRows += g.Count
+		groups = append(groups, g)
+	}
+	sort.Slice(groups, func(i, j int) bool {
+		if groups[i].Count != groups[j].Count {
+			return groups[i].Count > groups[j].Count
+		}
+		return groups[i].File < groups[j].File
+	})
+	totalEdgesFloor = max(totalEdgesFloor, mergedRows)
+
+	args := subGraphArgsFromBody(body)
+	limit := 50
+	if args.Limit != nil {
+		limit = *args.Limit
+	}
+	if limit > 0 && mergedRows > limit {
+		remaining := limit
+		kept := groups[:0]
+		for _, g := range groups {
+			if remaining == 0 {
+				break
+			}
+			if len(g.Uses) > remaining {
+				g.Uses = g.Uses[:remaining]
+				g.Count = remaining
+			}
+			remaining -= g.Count
+			kept = append(kept, g)
+		}
+		groups = kept
+		anyTruncated = true
+		mergedRows = limit
+	}
+
+	out := groupedUsagesWire{
+		GroupedBy: "file",
+		FileCount: len(groups),
+		TotalUses: mergedRows,
+		Groups:    groups,
+		Truncated: anyTruncated,
+	}
+	if anyTruncated {
+		out.TotalEdges = totalEdgesFloor
+	}
+	b, err := json.Marshal(out)
+	if err != nil {
+		return local, origins
+	}
+	return b, origins
+}
+
 // mergeSubGraph merges query.SubGraph responses: nodes deduped by string
 // ID (local wins), edges by (From,To,Kind,FilePath,Line) so distinct
 // call sites of the same pair stay distinct rows. Origins keys each
@@ -328,13 +616,19 @@ func mergeSubGraph(tool string, body, local []byte, remotes []remoteResult) ([]b
 	if err := json.Unmarshal(local, &sg); err != nil {
 		return local, origins
 	}
-	anySourceTruncated := sg.Truncated
+	// A source page the budget layer structurally trimmed is incomplete
+	// even when its own `truncated` flag is false: the trim's
+	// `_truncated_by_budget` marker is a map key, not a SubGraph field,
+	// so it must be read off the raw source bytes before the typed
+	// round trip discards it.
+	anySourceTruncated := sg.Truncated || budgetTrimmed(local)
 	totalEdgesFloor := sg.TotalEdges
 	totalNodesFloor := sg.TotalNodes
 	var sourceSummaries []*query.UsageSummary
 	if sg.UsageSummary != nil {
 		sourceSummaries = append(sourceSummaries, sg.UsageSummary)
 	}
+	var remoteCaveats []*graph.ZeroEdgeCaveat
 	seen := make(map[string]bool, len(sg.Nodes))
 	for _, n := range sg.Nodes {
 		if n != nil {
@@ -353,7 +647,7 @@ func mergeSubGraph(tool string, body, local []byte, remotes []remoteResult) ([]b
 		if err := json.Unmarshal(rr.toolJSON, &rsg); err != nil {
 			continue
 		}
-		if rsg.Truncated {
+		if rsg.Truncated || budgetTrimmed(rr.toolJSON) {
 			anySourceTruncated = true
 		}
 		totalEdgesFloor = max(totalEdgesFloor, rsg.TotalEdges)
@@ -367,6 +661,19 @@ func mergeSubGraph(tool string, body, local []byte, remotes []remoteResult) ([]b
 		if rsg.UsageSummary != nil {
 			sourceSummaries = append(sourceSummaries, rsg.UsageSummary)
 		}
+		// Uncertainty metadata: a peer's caveat, suppression counters,
+		// and tier_filtered marker make the merged answer exactly as
+		// uncertain as that peer's own answer was. Counts floor at the
+		// largest single source — the deduplicated union is unknowable.
+		if rsg.Caveat != nil {
+			remoteCaveats = append(remoteCaveats, rsg.Caveat)
+		}
+		sg.TextMatchedSuppressed = max(sg.TextMatchedSuppressed, rsg.TextMatchedSuppressed)
+		sg.NameOnlyCandidates = max(sg.NameOnlyCandidates, rsg.NameOnlyCandidates)
+		if sg.SuppressionCaveat == "" {
+			sg.SuppressionCaveat = rsg.SuppressionCaveat
+		}
+		sg.TierFiltered = mergeTierFiltered(sg.TierFiltered, rsg.TierFiltered)
 		if len(rsg.CallerNotes) > 0 {
 			if sg.CallerNotes == nil {
 				sg.CallerNotes = make(map[string]*graph.ConcurrencyAnnotation, len(rsg.CallerNotes))
@@ -407,11 +714,20 @@ func mergeSubGraph(tool string, body, local []byte, remotes []remoteResult) ([]b
 	// Merged rows can invalidate the local zero-edge caveat: a symbol
 	// unused locally but used on a peer must not answer "appears unused"
 	// above rows that prove otherwise. Re-judge from the merged edges.
+	// With zero merged rows every source answered empty, and the most
+	// conservative source caveat survives — a local "likely_unused"
+	// must not out-rank a peer's "coverage_incomplete".
 	if len(sg.Edges) > 0 {
 		if graph.WeakUsageEvidenceOnly(sg.Edges) {
 			sg.Caveat = graph.CaveatForWeakUsageEvidence()
 		} else {
 			sg.Caveat = nil
+		}
+	} else {
+		for _, c := range remoteCaveats {
+			if sg.Caveat == nil || graph.ZeroEdgeClassConservatism(c.Class) > graph.ZeroEdgeClassConservatism(sg.Caveat.Class) {
+				sg.Caveat = c
+			}
 		}
 	}
 	// The summary is a whole-set rollup. Recompute it over the merged
@@ -486,6 +802,35 @@ func mergeSubGraph(tool string, body, local []byte, remotes []remoteResult) ([]b
 		return local, origins
 	}
 	return out, origins
+}
+
+// mergeTierFiltered floors the tier_filtered marker across sources:
+// the counter keeps the largest single source's floor and the
+// available tier keeps the strongest tier any source still holds, so
+// a min_tier-emptied peer stays legible as "filtered", never as "no
+// usages on that peer".
+func mergeTierFiltered(local, remote *graph.TierFilteredCaveat) *graph.TierFilteredCaveat {
+	if remote == nil {
+		return local
+	}
+	if local == nil {
+		c := *remote
+		return &c
+	}
+	local.EdgesBelowMinTier = max(local.EdgesBelowMinTier, remote.EdgesBelowMinTier)
+	if graph.OriginRank(remote.MaxAvailableTier) > graph.OriginRank(local.MaxAvailableTier) {
+		local.MaxAvailableTier = remote.MaxAvailableTier
+	}
+	return local
+}
+
+// budgetTrimmed reports whether a source's raw tool JSON carries the
+// budget layer's structural-trim marker (respbudget.TruncatedKey).
+func budgetTrimmed(toolJSON []byte) bool {
+	var probe struct {
+		TruncatedByBudget bool `json:"_truncated_by_budget"`
+	}
+	return json.Unmarshal(toolJSON, &probe) == nil && probe.TruncatedByBudget
 }
 
 // mapNodeGetter serves graph.NodeGetter lookups from the merged node
