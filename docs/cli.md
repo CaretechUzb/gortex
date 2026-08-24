@@ -48,10 +48,15 @@ gortex daemon start --detach --http-addr 127.0.0.1:7411 --log-level debug
                                     # --detach forwards every other flag to the background process,
                                     # so a detached start behaves like the same command without it
 gortex daemon status                # PID, uptime, memory, tracked repos, sessions, server roster, search backend, warmup + enrichment progress
+                                    # Answers while a track / reload / enrichment holds the daemon: the repo
+                                    # table is then the last one computed and the heading says so
+                                    # ("cached 45s ago — a track/reload is in progress"). Everything else —
+                                    # readiness, runtime, the view census — is live either way.
 gortex daemon status --exact        # recount nodes/edges from the store instead of reading the counters the
                                     # indexer maintains, and repair any that have drifted. Proportional to the
                                     # whole corpus — tens of seconds on a large store — so it waits without a
-                                    # timeout. Routine status never scans.
+                                    # timeout, and waits for the busy daemon rather than serving the cached
+                                    # table. Routine status never scans.
 gortex daemon stop                  # graceful shutdown; the graph store is already on disk
 gortex daemon restart               # stop + start
 gortex daemon reload                # re-read the global config AND every tracked repo's .gortex.yaml, pick up new/removed repos

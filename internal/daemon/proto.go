@@ -324,6 +324,23 @@ type StatusResponse struct {
 	// rendering an unasked zero as a real one is the same class of mistake as
 	// reading a timed-out status as "nothing is tracked".
 	CountsUnknown bool `json:"counts_unknown,omitempty"`
+	// AggregateBusy marks a response whose repo table, workspace rollup and
+	// search attribution did not come from this pass: the controller mutex
+	// was held by a long-running track / reload / enrichment for the whole
+	// slice of the budget the aggregate was allowed, so what is reported is
+	// the last pass that did hold it. Everything else — readiness, runtime,
+	// the view census — is live.
+	//
+	// A late-but-marked answer beats a timeout: `daemon status` is how a
+	// user finds out that a track is what the daemon is busy with, so it is
+	// the one call that must survive one. Old clients ignore the field and
+	// see the response they always saw.
+	AggregateBusy bool `json:"aggregate_busy,omitempty"`
+	// AggregateCachedUnix is when the served aggregate was computed. Zero
+	// alongside AggregateBusy means no pass has ever completed one, so the
+	// repo table is empty because it is unknown — not because nothing is
+	// tracked.
+	AggregateCachedUnix int64 `json:"aggregate_cached_unix,omitempty"`
 	// PProfAddr is set when the daemon has opened an HTTP pprof
 	// listener (via the GORTEX_DAEMON_PPROF_ADDR env var). Empty
 	// string means pprof is not enabled on this daemon.

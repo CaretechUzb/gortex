@@ -126,6 +126,15 @@ type realController struct {
 	warmupSeconds atomic.Int64
 	enriched      atomic.Bool
 	enrichSeconds atomic.Int64
+
+	// lastAggregate is the mutex-guarded half of the last status pass that
+	// managed to take mu: the repo table, the workspace rollup and the rest
+	// of what the indexer registry decides. A status caller that cannot get
+	// mu inside its budget serves this instead of timing out — see Status.
+	//
+	// Atomic, deliberately not guarded by mu: the entire point of the cache
+	// is to be readable while a minutes-long track holds mu.
+	lastAggregate atomic.Pointer[statusAggregate]
 }
 
 // Track indexes a new repository and persists it to the global config.
@@ -802,7 +811,7 @@ func (c *realController) StatusExact(ctx context.Context) (daemon.StatusResponse
 				zap.Bool("backend_can_recount", ok),
 				zap.Bool("enriched", c.enriched.Load()))
 		}
-		return c.Status(ctx)
+		return c.status(ctx, true)
 	}
 
 	scanned, err := scanner.ScanRepoMemoryEstimates(ctx)
@@ -819,10 +828,22 @@ func (c *realController) StatusExact(ctx context.Context) (daemon.StatusResponse
 			return daemon.StatusResponse{}, fmt.Errorf("reconcile repo counters: %w", err)
 		}
 	}
-	return c.Status(ctx)
+	return c.status(ctx, true)
 }
 
+// Status answers within the caller's budget even while the controller mutex
+// is held. See status: the aggregate half may be served from the last
+// successful pass, marked as such on the response.
 func (c *realController) Status(ctx context.Context) (daemon.StatusResponse, error) {
+	return c.status(ctx, false)
+}
+
+// status assembles a status response. waitForAggregate distinguishes the two
+// contracts: the routine pass (false) gives the controller mutex a slice of
+// the budget and falls back to the last aggregate it computed, while the
+// exact pass (true) waits for the mutex — a caller that paid for a full
+// recount asked for measured numbers, and a cached table is not that.
+func (c *realController) status(ctx context.Context, waitForAggregate bool) (daemon.StatusResponse, error) {
 	// Bail before doing any work if the caller is already gone. Status sits
 	// on the critical path of `daemon stop`, `gortex call`, and the agent
 	// hooks, all of which now bound the round trip — once their budget has
@@ -887,8 +908,232 @@ func (c *realController) Status(ctx context.Context) (daemon.StatusResponse, err
 		return daemon.StatusResponse{}, err
 	}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	agg, cached, err := c.statusAggregateFor(ctx, waitForAggregate, statusAggregateInput{
+		enriched:        enriched,
+		memEstimates:    memEstimates,
+		wholeStoreNodes: wholeStoreNodes,
+		wholeStoreEdges: wholeStoreEdges,
+		repoMissing:     repoMissing,
+	})
+	if err != nil {
+		return daemon.StatusResponse{}, err
+	}
+
+	// Reconcile the live indexer registry against the tracked-repo registry
+	// in the global config, so `daemon status` and `gortex repos` report one
+	// inventory instead of two that can drift apart (#312). A repo whose
+	// directory was deleted while the daemon was down fails startup indexing
+	// and never reaches AllMetadata — it would silently vanish from this
+	// response while `gortex repos`, which reads the config, kept listing it.
+	// Synthesised rows carry zero counts and are appended AFTER the workspace
+	// rollup, which summarises indexed content only.
+	//
+	// Both inputs were read without the controller mutex, so this half still
+	// answers on a pass that had to serve a cached aggregate: a daemon in its
+	// first track reports the repos it is about to index rather than none.
+	// The copy keeps the cached slice immutable — it is shared by every
+	// subsequent busy pass.
+	tracked := append([]daemon.TrackedRepoStatus(nil), agg.tracked...)
+	tracked = append(tracked, reconcileUnloadedRepos(configRepos, repoMissing, agg.tracked)...)
+
+	// mem was sampled before the mutex was taken — see the note at the top
+	// of status.
+
+	resp := daemon.StatusResponse{
+		TrackedRepos:   tracked,
+		MemoryBytes:    mem.Alloc,
+		SearchBackend:  agg.searchBackend,
+		TrigramCache:   trigramCacheForResponse(),
+		GraphIntegrity: daemon.GraphIntegrityStatusFor(g),
+		Runtime: daemon.RuntimeStats{
+			Alloc:        mem.Alloc,
+			Sys:          mem.Sys,
+			HeapInuse:    mem.HeapInuse,
+			HeapIdle:     mem.HeapIdle,
+			HeapReleased: mem.HeapReleased,
+			StackInuse:   mem.StackInuse,
+			NumGC:        mem.NumGC,
+			NumGoroutine: runtime.NumGoroutine(),
+		},
+		PProfAddr:          daemonPProfAddr(),
+		Ready:              c.ready.Load(),
+		WarmupSeconds:      c.warmupSeconds.Load(),
+		EnrichmentComplete: enriched,
+		EnrichSeconds:      c.enrichSeconds.Load(),
+		Workspaces:         agg.workspaces,
+		ConfiguredServers:  agg.configuredServers,
+		LocalServerSlug:    agg.localServerSlug,
+		LSPRouter:          agg.lspRouter,
+		Enrichment:         agg.enrichment,
+		Views:              views,
+		ToolPreset:         agg.toolPreset,
+		ToolPresetMode:     agg.toolPresetMode,
+		LearnedTools:       agg.learnedTools,
+	}
+	if cached {
+		// Say which half is a snapshot. Without the marker a stale repo
+		// table is indistinguishable from a current one, and an empty one
+		// reads as "nothing is tracked" rather than "not computed yet".
+		resp.AggregateBusy = true
+		if !agg.takenAt.IsZero() {
+			resp.AggregateCachedUnix = agg.takenAt.Unix()
+		}
+	}
+	return resp, nil
+	// MCPSessions is populated by the daemon Server (it owns the
+	// SessionRegistry — the controller doesn't have a back-pointer).
+	// See internal/daemon/server.go around the ControlStatus handler.
+}
+
+// statusAggregate is the half of a status response that only the controller
+// mutex can produce: the per-repo table and everything derived from the
+// indexer registry behind it. Status caches the last one it managed to
+// compute, so a caller arriving while a track holds the mutex gets that
+// instead of a timeout.
+//
+// Treat a stored aggregate as immutable — every busy pass shares the one
+// pointer, so a reader that appends to its slices corrupts the next answer.
+type statusAggregate struct {
+	takenAt           time.Time
+	tracked           []daemon.TrackedRepoStatus
+	workspaces        []daemon.WorkspaceSummary
+	searchBackend     daemon.SearchBackendStats
+	configuredServers []daemon.ConfiguredServerStatus
+	localServerSlug   string
+	lspRouter         *daemon.LSPRouterStatus
+	enrichment        *daemon.EnrichmentProgress
+	toolPreset        string
+	toolPresetMode    string
+	learnedTools      int
+}
+
+// statusAggregateInput carries the lock-free half of the computation into the
+// aggregate pass: the corpus-wide estimates and the repo-path liveness map are
+// deliberately gathered before the mutex is taken (see status).
+type statusAggregateInput struct {
+	enriched        bool
+	memEstimates    map[string]graph.RepoMemoryEstimate
+	wholeStoreNodes int
+	wholeStoreEdges int
+	repoMissing     map[string]bool
+}
+
+// statusLockPoll is how often a status caller retries the controller mutex
+// while it waits for it. sync.Mutex has no context-aware acquire, so the wait
+// is a poll: fine-grained enough to pick the mutex up as soon as a track
+// releases it, coarse enough to cost nothing over a whole budget.
+const statusLockPoll = 5 * time.Millisecond
+
+// statusLockWait caps how long the routine status pass waits for the mutex
+// before serving its last aggregate. A mutex that has not come free in this
+// long is held by something long — a track, a reload, an enrichment — and
+// every further second of waiting trades the caller's whole budget for a
+// shrinking chance at a fresh repo table.
+const statusLockWait = 2 * time.Second
+
+// statusLockReserve is the slice of the caller's remaining budget kept back
+// from the wait. The daemon abandons a control handler the instant its budget
+// expires (Server.handleControlBounded), so a wait that runs to the deadline
+// produces exactly the timeout it was meant to prevent.
+const statusLockReserve = 250 * time.Millisecond
+
+// statusAggregateFor produces the mutex-guarded half of a status response,
+// reporting whether it had to be served from the last successful pass.
+//
+// wait is the StatusExact contract: hold out for the mutex until the caller's
+// context ends, and report that expiry rather than substituting a snapshot.
+func (c *realController) statusAggregateFor(ctx context.Context, wait bool, in statusAggregateInput) (*statusAggregate, bool, error) {
+	if wait {
+		if err := lockContext(ctx, &c.mu, 0); err != nil {
+			return nil, false, err
+		}
+		return c.storeStatusAggregate(in), false, nil
+	}
+
+	budget := statusLockWait
+	if deadline, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(deadline) - statusLockReserve; remaining < budget {
+			budget = remaining
+		}
+	}
+	switch {
+	case budget <= 0:
+		// Not enough budget left to wait in: the answer has to be assembled
+		// now. One attempt still catches a free mutex.
+		if c.mu.TryLock() {
+			return c.storeStatusAggregate(in), false, nil
+		}
+	default:
+		if err := lockContext(ctx, &c.mu, budget); err == nil {
+			return c.storeStatusAggregate(in), false, nil
+		}
+	}
+
+	// The mutex is held by a long operation. Everything else in the response
+	// is live; this half is the last one that was computable. A daemon that
+	// has never finished a pass has none, and reports an empty aggregate
+	// under the same marker — status must degrade, never fail, or the one
+	// call that explains a busy daemon is the one the busy daemon eats.
+	if agg := c.lastAggregate.Load(); agg != nil {
+		return agg, true, nil
+	}
+	return &statusAggregate{}, true, nil
+}
+
+// storeStatusAggregate computes the aggregate under the already-held mutex,
+// publishes it as the new last-good snapshot, and releases the mutex.
+func (c *realController) storeStatusAggregate(in statusAggregateInput) *statusAggregate {
+	agg := c.buildStatusAggregate(in)
+	// Publish before releasing, so mu orders the stores: a pass descheduled
+	// between building and publishing cannot overwrite a newer snapshot with
+	// its own older one.
+	c.lastAggregate.Store(agg)
+	c.mu.Unlock()
+	return agg
+}
+
+// lockContext acquires mu without letting the caller's budget expire in the
+// queue. budget caps the wait when positive; the context bounds it either way.
+//
+// sync.Mutex cannot be acquired against a context, so this polls TryLock. A
+// caller with nothing that can end its wait blocks outright instead: waiting
+// is what it asked for, and it is cheaper than spinning for the length of a
+// track.
+func lockContext(ctx context.Context, mu *sync.Mutex, budget time.Duration) error {
+	if mu.TryLock() {
+		return nil
+	}
+	if ctx.Done() == nil && budget <= 0 {
+		mu.Lock()
+		return nil
+	}
+	if budget > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, budget)
+		defer cancel()
+	}
+	ticker := time.NewTicker(statusLockPoll)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if mu.TryLock() {
+				return nil
+			}
+		}
+	}
+}
+
+// buildStatusAggregate assembles the per-repo table and its rollups. Callers
+// must hold c.mu: it reads the indexer registry that track / untrack / reload
+// mutate.
+func (c *realController) buildStatusAggregate(in statusAggregateInput) *statusAggregate {
+	enriched := in.enriched
+	memEstimates := in.memEstimates
+	repoMissing := in.repoMissing
+	wholeStoreNodes, wholeStoreEdges := in.wholeStoreNodes, in.wholeStoreEdges
 
 	var (
 		tracked                  []daemon.TrackedRepoStatus
@@ -1081,54 +1326,20 @@ func (c *realController) Status(ctx context.Context) (daemon.StatusResponse, err
 		workspaces = append(workspaces, *wsAgg[k])
 	}
 
-	// Reconcile the live indexer registry against the tracked-repo registry
-	// in the global config, so `daemon status` and `gortex repos` report one
-	// inventory instead of two that can drift apart (#312). A repo whose
-	// directory was deleted while the daemon was down fails startup indexing
-	// and never reaches AllMetadata — it would silently vanish from this
-	// response while `gortex repos`, which reads the config, kept listing it.
-	// Synthesised rows carry zero counts and are appended AFTER the workspace
-	// rollup above, which summarises indexed content only.
-	tracked = append(tracked, reconcileUnloadedRepos(configRepos, repoMissing, tracked)...)
-
-	// mem was sampled before the mutex was taken — see the note at the top
-	// of Status.
-
-	resp := daemon.StatusResponse{
-		TrackedRepos:   tracked,
-		MemoryBytes:    mem.Alloc,
-		SearchBackend:  searchBackendForResponse,
-		TrigramCache:   trigramCacheForResponse(),
-		GraphIntegrity: daemon.GraphIntegrityStatusFor(g),
-		Runtime: daemon.RuntimeStats{
-			Alloc:        mem.Alloc,
-			Sys:          mem.Sys,
-			HeapInuse:    mem.HeapInuse,
-			HeapIdle:     mem.HeapIdle,
-			HeapReleased: mem.HeapReleased,
-			StackInuse:   mem.StackInuse,
-			NumGC:        mem.NumGC,
-			NumGoroutine: runtime.NumGoroutine(),
-		},
-		PProfAddr:          daemonPProfAddr(),
-		Ready:              c.ready.Load(),
-		WarmupSeconds:      c.warmupSeconds.Load(),
-		EnrichmentComplete: enriched,
-		EnrichSeconds:      c.enrichSeconds.Load(),
-		Workspaces:         workspaces,
-		ConfiguredServers:  c.collectConfiguredServers(),
-		LocalServerSlug:    c.localServerSlug(),
-		LSPRouter:          c.collectLSPRouterStatus(),
-		Enrichment:         c.collectEnrichmentProgress(),
-		Views:              views,
+	agg := &statusAggregate{
+		takenAt:           time.Now(),
+		tracked:           tracked,
+		workspaces:        workspaces,
+		searchBackend:     searchBackendForResponse,
+		configuredServers: c.collectConfiguredServers(),
+		localServerSlug:   c.localServerSlug(),
+		lspRouter:         c.collectLSPRouterStatus(),
+		enrichment:        c.collectEnrichmentProgress(),
 	}
 	if c.toolSurface != nil {
-		resp.ToolPreset, resp.ToolPresetMode, resp.LearnedTools = c.toolSurface()
+		agg.toolPreset, agg.toolPresetMode, agg.learnedTools = c.toolSurface()
 	}
-	return resp, nil
-	// MCPSessions is populated by the daemon Server (it owns the
-	// SessionRegistry — the controller doesn't have a back-pointer).
-	// See internal/daemon/server.go around the ControlStatus handler.
+	return agg
 }
 
 // trackedRepoLiveness snapshots the configured repo registry and stats

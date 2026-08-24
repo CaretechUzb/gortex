@@ -1502,8 +1502,16 @@ func formatEnrichmentProgress(e *daemon.EnrichmentProgress) string {
 // process-total memory and the sum of attributed per-repo memory —
 // embedder model weights, runtime heap headroom, semantic caches, etc.
 func renderDaemonRepos(w io.Writer, st daemon.StatusResponse) {
+	// A daemon that could not take its own controller mutex inside the
+	// request budget answers from the last table it computed. The heading
+	// carries that caveat: an unmarked snapshot is indistinguishable from
+	// the current inventory.
+	suffix := daemonAggregateSuffix(st, time.Now())
 	if len(st.TrackedRepos) == 0 {
-		fmt.Fprintln(w, "\ntracked repos: (none)")
+		if suffix == "" {
+			suffix = " (none)"
+		}
+		fmt.Fprintln(w, "\ntracked repos:"+suffix)
 		return
 	}
 
@@ -1513,7 +1521,7 @@ func renderDaemonRepos(w io.Writer, st daemon.StatusResponse) {
 		return rows[i].Memory.TotalBytes > rows[j].Memory.TotalBytes
 	})
 
-	fmt.Fprintln(w, "\ntracked repos:")
+	fmt.Fprintln(w, "\ntracked repos:"+suffix)
 	t := table.NewWriter()
 	t.SetOutputMirror(w)
 	t.SetStyle(table.StyleLight)
@@ -1917,6 +1925,29 @@ func tailLines(f io.Reader, n int) ([]string, error) {
 		out = out[len(out)-n:]
 	}
 	return out, nil
+}
+
+// daemonAggregateSuffix qualifies the repo-table heading when the daemon
+// served the aggregate half of its status from an earlier pass — the mutex
+// that guards it was held by a track / reload / enrichment for the whole
+// slice of the budget the wait was allowed. Empty for the ordinary case, so
+// an uncontended status prints exactly what it has always printed.
+func daemonAggregateSuffix(st daemon.StatusResponse, now time.Time) string {
+	if !st.AggregateBusy {
+		return ""
+	}
+	if st.AggregateCachedUnix <= 0 {
+		// No pass has ever computed one. Any rows below came from the
+		// tracked-repo registry, which is read without the mutex, so the
+		// caveat is the counts rather than the table.
+		return " (counts not computed — a track/reload is in progress)"
+	}
+	age := now.Sub(time.Unix(st.AggregateCachedUnix, 0))
+	if age < 0 {
+		age = 0 // clock skew must not print a negative age
+	}
+	return fmt.Sprintf(" (cached %s ago — a track/reload is in progress)",
+		formatDuration(age.Round(time.Second)))
 }
 
 func formatDuration(d time.Duration) string {
