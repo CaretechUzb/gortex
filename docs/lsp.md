@@ -189,6 +189,39 @@ The router therefore requires an absolute, existing directory and
 rejects anything else before spawning. `gortex daemon --detach` can be
 started from anywhere; no repo needs to be the daemon's cwd.
 
+### Checkout workspaces
+
+A routed checkout — a linked worktree served from its family's shared lane
+(see [multi-repo.md](multi-repo.md#checkout-families-and-worktree-views)) — runs
+its own enrichment stage against its own root when its working-tree layer is
+built. Those servers are additional to the ones the tracked repositories keep
+warm, since a worktree is a second copy of a repository that already has one, so
+they are capped separately:
+
+```yaml
+semantic:
+  checkout_lsp: on               # "" / "on" run the stage (default), "off" switches it off
+  checkout_lsp_max_workspaces: 4 # (language, checkout root) pairs holding a server at once
+```
+
+`checkout_lsp` is a tri-state: anything but an explicit `off` runs the stage, so
+a config written before the knob existed keeps the shipped default.
+`checkout_lsp_max_workspaces` is a global cap across every checkout of every
+family; zero takes the built-in 4. It is the cap, not the switch, that bounds
+the cost — set `checkout_lsp: off` to disable the stage rather than setting the
+cap to zero.
+
+A pair the cap cannot admit is refused, not queued: a build that waits for a
+server slot is a checkout whose view stops moving. The starved languages leave
+the generation's language-server capabilities `incomplete` (and `off` leaves
+them `disabled_by_config`), so a query through that view reports the shortfall
+— on the response's `degraded_capabilities`, or as a typed refusal when the
+caller required it ([mcp.md](mcp.md#capability-arguments)) — instead of
+answering thinly and looking complete doing it. The next working-tree build
+over that checkout runs the stage again. A pair a pass is currently holding is
+never the eviction victim; otherwise the least-recently-acquired pair loses its
+slot and its servers are stopped.
+
 ## Enrichment cost model
 
 The resolution path (use 1 at the top of this page) runs as a batch
