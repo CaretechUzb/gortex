@@ -143,7 +143,8 @@ func (f *Federator) Augment(ctx context.Context, tool string, body, localResult 
 	// but until then a labeled local answer beats an unlabeled one.
 	probe := bytes.TrimLeft(localTool, " \t\r\n")
 	if len(probe) == 0 || (probe[0] != '{' && probe[0] != '[') || !json.Valid(probe) {
-		return annotateLocalOnlyFormat(localResult, wrapped, len(remotes))
+		return annotateLocalOnlyFormat(localResult, wrapped, len(remotes),
+			respbudget.EffectiveFromArgs(argsMapFromBody(body)))
 	}
 
 	results, meta := f.fanOut(ctx, tool, body, remotes)
@@ -278,12 +279,83 @@ func argsMapFromBody(body []byte) map[string]any {
 	return env.Arguments
 }
 
+// localOnlyNote is the visible signal that a non-mergeable-format
+// response is local-only. One definition, because its byte length is
+// load-bearing twice: ReserveLocalNoteBudget subtracts it from the
+// budget forwarded to the local handler, and annotateLocalOnlyFormat
+// fits it into what that handler left.
+func localOnlyNote(peerCount int) string {
+	return fmt.Sprintf("note: local results only — %d enabled federation peer(s) were not queried because this response format cannot be merged; use the JSON format for federated results.", peerCount)
+}
+
+// nonMergeableFormatRequested mirrors the format routing the local
+// handler will take, from the request args alone: these renderings
+// cannot round-trip as JSON, so their federation path is the local-only
+// note. A session-DEFAULT toon/gcx rendering is invisible here — that
+// request gets no reservation and falls back to the fit-or-drop rule
+// in annotateLocalOnlyFormat.
+func nonMergeableFormatRequested(args map[string]any) bool {
+	if compact, _ := args["compact"].(bool); compact {
+		return true
+	}
+	switch f, _ := args["format"].(string); strings.ToLower(strings.TrimSpace(f)) {
+	case "compact", "gcx", "toon", "mermaid", "dot":
+		return true
+	}
+	return false
+}
+
+// ReserveLocalNoteBudget rewrites a to-be-dispatched local request so
+// the local handler leaves headroom for the local-only note: the
+// caller's effective cap minus the note's size, injected as max_bytes
+// (min-merged by the handler with any caller axis, so it binds on
+// both). Reserve-first is the token-budget decoration's rule — the
+// note must never be the bytes that break the cap, and dropping it
+// instead would silence the only "peers were not queried" signal on
+// exactly the saturating responses. Requests that keep the JSON merge
+// path, opt out of budgeting, or cap below the note's own size pass
+// through untouched.
+func (f *Federator) ReserveLocalNoteBudget(tool string, body []byte, peerCount int) []byte {
+	if !federationReadTools[tool] || IsEffectful(tool) || peerCount == 0 {
+		return body
+	}
+	var env map[string]any
+	if err := json.Unmarshal(body, &env); err != nil {
+		return body
+	}
+	args, _ := env["arguments"].(map[string]any)
+	if !nonMergeableFormatRequested(args) {
+		return body
+	}
+	budget := respbudget.EffectiveFromArgs(args)
+	reserve := len(localOnlyNote(peerCount))
+	if budget <= 0 || budget <= reserve {
+		return body
+	}
+	// The reserved cap min-merges below any caller token axis, so it
+	// binds regardless of which axis was the tighter one.
+	args["max_bytes"] = budget - reserve
+	env["arguments"] = args
+	out, err := json.Marshal(env)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
 // annotateLocalOnlyFormat appends an explicit local-only note to a
 // non-mergeable-format response as a second content item, leaving the
 // primary rendering byte-for-byte intact. Error results and unwrapped
 // bodies pass through unchanged — an error is already explicit, and a
 // bare body has no envelope to carry the note.
-func annotateLocalOnlyFormat(localResult []byte, wrapped bool, peerCount int) []byte {
+//
+// The caller's byte/token budget binds the COMPLETE response.
+// ReserveLocalNoteBudget normally pre-shrank the local rendering so
+// the note has room by construction; when it could not (session-
+// default formats, caps below the note's own size), a note that
+// does not fit the remaining headroom is dropped — never the bytes
+// that push the response past the cap it was budgeted to.
+func annotateLocalOnlyFormat(localResult []byte, wrapped bool, peerCount, budget int) []byte {
 	if !wrapped {
 		return localResult
 	}
@@ -298,7 +370,20 @@ func annotateLocalOnlyFormat(localResult []byte, wrapped bool, peerCount int) []
 	if !ok {
 		return localResult
 	}
-	note := fmt.Sprintf("note: local results only — %d enabled federation peer(s) were not queried because this response format cannot be merged; use the JSON format for federated results.", peerCount)
+	note := localOnlyNote(peerCount)
+	if budget > 0 {
+		spent := 0
+		for _, c := range content {
+			if cm, ok := c.(map[string]any); ok {
+				if text, ok := cm["text"].(string); ok {
+					spent += len(text)
+				}
+			}
+		}
+		if spent+len(note) > budget {
+			return localResult
+		}
+	}
 	m["content"] = append(content, map[string]any{"type": "text", "text": note})
 	out, err := json.Marshal(m)
 	if err != nil {
@@ -551,6 +636,10 @@ func mergeGroupedUsages(body, local []byte, remotes []remoteResult) ([]byte, map
 	groups := make([]*query.UsageFileGroup, 0, len(byFile))
 	mergedRows := 0
 	for _, g := range byFile {
+		// The comparator is a total order over every field of the dedup
+		// identity (line, kind, symbol, name, context): two rows the
+		// dedup keeps apart must never compare equal, or the limit cut
+		// below picks its survivor by source arrival order.
 		sort.Slice(g.Uses, func(i, j int) bool {
 			a, b := g.Uses[i], g.Uses[j]
 			if a.Line != b.Line {
@@ -562,7 +651,10 @@ func mergeGroupedUsages(body, local []byte, remotes []remoteResult) ([]byte, map
 			if a.SymbolID != b.SymbolID {
 				return a.SymbolID < b.SymbolID
 			}
-			return a.SymbolName < b.SymbolName
+			if a.SymbolName != b.SymbolName {
+				return a.SymbolName < b.SymbolName
+			}
+			return a.Context < b.Context
 		})
 		g.Count = len(g.Uses)
 		mergedRows += g.Count
@@ -671,7 +763,22 @@ func mergeSubGraph(tool string, body, local []byte, remotes []remoteResult) ([]b
 	if sg.UsageSummary != nil {
 		sourceSummaries = append(sourceSummaries, sg.UsageSummary)
 	}
-	var remoteCaveats []*graph.ZeroEdgeCaveat
+	// Zero-edge caveats are judged per SOURCE, each tagged with whether
+	// that source resolved the queried node — the gate below needs the
+	// distinction in both orientations, local and remote alike.
+	type sourceCaveat struct {
+		caveat   *graph.ZeroEdgeCaveat
+		resolved bool
+	}
+	// Read the local orientation BEFORE the merge loop: sg.Nodes gains
+	// remote rows below, after which this containment check would read
+	// "anyone resolved".
+	localResolved := nodeListContains(sg.Nodes, args.ID)
+	depthUnknown := false
+	var caveats []sourceCaveat
+	if sg.Caveat != nil {
+		caveats = append(caveats, sourceCaveat{sg.Caveat, localResolved})
+	}
 	seen := make(map[string]bool, len(sg.Nodes))
 	for _, n := range sg.Nodes {
 		if n != nil {
@@ -701,6 +808,21 @@ func mergeSubGraph(tool string, body, local []byte, remotes []remoteResult) ([]b
 		sg.LowerBound = sg.LowerBound || rsg.LowerBound
 		sg.Boundaries = appendBoundaries(sg.Boundaries, rsg.Boundaries)
 		sg.DynamicBoundaries = appendDynamicBoundaries(sg.DynamicBoundaries, rsg.DynamicBoundaries)
+		// Budgeted-walk and freshness metadata: any source's early stop
+		// makes the merged result at least as incomplete, the merged
+		// depth guarantee is the weakest source's — unknowable when a
+		// source stopped on budget without reporting how deep it got —
+		// and the merged freshness is the stalest source's.
+		sg.BudgetHit = sg.BudgetHit || rsg.BudgetHit
+		if rsg.BudgetHit && rsg.StoppedAtDepth == 0 {
+			depthUnknown = true
+		}
+		if rsg.StoppedAtDepth > 0 && (sg.StoppedAtDepth == 0 || rsg.StoppedAtDepth < sg.StoppedAtDepth) {
+			sg.StoppedAtDepth = rsg.StoppedAtDepth
+		}
+		if rsg.LastSynced != nil && (sg.LastSynced == nil || rsg.LastSynced.Before(*sg.LastSynced)) {
+			sg.LastSynced = rsg.LastSynced
+		}
 		if rsg.UsageSummary != nil {
 			sourceSummaries = append(sourceSummaries, rsg.UsageSummary)
 		}
@@ -709,14 +831,7 @@ func mergeSubGraph(tool string, body, local []byte, remotes []remoteResult) ([]b
 		// uncertain as that peer's own answer was. Counts floor at the
 		// largest single source — the deduplicated union is unknowable.
 		if rsg.Caveat != nil {
-			// A peer that resolved nothing has no evidence about the
-			// symbol: its extraction-gap caveat describes its own graph,
-			// not the union, and must not displace a classification from
-			// a daemon that resolved the node.
-			gap := rsg.Caveat.Class == graph.ZeroEdgePossibleExtractionGap
-			if !gap || nodeListContains(rsg.Nodes, args.ID) {
-				remoteCaveats = append(remoteCaveats, rsg.Caveat)
-			}
+			caveats = append(caveats, sourceCaveat{rsg.Caveat, nodeListContains(rsg.Nodes, args.ID)})
 		}
 		sg.TextMatchedSuppressed = max(sg.TextMatchedSuppressed, rsg.TextMatchedSuppressed)
 		sg.NameOnlyCandidates = max(sg.NameOnlyCandidates, rsg.NameOnlyCandidates)
@@ -754,6 +869,9 @@ func mergeSubGraph(tool string, body, local []byte, remotes []remoteResult) ([]b
 			sg.Edges = append(sg.Edges, e)
 		}
 	}
+	if depthUnknown {
+		sg.StoppedAtDepth = 0
+	}
 	// Totals: exact deduplicated counts when every source was complete;
 	// otherwise the best available floor — never smaller than any single
 	// source's own full count or the merged set itself.
@@ -766,23 +884,46 @@ func mergeSubGraph(tool string, body, local []byte, remotes []remoteResult) ([]b
 	// above rows that prove otherwise. Re-judge from the merged edges.
 	// With zero merged rows every source answered empty, and the most
 	// conservative source caveat survives — a local "likely_unused"
-	// must not out-rank a peer's "coverage_incomplete".
+	// must not out-rank a peer's "coverage_incomplete". Two gates,
+	// applied to local and remote sources alike, with the class
+	// semantics owned by the graph package beside the class producer:
+	//
+	//   - A source that resolved nothing answers an own-graph-only
+	//     caveat about its own graph, not the union: it cannot
+	//     displace a CLASSIFICATION from a source that resolved the
+	//     node. A resolving source that carried no caveat classified
+	//     nothing, so it displaces nothing — without a resolving
+	//     classification the gap caveat is the honest answer and
+	//     survives, never a bare, confident "0 usages".
+	//   - A tier_filtered marker suppresses only the classes it
+	//     refutes: it names edges that exist below the requested tier.
+	//     A different source's coverage UNCERTAINTY rides alongside
+	//     the merged filter marker. (Within one response the handler
+	//     keeps the markers exclusive; cross-source they are
+	//     independent.)
 	if len(sg.Edges) > 0 {
 		if graph.WeakUsageEvidenceOnly(sg.Edges) {
 			sg.Caveat = graph.CaveatForWeakUsageEvidence()
 		} else {
 			sg.Caveat = nil
 		}
-	} else if sg.TierFiltered != nil {
-		// A tier_filtered emptiness already explains itself — the
-		// handler contract keeps the two markers exclusive, and a
-		// zero-edge caveat on top would assert a second, contradictory
-		// reason for the same empty page.
-		sg.Caveat = nil
 	} else {
-		for _, c := range remoteCaveats {
-			if sg.Caveat == nil || graph.ZeroEdgeClassConservatism(c.Class) > graph.ZeroEdgeClassConservatism(sg.Caveat.Class) {
-				sg.Caveat = c
+		resolvedClassified := false
+		for _, sc := range caveats {
+			if sc.resolved {
+				resolvedClassified = true
+			}
+		}
+		sg.Caveat = nil
+		for _, sc := range caveats {
+			if graph.ZeroEdgeClassDescribesOwnGraphOnly(sc.caveat.Class) && !sc.resolved && resolvedClassified {
+				continue
+			}
+			if sg.TierFiltered != nil && graph.ZeroEdgeClassRefutedByTierFilter(sc.caveat.Class) {
+				continue
+			}
+			if sg.Caveat == nil || graph.ZeroEdgeClassConservatism(sc.caveat.Class) > graph.ZeroEdgeClassConservatism(sg.Caveat.Class) {
+				sg.Caveat = sc.caveat
 			}
 		}
 	}
