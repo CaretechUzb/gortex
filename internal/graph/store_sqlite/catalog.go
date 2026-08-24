@@ -34,9 +34,14 @@ type Catalog struct {
 // payload writes.
 func (s *Store) Catalog() *Catalog { return &Catalog{store: s.atBase()} }
 
-// exec runs one control-plane statement under the mutation gate.
+// exec runs one control-plane statement under the mutation gate. The gate is
+// taken under the caller's context for the reason withTx gives: a deadline
+// that bounds only the statement bounds nothing at all while the queue in
+// front of it is a whole build.
 func (c *Catalog) exec(ctx context.Context, query string, args ...any) (sql.Result, error) {
-	c.store.writeMu.Lock()
+	if err := c.store.writeMu.LockContext(ctx); err != nil {
+		return nil, err
+	}
 	defer c.store.writeMu.Unlock()
 	return c.store.execActiveWriteLocked(ctx, query, args...)
 }
@@ -96,8 +101,17 @@ func (c *Catalog) deleteOne(ctx context.Context, subject string, query string, a
 
 // withTx runs a multi-statement guarded transition as one transaction under
 // the mutation gate.
+//
+// The gate is taken under the caller's context rather than unconditionally.
+// It is held for as long as the pass in front holds it — a build's
+// transactions run for as long as the build does — so a write with a deadline
+// has to be able to stop waiting for its turn. Without that, the deadline
+// bounded only the transaction and not the queue in front of it, and a caller
+// that budgeted two seconds waited out the whole pass.
 func (c *Catalog) withTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
-	c.store.writeMu.Lock()
+	if err := c.store.writeMu.LockContext(ctx); err != nil {
+		return err
+	}
 	defer c.store.writeMu.Unlock()
 	tx, err := c.store.beginWriteContext(ctx)
 	if err != nil {
@@ -1997,6 +2011,54 @@ func scanRefViewBuild(scan func(...any) error, build *RefViewBuild) error {
 	build.GenerationID = generation.Int64
 	build.State = ViewGenerationState(state)
 	return nil
+}
+
+// RefViewBuildKey names one coalescing slot: the four columns the partial
+// unique index on the in-flight builds is keyed by.
+type RefViewBuildKey struct {
+	RefViewID        string
+	DesiredTree      string
+	BaseGenerationID int64
+	BuildFingerprint string
+}
+
+// InFlightRefViewBuild returns the attempt holding one coalescing slot.
+//
+// It is the row ClaimRefViewBuild collides with, read instead of collided
+// with, and it answers on the read pool. That is the whole of why it exists:
+// a claim is an upsert on the writer, and while a build runs the writer is
+// saturated by that build's own transactions, so a selection that wants
+// nothing but the token to poll must not have to queue behind the build it is
+// about to report.
+//
+// aliveAfter is the liveness cutoff ClaimRefViewBuild would apply. An attempt
+// that has not stamped progress since is one the next claim reclaims, so it is
+// not reported in flight here either — handing back a dead build's token is
+// exactly the wedge the reclaim exists to break. A cutoff at or below zero
+// disables the check, as it does on the claim.
+func (c *Catalog) InFlightRefViewBuild(
+	ctx context.Context,
+	key RefViewBuildKey,
+	aliveAfter int64,
+) (RefViewBuild, bool, error) {
+	var build RefViewBuild
+	row := c.store.db.QueryRowContext(ctx, `
+SELECT build_id, `+refViewBuildColumns+` FROM ref_view_builds
+ WHERE ref_view_id = ? AND desired_tree = ? AND base_generation_id = ?
+   AND build_fingerprint = ? AND state = ?`,
+		key.RefViewID, key.DesiredTree, key.BaseGenerationID,
+		key.BuildFingerprint, string(ViewGenerationBuilding))
+	err := scanRefViewBuild(row.Scan, &build)
+	if errors.Is(err, sql.ErrNoRows) {
+		return RefViewBuild{}, false, nil
+	}
+	if err != nil {
+		return RefViewBuild{}, false, err
+	}
+	if aliveAfter > 0 && build.LastProgress < aliveAfter {
+		return build, false, nil
+	}
+	return build, true, nil
 }
 
 // GetRefViewBuild returns one build attempt.
