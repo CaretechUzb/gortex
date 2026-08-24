@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -455,7 +456,15 @@ func TestProbeMatchesAPathSpelledThroughASymlink(t *testing.T) {
 	linkRoot := filepath.Join(dir, "link-wt")
 	require.NoError(t, os.MkdirAll(filepath.Join(realRoot, "internal"), 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(realRoot, probeFile), []byte("package live\n"), 0o644))
-	require.NoError(t, os.Symlink(realRoot, linkRoot))
+	// Creating a symlink on Windows needs a privilege the host may withhold,
+	// which is a limitation of the host rather than a defect in the fold.
+	// Everywhere else the failure is real.
+	if err := os.Symlink(realRoot, linkRoot); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skipf("symlink creation unavailable on this Windows host: %v", err)
+		}
+		t.Fatal(err)
+	}
 
 	// The catalog holds the spelling git records — symlinks resolved — while
 	// the probe arrives spelled the way the caller's shell handed it over.
