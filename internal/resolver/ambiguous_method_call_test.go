@@ -61,3 +61,32 @@ func TestResolveMethodCall_AmbiguousCandidatesPreserveEvidence(t *testing.T) {
 		assert.Equal(t, graph.ZeroEdgeCoverageIncomplete, graph.ClassifyZeroEdge(g, methodID))
 	}
 }
+
+func TestResolveMethodCall_AmbiguousMethodsWithFunctionStayUnresolved(t *testing.T) {
+	g := graph.New()
+	file := "pkg/call.go"
+	g.AddNode(&graph.Node{ID: file, Kind: graph.KindFile, Name: "call.go", FilePath: file, Language: "go"})
+	g.AddNode(&graph.Node{ID: file + "::caller", Kind: graph.KindFunction, Name: "caller", FilePath: file, Language: "go"})
+
+	for _, typ := range []string{"First", "Second"} {
+		g.AddNode(&graph.Node{
+			ID: file + "::" + typ + ".run", Kind: graph.KindMethod, Name: "run",
+			FilePath: file, Language: "go", Meta: map[string]any{"receiver": typ},
+		})
+	}
+	g.AddNode(&graph.Node{ID: file + "::run", Kind: graph.KindFunction, Name: "run", FilePath: file, Language: "go"})
+
+	const placeholderID = "unresolved::*.run"
+	callEdge := &graph.Edge{
+		From: file + "::caller", To: placeholderID,
+		Kind: graph.EdgeCalls, FilePath: file, Line: 10,
+	}
+	g.AddEdge(callEdge)
+
+	stats := New(g).ResolveAll()
+
+	assert.Equal(t, 0, stats.Resolved)
+	assert.Equal(t, 1, stats.Unresolved)
+	assert.Equal(t, placeholderID, callEdge.To,
+		"a same-named function is not receiver evidence for choosing either method")
+}
