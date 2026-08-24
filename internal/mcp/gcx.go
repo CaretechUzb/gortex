@@ -55,8 +55,12 @@ func (s *Server) isGCX(ctx context.Context, req mcp.CallToolRequest) bool {
 func (s *Server) gcxResponseWithBudget(req mcp.CallToolRequest) func([]byte, error) (*mcp.CallToolResult, error) {
 	budget := effectiveBudget(req)
 	// The token-budget comment lands after the row trim; reserve its
-	// bytes so the decorated payload stays in cap.
-	if reserve := tokenBudgetDecorationReserve(req); reserve < budget {
+	// bytes so the decorated payload stays in cap. A budget the reserve
+	// itself cannot fit inside drops the comment instead of letting it
+	// become the bytes that break the contract.
+	reserve := tokenBudgetDecorationReserve(req)
+	decorate := reserve == 0 || reserve < budget
+	if reserve > 0 && decorate {
 		budget -= reserve
 	}
 	return func(payload []byte, err error) (*mcp.CallToolResult, error) {
@@ -66,7 +70,7 @@ func (s *Server) gcxResponseWithBudget(req mcp.CallToolRequest) func([]byte, err
 		if budget > 0 {
 			if trimmed, didTrim := trimGCXBytes(payload, budget); trimmed != nil {
 				payload = trimmed
-				if didTrim {
+				if didTrim && decorate {
 					payload = decorateTokenBudgetGCX(payload, req)
 				}
 			}

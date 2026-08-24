@@ -1413,9 +1413,18 @@ func (e *Engine) bfs(nodeID string, opts QueryOptions, forward bool, edgeKinds [
 				// vs kind-grouped), so without this sort a capped page's
 				// membership would depend on the storage engine and the
 				// graph's write history. Strongest evidence first — the
-				// same order the usage page cap consumes. The backends
-				// return fresh slices, so the in-place sort is safe.
-				SortEdgesForPage(edges)
+				// same order the usage page cap consumes. Sorted only
+				// when this expansion can reach the cap: an uncapped
+				// expansion admits every eligible edge, so order cannot
+				// change membership and a hub's edge list is not worth
+				// E·log E comparator calls. Scope: this per-node path —
+				// the one post-fetch filters force onto every backend;
+				// the batched expander and BFSCapable fast paths keep
+				// their own store order. The backends return fresh
+				// slices, so the in-place sort is safe.
+				if opts.Limit > 0 && len(allNodes)+len(edges) >= opts.Limit {
+					SortEdgesForPage(edges)
+				}
 				for _, edge := range edges {
 					if !bidir && !kindSet[edge.Kind] {
 						continue

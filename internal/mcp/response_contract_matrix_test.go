@@ -17,11 +17,11 @@ import (
 
 // TestResponseBudgetContractMatrix sweeps the schema's byte/token
 // budget across EVERY find_usages rendering on BOTH backends: the
-// budget is a contract on the response, not on one renderer, so a new
-// format (or a format newly brought to life) cannot silently bypass it
-// the way the TOON path once did. Text renderers trim to a hard
-// ceiling; structured renderers trim list tails, so their floor is the
-// scalar skeleton — the matrix budget sits above it.
+// budget is a contract on the response, not on one renderer, so no
+// format — new, or newly brought to life — can step outside it
+// silently. Text renderers trim to a hard ceiling; structured
+// renderers trim list tails, so their floor is the scalar skeleton —
+// the matrix budget sits above it.
 func TestResponseBudgetContractMatrix(t *testing.T) {
 	renderings := []struct {
 		name string

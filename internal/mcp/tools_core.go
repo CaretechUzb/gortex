@@ -223,12 +223,26 @@ func (s *Server) returnSubGraph(ctx context.Context, req mcp.CallToolRequest, sg
 	// `gortex query ... --format mermaid|dot` gets a real diagram.
 	// Every text renderer below keeps the same byte/token budget the
 	// JSON and GCX paths enforce: the budget is a contract on the
-	// response, not on one format.
+	// response, not on one format. Structured grammars re-render over
+	// fewer rows instead of taking a byte-level cut — a sliced diagram
+	// or TOON table fails downstream parsers while looking successful.
 	switch req.GetString("format", "") {
 	case "mermaid":
-		return mcp.NewToolResultText(textWithinBudget(req, sg.ToMermaid())), nil
+		return mcp.NewToolResultText(renderSubGraphWithinBudget(req, sg, func(t *query.SubGraph) string {
+			text := t.ToMermaid()
+			if t.Truncated && t.TotalEdges > len(t.Edges) {
+				text += fmt.Sprintf("%%%% %d of %d edges shown (byte budget); pass max_bytes:0 for the full graph\n", len(t.Edges), t.TotalEdges)
+			}
+			return text
+		})), nil
 	case "dot":
-		return mcp.NewToolResultText(textWithinBudget(req, sg.ToDot())), nil
+		return mcp.NewToolResultText(renderSubGraphWithinBudget(req, sg, func(t *query.SubGraph) string {
+			text := t.ToDot()
+			if t.Truncated && t.TotalEdges > len(t.Edges) {
+				text += fmt.Sprintf("// %d of %d edges shown (byte budget); pass max_bytes:0 for the full graph\n", len(t.Edges), t.TotalEdges)
+			}
+			return text
+		})), nil
 	}
 	if isCompact(req) {
 		// Compact is a caller-facing renderer, not an escape hatch from
@@ -245,8 +259,10 @@ func (s *Server) returnSubGraph(ctx context.Context, req mcp.CallToolRequest, sg
 		return s.gcxResponseWithBudget(req)(encodeSubGraph(tool, sg, s.nodeGetterFor(ctx)))
 	}
 	if s.isTOON(ctx, req) {
-		res, err := subGraphToTOON(sg, s.nodeGetterFor(ctx))
-		return trimResultToBudget(req, res), err
+		getter := s.nodeGetterFor(ctx)
+		return mcp.NewToolResultText(renderSubGraphWithinBudget(req, sg, func(t *query.SubGraph) string {
+			return subGraphToTOON(t, getter)
+		})), nil
 	}
 	return s.respondJSONOrTOON(ctx, req, sg)
 }
@@ -292,17 +308,74 @@ func textWithinBudget(req mcp.CallToolRequest, text string) string {
 	return text
 }
 
-// trimResultToBudget applies textWithinBudget to a text tool result.
-// Error and non-text results pass through untouched.
-func trimResultToBudget(req mcp.CallToolRequest, res *mcp.CallToolResult) *mcp.CallToolResult {
-	if res == nil || res.IsError || len(res.Content) == 0 {
-		return res
+// renderSubGraphWithinBudget renders sg through render and, when the
+// full rendering overflows the caller's budget, re-renders over the
+// largest edge prefix that fits — nodes pruned to the surviving rows,
+// Truncated and the TotalEdges floor stamped on the trial — so the
+// output stays syntactically valid in grammars a byte-level cut would
+// corrupt. The page order the prefix consumes is whatever the handler
+// already established. The degenerate case where even a rowless
+// rendering overflows falls back to the plain-text trim.
+func renderSubGraphWithinBudget(req mcp.CallToolRequest, sg *query.SubGraph, render func(*query.SubGraph) string) string {
+	budget := effectiveBudget(req)
+	full := render(sg)
+	if budget <= 0 || len(full) <= budget {
+		return full
 	}
-	if tc, ok := res.Content[0].(mcp.TextContent); ok {
-		tc.Text = textWithinBudget(req, tc.Text)
-		res.Content[0] = tc
+	trial := *sg
+	trial.Truncated = true
+	trial.TotalEdges = max(sg.TotalEdges, len(sg.Edges))
+	fit := ""
+	lo, hi := 0, len(sg.Edges)
+	for lo < hi {
+		mid := (lo + hi + 1) / 2
+		trial.Edges = sg.Edges[:mid]
+		trial.Nodes = nodesForEdgePage(sg, trial.Edges)
+		if text := render(&trial); len(text) <= budget {
+			lo, fit = mid, text
+		} else {
+			hi = mid - 1
+		}
 	}
-	return res
+	if fit != "" {
+		return fit
+	}
+	trial.Edges = nil
+	trial.Nodes = nodesForEdgePage(sg, nil)
+	if text := render(&trial); len(text) <= budget {
+		return text
+	}
+	return trimTextToBudget(full, budget)
+}
+
+// nodesForEdgePage keeps the nodes a trimmed edge page references,
+// plus every node with no incident edge in the full result (the
+// queried seed among them), so the page cut never drops the subject.
+func nodesForEdgePage(sg *query.SubGraph, page []*graph.Edge) []*graph.Node {
+	incident := make(map[string]bool, len(sg.Edges)*2)
+	for _, e := range sg.Edges {
+		if e != nil {
+			incident[e.From] = true
+			incident[e.To] = true
+		}
+	}
+	keep := make(map[string]bool, len(page)*2)
+	for _, e := range page {
+		if e != nil {
+			keep[e.From] = true
+			keep[e.To] = true
+		}
+	}
+	out := make([]*graph.Node, 0, len(page)*2)
+	for _, n := range sg.Nodes {
+		if n == nil {
+			continue
+		}
+		if keep[n.ID] || !incident[n.ID] {
+			out = append(out, n)
+		}
+	}
+	return out
 }
 
 // requestToolName extracts the MCP tool name from a CallToolRequest.
@@ -369,9 +442,13 @@ func returnTOON(payload any) (*mcp.CallToolResult, error) {
 func (s *Server) respondJSONOrTOON(ctx context.Context, req mcp.CallToolRequest, payload any) (*mcp.CallToolResult, error) {
 	payload = applyFieldsFilter(payload, parseFields(req.GetString("fields", "")))
 	if budget := effectiveBudget(req); budget > 0 {
-		// The token-budget decoration below lands after the fit;
-		// reserve its bytes so the decorated payload stays in cap.
-		if reserve := tokenBudgetDecorationReserve(req); reserve < budget {
+		// The token-budget decoration lands after the fit; reserve its
+		// bytes so the decorated payload stays in cap. A budget the
+		// reserve itself cannot fit inside drops the decoration instead
+		// of letting it become the bytes that break the contract.
+		reserve := tokenBudgetDecorationReserve(req)
+		decorate := reserve == 0 || reserve < budget
+		if reserve > 0 && decorate {
 			budget -= reserve
 		}
 		var trimmed bool
@@ -380,7 +457,7 @@ func (s *Server) respondJSONOrTOON(ctx context.Context, req mcp.CallToolRequest,
 		} else {
 			payload, trimmed = applyBudget(payload, budget)
 		}
-		if trimmed {
+		if trimmed && decorate {
 			payload = decorateTokenBudgetJSON(payload, req)
 		}
 	}
@@ -404,8 +481,10 @@ func (s *Server) respondJSONOrTOON(ctx context.Context, req mcp.CallToolRequest,
 	return mcp.NewToolResultJSON(payload)
 }
 
-// subGraphToTOON converts a SubGraph to a TOON-encoded text result.
-func subGraphToTOON(sg *query.SubGraph, g graph.NodeGetter) (*mcp.CallToolResult, error) {
+// subGraphToTOON renders a SubGraph as TOON text; a marshal failure
+// falls back to the JSON rendering so the caller always holds one
+// parseable document.
+func subGraphToTOON(sg *query.SubGraph, g graph.NodeGetter) string {
 	var edgeRows []toonEdgeRow
 	for _, e := range sg.Edges {
 		label := e.ConfidenceLabel
@@ -455,9 +534,12 @@ func subGraphToTOON(sg *query.SubGraph, g graph.NodeGetter) (*mcp.CallToolResult
 	}
 	data, err := toon.Marshal(result)
 	if err != nil {
-		return mcp.NewToolResultJSON(sg)
+		if j, jerr := json.Marshal(sg); jerr == nil {
+			return string(j)
+		}
+		return ""
 	}
-	return mcp.NewToolResultText(string(data)), nil
+	return string(data)
 }
 
 // resolveRepoFilter resolves the optional repo/project/ref params into
@@ -3119,25 +3201,6 @@ func filterUsagesByFlavor(g graph.NodeGetter, sg *query.SubGraph, targetID, flav
 	sg.Nodes = keptNodes
 }
 
-// usageFileGroup is one file's worth of references from a
-// group_by:"file" find_usages response.
-type usageFileGroup struct {
-	File  string           `json:"file"`
-	Count int              `json:"count"`
-	Uses  []usageGroupItem `json:"uses"`
-}
-
-// usageGroupItem is one reference inside a usageFileGroup -- the
-// line it sits on plus the enclosing symbol.
-type usageGroupItem struct {
-	Line        int    `json:"line"`
-	EdgeKind    string `json:"edge_kind"`
-	Context     string `json:"context,omitempty"`
-	ReturnUsage string `json:"return_usage,omitempty"`
-	SymbolID    string `json:"symbol_id,omitempty"`
-	SymbolName  string `json:"symbol_name,omitempty"`
-}
-
 // groupUsagesByFile buckets a find_usages SubGraph by the file each
 // reference originates in. The `from` endpoint of every edge is the
 // usage site; its file path is the bucket key and the from-node's
@@ -3148,7 +3211,7 @@ func groupUsagesByFile(sg *query.SubGraph) map[string]any {
 	for _, n := range sg.Nodes {
 		nodeByID[n.ID] = n
 	}
-	groups := map[string]*usageFileGroup{}
+	groups := map[string]*query.UsageFileGroup{}
 	for _, e := range sg.Edges {
 		from := nodeByID[e.From]
 		file := e.FilePath
@@ -3160,10 +3223,10 @@ func groupUsagesByFile(sg *query.SubGraph) map[string]any {
 		}
 		g := groups[file]
 		if g == nil {
-			g = &usageFileGroup{File: file}
+			g = &query.UsageFileGroup{File: file}
 			groups[file] = g
 		}
-		item := usageGroupItem{Line: e.Line, EdgeKind: string(e.Kind), Context: e.Context, ReturnUsage: e.ReturnUsage}
+		item := query.UsageGroupItem{Line: e.Line, EdgeKind: string(e.Kind), Context: e.Context, ReturnUsage: e.ReturnUsage}
 		if from != nil {
 			item.SymbolID = from.ID
 			item.SymbolName = from.Name
@@ -3171,7 +3234,7 @@ func groupUsagesByFile(sg *query.SubGraph) map[string]any {
 		g.Uses = append(g.Uses, item)
 		g.Count++
 	}
-	out := make([]*usageFileGroup, 0, len(groups))
+	out := make([]*query.UsageFileGroup, 0, len(groups))
 	for _, g := range groups {
 		out = append(out, g)
 	}

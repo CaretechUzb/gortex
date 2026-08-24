@@ -7,6 +7,7 @@ package respbudget
 
 import (
 	"encoding/json"
+	"maps"
 	"sort"
 )
 
@@ -189,9 +190,14 @@ func Apply(payload any, maxBytes int) (any, bool) {
 	// Re-shape into a generic map so we can manipulate any payload
 	// type uniformly (struct, *query.SubGraph, map[string]any). The
 	// JSON round-trip costs one extra alloc — cheap given we already
-	// know we are over budget.
-	var generic map[string]any
-	if err := json.Unmarshal(bytes, &generic); err != nil {
+	// know we are over budget. A payload that already is a generic map
+	// (the federation merge hands one over) skips the round trip; the
+	// trim writes only top-level keys, so a shallow clone keeps the
+	// caller's map — which callers may reuse — untouched.
+	generic, ok := payload.(map[string]any)
+	if ok {
+		generic = maps.Clone(generic)
+	} else if err := json.Unmarshal(bytes, &generic); err != nil {
 		return payload, false
 	}
 
@@ -251,27 +257,14 @@ func Apply(payload any, maxBytes int) (any, bool) {
 	return generic, trimmed
 }
 
-// ApplyToJSON is Apply over raw marshaled bytes: the federation merge
-// holds the final representation as JSON, not as a typed payload. On
-// any parse failure the input is returned unchanged — a non-JSON body
-// is some other layer's contract.
-func ApplyToJSON(raw []byte, maxBytes int) []byte {
-	if maxBytes <= 0 || len(raw) <= maxBytes {
-		return raw
+// Trimmed reports whether raw marshaled JSON carries Apply's
+// truncation marker (TruncatedKey). Lives beside the constant so
+// every layer probing for the marker shares one definition.
+func Trimmed(raw []byte) bool {
+	var probe struct {
+		TruncatedByBudget bool `json:"_truncated_by_budget"`
 	}
-	var generic map[string]any
-	if err := json.Unmarshal(raw, &generic); err != nil {
-		return raw
-	}
-	trimmed, ok := Apply(generic, maxBytes)
-	if !ok {
-		return raw
-	}
-	out, err := json.Marshal(trimmed)
-	if err != nil {
-		return raw
-	}
-	return out
+	return json.Unmarshal(raw, &probe) == nil && probe.TruncatedByBudget
 }
 
 // findLongestSliceKey returns the top-level field name whose value is
