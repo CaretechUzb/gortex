@@ -393,6 +393,12 @@ func FindDeadCode(g graph.Store, processes *ProcessResult, excludePatterns []str
 			continue
 		}
 
+		// An unresolved same-name call is direct evidence of incomplete
+		// resolution, so zero concrete incoming edges is not proof of dead code.
+		if graph.ClassifyZeroEdge(g, n.ID) == graph.ZeroEdgeCoverageIncomplete {
+			continue
+		}
+
 		// For methods with zero incoming edges, check if they exist to satisfy
 		// an interface contract.  Look up the receiver type via member_of edges
 		// and check if any implemented interface requires this method name.
