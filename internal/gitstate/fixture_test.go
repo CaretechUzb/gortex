@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/zzet/gortex/internal/pathkey"
 )
 
 // isolateGit pins the git environment for the whole test: no user or
@@ -110,11 +112,20 @@ func addWorktree(t *testing.T, repo, path string, extra ...string) string {
 	return path
 }
 
-// recordFor returns the inventory record whose Path equals path.
+// samePath reports whether two spellings name the same directory.
+// WorktreeRecord.Path is git's own spelling, which uses "/" separators
+// on every platform, while a fixture path is built with the host
+// separator. Every production consumer folds the two before comparing,
+// so the fixtures identify records through the same fold.
+func samePath(a, b string) bool {
+	return pathkey.EqualPaths(a, b)
+}
+
+// recordFor returns the inventory record for path.
 func recordFor(t *testing.T, inv *FamilyInventory, path string) WorktreeRecord {
 	t.Helper()
 	for _, r := range inv.Records {
-		if r.Path == path {
+		if samePath(r.Path, path) {
 			return r
 		}
 	}
@@ -129,7 +140,7 @@ func recordFor(t *testing.T, inv *FamilyInventory, path string) WorktreeRecord {
 // hasRecord reports whether the inventory carries a record for path.
 func hasRecord(inv *FamilyInventory, path string) bool {
 	for _, r := range inv.Records {
-		if r.Path == path {
+		if samePath(r.Path, path) {
 			return true
 		}
 	}

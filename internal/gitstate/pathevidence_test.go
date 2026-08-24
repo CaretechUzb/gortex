@@ -146,12 +146,19 @@ func TestSamplePathEvidenceOnBlankPath(t *testing.T) {
 
 func TestSamplePathEvidenceOnFilesystemRoot(t *testing.T) {
 	// The ancestor walk must terminate at the filesystem root rather
-	// than looping forever.
+	// than looping forever. A bare separator is the root only once it
+	// carries a volume, which is what the sampler absolutizes it to
+	// before walking (a no-op on POSIX, "C:\" on Windows).
+	fsRoot, err := filepath.Abs(string(filepath.Separator))
+	if err != nil {
+		t.Fatalf("resolve the filesystem root: %v", err)
+	}
+
 	ev := SamplePathEvidence(string(filepath.Separator))
 	if !ev.RootExists {
 		t.Fatal("the filesystem root should exist")
 	}
-	if ev.AncestorPath != string(filepath.Separator) {
-		t.Errorf("AncestorPath = %q, want the filesystem root", ev.AncestorPath)
+	if ev.AncestorPath != fsRoot {
+		t.Errorf("AncestorPath = %q, want the filesystem root %q", ev.AncestorPath, fsRoot)
 	}
 }

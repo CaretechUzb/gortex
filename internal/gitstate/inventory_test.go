@@ -30,7 +30,7 @@ func TestInventoryMainOnlyRepo(t *testing.T) {
 	}
 
 	r := inv.Records[0]
-	if r.Path != repo {
+	if !samePath(r.Path, repo) {
 		t.Errorf("Path = %q, want %q", r.Path, repo)
 	}
 	if !r.IsMain {
@@ -75,7 +75,7 @@ func TestInventoryLinkedWorktreesWithAwkwardPaths(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Inventory: %v", err)
 	}
-	if !inv.Records[0].IsMain || inv.Records[0].Path != repo {
+	if !inv.Records[0].IsMain || !samePath(inv.Records[0].Path, repo) {
 		t.Fatalf("first record is not the main worktree: %+v", inv.Records[0])
 	}
 	for _, r := range inv.Records[1:] {
@@ -285,7 +285,7 @@ func TestInventoryFromLinkedWorktreeSeesWholeFamily(t *testing.T) {
 	if len(inv.Records) != 2 {
 		t.Fatalf("expected 2 records, got %d", len(inv.Records))
 	}
-	if !inv.Records[0].IsMain || inv.Records[0].Path != repo {
+	if !inv.Records[0].IsMain || !samePath(inv.Records[0].Path, repo) {
 		t.Errorf("main record = %+v, want %q", inv.Records[0], repo)
 	}
 	if inv.CommonDir != filepath.Join(repo, ".git") {

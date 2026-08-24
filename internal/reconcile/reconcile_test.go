@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -787,7 +788,9 @@ func TestReconcileRecordsHeadAndPathEvidence(t *testing.T) {
 	if row.HeadRef != "refs/heads/wt" || row.HeadCommit != "b1" || row.HeadTree != "t1" {
 		t.Fatalf("head columns = %q/%q/%q", row.HeadRef, row.HeadCommit, row.HeadTree)
 	}
-	if row.GitDir != testCommonDir+"/worktrees/wt" {
+	// The pass joins the admin directory with the host separator, so the
+	// slash-spelled fixture constant is compared through the same join.
+	if row.GitDir != filepath.Join(testCommonDir, "worktrees", "wt") {
 		t.Fatalf("git_dir = %q", row.GitDir)
 	}
 

@@ -193,16 +193,23 @@ func TestTwoPathsAndResolveAgainst(t *testing.T) {
 		t.Error("twoPaths accepted empty output")
 	}
 
-	if got := resolveAgainst("/repo", ".git"); got != filepath.Join("/repo", ".git") {
+	// The anchor and the already-absolute path are built from a real
+	// temporary directory: a "/repo" literal carries no volume, so on
+	// Windows it is not an absolute path at all and resolveAgainst would
+	// join it onto the anchor instead of returning it.
+	repo := filepath.Join(t.TempDir(), "repo")
+	elsewhere := filepath.Join(t.TempDir(), "elsewhere", ".git")
+
+	if got := resolveAgainst(repo, ".git"); got != filepath.Join(repo, ".git") {
 		t.Errorf("resolveAgainst relative = %q", got)
 	}
-	if got := resolveAgainst("/repo", "."); got != "/repo" {
+	if got := resolveAgainst(repo, "."); got != repo {
 		t.Errorf("resolveAgainst dot = %q", got)
 	}
-	if got := resolveAgainst("/repo", "/elsewhere/.git"); got != "/elsewhere/.git" {
+	if got := resolveAgainst(repo, elsewhere); got != elsewhere {
 		t.Errorf("resolveAgainst absolute = %q", got)
 	}
-	if got := resolveAgainst("/repo", ""); got != "" {
+	if got := resolveAgainst(repo, ""); got != "" {
 		t.Errorf("resolveAgainst empty = %q", got)
 	}
 }
