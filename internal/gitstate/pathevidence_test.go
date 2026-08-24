@@ -1,10 +1,18 @@
 package gitstate
 
 import (
+	"io/fs"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+// The path argument is unused by the Unix implementation and would look
+// removable to a cleanup pass, so the seam's shape is pinned here: a
+// platform whose identity lives behind an open handle can only reopen the
+// object by path, and dropping the argument would make such an
+// implementation impossible to write.
+var _ func(string, fs.FileInfo) (string, string, string) = pathIdentity
 
 func TestSamplePathEvidenceExistingRoot(t *testing.T) {
 	root := realPath(t, t.TempDir())

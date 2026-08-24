@@ -5,6 +5,19 @@ import (
 	"path/filepath"
 )
 
+// pathIdentity is the per-platform seam, implemented once per build
+// constraint (pathevidence_unix.go and pathevidence_other.go today). It
+// takes the path alongside the FileInfo because not every platform can
+// answer from a stat alone: Windows keeps the volume serial number and
+// file index behind GetFileInformationByHandle, which needs the path
+// reopened as a handle (with FILE_FLAG_BACKUP_SEMANTICS for a
+// directory).
+//
+// The two arguments always describe the same Lstat: the path is the
+// cleaned absolute path that produced the FileInfo, with symlinks left
+// unresolved, so an implementation that reopens it must not follow them
+// either.
+
 // Volume kinds reported by PathEvidence.
 const (
 	// VolumeKindUnixDev means the volume token is a Unix device number.
@@ -62,14 +75,14 @@ func SamplePathEvidence(root string) PathEvidence {
 
 	if fi, statErr := os.Lstat(abs); statErr == nil {
 		ev.RootExists = true
-		ev.VolumeKind, ev.VolumeToken, ev.RootIdentity = pathIdentity(fi)
+		ev.VolumeKind, ev.VolumeToken, ev.RootIdentity = pathIdentity(abs, fi)
 	}
 
 	parent := filepath.Dir(abs)
 	for {
 		if fi, statErr := os.Lstat(parent); statErr == nil {
 			ev.AncestorPath = parent
-			ev.AncestorVolumeKind, ev.AncestorVolumeToken, _ = pathIdentity(fi)
+			ev.AncestorVolumeKind, ev.AncestorVolumeToken, _ = pathIdentity(parent, fi)
 			break
 		}
 		next := filepath.Dir(parent)
