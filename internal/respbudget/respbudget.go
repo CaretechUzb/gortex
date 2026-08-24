@@ -7,7 +7,6 @@ package respbudget
 
 import (
 	"encoding/json"
-	"maps"
 	"sort"
 )
 
@@ -170,11 +169,18 @@ func EffectiveFromArgs(args map[string]any) int {
 // Multi-list payloads (`nodes` + `edges` for get_file_summary, etc.)
 // are trimmed iteratively: the longest list is binary-searched first;
 // if the result still exceeds the cap, the next-longest list is
-// trimmed too, and so on. We stop when the cap is met or every list
-// has been emptied (the second is a degraded fallback — extremely
-// large per-row payloads can still exceed the budget with zero
-// rows; that case is rare and the MCP transport's spill fallback
-// handles it).
+// trimmed too, and so on.
+//
+// FLOOR: the enforceable minimum for a structured payload is its
+// scalar skeleton — the marshaled size with every top-level list
+// emptied, truncation meta included. A budget below that floor still
+// gets every list emptied and the meta stamped, and the response then
+// exceeds the cap by the skeleton's size: scalars are not trimmable
+// without discarding the answer itself, and a byte-level cut would
+// corrupt the JSON. Callers that need a hard ceiling at any size
+// (the text renderers) enforce it with their own grammar-aware trim;
+// for JSON the cap is a contract above the floor and best-effort
+// below it. TestApplyScalarSkeletonFloor pins this exact shape.
 //
 // Best-effort: if no top-level list is found in the marshaled JSON,
 // the payload is returned unchanged.
@@ -190,33 +196,29 @@ func Apply(payload any, maxBytes int) (any, bool) {
 	// Re-shape into a generic map so we can manipulate any payload
 	// type uniformly (struct, *query.SubGraph, map[string]any). The
 	// JSON round-trip costs one extra alloc — cheap given we already
-	// know we are over budget. A payload that already is a generic map
-	// (the federation merge hands one over) skips the round trip; the
-	// trim writes only top-level keys, so a shallow clone keeps the
-	// caller's map — which callers may reuse — untouched.
-	generic, ok := payload.(map[string]any)
-	if ok {
-		generic = maps.Clone(generic)
-	} else if err := json.Unmarshal(bytes, &generic); err != nil {
+	// know we are over budget — and it is load-bearing twice over:
+	// it normalizes TYPED slices (a handler's []*graph.Edge inside a
+	// map[string]any) into the []any the trimmer recognizes, and it
+	// yields a fresh map so the caller's payload — which callers may
+	// reuse — stays untouched. Do not shortcut it with a map
+	// assertion: a shallow clone keeps the typed slices and the trim
+	// silently returns the oversized payload.
+	var generic map[string]any
+	if err := json.Unmarshal(bytes, &generic); err != nil {
 		return payload, false
 	}
 
 	trimmed := false
-	// Cap iteration count by the number of distinct top-level slices
-	// so we cannot loop forever on a payload whose non-list scalars
-	// alone exceed the cap.
-	for pass := 0; pass < 8; pass++ {
+	// Each non-fitting pass empties the then-longest list, so the
+	// number of top-level keys bounds the loop: a payload whose
+	// scalars alone exceed the cap terminates with every list empty
+	// (the documented floor), never spins.
+	for pass := 0; pass < len(generic); pass++ {
 		longestKey := findLongestSliceKey(generic)
 		if longestKey == "" {
 			break
 		}
 		longest := genericSlice(generic, longestKey)
-		if len(longest) == 0 {
-			// Already-empty list cannot shrink further; pick the
-			// next-longest in the next iteration. Mark this list
-			// completed by removing it from candidate set via length 0.
-			break
-		}
 		originalLen := len(longest)
 		// Binary search for the largest prefix that fits.
 		lo, hi := 0, originalLen

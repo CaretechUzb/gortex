@@ -73,6 +73,27 @@ func ZeroEdgeClassConservatism(c ZeroEdgeClass) int {
 	}
 }
 
+// ZeroEdgeClassRefutedByTierFilter reports whether a tier_filtered
+// marker contradicts this class outright. The marker names edges that
+// EXIST below the requested tier, which refutes the likely_unused
+// CONCLUSION — the symbol is not unused, its evidence is filtered —
+// while coverage_incomplete and possible_extraction_gap are
+// UNCERTAINTY about coverage that a filter explains nothing about.
+// Lives beside the class producer so layers merging caveats
+// (federation) never re-derive class semantics by enum comparison.
+func ZeroEdgeClassRefutedByTierFilter(c ZeroEdgeClass) bool {
+	return c == ZeroEdgeLikelyUnused
+}
+
+// ZeroEdgeClassDescribesOwnGraphOnly reports whether a caveat of this
+// class from a source that did NOT resolve the queried symbol speaks
+// only for that source's graph: an extraction-gap caveat is "MY graph
+// may have failed to extract this", which is evidence about the
+// answering graph, never about the union.
+func ZeroEdgeClassDescribesOwnGraphOnly(c ZeroEdgeClass) bool {
+	return c == ZeroEdgePossibleExtractionGap
+}
+
 // ZeroEdgeReader is the minimal read surface zero-edge classification
 // needs. Both graph backends and request-scoped overlay views satisfy
 // it, so callers serving an overlay session pass the same view the

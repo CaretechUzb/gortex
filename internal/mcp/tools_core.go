@@ -230,16 +230,16 @@ func (s *Server) returnSubGraph(ctx context.Context, req mcp.CallToolRequest, sg
 	case "mermaid":
 		return mcp.NewToolResultText(renderSubGraphWithinBudget(req, sg, func(t *query.SubGraph) string {
 			text := t.ToMermaid()
-			if t.Truncated && t.TotalEdges > len(t.Edges) {
-				text += fmt.Sprintf("%%%% %d of %d edges shown (byte budget); pass max_bytes:0 for the full graph\n", len(t.Edges), t.TotalEdges)
+			if note := subGraphBudgetNote(t, sg); note != "" {
+				text += "%% " + note + "\n"
 			}
 			return text
 		})), nil
 	case "dot":
 		return mcp.NewToolResultText(renderSubGraphWithinBudget(req, sg, func(t *query.SubGraph) string {
 			text := t.ToDot()
-			if t.Truncated && t.TotalEdges > len(t.Edges) {
-				text += fmt.Sprintf("// %d of %d edges shown (byte budget); pass max_bytes:0 for the full graph\n", len(t.Edges), t.TotalEdges)
+			if note := subGraphBudgetNote(t, sg); note != "" {
+				text += "// " + note + "\n"
 			}
 			return text
 		})), nil
@@ -310,12 +310,16 @@ func textWithinBudget(req mcp.CallToolRequest, text string) string {
 
 // renderSubGraphWithinBudget renders sg through render and, when the
 // full rendering overflows the caller's budget, re-renders over the
-// largest edge prefix that fits — nodes pruned to the surviving rows,
-// Truncated and the TotalEdges floor stamped on the trial — so the
-// output stays syntactically valid in grammars a byte-level cut would
-// corrupt. The page order the prefix consumes is whatever the handler
-// already established. The degenerate case where even a rowless
-// rendering overflows falls back to the plain-text trim.
+// largest structural subset that fits, so the output stays
+// syntactically valid in grammars a byte-level cut would corrupt.
+// Two stages, both stamping Truncated plus the TotalEdges/TotalNodes
+// floors on the trial: first the largest edge prefix (nodes pruned to
+// the surviving rows), then — when no edge prefix fits, the shape a
+// node-heavy result with few or zero edges produces — the largest
+// node prefix over the rowless base. The page order each prefix
+// consumes is whatever the handler already established. Only the
+// degenerate case where even an empty rendering overflows falls back
+// to the plain-text trim.
 func renderSubGraphWithinBudget(req mcp.CallToolRequest, sg *query.SubGraph, render func(*query.SubGraph) string) string {
 	budget := effectiveBudget(req)
 	full := render(sg)
@@ -325,27 +329,96 @@ func renderSubGraphWithinBudget(req mcp.CallToolRequest, sg *query.SubGraph, ren
 	trial := *sg
 	trial.Truncated = true
 	trial.TotalEdges = max(sg.TotalEdges, len(sg.Edges))
-	fit := ""
-	lo, hi := 0, len(sg.Edges)
-	for lo < hi {
-		mid := (lo + hi + 1) / 2
-		trial.Edges = sg.Edges[:mid]
-		trial.Nodes = nodesForEdgePage(sg, trial.Edges)
-		if text := render(&trial); len(text) <= budget {
-			lo, fit = mid, text
-		} else {
-			hi = mid - 1
+	trial.TotalNodes = max(sg.TotalNodes, len(sg.Nodes))
+	// One fit predicate for both stages: the largest prefix count whose
+	// rendering fits, with set() mutating the trial to the candidate.
+	largestFit := func(n int, set func(int)) string {
+		fit := ""
+		lo, hi := 0, n
+		for lo < hi {
+			mid := (lo + hi + 1) / 2
+			set(mid)
+			if text := render(&trial); len(text) <= budget {
+				lo, fit = mid, text
+			} else {
+				hi = mid - 1
+			}
 		}
-	}
-	if fit != "" {
 		return fit
 	}
+	if fit := largestFit(len(sg.Edges), func(m int) {
+		trial.Edges = sg.Edges[:m]
+		trial.Nodes = nodesForEdgePage(sg, trial.Edges)
+	}); fit != "" {
+		return fit
+	}
+	// No edge prefix fits — the shape a node-heavy result with few or
+	// zero edges produces. Cut a node prefix over the edge-touched
+	// nodes first (the queried subject is incident to its own rows),
+	// then the isolated remainder, so the subject survives any cut
+	// that keeps at least one node.
 	trial.Edges = nil
-	trial.Nodes = nodesForEdgePage(sg, nil)
+	baseNodes := edgeIncidentFirst(sg)
+	if fit := largestFit(len(baseNodes), func(m int) {
+		trial.Nodes = baseNodes[:m]
+	}); fit != "" {
+		return fit
+	}
+	trial.Nodes = nil
 	if text := render(&trial); len(text) <= budget {
 		return text
 	}
 	return trimTextToBudget(full, budget)
+}
+
+// edgeIncidentFirst orders the subgraph's nodes with the ones its
+// edges touch ahead of the isolated remainder, keeping the handler's
+// relative order within each class. The node-prefix budget cut
+// consumes this order, so the result's structurally-connected nodes —
+// the queried subject among them — outlive the isolated tail.
+func edgeIncidentFirst(sg *query.SubGraph) []*graph.Node {
+	incident := make(map[string]bool, len(sg.Edges)*2)
+	for _, e := range sg.Edges {
+		if e != nil {
+			incident[e.From] = true
+			incident[e.To] = true
+		}
+	}
+	out := make([]*graph.Node, 0, len(sg.Nodes))
+	for _, n := range sg.Nodes {
+		if n != nil && incident[n.ID] {
+			out = append(out, n)
+		}
+	}
+	for _, n := range sg.Nodes {
+		if n != nil && !incident[n.ID] {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// subGraphBudgetNote names what the BYTE-BUDGET cut left out — edges,
+// nodes, or both — in one grammar-neutral sentence the diagram
+// renderers wrap in their own comment syntax. The cut is measured
+// against base, the row set the handler returned: a handler-side
+// `limit` cap also stamps Truncated and pre-cut totals, and blaming
+// the byte budget for those rows would send the caller on a
+// `max_bytes:0` retry that cannot restore them. The denominators are
+// base's row counts for the same reason — they are what max_bytes:0
+// actually returns. Empty when the rendering was not byte-cut.
+func subGraphBudgetNote(t, base *query.SubGraph) string {
+	var parts []string
+	if len(t.Edges) < len(base.Edges) {
+		parts = append(parts, fmt.Sprintf("%d of %d edges", len(t.Edges), len(base.Edges)))
+	}
+	if len(t.Nodes) < len(base.Nodes) {
+		parts = append(parts, fmt.Sprintf("%d of %d nodes", len(t.Nodes), len(base.Nodes)))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.Join(parts, ", ") + " shown (byte budget); pass max_bytes:0 for the full graph"
 }
 
 // nodesForEdgePage keeps the nodes a trimmed edge page references,
@@ -2646,13 +2719,17 @@ func (s *Server) handleGetCallers(ctx context.Context, req mcp.CallToolRequest) 
 	// Epistemic lower bound: a caller walk over in-edges cannot see callers
 	// that reach this symbol through interface dispatch the resolver left
 	// unbound. Flag the floor + name the interface so the agent can widen it.
-	if bs := graph.CallerBoundaries(s.graph, []string{id}, 0); len(bs) > 0 {
+	// Judged from the request-scoped view — the same graph the query ran
+	// on — so an overlay-added implements edge surfaces its floor and a
+	// tombstoned one stops reporting a stale one.
+	reader := s.readerFor(ctx)
+	if bs := graph.CallerBoundaries(reader, []string{id}, 0); len(bs) > 0 {
 		sg.Boundaries = bs
 		sg.LowerBound = graph.LowerBoundCaveat(bs)
 		// The reach is a floor because dispatch is dynamic — scan the seed's
 		// body for the exact runtime-dispatch sites so the agent gets
 		// {site, form, key, candidates} instead of a read-spiral.
-		if db := s.dynamicBoundariesForSymbol(s.graph.GetNode(id)); len(db) > 0 {
+		if db := s.dynamicBoundariesForSymbol(ctx, reader.GetNode(id)); len(db) > 0 {
 			sg.DynamicBoundaries = db
 		}
 	}
