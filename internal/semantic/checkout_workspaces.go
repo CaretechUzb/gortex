@@ -173,9 +173,10 @@ func (w *CheckoutWorkspaces) Live() []CheckoutWorkspaceRef {
 
 // Acquire admits one (language, root) pair, charging the slots its language's
 // server weighs, and returns the release that gives its hold back. The second
-// return is false when the budget is spent on pairs other passes are holding —
-// or when the language weighs more than the whole budget — which is the
-// caller's signal to skip the stage.
+// return is false when the budget cannot reach that weight — the slots are
+// spent on pairs other passes are holding, or the language weighs more than
+// the whole budget — which is the caller's signal to skip the stage, and it
+// leaves the live set as it found it.
 //
 // The returned release must be called once. It does not stop the server: the
 // point of keeping it alive past the pass is that the next build over the same
@@ -204,26 +205,12 @@ func (w *CheckoutWorkspaces) admit(ref CheckoutWorkspaceRef) (func(), []func(), 
 		return w.releaseFor(ref), nil, true
 	}
 	weight := w.weightFor(ref.Language)
-	if weight > w.cap {
-		// The budget is smaller than this one server, so no amount of
-		// eviction makes room for it. Refusing before evicting anything keeps
-		// a cap an operator tightened below a heavy server's weight from
-		// costing the other checkouts their warm servers for nothing.
+	stops, admissible := w.makeRoomLocked(weight)
+	if !admissible {
+		// The budget cannot reach this weight, so the admission is starved.
+		// It is the one outcome that costs a stage rather than a subprocess.
 		viewmetrics.Count(viewmetrics.LSPWorkspaceTotal, viewmetrics.WorkspaceStarved)
 		return nil, nil, false
-	}
-	var stops []func()
-	for w.charged+weight > w.cap {
-		stop, evicted := w.evictOldestLocked()
-		if !evicted {
-			// Every live pair is held by an in-flight pass, so the cap cannot
-			// make room and this admission is starved. It is the one outcome
-			// that costs a stage rather than a subprocess.
-			viewmetrics.Count(viewmetrics.LSPWorkspaceTotal, viewmetrics.WorkspaceStarved)
-			return nil, stops, false
-		}
-		viewmetrics.Count(viewmetrics.LSPWorkspaceTotal, viewmetrics.WorkspaceEvicted)
-		stops = append(stops, stop)
 	}
 	w.clock++
 	w.live[ref] = &checkoutWorkspace{held: 1, used: w.clock, weight: weight}
@@ -287,30 +274,62 @@ func (w *CheckoutWorkspaces) releaseFor(ref CheckoutWorkspaceRef) func() {
 	}
 }
 
-// evictOldestLocked drops the least recently used unheld pair from the live
-// set and returns what stops its servers. The second return is false when
-// every live pair is held by an in-flight pass, so the cap cannot make room
-// without cutting a pass short.
+// makeRoomLocked frees the budget an admission of this weight needs by
+// dropping the least recently used unheld pairs, and returns what stops their
+// servers. The second return is false when the budget cannot hold the weight
+// at all, in which case nothing is dropped.
 //
-// The victim gives back every slot it charged, not one: it is a whole server
-// that stops, so an admission behind a heavy victim needs no second eviction.
-func (w *CheckoutWorkspaces) evictOldestLocked() (func(), bool) {
-	var victim CheckoutWorkspaceRef
-	var oldest *checkoutWorkspace
-	for ref, entry := range w.live {
-		if entry.held > 0 {
-			continue
-		}
-		if oldest == nil || entry.used < oldest.used {
-			victim, oldest = ref, entry
-		}
+// It picks the whole victim set before dropping any of it, because a refusal
+// must cost no servers. A pair a pass holds is out of reach — the pass is
+// reading the very server the eviction would stop — so an admission heavier
+// than the free slots plus the unheld pairs' is starved however many pairs are
+// stopped for it: evicting toward that budget would leave the other checkouts
+// cold and the stage skipped anyway. That covers both shapes of the refusal, a
+// cap an operator tightened below one heavy server's weight and a live set
+// whose reachable slots do not add up to it.
+//
+// A victim gives back every slot it charged, not one: it is a whole server
+// that stops, so an admission behind a heavy victim takes no second one.
+func (w *CheckoutWorkspaces) makeRoomLocked(weight int) ([]func(), bool) {
+	need := w.charged + weight - w.cap
+	if need <= 0 {
+		return nil, true
 	}
-	if oldest == nil {
+	victims := w.evictionOrderLocked()
+	freed, taken := 0, 0
+	for _, ref := range victims {
+		if freed >= need {
+			break
+		}
+		freed += w.live[ref].weight
+		taken++
+	}
+	if freed < need {
 		return nil, false
 	}
-	delete(w.live, victim)
-	w.charged -= oldest.weight
-	return w.stopLocked(victim, oldest.weight, "the workspace cap admitted another checkout"), true
+	stops := make([]func(), 0, taken)
+	for _, ref := range victims[:taken] {
+		entry := w.live[ref]
+		delete(w.live, ref)
+		w.charged -= entry.weight
+		viewmetrics.Count(viewmetrics.LSPWorkspaceTotal, viewmetrics.WorkspaceEvicted)
+		stops = append(stops, w.stopLocked(ref, entry.weight, "the workspace cap admitted another checkout"))
+	}
+	return stops, true
+}
+
+// evictionOrderLocked lists the pairs the cap may take, least recently used
+// first, which is the order it takes them in. Held pairs are absent: they are
+// not victims at any point in the order.
+func (w *CheckoutWorkspaces) evictionOrderLocked() []CheckoutWorkspaceRef {
+	out := make([]CheckoutWorkspaceRef, 0, len(w.live))
+	for ref, entry := range w.live {
+		if entry.held == 0 {
+			out = append(out, ref)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return w.live[out[i]].used < w.live[out[j]].used })
+	return out
 }
 
 // stopLocked builds the stop for a pair the registry has already dropped. The

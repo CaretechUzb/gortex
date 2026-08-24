@@ -243,7 +243,10 @@ over that checkout runs the stage again. A pair a pass is currently holding is
 never the eviction victim; otherwise the least-recently-acquired pair loses its
 slots and its servers are stopped. Eviction gives back the victim's whole
 weight, so displacing one heavy workspace makes room for two ordinary ones
-rather than costing a second server as well.
+rather than costing a second server as well. A refusal stops nothing: the
+budget weighs what eviction could reach before taking any of it, so a pair that
+would still not fit once every unheld pair was stopped leaves them all warm and
+skips its stage alone.
 
 ## Enrichment cost model
 

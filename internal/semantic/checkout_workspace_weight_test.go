@@ -185,6 +185,46 @@ func TestCheckoutWorkspaceCapRaiseWidensTheWeightedBudget(t *testing.T) {
 	}
 }
 
+// TestCheckoutWorkspacesStarveWithoutStoppingWhatCannotHelp is the same rule
+// one step in: a heavy admission whose weight exceeds what eviction can
+// possibly reach is refused before anything is stopped. Evicting toward a
+// budget the admission will never reach costs the other checkouts their warm
+// servers and starves anyway, so the starved admission stays what it was under
+// unit weights — one skipped stage, no subprocess.
+func TestCheckoutWorkspacesStarveWithoutStoppingWhatCannotHelp(t *testing.T) {
+	withCheckoutWorkspaceWeights(t, map[string]int{"java": 2})
+	synctest.Test(t, func(t *testing.T) {
+		stopper := &recordingStopper{}
+		w := NewCheckoutWorkspaces(4, zap.NewNop())
+		w.SetStopper(stopper)
+
+		// Three slots are held by in-flight passes and out of reach; the
+		// fourth is a warm pair, so eviction can free one slot and no more.
+		holds := []func(){
+			acquire(t, w, "go", "/family/first"),
+			acquire(t, w, "go", "/family/second"),
+			acquire(t, w, "go", "/family/third"),
+		}
+		acquire(t, w, "go", "/family/fourth")()
+
+		if _, ok := w.Acquire("java", "/family/fifth"); ok {
+			t.Fatal("a heavy workspace was admitted into a single reachable slot")
+		}
+
+		synctest.Wait()
+		if got := stopper.calls(); len(got) != 0 {
+			t.Errorf("the starved admission stopped %v, want the live set left warm", got)
+		}
+		if got := w.Live(); len(got) != 4 {
+			t.Errorf("live = %v, want the four pairs the refusal did not touch", got)
+		}
+
+		for _, release := range holds {
+			release()
+		}
+	})
+}
+
 // TestCheckoutWorkspacesRefuseAServerHeavierThanTheWholeBudget covers the
 // other end of the knob: a budget an operator tightened below one server's
 // weight cannot hold that server, and discovering it by evicting the live set
