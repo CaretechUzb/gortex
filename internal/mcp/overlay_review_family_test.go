@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -21,11 +22,25 @@ import (
 // that: reverting a site to s.graph serves the indexed payload and keeps
 // reporting a symbol the buffer deleted.
 
+// The fixture keeps the two path vocabularies apart, because the review
+// handlers are the seam between them: rf*File is the repo-relative,
+// '/'-spelled path a forge or `git diff` hands the caller, and rf*Key is the
+// key the store actually holds — the remainder in the indexing machine's
+// native separators (see internal/graphpath), with no repo prefix here. They
+// coincide on POSIX and diverge on Windows, where analysis.JoinFileNodes
+// converts the caller's path before the lookup. Keying the graph with the
+// '/'-joined form describes a file a Windows daemon never indexes, and the
+// converted query then misses it.
 const (
 	rfKeptFile = "repo/edit.go"
 	rfGoneFile = "repo/gone.go"
-	rfKeptID   = rfKeptFile + "::Kept"
-	rfGoneID   = rfGoneFile + "::Gone"
+)
+
+var (
+	rfKeptKey = filepath.FromSlash(rfKeptFile)
+	rfGoneKey = filepath.FromSlash(rfGoneFile)
+	rfKeptID  = rfKeptKey + "::Kept"
+	rfGoneID  = rfGoneKey + "::Gone"
 )
 
 // reviewFamilyServer wires a fully constructed server (engine included —
@@ -43,20 +58,23 @@ func reviewFamilyFixture(t *testing.T) (*Server, *graph.OverlayLayer) {
 	g := graph.New()
 	g.AddNode(&graph.Node{
 		ID: rfKeptID, Name: "Kept", Kind: graph.KindFunction,
-		FilePath: rfKeptFile, Language: "go", StartLine: 10, EndLine: 14,
+		FilePath: rfKeptKey, Language: "go", StartLine: 10, EndLine: 14,
 	})
 	g.AddNode(&graph.Node{
 		ID: rfGoneID, Name: "Gone", Kind: graph.KindFunction,
-		FilePath: rfGoneFile, Language: "go", StartLine: 3, EndLine: 6,
+		FilePath: rfGoneKey, Language: "go", StartLine: 3, EndLine: 6,
 	})
 
+	// A layer covers a file under the key the store spells it with — the
+	// same key the base graph is indexed by, so the buffer shadows the
+	// indexed file instead of sitting beside it.
 	layer := graph.NewOverlayLayer()
-	layer.MarkFile(rfKeptFile, false)
-	layer.AddNode(rfKeptFile, &graph.Node{
+	layer.MarkFile(rfKeptKey, false)
+	layer.AddNode(rfKeptKey, &graph.Node{
 		ID: rfKeptID, Name: "Kept", Kind: graph.KindFunction,
-		FilePath: rfKeptFile, Language: "go", StartLine: 40, EndLine: 44,
+		FilePath: rfKeptKey, Language: "go", StartLine: 40, EndLine: 44,
 	})
-	layer.MarkFile(rfGoneFile, false)
+	layer.MarkFile(rfGoneKey, false)
 	layer.MarkRemoved("Gone", rfGoneID)
 
 	return reviewFamilyServer(t, g), layer
@@ -103,15 +121,17 @@ func TestPRReviewContextReflectsOverlay(t *testing.T) {
 		return m
 	}
 
+	// The roll-up is built from the enriched nodes' own file paths, so it
+	// speaks the store's vocabulary rather than the caller's.
 	onBase := prReviewDiffContextFor(t, srv, context.Background())
-	assert.ElementsMatch(t, []string{rfKeptFile, rfGoneFile}, onBase.ChangedFiles,
+	assert.ElementsMatch(t, []string{rfKeptKey, rfGoneKey}, onBase.ChangedFiles,
 		"a plain request reports both indexed files")
 	baseLines := lineByID(onBase)
 	assert.Equal(t, 10, baseLines[rfKeptID], "a plain request reports the indexed line")
 	assert.Contains(t, baseLines, rfGoneID, "a plain request still enriches the indexed symbol")
 
 	onView := prReviewDiffContextFor(t, srv, overlayCtx(t, srv, layer))
-	assert.Equal(t, []string{rfKeptFile}, onView.ChangedFiles,
+	assert.Equal(t, []string{rfKeptKey}, onView.ChangedFiles,
 		"the file the buffer emptied must drop out of the changeset")
 	viewLines := lineByID(onView)
 	assert.Equal(t, 40, viewLines[rfKeptID], "the buffer's payload must replace the indexed one")
@@ -127,21 +147,24 @@ func TestClassifyChangedSymbolsReadsThroughRequestReader(t *testing.T) {
 	g := graph.New()
 	g.AddNode(&graph.Node{
 		ID: rfKeptID, Name: "Kept", Kind: graph.KindFunction,
-		FilePath: rfKeptFile, Language: "go", StartLine: 10, EndLine: 14,
+		FilePath: rfKeptKey, Language: "go", StartLine: 10, EndLine: 14,
 	})
 	srv := reviewFamilyServer(t, g)
 
 	// The buffer turned the function into a constant under the same id.
 	layer := graph.NewOverlayLayer()
-	layer.MarkFile(rfKeptFile, false)
-	layer.AddNode(rfKeptFile, &graph.Node{
+	layer.MarkFile(rfKeptKey, false)
+	layer.AddNode(rfKeptKey, &graph.Node{
 		ID: rfKeptID, Name: "Kept", Kind: graph.KindConstant,
-		FilePath: rfKeptFile, Language: "go", StartLine: 10, EndLine: 10,
+		FilePath: rfKeptKey, Language: "go", StartLine: 10, EndLine: 10,
 	})
 
+	// A DiffResult carries both vocabularies: ChangedFiles keeps git's
+	// repo-relative spelling, while a changed symbol's FilePath is copied
+	// off the graph node it joined to.
 	diff := &analysis.DiffResult{
 		ChangedFiles:   []string{rfKeptFile},
-		ChangedSymbols: []analysis.ChangedSymbol{{ID: rfKeptID, Name: "Kept", FilePath: rfKeptFile}},
+		ChangedSymbols: []analysis.ChangedSymbol{{ID: rfKeptID, Name: "Kept", FilePath: rfKeptKey}},
 	}
 
 	onBase := srv.classifyChangedSymbols(context.Background(), diff, nil)
@@ -233,6 +256,9 @@ func TestSuggestedReviewQuestionsReflectsOverlay(t *testing.T) {
 // the buffer deleted as changed and dates the surviving one to the index.
 func TestChangedSymbolsForFilesReflectsOverlay(t *testing.T) {
 	srv, layer := reviewFamilyFixture(t)
+	// A forge / git changed-file list is repo-relative and '/'-spelled in
+	// every daemon; the join converts it to the store's key. Passing the
+	// keys here instead would skip that conversion and stop covering it.
 	files := []string{rfKeptFile, rfGoneFile}
 
 	lineByID := func(nodes []*graph.Node) map[string]int {
