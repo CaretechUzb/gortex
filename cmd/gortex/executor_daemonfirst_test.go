@@ -38,6 +38,9 @@ type stubDaemonServer struct {
 	checkoutRoots []string
 	// coverageProbes records every path file_coverage was asked about.
 	coverageProbes []string
+	// coverageBusy makes file_coverage answer the way a daemon holding its
+	// controller mutex does: it could not finish in time.
+	coverageBusy bool
 }
 
 type stubRPCError struct {
@@ -132,6 +135,13 @@ func (s *stubDaemonServer) serveControl(conn net.Conn, reader *bufio.Reader) {
 			raw, _ := json.Marshal(st)
 			_ = daemon.WriteJSONLine(conn, daemon.ControlResponse{OK: true, Result: raw})
 		case daemon.ControlFileCoverage:
+			s.mu.Lock()
+			busy := s.coverageBusy
+			s.mu.Unlock()
+			if busy {
+				_ = daemon.WriteJSONLine(conn, daemon.ControlResponse{OK: false, ErrorCode: daemon.ErrTimeout})
+				continue
+			}
 			raw, _ := json.Marshal(s.fileCoverage(req.Params))
 			_ = daemon.WriteJSONLine(conn, daemon.ControlResponse{OK: true, Result: raw})
 		default:
@@ -171,6 +181,15 @@ func (s *stubDaemonServer) serveCheckouts(roots ...string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.checkoutRoots = roots
+}
+
+// serveCoverageBusy makes every subsequent file_coverage probe answer
+// "could not finish in time", under the same lock the serving goroutine
+// reads it with.
+func (s *stubDaemonServer) serveCoverageBusy() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.coverageBusy = true
 }
 
 // seenCoverageProbes returns every path file_coverage was asked about.

@@ -384,3 +384,26 @@ func TestCheckoutVerbs_UnboundWorktreeCWDRelaysThroughTheFamily(t *testing.T) {
 		}
 	})
 }
+
+// TestResolveExecutor_BusyCoverageProbeKeepsAskingTheDaemon pins the
+// fail-open the routing probe documents for its status half onto its coverage
+// half. A daemon too busy to answer "which view serves this path" has not
+// said the worktree is unbound — it has said nothing, and reporting the
+// reconcile remedy on that silence is the same lie the status probe refuses
+// to tell.
+func TestResolveExecutor_BusyCoverageProbeKeepsAskingTheDaemon(t *testing.T) {
+	dir := t.TempDir()
+	mainRepo, worktree := fakeLinkedWorktree(t, dir)
+
+	stub := startStubDaemon(t, []string{mainRepo})
+	stub.serveCoverageBusy()
+
+	exec, err := resolveExecutor(worktree)
+	if err != nil {
+		t.Fatalf("an indeterminate coverage probe must fall through to the daemon: %v", err)
+	}
+	defer exec.Close()
+	if hs := stub.seenMCPHandshake(); hs.CWD != worktree {
+		t.Fatalf("the call must carry the worktree cwd, daemon saw %q want %q", hs.CWD, worktree)
+	}
+}

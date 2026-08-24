@@ -318,12 +318,18 @@ func trackedReposReach(st daemon.StatusResponse, p string) bool {
 // be the control surface: the tool surface is what this pre-flight guards, so
 // asking it here would be circular.
 //
-// A daemon too old to know the verb, or one that cannot answer inside the
-// routing budget, reports no checkout — leaving the caller with exactly the
-// verdict it reached before this arm existed.
+// A daemon too old to know the verb reports no checkout, leaving the caller
+// with exactly the verdict it reached before this arm existed. A daemon too
+// BUSY to answer inside the routing budget reports a binding instead: that is
+// the fail-open the status probe above takes, for the same reason. Silence is
+// not evidence that the worktree is unbound, and answering it with the
+// reconcile remedy would be the same lie in a new place.
 func checkoutBindsCWD(c *daemon.Client, abs string) bool {
 	resp, err := c.ControlWithTimeout(daemon.ControlFileCoverage,
 		daemon.FileCoverageParams{Path: abs}, daemonRoutingProbeTimeout)
+	if daemonProbeIndeterminate(err, resp) {
+		return true
+	}
 	if err != nil || !resp.OK {
 		return false
 	}
