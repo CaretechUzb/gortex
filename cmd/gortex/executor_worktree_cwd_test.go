@@ -3,9 +3,12 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/zzet/gortex/internal/daemon"
 )
 
 // fakeLinkedWorktree lays out on disk what `git worktree add` leaves behind:
@@ -33,6 +36,184 @@ func fakeLinkedWorktree(t *testing.T, dir string) (mainRepo, worktree string) {
 		t.Fatalf("write commondir: %v", err)
 	}
 	return mainRepo, worktree
+}
+
+// fakeBareHubFamily lays out the family a bare hub owns: `git clone --bare
+// hub.git` followed by `git worktree add`. The shared git directory is
+// `hub.git`, NOT a directory named `.git`, and every working copy of the
+// family is a linked worktree — the family has no main checkout at all, so
+// the only working copy that can ever be tracked is a worktree.
+func fakeBareHubFamily(t *testing.T, dir string) (hub, tracked, worktree string) {
+	t.Helper()
+	hub = filepath.Join(dir, "hub.git")
+	tracked = filepath.Join(dir, "wt", "trunk")
+	worktree = filepath.Join(dir, "wt", "feature")
+
+	for name, root := range map[string]string{"trunk": tracked, "feature": worktree} {
+		wtGitDir := filepath.Join(hub, "worktrees", name)
+		for _, d := range []string{wtGitDir, root} {
+			if err := os.MkdirAll(d, 0o755); err != nil {
+				t.Fatalf("mkdir %s: %v", d, err)
+			}
+		}
+		if err := os.WriteFile(filepath.Join(root, ".git"),
+			[]byte("gitdir: "+wtGitDir+"\n"), 0o644); err != nil {
+			t.Fatalf("write %s/.git: %v", root, err)
+		}
+		// `../..` from hub.git/worktrees/<name> is hub.git itself.
+		if err := os.WriteFile(filepath.Join(wtGitDir, "commondir"), []byte("../..\n"), 0o644); err != nil {
+			t.Fatalf("write commondir: %v", err)
+		}
+	}
+	return hub, tracked, worktree
+}
+
+// TestLinkedWorktreeAt_RealGitLayouts runs the classifier against layouts git
+// itself produced, so the hand-built fixtures above cannot drift into
+// agreeing with a wrong answer about the shape they imitate.
+//
+// The bare-hub arm is the one that matters: its shared git directory is not
+// named `.git`, which is exactly the case that left a worktree resolved as
+// its own main checkout.
+func TestLinkedWorktreeAt_RealGitLayouts(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is not on PATH")
+	}
+	// Resolve the temp root once: git records the path it is handed, and a
+	// symlinked temp dir would otherwise make two spellings of one directory.
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("eval temp dir: %v", err)
+	}
+	git := func(dir string, args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t",
+			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v in %s: %v\n%s", args, dir, err, out)
+		}
+	}
+
+	seed := filepath.Join(root, "seed")
+	if err := os.MkdirAll(seed, 0o755); err != nil {
+		t.Fatalf("mkdir seed: %v", err)
+	}
+	git(seed, "init", "-q")
+	git(seed, "checkout", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(seed, "a.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("write a.txt: %v", err)
+	}
+	git(seed, "add", "a.txt")
+	git(seed, "commit", "-qm", "initial")
+
+	t.Run("main checkout and its worktree", func(t *testing.T) {
+		wt := filepath.Join(root, "plain-wt")
+		git(seed, "worktree", "add", "-q", "-b", "plain", wt)
+
+		if _, ok := linkedWorktreeAt(seed); ok {
+			t.Fatal("a main checkout is not a linked worktree")
+		}
+		fam, ok := linkedWorktreeAt(wt)
+		if !ok {
+			t.Fatal("git worktree add produced a directory the classifier does not recognise")
+		}
+		if fam.mainRepo != seed {
+			t.Fatalf("main checkout: got %q want %q", fam.mainRepo, seed)
+		}
+		if want := filepath.Join(seed, ".git"); fam.commonDir != want {
+			t.Fatalf("common dir: got %q want %q", fam.commonDir, want)
+		}
+	})
+
+	t.Run("bare hub has no main checkout", func(t *testing.T) {
+		hub := filepath.Join(root, "hub.git")
+		git(root, "clone", "-q", "--bare", seed, hub)
+		trunk := filepath.Join(root, "wt", "trunk")
+		feature := filepath.Join(root, "wt", "feature")
+		git(hub, "worktree", "add", "-q", "-b", "trunk", trunk)
+		git(hub, "worktree", "add", "-q", "-b", "feature", feature)
+
+		fam, ok := linkedWorktreeAt(feature)
+		if !ok {
+			t.Fatal("a bare hub's worktree must classify as a linked worktree")
+		}
+		if fam.mainRepo != "" {
+			t.Fatalf("a bare hub owns no main checkout, got %q", fam.mainRepo)
+		}
+		if fam.commonDir != hub {
+			t.Fatalf("common dir: got %q want %q", fam.commonDir, hub)
+		}
+
+		// The only working copy such a family can offer is a sibling
+		// worktree, so that is what the remedy has to be able to name.
+		st := daemon.StatusResponse{TrackedRepos: []daemon.TrackedRepoStatus{{Path: trunk}}}
+		if got := familyRepoIn(st, fam); got != trunk {
+			t.Fatalf("tracked working copy of the family: got %q want %q", got, trunk)
+		}
+		if got := familyRepoIn(daemon.StatusResponse{}, fam); got != "" {
+			t.Fatalf("nothing tracked must resolve to no repository, got %q", got)
+		}
+	})
+}
+
+// TestRequireDaemonTool_BareHubWorktreeNamesTheTrackedSibling covers the
+// family whose hub is bare. No working copy of it is the "main checkout", so
+// the remedy has to be derived from what the daemon actually tracks — a
+// sibling worktree — and never from the cwd itself.
+//
+// Resolving a main checkout by stripping a trailing `/.git` leaves a bare
+// hub's worktree as its own main, which turned the remedy into the one
+// suggestion that must never appear: track this worktree as a repository, in
+// a message that also called it a linked worktree of itself.
+func TestRequireDaemonTool_BareHubWorktreeNamesTheTrackedSibling(t *testing.T) {
+	dir := t.TempDir()
+	_, tracked, worktree := fakeBareHubFamily(t, dir)
+
+	startStubDaemon(t, []string{tracked})
+
+	_, err := requireDaemonTool(worktree, "graph_stats", map[string]any{})
+	if err == nil {
+		t.Fatal("an unbound worktree must fail rather than answer from the wrong working copy")
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "gortex track") {
+		t.Fatalf("the daemon already tracks the family — the remedy must not be a track: %q", msg)
+	}
+	if strings.Contains(msg, "worktree of "+worktree) {
+		t.Fatalf("the worktree must never be named as its own main checkout: %q", msg)
+	}
+	if !strings.Contains(msg, "gortex repos reconcile "+tracked) {
+		t.Fatalf("the error must point at the tracked working copy of the family: %q", msg)
+	}
+}
+
+// TestRequireDaemonTool_UntrackedBareHubWorktreeNeverTracksItself is the same
+// layout with nothing of the family tracked. There is still no main checkout
+// to name, so the remedy names the family's shared git directory and asks for
+// a working copy — the one thing it must not do is offer the cwd.
+func TestRequireDaemonTool_UntrackedBareHubWorktreeNeverTracksItself(t *testing.T) {
+	dir := t.TempDir()
+	hub, _, worktree := fakeBareHubFamily(t, dir)
+
+	startStubDaemon(t, []string{filepath.Join(t.TempDir(), "elsewhere")})
+
+	_, err := requireDaemonTool(worktree, "graph_stats", map[string]any{})
+	if err == nil {
+		t.Fatal("an untracked worktree must fail")
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "gortex track "+worktree) {
+		t.Fatalf("the error must not tell the user to track the worktree: %q", msg)
+	}
+	if strings.Contains(msg, "worktree of "+worktree) {
+		t.Fatalf("the worktree must never be named as its own main checkout: %q", msg)
+	}
+	if !strings.Contains(msg, hub) {
+		t.Fatalf("the error must name the family the worktree belongs to: %q", msg)
+	}
 }
 
 // TestResolveExecutor_RegisteredCheckoutCWDReachesTheDaemon pins the fix: a

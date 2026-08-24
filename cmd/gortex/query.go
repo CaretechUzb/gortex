@@ -84,8 +84,8 @@ func daemonRequiredErr(repoPath string) error {
 	if aerr != nil {
 		abs = repoPath
 	}
-	if main := linkedWorktreeMain(abs); main != "" {
-		return worktreeCWDErr(abs, main, daemon.IsRunning() && daemonOwnsRepo(main))
+	if fam, ok := linkedWorktreeAt(abs); ok {
+		return worktreeCWDErr(abs, fam, trackedFamilyRepo(fam))
 	}
 	if !daemon.IsRunning() {
 		return fmt.Errorf("no gortex daemon is running — start it with `gortex daemon start --detach`, then track this repo with `gortex track %s`", abs)

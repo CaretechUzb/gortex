@@ -175,7 +175,7 @@ func resolveExecutorWithToolSurface(repoPath, tools, toolsMode string) (cliExecu
 		// bound; refusing with ErrNoExecutor here would hand the caller the
 		// `gortex track <worktree>` remedy, which is the one thing that must
 		// not happen for a worktree.
-		return nil, worktreeCWDErr(abs, verdict.mainRepo, true)
+		return nil, worktreeCWDErr(abs, verdict.family, verdict.familyRepo)
 	default:
 		return nil, ErrNoExecutor
 	}
@@ -211,10 +211,14 @@ const (
 // cwdVerdict is what the routing probe decided about one working directory.
 type cwdVerdict struct {
 	reach cwdReach
-	// mainRepo is the main checkout of the linked worktree the path sits in.
-	// Set only for reachUnboundWorktree — it is the repository the remedy
-	// names, because the worktree itself must never be tracked separately.
-	mainRepo string
+	// family is the linked-worktree family the path belongs to. Set only for
+	// reachUnboundWorktree.
+	family worktreeFamily
+	// familyRepo is the tracked working copy that proves the daemon knows the
+	// family. It is the repository the remedy names and the one the checkout
+	// verbs relay through — never the worktree itself, which must not be
+	// tracked as a repository of its own.
+	familyRepo string
 }
 
 // daemonOwnsRepo reports whether the running daemon can answer for abs.
@@ -271,8 +275,10 @@ func probeCWDReach(abs string) cwdVerdict {
 	}
 	// A worktree of a tracked family that no checkout is bound to yet. The
 	// query cannot be served, but the caller must not be told to track it.
-	if main := linkedWorktreeMain(abs); main != "" && trackedRootContains(st, main) {
-		return cwdVerdict{reach: reachUnboundWorktree, mainRepo: main}
+	if fam, ok := linkedWorktreeAt(abs); ok {
+		if repo := familyRepoIn(st, fam); repo != "" {
+			return cwdVerdict{reach: reachUnboundWorktree, family: fam, familyRepo: repo}
+		}
 	}
 	return cwdVerdict{reach: reachNone}
 }
@@ -328,44 +334,121 @@ func checkoutBindsCWD(c *daemon.Client, abs string) bool {
 	return out.View != nil && out.View.CheckoutID != ""
 }
 
-// linkedWorktreeMain resolves the main checkout of the linked git worktree abs
-// sits in, or "" when it sits in none. A cwd is not necessarily a worktree
-// root, so the nearest enclosing `.git` is what gets classified.
-func linkedWorktreeMain(abs string) string {
+// worktreeFamily identifies the set of working copies a linked git worktree
+// shares a git directory with.
+type worktreeFamily struct {
+	// mainRepo is the family's main checkout — the directory holding the
+	// shared git directory. Empty when the family has none: a bare hub
+	// (`git clone --bare`) owns worktrees but is nobody's working copy, so
+	// there is no main checkout to name, let alone to track.
+	mainRepo string
+	// commonDir is the shared git directory every worktree of the family
+	// resolves through. It is the family's identity, and the only handle the
+	// error message has when mainRepo is empty.
+	commonDir string
+}
+
+// linkedWorktreeAt describes the linked git worktree abs sits in, reporting
+// false when it sits in none. A cwd is not necessarily a worktree root, so
+// the nearest enclosing `.git` is what gets classified.
+func linkedWorktreeAt(abs string) (worktreeFamily, bool) {
 	for dir := filepath.Clean(abs); ; {
 		if _, err := os.Lstat(filepath.Join(dir, ".git")); err == nil {
 			info := indexer.ResolveWorktree(dir)
 			if !info.IsWorktree {
-				return ""
+				return worktreeFamily{}, false
 			}
-			return info.MainRepoPath
+			fam := worktreeFamily{commonDir: info.GitCommonDir}
+			// ResolveWorktree names a main checkout only when the shared git
+			// directory is itself called `.git`; a bare hub's is not, and it
+			// leaves MainRepoPath as the queried directory. A worktree is
+			// never its own main checkout, so that answer is dropped.
+			if info.MainRepoPath != dir {
+				fam.mainRepo = info.MainRepoPath
+			}
+			return fam, true
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
-			return ""
+			return worktreeFamily{}, false
 		}
 		dir = parent
 	}
 }
 
-// worktreeCWDErr explains a linked git worktree the daemon cannot answer for.
+// familyRepoIn returns the tracked repository that belongs to fam, or "" when
+// the daemon tracks none of the family's working copies.
 //
-// The remedy is never `gortex track <worktree>`: a linked worktree registered
+// Membership is the shared git directory, not root containment: a family's
+// tracked working copy can be its main checkout OR any sibling worktree, and
+// a bare hub has no main checkout at all — a worktree is the only working
+// copy such a family can ever offer.
+func familyRepoIn(st daemon.StatusResponse, fam worktreeFamily) string {
+	if fam.mainRepo != "" && trackedRootContains(st, fam.mainRepo) {
+		return fam.mainRepo
+	}
+	if fam.commonDir == "" {
+		return ""
+	}
+	for _, repo := range st.TrackedRepos {
+		if repo.Path == "" {
+			continue
+		}
+		if indexer.ResolveWorktree(repo.Path).GitCommonDir == fam.commonDir {
+			return repo.Path
+		}
+	}
+	return ""
+}
+
+// trackedFamilyRepo asks the running daemon which of fam's working copies it
+// tracks. Used on the arms that have no probe verdict to hand.
+func trackedFamilyRepo(fam worktreeFamily) string {
+	if !daemon.IsRunning() {
+		return ""
+	}
+	c, err := daemon.Dial(daemon.Handshake{Mode: daemon.ModeControl, ClientName: "cli"})
+	if err != nil {
+		return ""
+	}
+	defer c.Close()
+	resp, err := c.ControlWithTimeout(daemon.ControlStatus, nil, daemonRoutingProbeTimeout)
+	if err != nil || !resp.OK {
+		return ""
+	}
+	var st daemon.StatusResponse
+	if err := json.Unmarshal(resp.Result, &st); err != nil {
+		return ""
+	}
+	return familyRepoIn(st, fam)
+}
+
+// worktreeCWDErr explains a linked git worktree the daemon cannot answer for.
+// familyRepo is the family's tracked working copy, or "" when it has none.
+//
+// The remedy is never `gortex track <worktree>`. A linked worktree registered
 // as a repository of its own is indexed a second time and stops being served
-// through its family, which is what the family model exists to prevent. The
-// main checkout is what gets tracked; the worktree is served through it.
-func worktreeCWDErr(worktree, mainRepo string, familyTracked bool) error {
-	if familyTracked {
+// through its family, which is what the family model exists to prevent — and
+// for a bare hub, whose worktrees have no main checkout above them, naming the
+// worktree would also be naming it as its own main.
+func worktreeCWDErr(worktree string, fam worktreeFamily, familyRepo string) error {
+	if familyRepo != "" {
 		return fmt.Errorf(
-			"the gortex daemon tracks %s but has not bound the worktree %s to a view yet — run `gortex repos reconcile %s` and retry (never track a worktree as its own repository)",
-			mainRepo, worktree, mainRepo)
+			"the gortex daemon tracks %s but has not bound the worktree %s to a view yet — run `gortex repos reconcile %s` and retry",
+			familyRepo, worktree, familyRepo)
+	}
+	remedy := fmt.Sprintf("track its main checkout with `gortex track %s`", fam.mainRepo)
+	if fam.mainRepo == "" {
+		remedy = fmt.Sprintf(
+			"track one of the family's own worktrees with `gortex track <checkout>` (its shared git directory %s is bare, so the family has no main checkout)",
+			fam.commonDir)
 	}
 	if !daemon.IsRunning() {
 		return fmt.Errorf(
-			"no gortex daemon is running — start it with `gortex daemon start --detach`, then track the main checkout with `gortex track %s`; %s is a linked worktree of it and is served through it",
-			mainRepo, worktree)
+			"no gortex daemon is running — start it with `gortex daemon start --detach`, then %s; %s is served through the family, not as a repository of its own",
+			remedy, worktree)
 	}
 	return fmt.Errorf(
-		"the gortex daemon does not track %s — it is a linked worktree of %s; add the main checkout with `gortex track %s` and the worktree is served through it",
-		worktree, mainRepo, mainRepo)
+		"the gortex daemon does not track the family %s is a linked worktree of — %s; the worktree is then served through it",
+		worktree, remedy)
 }
