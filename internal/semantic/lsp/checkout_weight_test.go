@@ -28,6 +28,36 @@ func TestHeavyServersCarryACheckoutWorkspaceWeight(t *testing.T) {
 	}
 }
 
+// TestTheRegistryContributesItsWeightsToTheBudget pins the wiring rather than
+// the table. The budget lives in the package this one imports, so a weight a
+// spec declares reaches it only through the registration this package's init
+// performs; read the table directly and that registration can be gone with
+// every other test still green, while the shipped binary charges a
+// gigabytes-resident server the same slot as a 200-500MB one.
+func TestTheRegistryContributesItsWeightsToTheBudget(t *testing.T) {
+	// Three slots hold one heavy workspace and one ordinary one, and a third
+	// pair fits behind them only if the heavy one was charged a single slot.
+	// Both live pairs stay held, so a refusal here is the budget's and not an
+	// eviction the test happened to observe.
+	w := semantic.NewCheckoutWorkspaces(3, zap.NewNop())
+
+	heavy, ok := w.Acquire("java", "/family/first")
+	if !ok {
+		t.Fatal("a budget of three slots refused the heavy workspace")
+	}
+	ordinary, ok := w.Acquire("go", "/family/first")
+	if !ok {
+		t.Fatal("a budget of three slots refused the ordinary workspace beside it")
+	}
+
+	if _, ok := w.Acquire("go", "/family/second"); ok {
+		t.Error("a third workspace fitted three slots, so the registry's weights never reached the budget")
+	}
+
+	heavy()
+	ordinary()
+}
+
 // TestOneHeavyWorkspaceFitsTheShippedDefaultBudget is the limit on how heavy a
 // heavy server may be declared: the shipped budget must still admit one, with
 // room for an ordinary server beside it. A weight that refused the only
