@@ -201,17 +201,38 @@ they are capped separately:
 ```yaml
 semantic:
   checkout_lsp: on               # "" / "on" run the stage (default), "off" switches it off
-  checkout_lsp_max_workspaces: 4 # (language, checkout root) pairs holding a server at once
+  checkout_lsp_max_workspaces: 4 # slots the live (language, checkout root) pairs may spend
 ```
 
 `checkout_lsp` is a tri-state: anything but an explicit `off` runs the stage, so
 a config written before the knob existed keeps the shipped default.
-`checkout_lsp_max_workspaces` is a global cap across every checkout of every
-family; zero takes the built-in 4. It is the cap, not the switch, that bounds
-the cost — set `checkout_lsp: off` to disable the stage rather than setting the
-cap to zero.
+`checkout_lsp_max_workspaces` is a global budget across every checkout of every
+family; zero takes the built-in 4. It is the budget, not the switch, that bounds
+the cost — set `checkout_lsp: off` to disable the stage rather than setting it
+to zero.
 
-A pair the cap cannot admit is refused, not queued: a build that waits for a
+The budget counts **slots, not workspaces**, because a language server's cost is
+its resident set and those differ by an order of magnitude. One ordinary server
+— the 200-500MB subprocess most of them are — spends one slot; a server whose
+resident set is measured in gigabytes spends several, so the number bounds
+approximate memory rather than instance count:
+
+| server | languages | slots |
+| --- | --- | --- |
+| `jdtls` | `java` | 2 |
+| `omnisharp` / `csharp-ls` | `csharp` | 2 |
+| every other server | | 1 |
+
+At the default of 4 that admits one heavy workspace with two ordinary ones
+beside it, or two heavy ones on their own — where counting workspaces admitted
+four of them, which on a worktree-heavy day is ~20GB of language servers on top
+of what the tracked repositories keep warm. Raising the number raises the
+weighted budget: `checkout_lsp_max_workspaces: 6` buys a third jdtls workspace,
+or six ordinary ones. A budget below a server's own weight never admits that
+server at all, which is how a machine says "no Java or C# servers for checkouts
+here" without switching the stage off for every other language.
+
+A pair the budget cannot admit is refused, not queued: a build that waits for a
 server slot is a checkout whose view stops moving. The starved languages leave
 the generation's language-server capabilities `incomplete` (and `off` leaves
 them `disabled_by_config`), so a query through that view reports the shortfall
@@ -220,7 +241,9 @@ caller required it ([mcp.md](mcp.md#capability-arguments)) — instead of
 answering thinly and looking complete doing it. The next working-tree build
 over that checkout runs the stage again. A pair a pass is currently holding is
 never the eviction victim; otherwise the least-recently-acquired pair loses its
-slot and its servers are stopped.
+slots and its servers are stopped. Eviction gives back the victim's whole
+weight, so displacing one heavy workspace makes room for two ordinary ones
+rather than costing a second server as well.
 
 ## Enrichment cost model
 

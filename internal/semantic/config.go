@@ -41,11 +41,14 @@ type Config struct {
 	// because the cap, not the switch, is what bounds the cost: a checkout
 	// whose languages the cap cannot admit skips the stage on its own.
 	CheckoutLSP string `mapstructure:"checkout_lsp" yaml:"checkout_lsp,omitempty"`
-	// CheckoutLSPMaxWorkspaces caps how many (language, checkout root) pairs
-	// may hold a language server at once, across every checkout of every
-	// family. Zero takes defaultCheckoutWorkspaceCap. Set CheckoutLSP to "off"
-	// rather than this to zero to switch the stage off — an unbounded cap is
-	// what this knob exists to prevent.
+	// CheckoutLSPMaxWorkspaces budgets the language servers (language,
+	// checkout root) pairs may hold at once, across every checkout of every
+	// family. It counts slots rather than pairs: an ordinary server spends
+	// one and a gigabytes-resident one spends several
+	// (lsp.ServerSpec.CheckoutWorkspaceWeight), so raising this raises the
+	// weighted budget. Zero takes defaultCheckoutWorkspaceCap. Set CheckoutLSP
+	// to "off" rather than this to zero to switch the stage off — an unbounded
+	// budget is what this knob exists to prevent.
 	CheckoutLSPMaxWorkspaces int `mapstructure:"checkout_lsp_max_workspaces" yaml:"checkout_lsp_max_workspaces,omitempty"`
 	// EagerLSP runs the subprocess LSP servers during the synchronous
 	// enrichment pass. Default false: LSP is the slowest part of a cold index

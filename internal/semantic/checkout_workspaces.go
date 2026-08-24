@@ -33,12 +33,24 @@ import (
 // capability states is the better trade. Recovery needs no bookkeeping either:
 // the refused checkout runs the stage again on its next working-tree build,
 // which is the same build its own edits already trigger.
+//
+// The cap counts slots rather than workspaces. A language server's cost is its
+// resident set, and those differ by an order of magnitude: most servers here
+// are a 200-500MB subprocess, while an Eclipse JDT or Roslyn workspace runs
+// into gigabytes. Charging every pair one slot bounded the count and nothing
+// else — four of the heavy ones is ~20GB of language servers on top of what
+// the tracked repositories keep warm. Each pair therefore charges the weight
+// its language's server declared (lsp.ServerSpec.CheckoutWorkspaceWeight,
+// reaching this package through RegisterCheckoutWorkspaceWeights), so the
+// worst case the cap allows is bounded in approximate memory.
 
 // defaultCheckoutWorkspaceCap bounds the language servers routed checkouts may
-// hold at once. It sits below the router's own live-provider cap because these
-// servers are additional to the ones the tracked repositories themselves keep
-// warm: a checkout's server answers about a worktree, and the worktree is a
-// second copy of a repository that already has one.
+// hold at once, in slots: four ordinary servers' worth, or one multi-GB server
+// with two ordinary ones beside it. It sits below the router's own
+// live-provider cap because these servers are additional to the ones the
+// tracked repositories themselves keep warm: a checkout's server answers about
+// a worktree, and the worktree is a second copy of a repository that already
+// has one.
 const defaultCheckoutWorkspaceCap = 4
 
 // WorkspaceStopper stops the language servers one (language, root) pair holds.
@@ -71,7 +83,15 @@ type CheckoutWorkspaces struct {
 	// clock: what the evictor needs is the order acquisitions happened in, and
 	// two acquisitions inside one timer tick have an order a timestamp loses.
 	clock uint64
-	live  map[CheckoutWorkspaceRef]*checkoutWorkspace
+	// charged is the slots the live pairs spend between them, which is what
+	// the cap bounds. Carried alongside the live set rather than recomputed,
+	// so admission and eviction cannot disagree about the budget.
+	charged int
+	// weights maps a language to the slots one of its workspaces charges,
+	// snapshotted at construction from what the LSP registry registered. A
+	// language absent from it weighs one.
+	weights map[string]int
+	live    map[CheckoutWorkspaceRef]*checkoutWorkspace
 }
 
 // checkoutWorkspace is one live pair's admission state.
@@ -83,10 +103,15 @@ type checkoutWorkspace struct {
 	// used is the clock value of the most recent acquisition, which is the
 	// order the evictor picks its victim in.
 	used uint64
+	// weight is the slots this pair charged when it was admitted, remembered
+	// here so eviction gives back exactly what admission took.
+	weight int
 }
 
 // NewCheckoutWorkspaces builds the registry. A non-positive cap takes
-// defaultCheckoutWorkspaceCap.
+// defaultCheckoutWorkspaceCap. The per-language weights are read once here:
+// they come from a registry compiled into the binary, not from anything that
+// changes while the daemon runs.
 func NewCheckoutWorkspaces(cap int, logger *zap.Logger) *CheckoutWorkspaces {
 	if cap <= 0 {
 		cap = defaultCheckoutWorkspaceCap
@@ -95,9 +120,10 @@ func NewCheckoutWorkspaces(cap int, logger *zap.Logger) *CheckoutWorkspaces {
 		logger = zap.NewNop()
 	}
 	return &CheckoutWorkspaces{
-		logger: logger,
-		cap:    cap,
-		live:   make(map[CheckoutWorkspaceRef]*checkoutWorkspace, cap),
+		logger:  logger,
+		cap:     cap,
+		weights: checkoutWorkspaceWeights(),
+		live:    make(map[CheckoutWorkspaceRef]*checkoutWorkspace, cap),
 	}
 }
 
@@ -112,7 +138,10 @@ func (w *CheckoutWorkspaces) SetStopper(stopper WorkspaceStopper) {
 	w.mu.Unlock()
 }
 
-// Cap reports the global limit on concurrently live pairs.
+// Cap reports the global budget the live pairs spend between them, in slots:
+// an ordinary language server spends one and a gigabytes-resident one spends
+// several, so the number is a bound on approximate memory rather than on how
+// many pairs may be live.
 func (w *CheckoutWorkspaces) Cap() int {
 	if w == nil {
 		return 0
@@ -142,9 +171,11 @@ func (w *CheckoutWorkspaces) Live() []CheckoutWorkspaceRef {
 	return out
 }
 
-// Acquire admits one (language, root) pair and returns the release that gives
-// its slot back. The second return is false when the cap is full of pairs
-// other passes are holding, which is the caller's signal to skip the stage.
+// Acquire admits one (language, root) pair, charging the slots its language's
+// server weighs, and returns the release that gives its hold back. The second
+// return is false when the budget is spent on pairs other passes are holding —
+// or when the language weighs more than the whole budget — which is the
+// caller's signal to skip the stage.
 //
 // The returned release must be called once. It does not stop the server: the
 // point of keeping it alive past the pass is that the next build over the same
@@ -172,8 +203,17 @@ func (w *CheckoutWorkspaces) admit(ref CheckoutWorkspaceRef) (func(), []func(), 
 		viewmetrics.Count(viewmetrics.LSPWorkspaceTotal, viewmetrics.WorkspaceReused)
 		return w.releaseFor(ref), nil, true
 	}
+	weight := w.weightFor(ref.Language)
+	if weight > w.cap {
+		// The budget is smaller than this one server, so no amount of
+		// eviction makes room for it. Refusing before evicting anything keeps
+		// a cap an operator tightened below a heavy server's weight from
+		// costing the other checkouts their warm servers for nothing.
+		viewmetrics.Count(viewmetrics.LSPWorkspaceTotal, viewmetrics.WorkspaceStarved)
+		return nil, nil, false
+	}
 	var stops []func()
-	for len(w.live) >= w.cap {
+	for w.charged+weight > w.cap {
 		stop, evicted := w.evictOldestLocked()
 		if !evicted {
 			// Every live pair is held by an in-flight pass, so the cap cannot
@@ -186,9 +226,19 @@ func (w *CheckoutWorkspaces) admit(ref CheckoutWorkspaceRef) (func(), []func(), 
 		stops = append(stops, stop)
 	}
 	w.clock++
-	w.live[ref] = &checkoutWorkspace{held: 1, used: w.clock}
+	w.live[ref] = &checkoutWorkspace{held: 1, used: w.clock, weight: weight}
+	w.charged += weight
 	viewmetrics.Count(viewmetrics.LSPWorkspaceTotal, viewmetrics.WorkspaceAcquired)
 	return w.releaseFor(ref), stops, true
+}
+
+// weightFor is the slots one workspace in this language charges. A language no
+// server declared a weight for spends one, which is the unit the cap counts.
+func (w *CheckoutWorkspaces) weightFor(language string) int {
+	if weight := w.weights[language]; weight > 1 {
+		return weight
+	}
+	return 1
 }
 
 // EvictRoot drops every unheld pair at one checkout root, stops its servers,
@@ -212,7 +262,8 @@ func (w *CheckoutWorkspaces) EvictRoot(root string) int {
 			continue
 		}
 		delete(w.live, ref)
-		stops = append(stops, w.stopLocked(ref, "the checkout it served went away"))
+		w.charged -= entry.weight
+		stops = append(stops, w.stopLocked(ref, entry.weight, "the checkout it served went away"))
 	}
 	w.mu.Unlock()
 	viewmetrics.Add(viewmetrics.LSPWorkspaceTotal, int64(len(stops)), viewmetrics.WorkspaceEvicted)
@@ -240,6 +291,9 @@ func (w *CheckoutWorkspaces) releaseFor(ref CheckoutWorkspaceRef) func() {
 // set and returns what stops its servers. The second return is false when
 // every live pair is held by an in-flight pass, so the cap cannot make room
 // without cutting a pass short.
+//
+// The victim gives back every slot it charged, not one: it is a whole server
+// that stops, so an admission behind a heavy victim needs no second eviction.
 func (w *CheckoutWorkspaces) evictOldestLocked() (func(), bool) {
 	var victim CheckoutWorkspaceRef
 	var oldest *checkoutWorkspace
@@ -255,13 +309,14 @@ func (w *CheckoutWorkspaces) evictOldestLocked() (func(), bool) {
 		return nil, false
 	}
 	delete(w.live, victim)
-	return w.stopLocked(victim, "the workspace cap admitted another checkout"), true
+	w.charged -= oldest.weight
+	return w.stopLocked(victim, oldest.weight, "the workspace cap admitted another checkout"), true
 }
 
 // stopLocked builds the stop for a pair the registry has already dropped. The
 // collaborators it needs are read here, under the mutex that guards them, so
 // the returned closure can run without one.
-func (w *CheckoutWorkspaces) stopLocked(ref CheckoutWorkspaceRef, why string) func() {
+func (w *CheckoutWorkspaces) stopLocked(ref CheckoutWorkspaceRef, weight int, why string) func() {
 	stopper, logger := w.stopper, w.logger
 	return func() {
 		stopped := 0
@@ -273,6 +328,7 @@ func (w *CheckoutWorkspaces) stopLocked(ref CheckoutWorkspaceRef, why string) fu
 			zap.String("root", ref.Root),
 			zap.String("reason", why),
 			zap.Int("servers_stopped", stopped),
+			zap.Int("slots_freed", weight),
 		)
 	}
 }
@@ -298,3 +354,40 @@ func cleanCheckoutRoot(root string) string {
 	}
 	return filepath.Clean(root)
 }
+
+// RegisterCheckoutWorkspaceWeights lets the LSP registry declare, per language,
+// how many slots one of its checkout workspaces charges against the cap. The
+// registry imports this package for its own types, so the weights arrive by
+// registration rather than a direct call — the same indirection
+// RegisterDefaultProviders uses. A language several registrations name takes
+// the largest weight any of them declared.
+func RegisterCheckoutWorkspaceWeights(fn func() map[string]int) {
+	if fn == nil {
+		return
+	}
+	checkoutWeightMu.Lock()
+	checkoutWeightRegistrations = append(checkoutWeightRegistrations, fn)
+	checkoutWeightMu.Unlock()
+}
+
+// checkoutWorkspaceWeights merges what the registrations declare into one
+// table. Only the heavy languages appear in it: an absent language weighs one,
+// which is the unit the cap counts.
+func checkoutWorkspaceWeights() map[string]int {
+	checkoutWeightMu.RLock()
+	defer checkoutWeightMu.RUnlock()
+	out := make(map[string]int)
+	for _, fn := range checkoutWeightRegistrations {
+		for language, weight := range fn() {
+			if weight > out[language] {
+				out[language] = weight
+			}
+		}
+	}
+	return out
+}
+
+var (
+	checkoutWeightMu            sync.RWMutex
+	checkoutWeightRegistrations []func() map[string]int
+)
