@@ -199,6 +199,26 @@ takes the shipped bound; a cap of zero would evict a generation the moment it
 was published. Language-server enrichment of a routed checkout has its own
 bounds — see [`semantic.checkout_lsp`](lsp.md#checkout-workspaces).
 
+**A view and a checkout at the same commit build separately.** That is by
+design, not a missed cache hit: a checkout's commit layer is keyed per checkout
+(`commit-<checkout id>`, owned by the graph) and a ref view's layer is keyed per
+view (`refview-layer-<view id>`, owned by the view), because the two have
+different owners and different retirement lifecycles — a checkout's layers
+follow its coordinator's route flips, a ref view's are collected by the sweep
+above. Sharing one generation row between them would still be safe — the
+guarded retire refuses any generation a ref view points at, whoever offered it
+— but it would entangle the two owners' accounting. The view's pointer would
+pin the checkout's layer, so a branch switch could never reclaim it and every
+sweep would re-offer a generation that is refused again; and each side's bounds
+— the view's retention window, count cap and byte budget against the
+coordinator's branch-switch reuse cache — would be sizing a payload the other
+one holds. The payloads are not interchangeable either: a ref
+view describes a tree nobody has checked out, so it carries neither the
+language-server enrichment nor the text-search rows a checkout's layers get from
+a root on disk. What the duplication costs, in the rare case where a view and a
+checkout do sit on the same tree over the same base, is one redundant build and
+the rows it writes.
+
 **Removal needs evidence.** Anything the daemon cannot positively prove is
 treated as a checkout that is temporarily unreachable, never as one that is
 gone: a failed stat looks identical either way and only one of the two is
