@@ -1,5 +1,7 @@
 package store_sqlite
 
+import "sync"
+
 // baseViewGeneration is the generation every store starts on: the single
 // corpus written by a plain index. The catalog mints new generations from 1
 // upwards, so 0 always names the base payload rows.
@@ -22,7 +24,27 @@ func (s *Store) AtGeneration(g int64) *Store {
 	if g == baseViewGeneration {
 		return s.atBase()
 	}
-	return &Store{storeCore: s.storeCore, viewGen: g, seal: s.payloadSealFor(g)}
+	return &Store{
+		storeCore:   s.storeCore,
+		viewGen:     g,
+		seal:        s.payloadSealFor(g),
+		resolveLane: s.resolveLaneFor(g),
+	}
+}
+
+// resolveLaneFor returns the resolver-coordination mutex shared by every
+// handle on generation g. Sharing it by generation rather than by handle is
+// what keeps two passes over one payload excluding each other; see
+// ResolveMutex for why generations do not exclude one another.
+func (s *Store) resolveLaneFor(g int64) *sync.Mutex {
+	if s.coreless() || g == baseViewGeneration {
+		return nil
+	}
+	if cached, ok := s.resolveLanes.Load(g); ok {
+		return cached.(*sync.Mutex)
+	}
+	shared, _ := s.resolveLanes.LoadOrStore(g, &sync.Mutex{})
+	return shared.(*sync.Mutex)
 }
 
 // atBase returns a handle over the same core pinned to the base corpus. The

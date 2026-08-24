@@ -77,6 +77,11 @@ type storeCore struct {
 	// Keyed by int64 generation; values are *payloadSeal.
 	payloadSeals sync.Map
 
+	// resolveLanes maps a derived payload generation to the resolver-
+	// coordination mutex every handle over that generation shares. Keyed by
+	// int64 generation; values are *sync.Mutex. See ResolveMutex.
+	resolveLanes sync.Map
+
 	// Structural integrity is owned by this logical store. Shadows forward
 	// rejected attempts into the same recorder; warnings are rate-limited per
 	// Store so independent workspaces never suppress each other's diagnostics.
@@ -251,6 +256,11 @@ type Store struct {
 	// never published and therefore never sealed.
 	seal *payloadSeal
 
+	// resolveLane is the resolver-coordination mutex for viewGen, shared with
+	// every other handle over the same generation. It is nil on the base
+	// handle, which coordinates on the core's own mutex.
+	resolveLane *sync.Mutex
+
 	// ownsCore marks the single handle Open returned. It gates teardown:
 	// pools, prepared statements and the checkpoint loop belong to the core,
 	// and closing them from a derived handle would break every other handle
@@ -274,13 +284,33 @@ var _ graph.Store = (*Store)(nil)
 // exists to check rather than failing to compile.
 var _ graph.RepoMemoryEstimateScanner = (*Store)(nil)
 
-// ResolveMutex returns the resolver-coordination mutex. Held by
-// cross-repo / temporal / external resolver passes to serialise edge
-// mutations. Separate from writeMu (which protects per-statement
-// write serialisation against SQLITE_BUSY) so the resolver can hold
-// it across multi-write batches without blocking unrelated steady-
-// state mutations on the same store.
-func (s *Store) ResolveMutex() *sync.Mutex { return &s.resolveMu }
+// ResolveMutex returns the resolver-coordination mutex for the generation this
+// handle reads and writes. Held by cross-repo / temporal / external resolver
+// passes to serialise edge mutations. Separate from writeMu (which protects
+// per-statement write serialisation against SQLITE_BUSY) so the resolver can
+// hold it across multi-write batches without blocking unrelated steady-state
+// mutations on the same store.
+//
+// The lane is per generation, and that grain is what the passes holding it
+// need. A pass takes it for its whole duration — the resolver's inference
+// passes, clone detection, capability / test-edge and external-call synthesis
+// are all O(graph) and none of them yields — because the mutations it
+// interleaves with are mutations of the graph it is reading. Reads and writes
+// through a derived handle are strictly generation-scoped: they neither see
+// nor touch the layer below, so two generations' passes cannot interleave with
+// each other at all, and one database-wide lane would only price a checkout's
+// build at every other checkout's — a lane held for as long as somebody else's
+// payload takes.
+//
+// The base corpus keeps the core's own mutex, so every base mutation — watcher
+// reindex, reconciliation, the warmup tail's whole-graph passes — still
+// serialises exactly as before.
+func (s *Store) ResolveMutex() *sync.Mutex {
+	if s.resolveLane != nil {
+		return s.resolveLane
+	}
+	return &s.resolveMu
+}
 
 // NeedsRebuild reports that Open dropped an incompatible on-disk database and
 // recreated it empty, so the daemon's warm-restart path should force a full

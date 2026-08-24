@@ -482,6 +482,10 @@ func (s *Store) RetirePayloadGeneration(ctx context.Context, generationID int64,
 		return err
 	}
 	s.payloadSeals.Delete(generationID)
+	// Generation ids are never reused, so a handle still holding the lane
+	// keeps a mutex nothing new can join rather than sharing one with a later
+	// generation.
+	s.resolveLanes.Delete(generationID)
 	viewmetrics.Count(viewmetrics.GenerationRetiredTotal, owner)
 	return nil
 }
