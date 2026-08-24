@@ -53,6 +53,37 @@ type ZeroEdgeCaveat struct {
 	Message string        `json:"message" toon:"message"`
 }
 
+// ZeroEdgeClassConservatism ranks caveat classes by how strongly they
+// warn against trusting an empty result — higher is more cautious.
+// Coverage-incomplete carries positive (if weak) evidence of use, so it
+// out-ranks the evidence-free classes; likely_unused is the most
+// permissive claim and must never displace either. Merging layers
+// (federation) use this to pick the surviving caveat when sources
+// disagree on a zero-row answer.
+func ZeroEdgeClassConservatism(c ZeroEdgeClass) int {
+	switch c {
+	case ZeroEdgeCoverageIncomplete:
+		return 3
+	case ZeroEdgePossibleExtractionGap:
+		return 2
+	case ZeroEdgeLikelyUnused:
+		return 1
+	default:
+		return 0
+	}
+}
+
+// ZeroEdgeReader is the minimal read surface zero-edge classification
+// needs. Both graph backends and request-scoped overlay views satisfy
+// it, so callers serving an overlay session pass the same view the
+// query ran on — classifying against the base graph misreports symbols
+// the overlay added, removed, or re-wired.
+type ZeroEdgeReader interface {
+	GetNode(id string) *Node
+	GetInEdges(nodeID string) []*Edge
+	GetOutEdges(nodeID string) []*Edge
+}
+
 // ZeroImpactCaveat is the per-symbol caveat attached to an empty impact
 // analysis result, which is computed over a list of symbols. It carries
 // the symbol ID alongside the same machine-checkable classification.
@@ -166,7 +197,7 @@ func IsWeakUsageEvidence(e *Edge) bool {
 // An unknown symbol ID is reported as an extraction gap: a query whose
 // target is not even in the graph is exactly as untrustworthy as one
 // whose target was never wired up.
-func ClassifyZeroEdge(g Store, symbolID string) ZeroEdgeClass {
+func ClassifyZeroEdge(g ZeroEdgeReader, symbolID string) ZeroEdgeClass {
 	if g == nil || symbolID == "" {
 		return ZeroEdgePossibleExtractionGap
 	}
@@ -225,7 +256,7 @@ func ClassifyZeroEdge(g Store, symbolID string) ZeroEdgeClass {
 // yes/no question is the expensive way to ask it. Backends that can count
 // server-side answer every candidate in one round-trip; the rest fall back to
 // the direct edge read.
-func hasUnresolvedSameNameCandidates(g Store, symbolID string) bool {
+func hasUnresolvedSameNameCandidates(g ZeroEdgeReader, symbolID string) bool {
 	n := g.GetNode(symbolID)
 	if n == nil {
 		return false
@@ -260,7 +291,7 @@ func hasUnresolvedSameNameCandidates(g Store, symbolID string) bool {
 // inbound module-level import edges on its file node (a module-level
 // `import ... from './file'` lands on the file, but still proves the
 // file's exports have consumers).
-func importConsumerCount(g Store, symbolID string) int {
+func importConsumerCount(g ZeroEdgeReader, symbolID string) int {
 	count := 0
 	for _, e := range g.GetInEdges(symbolID) {
 		if e.Kind == EdgeImports || e.Kind == EdgeReExports {
@@ -368,7 +399,7 @@ const zeroEdgeNotFoundMessage = "no symbol with this id is in the graph — the 
 // query result on symbolID. It returns nil when the symbol has
 // incoming usage edges (ZeroEdgeNone) — a non-empty result carries no
 // caveat — so callers can attach the return value unconditionally.
-func CaveatForZeroEdge(g Store, symbolID string) *ZeroEdgeCaveat {
+func CaveatForZeroEdge(g ZeroEdgeReader, symbolID string) *ZeroEdgeCaveat {
 	// A target that is not even in the graph is the most common cause of a
 	// "0 usages" surprise — usually a mistyped id or one missing its repo
 	// prefix. Keep the untrustworthy extraction-gap class so safety gates
@@ -383,7 +414,7 @@ func CaveatForZeroEdge(g Store, symbolID string) *ZeroEdgeCaveat {
 // request-scoped view already resolved symbolID: an overlay-served
 // symbol is absent from the base graph, so the mistyped-id fast path
 // would mislabel it. Classification goes straight to the deeper path.
-func CaveatForZeroEdgeResolved(g Store, symbolID string) *ZeroEdgeCaveat {
+func CaveatForZeroEdgeResolved(g ZeroEdgeReader, symbolID string) *ZeroEdgeCaveat {
 	class := ClassifyZeroEdge(g, symbolID)
 	if class == ZeroEdgeNone {
 		return nil

@@ -54,6 +54,11 @@ func (s *Server) isGCX(ctx context.Context, req mcp.CallToolRequest) bool {
 // (full result inline, transport-spilled if the harness cap fires).
 func (s *Server) gcxResponseWithBudget(req mcp.CallToolRequest) func([]byte, error) (*mcp.CallToolResult, error) {
 	budget := effectiveBudget(req)
+	// The token-budget comment lands after the row trim; reserve its
+	// bytes so the decorated payload stays in cap.
+	if reserve := tokenBudgetDecorationReserve(req); reserve < budget {
+		budget -= reserve
+	}
 	return func(payload []byte, err error) (*mcp.CallToolResult, error) {
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("wire encode failed: %v", err)), nil

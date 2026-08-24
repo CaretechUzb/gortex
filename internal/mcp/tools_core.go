@@ -221,22 +221,21 @@ func (s *Server) returnSubGraph(ctx context.Context, req mcp.CallToolRequest, sg
 	// Diagram formats render the subgraph directly — one place serves
 	// every traversal tool (callers/dependencies/usages/...), so a
 	// `gortex query ... --format mermaid|dot` gets a real diagram.
+	// Every text renderer below keeps the same byte/token budget the
+	// JSON and GCX paths enforce: the budget is a contract on the
+	// response, not on one format.
 	switch req.GetString("format", "") {
 	case "mermaid":
-		return mcp.NewToolResultText(sg.ToMermaid()), nil
+		return mcp.NewToolResultText(textWithinBudget(req, sg.ToMermaid())), nil
 	case "dot":
-		return mcp.NewToolResultText(sg.ToDot()), nil
+		return mcp.NewToolResultText(textWithinBudget(req, sg.ToDot())), nil
 	}
 	if isCompact(req) {
 		// Compact is a caller-facing renderer, not an escape hatch from
 		// the byte/token budget: a request routed here (including
 		// compact over a gcx session default) keeps the same
 		// effectiveBudget cap every other format path enforces.
-		text := compactSubGraph(sg)
-		if budget := effectiveBudget(req); budget > 0 && len(text) > budget {
-			text = trimTextToBudget(text, budget)
-		}
-		return mcp.NewToolResultText(text), nil
+		return mcp.NewToolResultText(textWithinBudget(req, compactSubGraph(sg))), nil
 	}
 	if s.isGCX(ctx, req) {
 		tool := requestToolName(req)
@@ -246,7 +245,8 @@ func (s *Server) returnSubGraph(ctx context.Context, req mcp.CallToolRequest, sg
 		return s.gcxResponseWithBudget(req)(encodeSubGraph(tool, sg, s.nodeGetterFor(ctx)))
 	}
 	if s.isTOON(ctx, req) {
-		return subGraphToTOON(sg, s.nodeGetterFor(ctx))
+		res, err := subGraphToTOON(sg, s.nodeGetterFor(ctx))
+		return trimResultToBudget(req, res), err
 	}
 	return s.respondJSONOrTOON(ctx, req, sg)
 }
@@ -280,6 +280,29 @@ func trimTextToBudget(text string, budget int) string {
 		cut++
 	}
 	return text[:cut] + trimBudgetMarker
+}
+
+// textWithinBudget applies the request's effective byte/token budget
+// to a rendered text payload, trimming only on overflow — the fitting
+// case passes through marker-free.
+func textWithinBudget(req mcp.CallToolRequest, text string) string {
+	if budget := effectiveBudget(req); budget > 0 && len(text) > budget {
+		return trimTextToBudget(text, budget)
+	}
+	return text
+}
+
+// trimResultToBudget applies textWithinBudget to a text tool result.
+// Error and non-text results pass through untouched.
+func trimResultToBudget(req mcp.CallToolRequest, res *mcp.CallToolResult) *mcp.CallToolResult {
+	if res == nil || res.IsError || len(res.Content) == 0 {
+		return res
+	}
+	if tc, ok := res.Content[0].(mcp.TextContent); ok {
+		tc.Text = textWithinBudget(req, tc.Text)
+		res.Content[0] = tc
+	}
+	return res
 }
 
 // requestToolName extracts the MCP tool name from a CallToolRequest.
@@ -346,6 +369,11 @@ func returnTOON(payload any) (*mcp.CallToolResult, error) {
 func (s *Server) respondJSONOrTOON(ctx context.Context, req mcp.CallToolRequest, payload any) (*mcp.CallToolResult, error) {
 	payload = applyFieldsFilter(payload, parseFields(req.GetString("fields", "")))
 	if budget := effectiveBudget(req); budget > 0 {
+		// The token-budget decoration below lands after the fit;
+		// reserve its bytes so the decorated payload stays in cap.
+		if reserve := tokenBudgetDecorationReserve(req); reserve < budget {
+			budget -= reserve
+		}
 		var trimmed bool
 		if shape, ok := degradeShapes[req.Params.Name]; ok {
 			payload, trimmed = applyDegradation(payload, shape, budget)
@@ -2517,10 +2545,13 @@ func (s *Server) handleGetCallers(ctx context.Context, req mcp.CallToolRequest) 
 		// now that classification weighs provenance it would report the
 		// very tier the caller asked to exclude. A symbol the request's
 		// view resolved (overlay-served included) is never a mistyped id.
+		// Classification reads the same request-scoped view the query
+		// ran on: the base graph misreports overlay-only symbols and
+		// still counts callers an overlay tombstone removed.
 		if eng.GetSymbol(id) != nil {
-			sg.Caveat = graph.CaveatForZeroEdgeResolved(s.graph, id)
+			sg.Caveat = graph.CaveatForZeroEdgeResolved(s.readerFor(ctx), id)
 		} else {
-			sg.Caveat = graph.CaveatForZeroEdge(s.graph, id)
+			sg.Caveat = graph.CaveatForZeroEdge(s.readerFor(ctx), id)
 		}
 	} else if len(sg.Edges) > 0 && graph.WeakUsageEvidenceOnly(sg.Edges) {
 		// Populated, but every caller is a bare-name match — the shape a
@@ -2816,11 +2847,12 @@ func (s *Server) handleFindUsages(ctx context.Context, req mcp.CallToolRequest) 
 		// already recorded why. Only reach for the extraction-gap / unused
 		// classification when the emptiness was NOT caused by min_tier.
 		// A node the request's view resolved (an overlay-served symbol
-		// among them) is never a mistyped id.
+		// among them) is never a mistyped id. Classification reads the
+		// same request-scoped view the query ran on, never the base graph.
 		if node != nil {
-			sg.Caveat = graph.CaveatForZeroEdgeResolved(s.graph, id)
+			sg.Caveat = graph.CaveatForZeroEdgeResolved(s.readerFor(ctx), id)
 		} else {
-			sg.Caveat = graph.CaveatForZeroEdge(s.graph, id)
+			sg.Caveat = graph.CaveatForZeroEdge(s.readerFor(ctx), id)
 		}
 	} else if len(sg.Edges) > 0 && graph.WeakUsageEvidenceOnly(sg.Edges) {
 		// Populated, but every usage is a bare-name match — the shape a

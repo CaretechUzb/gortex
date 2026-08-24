@@ -1408,6 +1408,14 @@ func (e *Engine) bfs(nodeID string, opts QueryOptions, forward bool, edgeKinds [
 				default:
 					edges = e.g.GetInEdges(cur)
 				}
+				// One deterministic admission order before the cap: the
+				// backends hand back raw edges in storage order (insertion
+				// vs kind-grouped), so without this sort a capped page's
+				// membership would depend on the storage engine and the
+				// graph's write history. Strongest evidence first — the
+				// same order the usage page cap consumes. The backends
+				// return fresh slices, so the in-place sort is safe.
+				SortEdgesForPage(edges)
 				for _, edge := range edges {
 					if !bidir && !kindSet[edge.Kind] {
 						continue
