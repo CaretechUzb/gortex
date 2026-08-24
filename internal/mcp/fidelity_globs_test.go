@@ -52,7 +52,12 @@ func TestMatchFidelityGlob(t *testing.T) {
 		// Bare directory prefix.
 		{"vendor", "vendor/x/y.go", true},
 		{"vendor", "vendored/x.go", false},
-		// Single-segment * never crosses a slash.
+		// Single-segment * never crosses a slash. On Windows this is the
+		// whole point of using path.Match: filepath.Match's separator is
+		// the platform's, so '/' is an ordinary character there and the
+		// second case answers true. Both cases pass on linux/macos with
+		// either matcher, so only the Windows runner can tell them apart
+		// — see the FidelityGlob selector in ci.yml.
 		{"internal/*.go", "internal/x.go", true},
 		{"internal/*.go", "internal/sub/x.go", false},
 	}
@@ -60,6 +65,36 @@ func TestMatchFidelityGlob(t *testing.T) {
 		got := matchFidelityGlob(c.pattern, c.rel)
 		assert.Equalf(t, c.want, got, "matchFidelityGlob(%q, %q)", c.pattern, c.rel)
 	}
+}
+
+// TestMatchFidelityGlob_DirStarStaysRecursive pins the one shape where
+// the segment rule above does not decide the verdict. A trailing `/*`
+// never reaches path.Match for a nested path — matchSegmentGlob's
+// directory-prefix shortcut answers first — so `internal/*` has the same
+// reach as `internal` and `internal/**`. That predates the path.Match
+// change and callers depend on it; this test exists so the compatibility
+// is a stated contract rather than an accident, and so a later cleanup of
+// the shortcut cannot silently narrow a rule someone already wrote.
+func TestMatchFidelityGlob_DirStarStaysRecursive(t *testing.T) {
+	const pattern = "internal/*"
+
+	assert.True(t, matchFidelityGlob(pattern, "internal"),
+		"the directory itself")
+	assert.True(t, matchFidelityGlob(pattern, "internal/a.go"),
+		"a direct child")
+	assert.True(t, matchFidelityGlob(pattern, "internal/sub/x.go"),
+		"a nested child — the documented exception to the segment rule")
+	assert.True(t, matchFidelityGlob(pattern, "internal/sub/deep/y.go"),
+		"an arbitrarily deep child")
+
+	// The shortcut is still segment-anchored: a sibling that merely
+	// starts with the same bytes must not match.
+	assert.False(t, matchFidelityGlob(pattern, "internalx/a.go"),
+		"a sibling directory sharing the prefix")
+
+	// And the segment-bounded form is still available, unchanged.
+	assert.False(t, matchFidelityGlob("internal/*.go", "internal/sub/x.go"),
+		"internal/*.go stays segment-bounded")
 }
 
 func TestFidelityDecideForPath(t *testing.T) {

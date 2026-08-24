@@ -11,7 +11,7 @@ import (
 // fidelityGlobsParamDescription documents the fidelity_globs param for
 // read_file / get_editing_context. Kept as a constant so both tool
 // registrations share one source of truth.
-const fidelityGlobsParamDescription = "Per-glob fidelity tiers, applied when compress_bodies is set: a comma-separated, ordered list of `glob:fidelity` rules where fidelity is one of full | compress | omit (e.g. \"internal/**:full,*_test.go:omit,vendor/**:compress\"). The first rule whose glob matches the file's repo-relative path wins; a file matching no rule falls back to the compress_bodies boolean (compress). Glob semantics: `*` matches within a single path segment (never across `/`), basenames are matched too (so `*_test.go` works without a `**/` prefix), a trailing `/**` matches the directory and everything beneath it, a leading `**/` matches any directory depth, and a bare directory prefix (`internal`) matches everything under it. The per-symbol `keep` predicate still composes: a kept symbol stays full even when its file's rule says compress or omit."
+const fidelityGlobsParamDescription = "Per-glob fidelity tiers, applied when compress_bodies is set: a comma-separated, ordered list of `glob:fidelity` rules where fidelity is one of full | compress | omit (e.g. \"internal/**:full,*_test.go:omit,vendor/**:compress\"). The first rule whose glob matches the file's repo-relative path wins; a file matching no rule falls back to the compress_bodies boolean (compress). Glob semantics: `*` matches within a single path segment (never across `/`), basenames are matched too (so `*_test.go` works without a `**/` prefix), a trailing `/**` matches the directory and everything beneath it, a leading `**/` matches any directory depth, and a bare directory prefix (`internal`) matches everything under it, as does a trailing `/*` (`internal/*` is a prefix, not a segment glob). The per-symbol `keep` predicate still composes: a kept symbol stays full even when its file's rule says compress or omit."
 
 // fidelityRule is one parsed `glob:fidelity` clause. Rules are matched
 // in declaration order; the first matching glob wins.
@@ -90,8 +90,11 @@ func fidelityDecideForPath(rules []fidelityRule, relPath string) func(elide.Decl
 // matchFidelityGlob matches a glob against a forward-slash relative
 // path. It extends matchPathPattern's basename/prefix semantics with
 // explicit `**` support so the documented `internal/**` / `**/*.go`
-// forms work as written (a single `*` never crosses `/` — see
-// matchSegmentGlob for why that requires path.Match, not filepath.Match).
+// forms work as written. Glob matching is segment-bounded — a single `*`
+// never crosses `/`, which is why matchSegmentGlob needs path.Match and
+// not filepath.Match — but matchSegmentGlob also carries a separate
+// directory-prefix rule that is not glob matching at all, and a trailing
+// `/*` goes through it. See matchSegmentGlob.
 func matchFidelityGlob(pattern, rel string) bool {
 	pattern = filepath.ToSlash(pattern)
 	rel = filepath.ToSlash(rel)
@@ -136,6 +139,14 @@ func matchFidelityGlob(pattern, rel string) bool {
 // `internal/*.go` matches `internal/sub/x.go`. path.Match's separator is
 // always '/', which is the semantics this file's `**` handling — and its
 // own doc-comment — already assume.
+//
+// The two prefix shortcuts below are deliberately not glob matching, and
+// they are what makes `internal/*` recursive: `dir/*` and a bare `dir`
+// both match the directory and everything beneath it, the same reach as
+// `dir/**`. That predates the path.Match change and callers depend on
+// it, so it stays — but it means "a single `*` never crosses `/`"
+// describes the glob rule, not this function's whole verdict.
+// TestMatchFidelityGlob_DirStarStaysRecursive pins it.
 func matchSegmentGlob(pattern, rel string) bool {
 	if ok, _ := path.Match(pattern, rel); ok {
 		return true
