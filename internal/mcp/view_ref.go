@@ -243,6 +243,12 @@ func refViewError(selector graphview.Selector, err error) error {
 		return graphview.WrapViewError(graphview.CodeRefNotAvailableLocally, selector.String(), err)
 	case errors.Is(err, gitstate.ErrRefNotCommit):
 		return graphview.WrapViewError(graphview.CodeRefNotCommit, selector.String(), err)
+	case errors.Is(err, indexer.ErrRefViewStoreBusy):
+		// A saturated writer is somebody else's build, so this is the same
+		// answer a build of this view gives: retry. It carries no token,
+		// because the selection never got as far as claiming one.
+		return graphview.WrapViewError(graphview.CodeViewBuilding, fmt.Sprintf(
+			"%s: retry after %ds", selector.String(), refViewRetryAfterSeconds), err)
 	case graphview.CodeOf(err) != "":
 		return err
 	default:

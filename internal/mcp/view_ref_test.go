@@ -498,6 +498,41 @@ func TestRefViewResolutionFailuresSurfaceVerbatim(t *testing.T) {
 	}
 }
 
+// TestRefViewSaturatedWriterAnswersViewBuilding pins what a selection says
+// when the store's writer is busy with somebody else's build.
+//
+// A ref view is served by a build, and a build holds the store's mutation gate
+// for as long as its transactions run. A selection that needed the writer for
+// its own bookkeeping used to queue there and answer nothing until the tool
+// deadline expired, which tells a caller neither what happened nor what to do.
+// The typed answer is view_building with the retry interval: the same thing a
+// build of this very view would have said, and the one a client can act on.
+func TestRefViewSaturatedWriterAnswersViewBuilding(t *testing.T) {
+	stack := newRefStack(t)
+
+	release, err := stack.store.HoldWriteGate(context.Background())
+	if err != nil {
+		t.Fatalf("HoldWriteGate: %v", err)
+	}
+	defer release()
+
+	res, err := stack.readFile(t, refSelector("git_ref", "refs/heads/feature"), "repo/edit.go")
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	text := viewResultText(t, res)
+	if !strings.Contains(text, graphview.CodeViewBuilding) {
+		t.Fatalf("want %s while the writer is saturated, got: %s", graphview.CodeViewBuilding, text)
+	}
+
+	// The saturation was the whole of it: with the gate free the same request
+	// builds the view and serves the committed bytes.
+	release()
+	if _, err := stack.readFile(t, refSelector("git_ref", "refs/heads/feature"), "repo/edit.go"); err != nil {
+		t.Fatalf("call once the writer freed up: %v", err)
+	}
+}
+
 // refProducerStates reads one generation's producer declarations by name.
 func refProducerStates(t *testing.T, stack *refStack, generationID int64) map[string]store_sqlite.ProducerState {
 	t.Helper()

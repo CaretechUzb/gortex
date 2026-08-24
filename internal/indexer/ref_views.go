@@ -104,7 +104,28 @@ const (
 	// deadline. Long enough that a small tree still answers ready in one call,
 	// short enough that a big one hands back a token to poll instead.
 	refViewBuildGrace = 5 * time.Second
+
+	// refViewWriterBudget bounds how long one selection waits for the store's
+	// writer.
+	//
+	// Everything a selection writes is bookkeeping — the view's row, what the
+	// selector resolved to, the claim on a build — and the store's mutation
+	// gate is held for as long as a build's transactions run. A selection
+	// that queued on the gate would wait out somebody else's whole pass and
+	// lose its own answer to the tool deadline, which is strictly worse than
+	// saying the store is busy: the caller retries either way, and a typed
+	// answer inside a couple of seconds is one it can act on.
+	refViewWriterBudget = 2 * time.Second
 )
+
+// ErrRefViewStoreBusy is the answer a selection gives when the store's writer
+// stayed saturated for its whole budget and the bookkeeping it needed could
+// not be written.
+//
+// It is a retry, not a failure. Nothing about the view is known to be wrong —
+// the selection never got far enough to decide anything — and the next
+// selection past the contention resolves it afresh.
+var ErrRefViewStoreBusy = errors.New("indexer: the store is busy building")
 
 // RefViewRequest names one view of one graph.
 type RefViewRequest struct {
@@ -186,13 +207,14 @@ type RefViewManagerConfig struct {
 	// the revalidation exists to close. nil in production.
 	buildBarrier func()
 
-	// buildGrace, buildHeartbeat and buildLiveness are test seams over the
-	// three build windows. Zero takes the package constant, which is what
-	// production runs on; the constants are minutes wide, which is exactly
-	// what a test that drives them cannot wait for.
+	// buildGrace, buildHeartbeat, buildLiveness and writerBudget are test
+	// seams over the manager's four windows. Zero takes the package constant,
+	// which is what production runs on; the constants are seconds to minutes
+	// wide, which is exactly what a test that drives them cannot wait for.
 	buildGrace     time.Duration
 	buildHeartbeat time.Duration
 	buildLiveness  time.Duration
+	writerBudget   time.Duration
 }
 
 // RefViewManager serves ref views of one store's graphs. It holds no
@@ -212,6 +234,7 @@ type RefViewManager struct {
 	buildGrace     time.Duration
 	buildHeartbeat time.Duration
 	buildLiveness  time.Duration
+	writerBudget   time.Duration
 }
 
 // NewRefViewManager builds a manager over one store.
@@ -238,7 +261,25 @@ func NewRefViewManager(cfg RefViewManagerConfig) (*RefViewManager, error) {
 		buildGrace:     refViewWindow(cfg.buildGrace, refViewBuildGrace),
 		buildHeartbeat: refViewWindow(cfg.buildHeartbeat, refViewBuildHeartbeat),
 		buildLiveness:  refViewWindow(cfg.buildLiveness, refViewBuildLiveness),
+		writerBudget:   refViewWindow(cfg.writerBudget, refViewWriterBudget),
 	}, nil
+}
+
+// withWriter runs one bookkeeping write a selection makes, under a budget of
+// its own, and re-types a budget that ran out as the busy answer.
+//
+// A request whose OWN context ended keeps its own error: that is the caller
+// giving up, and calling it a busy store would hide a cancellation behind a
+// retry. Everything else the write returns travels unchanged — a stale guard
+// is still a stale guard.
+func (m *RefViewManager) withWriter(ctx context.Context, write func(context.Context) error) error {
+	writeCtx, cancel := context.WithTimeout(ctx, m.writerBudget)
+	defer cancel()
+	err := write(writeCtx)
+	if err != nil && ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("%w: %w", ErrRefViewStoreBusy, err)
+	}
+	return err
 }
 
 // refViewWindow takes the configured build window, or the default when the
@@ -267,15 +308,7 @@ func (m *RefViewManager) EnsureRefView(ctx context.Context, req RefViewRequest) 
 		return RefViewResult{}, err
 	}
 	viewID := refViewID(req)
-	view, err := m.catalog.GetOrCreateRefView(ctx, store_sqlite.RefView{
-		RefViewID:         viewID,
-		GraphID:           req.GraphID,
-		SelectorKind:      string(req.SelectorKind),
-		SelectorValue:     req.SelectorValue,
-		EnrichmentProfile: req.EnrichmentProfile,
-		State:             store_sqlite.RefViewPending,
-		ExactView:         true,
-	})
+	view, err := m.row(ctx, viewID, req)
 	if err != nil {
 		return RefViewResult{}, err
 	}
@@ -291,6 +324,15 @@ func (m *RefViewManager) EnsureRefView(ctx context.Context, req RefViewRequest) 
 	if err != nil {
 		return RefViewResult{}, err
 	}
+	if !current {
+		coalesced, onto, err := m.coalesced(ctx, view, base, resolved, fingerprint)
+		if err != nil {
+			return RefViewResult{}, err
+		}
+		if onto {
+			return coalesced, nil
+		}
+	}
 
 	view, err = m.desire(ctx, view, resolved, fingerprint, current)
 	if err != nil {
@@ -300,6 +342,46 @@ func (m *RefViewManager) EnsureRefView(ctx context.Context, req RefViewRequest) 
 		return m.adoptMetadata(ctx, view, resolved)
 	}
 	return m.startBuild(ctx, req, view, base, resolved, identity, fingerprint)
+}
+
+// row finds the view's catalog row, reading before it writes.
+//
+// The read pool answers while the writer is saturated and the writer does
+// not, and for every selection after the first the row is already there. The
+// upsert this used to open with therefore charged every selection of an
+// established view a place in the writer's queue for a row it was not going
+// to change — and the pass ahead of it in that queue is usually the very
+// build the selection is about to report.
+func (m *RefViewManager) row(
+	ctx context.Context,
+	viewID string,
+	req RefViewRequest,
+) (store_sqlite.RefView, error) {
+	stored, found, err := m.catalog.GetRefView(ctx, viewID)
+	if err != nil {
+		return store_sqlite.RefView{}, err
+	}
+	if found {
+		return stored, nil
+	}
+	var created store_sqlite.RefView
+	err = m.withWriter(ctx, func(writeCtx context.Context) error {
+		var writeErr error
+		created, writeErr = m.catalog.GetOrCreateRefView(writeCtx, store_sqlite.RefView{
+			RefViewID:         viewID,
+			GraphID:           req.GraphID,
+			SelectorKind:      string(req.SelectorKind),
+			SelectorValue:     req.SelectorValue,
+			EnrichmentProfile: req.EnrichmentProfile,
+			State:             store_sqlite.RefViewPending,
+			ExactView:         true,
+		})
+		return writeErr
+	})
+	if err != nil {
+		return store_sqlite.RefView{}, err
+	}
+	return created, nil
 }
 
 // validate refuses a request that cannot name a view, and fills the one
@@ -358,6 +440,53 @@ func (m *RefViewManager) activeIsCurrent(
 	return found && servableGeneration(row.State), nil
 }
 
+// coalesced answers a selection whose build is already in flight, from the
+// read pool alone.
+//
+// This is the answer that must never queue. Everything it needs is a read —
+// that the row already wants exactly this tree under exactly this
+// fingerprint, and that the attempt holding the slot is still alive — and the
+// store answers reads on a pool the writer's saturation does not reach.
+// Reaching the same conclusion through the writer meant every selection of a
+// building view waited out the build it was about to report, because the
+// build is what holds the mutation gate.
+//
+// The desire is checked, not re-stamped. The fast path answers only when what
+// the desire write WOULD record is already what the row says, so declining to
+// write it leaves the catalog in the state the slow path would have left it
+// in; anything else falls through and writes. What a coalescing selection
+// then skips is the selection clock beside it, which nothing reads back and
+// the next selection re-stamps.
+func (m *RefViewManager) coalesced(
+	ctx context.Context,
+	view store_sqlite.RefView,
+	base primaryBase,
+	resolved gitstate.ResolvedSelector,
+	fingerprint string,
+) (RefViewResult, bool, error) {
+	if view.DesiredTree != resolved.TreeOID || view.DesiredBuildFingerprint != fingerprint {
+		return RefViewResult{}, false, nil
+	}
+	build, inFlight, err := m.catalog.InFlightRefViewBuild(ctx, store_sqlite.RefViewBuildKey{
+		RefViewID:        view.RefViewID,
+		DesiredTree:      resolved.TreeOID,
+		BaseGenerationID: base.generationID,
+		BuildFingerprint: fingerprint,
+	}, time.Now().Unix()-int64(m.buildLiveness/time.Second))
+	if err != nil || !inFlight {
+		return RefViewResult{}, false, err
+	}
+	viewmetrics.Count(viewmetrics.RefViewSelectionTotal, viewmetrics.RefViewCoalesced)
+	m.logger.Debug("ref view manager: selection coalesced onto a running build off the read pool",
+		zap.String("ref_view", view.RefViewID), zap.String("build_token", build.BuildToken))
+	return RefViewResult{
+		RefViewID:  view.RefViewID,
+		Resolved:   resolved,
+		State:      store_sqlite.RefViewBuilding,
+		BuildToken: build.BuildToken,
+	}, true, nil
+}
+
 // desire records what this selection resolved to and re-reads the row.
 //
 // The re-read is not a convenience: the desire write bumps the view's epoch
@@ -375,15 +504,17 @@ func (m *RefViewManager) desire(
 		state = store_sqlite.RefViewReady
 	}
 	now := time.Now().Unix()
-	err := m.catalog.UpdateRefViewDesire(ctx, store_sqlite.UpdateRefViewDesireRequest{
-		RefViewID:               view.RefViewID,
-		DesiredRef:              resolved.FullRef,
-		DesiredCommit:           resolved.CommitOID,
-		DesiredTree:             resolved.TreeOID,
-		DesiredBuildFingerprint: fingerprint,
-		State:                   state,
-		LastResolved:            now,
-		LastSelected:            now,
+	err := m.withWriter(ctx, func(writeCtx context.Context) error {
+		return m.catalog.UpdateRefViewDesire(writeCtx, store_sqlite.UpdateRefViewDesireRequest{
+			RefViewID:               view.RefViewID,
+			DesiredRef:              resolved.FullRef,
+			DesiredCommit:           resolved.CommitOID,
+			DesiredTree:             resolved.TreeOID,
+			DesiredBuildFingerprint: fingerprint,
+			State:                   state,
+			LastResolved:            now,
+			LastSelected:            now,
+		})
 	})
 	if err != nil {
 		return store_sqlite.RefView{}, err
@@ -406,22 +537,28 @@ func (m *RefViewManager) desire(
 // A lost epoch guard is not an error here. It means another actor re-targeted
 // the view between the two writes, and that does not make the generation this
 // call is answering with any less correct — it was built for the tree this
-// selection resolved to.
+// selection resolved to. A saturated writer is the same shape of nothing: the
+// stamp is metadata beside a generation that is already right, and the next
+// selection past the contention writes it.
 func (m *RefViewManager) adoptMetadata(
 	ctx context.Context,
 	view store_sqlite.RefView,
 	resolved gitstate.ResolvedSelector,
 ) (RefViewResult, error) {
 	now := time.Now().Unix()
-	err := m.catalog.TouchRefViewSelection(ctx, store_sqlite.TouchRefViewSelectionRequest{
-		RefViewID:          view.RefViewID,
-		ExpectedRouteEpoch: view.RouteEpoch,
-		ActiveRef:          resolved.FullRef,
-		ActiveCommit:       resolved.CommitOID,
-		LastResolved:       now,
-		LastSelected:       now,
+	err := m.withWriter(ctx, func(writeCtx context.Context) error {
+		return m.catalog.TouchRefViewSelection(writeCtx, store_sqlite.TouchRefViewSelectionRequest{
+			RefViewID:          view.RefViewID,
+			ExpectedRouteEpoch: view.RouteEpoch,
+			ActiveRef:          resolved.FullRef,
+			ActiveCommit:       resolved.CommitOID,
+			LastResolved:       now,
+			LastSelected:       now,
+		})
 	})
-	if err != nil && !errors.Is(err, store_sqlite.ErrCatalogStaleGuard) {
+	if err != nil &&
+		!errors.Is(err, store_sqlite.ErrCatalogStaleGuard) &&
+		!errors.Is(err, ErrRefViewStoreBusy) {
 		return RefViewResult{}, err
 	}
 	viewmetrics.Count(viewmetrics.RefViewSelectionTotal, viewmetrics.RefViewReady)
@@ -445,7 +582,7 @@ func (m *RefViewManager) startBuild(
 	fingerprint string,
 ) (RefViewResult, error) {
 	now := time.Now().Unix()
-	claimed, err := m.catalog.ClaimRefViewBuild(ctx, store_sqlite.RefViewBuild{
+	attempt := store_sqlite.RefViewBuild{
 		BuildID:            uuid.NewV7().String(),
 		RefViewID:          view.RefViewID,
 		DesiredRef:         resolved.FullRef,
@@ -459,7 +596,14 @@ func (m *RefViewManager) startBuild(
 		BuildToken:         uuid.NewV7().String(),
 		CreatedAt:          now,
 		LastProgress:       now,
-	}, now-int64(m.buildLiveness/time.Second))
+	}
+	var claimed store_sqlite.RefViewBuild
+	err := m.withWriter(ctx, func(writeCtx context.Context) error {
+		var claimErr error
+		claimed, claimErr = m.catalog.ClaimRefViewBuild(
+			writeCtx, attempt, now-int64(m.buildLiveness/time.Second))
+		return claimErr
+	})
 	if err != nil {
 		if errors.Is(err, store_sqlite.ErrRefViewBuildInFlight) {
 			viewmetrics.Count(viewmetrics.RefViewSelectionTotal, viewmetrics.RefViewCoalesced)
@@ -773,12 +917,20 @@ func (m *RefViewManager) completeBuild(
 // failed records why a selection could not be served and hands the cause back.
 // The active pointer is never touched: a view whose newest build failed keeps
 // serving what it was serving, and whoever reads it labels that inexact.
+//
+// The record is diagnostics, and it is bounded like every other write a
+// selection makes. It closes nothing — the claim is released by completeBuild,
+// which is not bounded for exactly that reason — so a saturated writer costs
+// the last_error stamp and nothing else, where waiting the writer out would
+// cost the caller the cause this call is about to return.
 func (m *RefViewManager) failed(
 	ctx context.Context,
 	view store_sqlite.RefView,
 	cause error,
 ) (RefViewResult, error) {
-	err := m.catalog.FailRefView(closingContext(ctx), store_sqlite.FailRefViewRequest{
+	recordCtx, cancel := context.WithTimeout(closingContext(ctx), m.writerBudget)
+	defer cancel()
+	err := m.catalog.FailRefView(recordCtx, store_sqlite.FailRefViewRequest{
 		RefViewID:          view.RefViewID,
 		ExpectedRouteEpoch: view.RouteEpoch,
 		LastError:          cause.Error(),
