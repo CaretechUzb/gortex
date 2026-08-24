@@ -54,3 +54,16 @@ func (s *Server) scopeForAutomaticCheckout(ctx context.Context, cwd string) (wor
 	}
 	return s.multiIndexer.ScopeForCWD(root)
 }
+
+// CheckoutServesCWD reports whether a working directory binds to a registered
+// checkout this server can scope a session to.
+//
+// It is the admission question the daemon's dispatcher asks before handing a
+// frame over, and it answers from scopeForAutomaticCheckout so the gate and
+// the scope behind it cannot disagree: a cwd admitted here is one sessionScope
+// binds to the family's primary, and a cwd refused here is one it would have
+// left unresolved.
+func (s *Server) CheckoutServesCWD(ctx context.Context, cwd string) bool {
+	_, _, _, ok := s.scopeForAutomaticCheckout(ctx, cwd)
+	return ok
+}

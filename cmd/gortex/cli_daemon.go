@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/zzet/gortex/internal/daemon"
+	"github.com/zzet/gortex/internal/indexer"
 	gortexmcp "github.com/zzet/gortex/internal/mcp"
 	"github.com/zzet/gortex/internal/pathkey"
 )
@@ -167,7 +168,15 @@ func resolveExecutorWithToolSurface(repoPath, tools, toolsMode string) (cliExecu
 	if !daemon.IsRunning() {
 		return nil, ErrNoExecutor
 	}
-	if !daemonOwnsRepo(abs) {
+	switch verdict := probeCWDReach(abs); verdict.reach {
+	case reachDaemon:
+	case reachUnboundWorktree:
+		// The daemon knows the family and would serve the worktree once it is
+		// bound; refusing with ErrNoExecutor here would hand the caller the
+		// `gortex track <worktree>` remedy, which is the one thing that must
+		// not happen for a worktree.
+		return nil, worktreeCWDErr(abs, verdict.mainRepo, true)
+	default:
 		return nil, ErrNoExecutor
 	}
 	c, err := daemon.Dial(daemon.Handshake{
@@ -186,8 +195,34 @@ func resolveExecutorWithToolSurface(repoPath, tools, toolsMode string) (cliExecu
 	}, nil
 }
 
-// daemonOwnsRepo reports whether the running daemon tracks a repo that
-// covers abs (so a daemon query won't answer empty for an untracked path).
+// cwdReach is how the running daemon reaches a working directory.
+type cwdReach int
+
+const (
+	// reachNone — no tracked repo and no registered checkout covers the path.
+	reachNone cwdReach = iota
+	// reachDaemon — the daemon can answer for the path.
+	reachDaemon
+	// reachUnboundWorktree — the path is a linked git worktree of a tracked
+	// repository that the daemon has not bound to a checkout view.
+	reachUnboundWorktree
+)
+
+// cwdVerdict is what the routing probe decided about one working directory.
+type cwdVerdict struct {
+	reach cwdReach
+	// mainRepo is the main checkout of the linked worktree the path sits in.
+	// Set only for reachUnboundWorktree — it is the repository the remedy
+	// names, because the worktree itself must never be tracked separately.
+	mainRepo string
+}
+
+// daemonOwnsRepo reports whether the running daemon can answer for abs.
+func daemonOwnsRepo(abs string) bool {
+	return probeCWDReach(abs).reach == reachDaemon
+}
+
+// probeCWDReach asks the running daemon how it reaches abs.
 //
 // This runs ahead of every CLI graph query, which made it the single point
 // where a busy daemon stalled the whole CLI: Status serialises behind the
@@ -203,10 +238,10 @@ func resolveExecutorWithToolSurface(repoPath, tools, toolsMode string) (cliExecu
 // about: that path does not need the controller mutex, and a genuinely
 // untracked repo comes back as repo_not_tracked, which surfaces the same
 // message this probe would have produced.
-func daemonOwnsRepo(abs string) bool {
+func probeCWDReach(abs string) cwdVerdict {
 	c, err := daemon.Dial(daemon.Handshake{Mode: daemon.ModeControl, ClientName: "cli"})
 	if err != nil {
-		return false
+		return cwdVerdict{reach: reachNone}
 	}
 	defer c.Close()
 	resp, err := c.ControlWithTimeout(daemon.ControlStatus, nil, daemonRoutingProbeTimeout)
@@ -214,31 +249,123 @@ func daemonOwnsRepo(abs string) bool {
 		fmt.Fprintf(os.Stderr,
 			"[gortex] daemon did not answer within %s (a track / reload / enrichment may be holding it) — asking it anyway\n",
 			daemonRoutingProbeTimeout)
-		return true
+		return cwdVerdict{reach: reachDaemon}
 	}
 	if err != nil || !resp.OK {
-		return false
+		return cwdVerdict{reach: reachNone}
 	}
 	var st daemon.StatusResponse
 	if err := json.Unmarshal(resp.Result, &st); err != nil {
-		return false
+		return cwdVerdict{reach: reachNone}
 	}
+	if trackedReposReach(st, abs) {
+		return cwdVerdict{reach: reachDaemon}
+	}
+	// abs lies in no tracked repo root, which is the ordinary shape of a
+	// linked worktree: the family is tracked through its main checkout and the
+	// worktree is a directory the repository registry never covers. The
+	// catalog binds such a path to its family's view, exactly as an MCP
+	// session cwd is bound, so the daemon is still the one that answers.
+	if checkoutBindsCWD(c, abs) {
+		return cwdVerdict{reach: reachDaemon}
+	}
+	// A worktree of a tracked family that no checkout is bound to yet. The
+	// query cannot be served, but the caller must not be told to track it.
+	if main := linkedWorktreeMain(abs); main != "" && trackedRootContains(st, main) {
+		return cwdVerdict{reach: reachUnboundWorktree, mainRepo: main}
+	}
+	return cwdVerdict{reach: reachNone}
+}
+
+// trackedRootContains reports whether p lies inside a tracked repo root.
+func trackedRootContains(st daemon.StatusResponse, p string) bool {
 	for _, repo := range st.TrackedRepos {
-		if repo.Path == "" {
-			continue
-		}
-		// Forward containment: abs is inside a tracked repo.
-		if pathkey.HasPathPrefix(abs, repo.Path) {
-			return true
-		}
-		// Reverse containment: abs is a root ABOVE tracked repos. The
-		// MCP dispatcher serves this shape (cmd/gortex/daemon_mcp.go
-		// cwdReachable), and the two gates answering differently for
-		// the same directory is a difference the user experiences as
-		// "the agent can query this folder but the CLI cannot".
-		if pathkey.HasPathPrefix(repo.Path, abs) {
+		if repo.Path != "" && pathkey.HasPathPrefix(p, repo.Path) {
 			return true
 		}
 	}
 	return false
+}
+
+// trackedReposReach adds reverse containment to trackedRootContains: p is a
+// root ABOVE tracked repos. The MCP dispatcher serves this shape
+// (cmd/gortex/daemon_mcp.go cwdReachable), and the two gates answering
+// differently for the same directory is a difference the user experiences as
+// "the agent can query this folder but the CLI cannot".
+func trackedReposReach(st daemon.StatusResponse, p string) bool {
+	if trackedRootContains(st, p) {
+		return true
+	}
+	for _, repo := range st.TrackedRepos {
+		if repo.Path != "" && pathkey.HasPathPrefix(repo.Path, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// checkoutBindsCWD asks the daemon whether abs sits inside a registered
+// checkout — a working copy the catalog binds to its family's view.
+//
+// file_coverage is the control-surface answer to "which graph serves this
+// path", and its view block names the checkout that owns the path. It has to
+// be the control surface: the tool surface is what this pre-flight guards, so
+// asking it here would be circular.
+//
+// A daemon too old to know the verb, or one that cannot answer inside the
+// routing budget, reports no checkout — leaving the caller with exactly the
+// verdict it reached before this arm existed.
+func checkoutBindsCWD(c *daemon.Client, abs string) bool {
+	resp, err := c.ControlWithTimeout(daemon.ControlFileCoverage,
+		daemon.FileCoverageParams{Path: abs}, daemonRoutingProbeTimeout)
+	if err != nil || !resp.OK {
+		return false
+	}
+	var out daemon.FileCoverageResult
+	if err := json.Unmarshal(resp.Result, &out); err != nil {
+		return false
+	}
+	return out.View != nil && out.View.CheckoutID != ""
+}
+
+// linkedWorktreeMain resolves the main checkout of the linked git worktree abs
+// sits in, or "" when it sits in none. A cwd is not necessarily a worktree
+// root, so the nearest enclosing `.git` is what gets classified.
+func linkedWorktreeMain(abs string) string {
+	for dir := filepath.Clean(abs); ; {
+		if _, err := os.Lstat(filepath.Join(dir, ".git")); err == nil {
+			info := indexer.ResolveWorktree(dir)
+			if !info.IsWorktree {
+				return ""
+			}
+			return info.MainRepoPath
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return ""
+		}
+		dir = parent
+	}
+}
+
+// worktreeCWDErr explains a linked git worktree the daemon cannot answer for.
+//
+// The remedy is never `gortex track <worktree>`: a linked worktree registered
+// as a repository of its own is indexed a second time and stops being served
+// through its family, which is what the family model exists to prevent. The
+// main checkout is what gets tracked; the worktree is served through it.
+func worktreeCWDErr(worktree, mainRepo string, familyTracked bool) error {
+	if familyTracked {
+		return fmt.Errorf(
+			"the gortex daemon tracks %s but has not bound the worktree %s to a view yet — run `gortex repos reconcile %s` and retry (never track a worktree as its own repository)",
+			mainRepo, worktree, mainRepo)
+	}
+	if !daemon.IsRunning() {
+		return fmt.Errorf(
+			"no gortex daemon is running — start it with `gortex daemon start --detach`, then track the main checkout with `gortex track %s`; %s is a linked worktree of it and is served through it",
+			mainRepo, worktree)
+	}
+	return fmt.Errorf(
+		"the gortex daemon does not track %s — it is a linked worktree of %s; add the main checkout with `gortex track %s` and the worktree is served through it",
+		worktree, mainRepo, mainRepo)
 }
