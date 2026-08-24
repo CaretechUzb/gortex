@@ -452,3 +452,32 @@ func worktreeCWDErr(worktree string, fam worktreeFamily, familyRepo string) erro
 		"the gortex daemon does not track the family %s is a linked worktree of — %s; the worktree is then served through it",
 		worktree, remedy)
 }
+
+// checkoutsRelayPath resolves the repository path the checkout verbs relay
+// through.
+//
+// Those verbs exist to inspect and repair the binding between a working copy
+// and its family, so the cwd whose binding is what's broken must not be the
+// path that decides whether they may run: the routing pre-flight would refuse
+// them with the very error that recommends them, and take the diagnostic verbs
+// for that state down with it. An unbound worktree relays through the tracked
+// working copy of its own family instead. Nothing but the daemon route depends
+// on this path — every one of these verbs names its subject explicitly or asks
+// about the whole catalog.
+func checkoutsRelayPath(repoPath string) string {
+	abs, err := filepath.Abs(repoPath)
+	if err != nil || !daemon.IsRunning() {
+		return repoPath
+	}
+	// Only a linked worktree can take the unbound shape. Classifying that on
+	// the filesystem first keeps an ordinary cwd from paying for a second
+	// routing probe, and keeps a worktree the daemon DOES serve on its own
+	// cwd — relaying that one away would answer it in another view.
+	if _, ok := linkedWorktreeAt(abs); !ok {
+		return repoPath
+	}
+	if v := probeCWDReach(abs); v.reach == reachUnboundWorktree && v.familyRepo != "" {
+		return v.familyRepo
+	}
+	return repoPath
+}

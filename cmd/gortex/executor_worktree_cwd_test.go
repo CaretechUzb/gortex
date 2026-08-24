@@ -318,3 +318,69 @@ func TestRequireDaemonTool_UntrackedCWDKeepsTheTrackSuggestion(t *testing.T) {
 		t.Fatalf("untracked message changed:\n got %q\nwant %q", err.Error(), want)
 	}
 }
+
+// TestCheckoutVerbs_UnboundWorktreeCWDRelaysThroughTheFamily pins that the
+// remedy an unbound worktree is given can be run from the worktree it is
+// given in.
+//
+// The checkout verbs relay through requireDaemonTool with --index defaulting
+// to ".", so routing them on the cwd made `gortex repos reconcile` fail with
+// the very error that recommended it — and took `explain-view` and `families`,
+// the verbs that diagnose exactly this state, down with it.
+func TestCheckoutVerbs_UnboundWorktreeCWDRelaysThroughTheFamily(t *testing.T) {
+	t.Run("main checkout tracked", func(t *testing.T) {
+		dir := t.TempDir()
+		mainRepo, worktree := fakeLinkedWorktree(t, dir)
+		stub := startStubDaemon(t, []string{mainRepo})
+
+		if _, err := checkoutsDaemonTool(worktree, "reconcile_checkouts", map[string]any{}); err != nil {
+			t.Fatalf("the recommended remedy must run from the worktree it is recommended in: %v", err)
+		}
+		if hs := stub.seenMCPHandshake(); hs.CWD != mainRepo {
+			t.Fatalf("the verb must relay through the family's tracked repo, daemon saw %q want %q", hs.CWD, mainRepo)
+		}
+		if tool, _ := stub.seenTool(); tool != "reconcile_checkouts" {
+			t.Fatalf("relayed the wrong tool: %q", tool)
+		}
+	})
+
+	t.Run("bare hub tracked through a sibling worktree", func(t *testing.T) {
+		dir := t.TempDir()
+		_, tracked, worktree := fakeBareHubFamily(t, dir)
+		stub := startStubDaemon(t, []string{tracked})
+
+		if _, err := checkoutsDaemonTool(worktree, "explain_view", map[string]any{"path": worktree}); err != nil {
+			t.Fatalf("the diagnostic verb for this state must run in it: %v", err)
+		}
+		if hs := stub.seenMCPHandshake(); hs.CWD != tracked {
+			t.Fatalf("the verb must relay through the family's tracked worktree, daemon saw %q want %q", hs.CWD, tracked)
+		}
+	})
+
+	t.Run("a bound worktree keeps its own cwd", func(t *testing.T) {
+		dir := t.TempDir()
+		mainRepo, worktree := fakeLinkedWorktree(t, dir)
+		stub := startStubDaemon(t, []string{mainRepo})
+		stub.serveCheckouts(worktree)
+
+		if _, err := checkoutsDaemonTool(worktree, "explain_view", map[string]any{"path": worktree}); err != nil {
+			t.Fatalf("a bound worktree serves the verb itself: %v", err)
+		}
+		if hs := stub.seenMCPHandshake(); hs.CWD != worktree {
+			t.Fatalf("a worktree the daemon serves must not be relayed away from its own view: got %q want %q",
+				hs.CWD, worktree)
+		}
+	})
+
+	t.Run("a tracked cwd is relayed unchanged", func(t *testing.T) {
+		repo := t.TempDir()
+		stub := startStubDaemon(t, []string{repo})
+
+		if _, err := checkoutsDaemonTool(repo, "list_checkouts", map[string]any{}); err != nil {
+			t.Fatalf("a tracked cwd must relay as itself: %v", err)
+		}
+		if hs := stub.seenMCPHandshake(); hs.CWD != repo {
+			t.Fatalf("the relay rewrote a tracked cwd: got %q want %q", hs.CWD, repo)
+		}
+	})
+}

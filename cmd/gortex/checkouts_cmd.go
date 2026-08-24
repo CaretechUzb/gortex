@@ -17,7 +17,15 @@ import (
 // The verbs below are thin: every decision they render was made by the tool
 // they called, which is the same tool an agent calls over MCP. A CLI that
 // re-derived any of it would be a second answer to the same question.
-var checkoutsDaemonTool = requireDaemonTool
+var checkoutsDaemonTool = requireCheckoutTool
+
+// requireCheckoutTool is requireDaemonTool with the relay path resolved away
+// from a working copy whose binding is the thing being repaired — see
+// checkoutsRelayPath. Without it these verbs are unreachable from exactly the
+// directory that needs them.
+func requireCheckoutTool(repoPath, tool string, args map[string]any) (json.RawMessage, error) {
+	return requireDaemonTool(checkoutsRelayPath(repoPath), tool, args)
+}
 
 var (
 	checkoutsIndex   string
