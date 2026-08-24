@@ -112,6 +112,57 @@ func TestCheckoutWorkspacesEvictionFreesTheWholeHeavyWeight(t *testing.T) {
 	})
 }
 
+// TestCheckoutWorkspacesEvictRootFreesTheWholeHeavyWeight pins the same
+// weight-consistency on the other eviction path. EvictRoot is what every
+// departing checkout runs, and a credit short of what the pair charged leaks
+// budget per departure: the slots stay spent on servers that are gone, and the
+// checkouts still being served lose admissions to them until the daemon
+// restarts.
+func TestCheckoutWorkspacesEvictRootFreesTheWholeHeavyWeight(t *testing.T) {
+	withCheckoutWorkspaceWeights(t, map[string]int{"java": 2})
+	synctest.Test(t, func(t *testing.T) {
+		stopper := &recordingStopper{}
+		w := NewCheckoutWorkspaces(4, zap.NewNop())
+		w.SetStopper(stopper)
+
+		// Two of the four slots go to the checkout that is about to depart,
+		// and the third to one that stays — held, so nothing below can reach
+		// its slot by evicting it.
+		acquire(t, w, "java", "/family/departing")()
+		staying := acquire(t, w, "go", "/family/staying")
+
+		if got := w.EvictRoot("/family/departing"); got != 1 {
+			t.Fatalf("EvictRoot dropped %d pairs, want the departed checkout's one", got)
+		}
+
+		// Three ordinary pairs now fit beside the held one, which is exactly
+		// the budget the departure gave back. A credit of one slot per
+		// departed pair — or none — leaves the last of them nothing to be
+		// admitted into.
+		holds := []func(){
+			acquire(t, w, "go", "/family/first"),
+			acquire(t, w, "go", "/family/second"),
+			acquire(t, w, "go", "/family/third"),
+		}
+		if got := w.Live(); len(got) != 4 {
+			t.Errorf("live = %v, want the held pair and three admitted beside it", got)
+		}
+
+		synctest.Wait()
+		// The readmissions came out of the freed budget, so none of them cost
+		// a surviving workspace its server.
+		want := []CheckoutWorkspaceRef{{Language: "java", Root: "/family/departing"}}
+		if got := stopper.calls(); !reflect.DeepEqual(got, want) {
+			t.Errorf("stopped %v, want %v", got, want)
+		}
+
+		for _, release := range holds {
+			release()
+		}
+		staying()
+	})
+}
+
 // TestCheckoutWorkspaceCapRaiseWidensTheWeightedBudget keeps the operator
 // knob's meaning under the weighting: checkout_lsp_max_workspaces buys slots,
 // so an operator whose machine has the memory for a third heavy server says so
