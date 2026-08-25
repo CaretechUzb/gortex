@@ -3,7 +3,6 @@ package config
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"reflect"
 	"sort"
 	"strings"
@@ -175,12 +174,19 @@ func (cm *ConfigManager) LoadWorkspaceConfig(repoPrefix, repoPath string) {
 // the caller keeps whatever it had cached. A (nil, true) result means the
 // file genuinely does not exist.
 func (cm *ConfigManager) readWorkspaceConfig(repoPrefix, repoPath string) (*Config, bool) {
-	configPath := filepath.Join(repoPath, ".gortex.yaml")
+	// Nearest-first from repoPath upward: a checkout nested inside a larger
+	// deployment inherits the deployment's config instead of needing its own
+	// copy. See FindWorkspaceConfig for why the walk exists and where it stops.
+	configPath := FindWorkspaceConfig(repoPath)
+	if configPath == "" {
+		// No workspace config at or above the repo — global defaults apply.
+		return nil, true
+	}
 
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// No workspace config — global defaults will apply.
+			// Deleted between the walk and the read; treat it as absent.
 			return nil, true
 		}
 		cm.logger.Warn("failed to read workspace config",
