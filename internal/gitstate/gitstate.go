@@ -26,6 +26,7 @@ import (
 	"strings"
 
 	"github.com/zzet/gortex/internal/gitcmd"
+	"github.com/zzet/gortex/internal/pathkey"
 )
 
 // MainAdminName is the sentinel AdminName carried by the main worktree.
@@ -339,12 +340,18 @@ func finalizeRecord(r WorktreeRecord) WorktreeRecord {
 // carry: which record is the main worktree, whether each root is
 // reachable on disk, and each linked worktree's administrative name.
 func annotateRecords(ctx context.Context, inv *FamilyInventory, commonDir string) {
-	var adminIndex map[string]string
+	var adminIndex []adminEntry
+	indexed := false
 	adminIndexFor := func(path string) string {
-		if adminIndex == nil {
-			adminIndex = buildAdminIndex(commonDir)
+		if !indexed {
+			adminIndex, indexed = buildAdminIndex(commonDir), true
 		}
-		return adminIndex[path]
+		for _, entry := range adminIndex {
+			if pathkey.EqualPaths(entry.root, path) {
+				return entry.name
+			}
+		}
+		return ""
 	}
 
 	for i := range inv.Records {
@@ -385,21 +392,43 @@ func adminNameFromWorktree(ctx context.Context, path string) string {
 	return filepath.Base(gitDir)
 }
 
-// buildAdminIndex maps each linked worktree's root path to its
+// adminEntry pairs the worktree root one administrative directory
+// records with that directory's name.
+type adminEntry struct {
+	// root is the worktree root read out of the admin directory's
+	// `gitdir` file, with the trailing `.git` component removed.
+	root string
+	// name is the basename of the administrative directory, which is
+	// the administrative name of the worktree it records.
+	name string
+}
+
+// buildAdminIndex pairs each linked worktree's root path with its
 // administrative directory name by reading the `gitdir` file every
 // admin directory keeps. It is the fallback for a worktree whose root
 // is gone: the admin directory outlives the checkout, and its `gitdir`
 // file still records where the checkout used to be.
-func buildAdminIndex(commonDir string) map[string]string {
-	index := map[string]string{}
+//
+// The result is a slice matched through pathkey.EqualPaths rather than
+// a map keyed on the root, because the two spellings being matched do
+// not agree byte for byte. The `gitdir` file holds git's own spelling,
+// which uses "/" on every platform, and filepath.Dir folds it to the
+// host separator — "C:\\wt" on Windows. The path being looked up is a
+// WorktreeRecord.Path, which is git's porcelain spelling untouched:
+// "C:/wt". A map keyed on either one therefore misses every lookup on
+// Windows, leaving a departed worktree with no administrative name to
+// key an identity on. Folding both sides also settles a drive letter
+// the two spellings disagree on.
+func buildAdminIndex(commonDir string) []adminEntry {
 	if commonDir == "" {
-		return index
+		return nil
 	}
 	base := filepath.Join(commonDir, "worktrees")
 	entries, err := os.ReadDir(base)
 	if err != nil {
-		return index
+		return nil
 	}
+	index := make([]adminEntry, 0, len(entries))
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
@@ -415,7 +444,7 @@ func buildAdminIndex(commonDir string) map[string]string {
 		if recorded == "" {
 			continue
 		}
-		index[filepath.Dir(recorded)] = e.Name()
+		index = append(index, adminEntry{root: filepath.Dir(recorded), name: e.Name()})
 	}
 	return index
 }
