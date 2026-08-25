@@ -109,7 +109,7 @@ func TestRegisteredFrameworkRoutePasses_CoversStructuralPasses(t *testing.T) {
 	for _, p := range RegisteredFrameworkRoutePasses() {
 		names[p.Name()] = true
 	}
-	for _, want := range []string{"file-based", "django", "drf", "rails-resources", "express-objects", "flask-decorator"} {
+	for _, want := range []string{"file-based", "django", "drf", "rails-resources", "express-objects", "flask-decorator", "odoo"} {
 		if !names[want] {
 			t.Errorf("registry missing structural pass %q", want)
 		}

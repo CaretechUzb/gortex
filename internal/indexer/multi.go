@@ -1737,9 +1737,16 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 	// carries the caller's detached census attestation: admission censuses read
 	// the raw whole store while synthesizer execution keeps the scoped view.
 	fwStart := time.Now()
-	fwRep := resolver.RunFrameworkSynthesizersScopedWithCensus(mi.graph, changedPrefixes, censusEligible)
+	fwRep := resolver.RunFrameworkSynthesizersScopedWithCensus(
+		mi.graph, changedPrefixes, censusEligible,
+		resolver.WithAllowedFrameworks(mi.allowedFrameworks()),
+		resolver.WithFrameworkAllowByRepo(mi.allowedFrameworksByRepo()),
+	)
 	mi.logger.Info("global pass: framework dispatch synthesis",
 		zap.Int("edges", fwRep.Total),
+		// Edges refused because the source repository excluded the pass
+		// in its own index.frameworks.allow. Absent when nothing narrows.
+		zap.Int("repo_gated", fwRep.RepoGated),
 		zap.Any("per_synthesizer", fwRep.Per),
 		zap.Int64("census_ms", fwRep.CensusMillis),
 		zap.Int64("scope_ms", fwRep.ScopeMillis),

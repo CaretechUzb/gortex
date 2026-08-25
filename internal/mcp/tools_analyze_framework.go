@@ -22,8 +22,8 @@ import (
 //   - method: HTTP verb (GET/POST/...) or gRPC method (case-insensitive)
 //   - path:   substring match on the contract's path / topic / channel
 //   - type:   contract type — http / grpc / graphql / topic / ws.
-//             Named `type` (not `kind`) because the analyze dispatcher
-//             reserves `kind` for the analyzer name itself.
+//     Named `type` (not `kind`) because the analyze dispatcher
+//     reserves `kind` for the analyzer name itself.
 func (s *Server) handleAnalyzeRoutes(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args := req.GetArguments()
 	methodFilter := strings.ToUpper(strings.TrimSpace(stringArg(args, "method")))
@@ -178,15 +178,34 @@ func (s *Server) handleAnalyzeRouteFrameworks(ctx context.Context, req mcp.CallT
 		Name      string   `json:"name"`
 		Languages []string `json:"languages,omitempty"`
 		Routes    int      `json:"routes"`
+		// Active reports whether index.frameworks.allow admits this pass.
+		// A pass reported here with Routes:0 is otherwise ambiguous —
+		// "ran and found nothing" and "never ran" look identical.
+		Active bool `json:"active"`
+		// AllowedIn names the repositories admitting the pass, populated
+		// only when the tracked repositories disagree.
+		AllowedIn []string `json:"allowed_in,omitempty"`
 	}
+	perRepo := s.frameworkAllowListsByRepo()
 	var passes []passRow
 	for _, p := range contracts.RegisteredFrameworkRoutePasses() {
-		passes = append(passes, passRow{Name: p.Name(), Languages: p.Languages(), Routes: frameworkCounts[p.Name()]})
+		active, allowedIn := frameworkAdmission(p.Name(), perRepo)
+		passes = append(passes, passRow{
+			Name:      p.Name(),
+			Languages: p.Languages(),
+			Routes:    frameworkCounts[p.Name()],
+			Active:    active,
+			AllowedIn: allowedIn,
+		})
 	}
 	if isCompact(req) {
 		var b strings.Builder
 		for _, p := range passes {
-			fmt.Fprintf(&b, "%-20s %v  (%d routes)\n", p.Name, p.Languages, p.Routes)
+			state := ""
+			if !p.Active {
+				state = "  [excluded by index.frameworks.allow]"
+			}
+			fmt.Fprintf(&b, "%-20s %v  (%d routes)%s\n", p.Name, p.Languages, p.Routes, state)
 		}
 		if len(passes) == 0 {
 			b.WriteString("no registered route frameworks\n")
@@ -522,11 +541,11 @@ func (s *Server) handleAnalyzeComponents(ctx context.Context, req mcp.CallToolRe
 // child to produce a fan-in / fan-out leaderboard.
 func (s *Server) componentsRollup(ctx context.Context, req mcp.CallToolRequest, nameFilter string) (*mcp.CallToolResult, error) {
 	type compRow struct {
-		ID      string `json:"id"`
-		Name    string `json:"name"`
-		FanIn   int    `json:"fan_in"`
-		FanOut  int    `json:"fan_out"`
-		File    string `json:"file,omitempty"`
+		ID     string `json:"id"`
+		Name   string `json:"name"`
+		FanIn  int    `json:"fan_in"`
+		FanOut int    `json:"fan_out"`
+		File   string `json:"file,omitempty"`
 	}
 	stats := map[string]*compRow{}
 	get := func(id string) *compRow {
@@ -706,8 +725,8 @@ func (s *Server) componentsForOne(ctx context.Context, req mcp.CallToolRequest, 
 // Filters:
 //   - framework:     dbt | sqlmesh
 //   - type:          resource type — model / seed / snapshot / source.
-//                    Named `type` (not `kind`) because the analyze
-//                    dispatcher reserves `kind` for the analyzer name.
+//     Named `type` (not `kind`) because the analyze
+//     dispatcher reserves `kind` for the analyzer name.
 //   - materialized:  substring match on the materialization
 //   - name:          substring match on the model / source name
 func (s *Server) handleAnalyzeDbtModels(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {

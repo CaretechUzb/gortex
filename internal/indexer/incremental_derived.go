@@ -207,6 +207,8 @@ func (mi *MultiIndexer) runIncrementalDerivedPassesTopologyHeld(
 		merged.Flags.Has(DerivedInvalidatesRuntime) {
 		framework := resolver.RunFrameworkSynthesizersScopedForFiles(
 			mi.graph, scopedPrefixes, merged.Files, merged.CSharpHierarchyChanged,
+			resolver.WithAllowedFrameworks(mi.allowedFrameworks()),
+			resolver.WithFrameworkAllowByRepo(mi.allowedFrameworksByRepo()),
 		)
 		report.Framework = framework.Total
 		report.FrameworkPer = framework.Per

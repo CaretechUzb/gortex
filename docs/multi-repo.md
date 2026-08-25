@@ -31,6 +31,8 @@ Two-tier config hierarchy:
 - **Global config** (`~/.gortex/config.yaml`) — projects, repo lists, active project, reference tags, and machine-level MCP policy
 - **Workspace config** (`.gortex.yaml` per repo) — guards, excludes, local overrides
 
+A workspace config is found by walking **up** from the tracked root and taking the first `.gortex.yaml`, so one file can configure several tracked repos at once. A deployment that tracks `<deploy>/src/odoo`, `<deploy>/src/addons` and `<deploy>/src/local` separately declares its frameworks and excludes once at `<deploy>/.gortex.yaml`; a checkout that needs to differ still wins by keeping its own file, since the walk starts at the root itself. The walk stops before `$HOME` and before the filesystem root — `~/.gortex/config.yaml` is already the machine-level layer, and a stray `.gortex.yaml` in a home directory silently reconfiguring every repo beneath it would be a trap rather than a feature. `gortex config exclude list` resolves the file the same way, so what it reports is what indexing uses.
+
 Excludes are layered — builtin → the repo's `.gitignore` chain → global → per-repo entry → workspace — with gitignore semantics. `.gitignore` is respected by default so you don't have to re-declare entries already curated for git; opt out per-workspace with `respect_gitignore: false` in `.gortex.yaml`. Use `!pattern` in a later layer to re-include something an earlier layer excluded. Beyond `.gitignore`, the index walk also honors per-directory `.gortexignore` files (Gortex's own ignore file, a sibling to `.gitignore`) and ripgrep's `.ignore` / `.rgignore` — each scoped to the directory that contains it.
 
 When a tracked root sits below its git root — the monorepo case, `gortex track repo/projects/App` with the repository at `repo/` — every `.gitignore` from the git root down to the tracked root applies, as it would for git, with ancestor patterns re-anchored onto the tracked root. A deeper file overrides a shallower one, so a `!pattern` next to your code still wins over the repository-wide rule. Ancestor patterns that describe a sibling subtree are dropped, and so is one that would ignore the tracked root itself: you asked Gortex to index that directory explicitly.
@@ -67,6 +69,42 @@ projects:
 ```
 
 The embedded MCP fallback is a machine-level, default-off policy. Enable `mcp.allow_embedded` only in the user-level config; see [Daemon availability and embedded fallback](mcp.md#daemon-availability-and-embedded-fallback).
+
+### Framework allow-list across repositories
+
+`index.frameworks.allow` narrows which framework passes run (see
+[features.md](features.md)). It resolves differently for the two layers,
+because they have different scopes:
+
+```yaml
+# .gortex.yaml
+index:
+  frameworks:
+    allow: [odoo, celery-dispatch]   # absent/empty = all; `none` = none
+```
+
+* **Route passes** run per repository during extraction, so each
+  repository honours its own list exactly.
+* **The dispatch synthesizers and claiming resolvers** run once over the
+  shared graph. Whether a pass *executes* is the **union** of every
+  tracked repository's list — a framework narrowed away in repository A
+  still runs if repository B allows it, otherwise A's setting would strip
+  B's edges and B never opted out. Where that pass may *write* is decided
+  separately, per edge: an edge is attributed to the repository owning its
+  **source** node, and it is dropped unless that repository's own list
+  admits the pass.
+
+So each repository gets exactly what it asked for. Given four Odoo
+checkouts with `allow: [odoo]` alongside an unconfigured repository, the
+Go and React passes still run — for the unconfigured repository — but land
+no edges in the four that excluded them.
+
+`analyze kind=frameworks` reports each pass's effective state, naming the
+admitting repositories when they disagree, and the global pass logs
+`repo_gated` with the number of edges refused this way. Setting the key in
+the global `~/.gortex/config.yaml` narrows the workspace as a whole, which
+stops the excluded passes from running at all rather than merely confining
+their output.
 
 `synthesize_external_calls: true` (opt-in, default off — set in `.gortex.yaml` or the global config) makes the resolver synthesize placeholder nodes for calls into un-indexed external packages or sibling services, so call-chains keep the external hop instead of terminating at the indexed boundary.
 

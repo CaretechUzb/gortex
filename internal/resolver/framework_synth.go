@@ -83,20 +83,25 @@ const (
 // label (for the report grouping) and as the value stamped on each
 // landed edge, so the two never drift.
 const (
-	SynthGRPCStub            = "grpc-stub"
-	SynthTemporalStub        = "temporal-stub"
-	SynthEventChannel        = "event-channel"
-	SynthSwiftObjC           = "swift-objc-bridge"
-	SynthReactNative         = "react-native-bridge"
-	SynthReactNativePair     = "react-native-native-pair"
-	SynthObserverChannel     = "observer-channel"
-	SynthClosureCollection   = "closure-collection"
-	SynthReactSetState       = "react-setstate"
-	SynthFlutterSetState     = "flutter-setstate"
-	SynthKMPExpectActual     = "kmp-expect-actual"
-	SynthExpoModules         = "expo-modules-bridge"
-	SynthFabric              = "fabric-codegen"
-	SynthMyBatis             = "mybatis"
+	SynthGRPCStub          = "grpc-stub"
+	SynthTemporalStub      = "temporal-stub"
+	SynthEventChannel      = "event-channel"
+	SynthSwiftObjC         = "swift-objc-bridge"
+	SynthReactNative       = "react-native-bridge"
+	SynthReactNativePair   = "react-native-native-pair"
+	SynthObserverChannel   = "observer-channel"
+	SynthClosureCollection = "closure-collection"
+	SynthReactSetState     = "react-setstate"
+	SynthFlutterSetState   = "flutter-setstate"
+	SynthKMPExpectActual   = "kmp-expect-actual"
+	SynthExpoModules       = "expo-modules-bridge"
+	SynthFabric            = "fabric-codegen"
+	SynthMyBatis           = "mybatis"
+	// SynthOdoo is the single name for the whole Odoo framework — the
+	// route pass, the model/XML/JS binders and everything else. Odoo is
+	// deliberately not split into sub-passes: one index.frameworks.allow
+	// entry governs it, and it can never be half-indexed.
+	SynthOdoo                = "odoo"
 	SynthRustScope           = "rust-scope"
 	SynthFactoryChain        = "factory-chain"
 	SynthSQLCallsite         = "sql-callsite"
@@ -602,12 +607,17 @@ const (
 // graph scans. These are deliberately one-way gates; a marker hit only keeps
 // the pass enabled and does not claim that an edge will be produced.
 var frameworkSynthNodePreflights = map[string][]string{
-	SynthEventChannel:        {SynthEventChannel},
-	SynthSwiftObjC:           {frameworkMarkerSwift, frameworkMarkerObjC},
-	SynthObserverChannel:     {SynthObserverChannel},
-	SynthReactSetState:       {SynthReactSetState},
-	SynthFlutterSetState:     {SynthFlutterSetState},
-	SynthMyBatis:             {SynthMyBatis},
+	SynthEventChannel:    {SynthEventChannel},
+	SynthSwiftObjC:       {frameworkMarkerSwift, frameworkMarkerObjC},
+	SynthObserverChannel: {SynthObserverChannel},
+	SynthReactSetState:   {SynthReactSetState},
+	SynthFlutterSetState: {SynthFlutterSetState},
+	SynthMyBatis:         {SynthMyBatis},
+	// One marker, not three: preflight markers are AND-ed, so listing
+	// odoo_model + odoo_xml_id + odoo_js_module would wrongly demand a
+	// repository use all three halves of Odoo. The census sets this
+	// single marker for any Odoo node, which is the OR the pass needs.
+	SynthOdoo:                {SynthOdoo},
 	SynthSidekiq:             {SynthSidekiq},
 	SynthLaravelEvent:        {SynthLaravelEvent},
 	SynthSwiftUIResolve:      {SynthSwiftUIResolve},
@@ -671,6 +681,13 @@ func recordFrameworkNodeCandidates(markers map[string]int, n *graph.Node, family
 	if isPubsubEventNode(n.ID) || isEmitterEventNode(n.ID) {
 		markers[SynthEventChannel]++
 	}
+	// Odoo spans Python classes, XML records and OWL JS in one framework,
+	// so its marker is keyed on the extractor's Meta rather than on a
+	// language: any one of the three halves admits the pass, and each
+	// binder no-ops cheaply when its own half is absent.
+	if odooNodeMarker(n) {
+		markers[SynthOdoo]++
+	}
 
 	language := strings.ToLower(strings.TrimSpace(n.Language))
 	if strict := languageFamily(language); strict != "" {
@@ -685,6 +702,8 @@ func recordFrameworkNodeCandidates(markers map[string]int, n *graph.Node, family
 		if n.Kind == graph.KindMethod {
 			markers[SynthMyBatis]++
 		}
+	case "odoo_xml":
+		markers[SynthOdoo]++
 	case "ruby":
 		if (n.Kind == graph.KindMethod || n.Kind == graph.KindFunction) && n.Name == "perform" {
 			markers[SynthSidekiq]++
@@ -898,6 +917,10 @@ func defaultFrameworkSynthesizers() []FrameworkSynthesizer {
 		synthFunc{name: SynthExpoModules, fn: ResolveExpoModuleBridge},
 		synthFunc{name: SynthFabric, fn: ResolveFabricComponents},
 		synthFunc{name: SynthMyBatis, fn: ResolveMyBatisCalls},
+		// Odoo runs as one pass; its three binding families are ordered
+		// sub-steps inside ResolveOdooRefs rather than registry entries,
+		// so their order cannot drift with registry edits.
+		synthFunc{name: SynthOdoo, fn: ResolveOdooRefs},
 		synthFunc{name: SynthSQLCallsite, fn: ResolveSQLCallsites},
 		// Store-factory (Zustand/Redux/Pinia/MobX) indirect action calls —
 		// binds getState()-chain and destructured calls to the action node.
@@ -1046,6 +1069,17 @@ type SynthCount struct {
 	// without retaining candidate objects after the pass completes.
 	ScopeRows  int `json:"scope_rows,omitempty"`
 	ScopeBytes int `json:"scope_bytes,omitempty"`
+	// Disabled reports that index.frameworks.allow excluded this pass,
+	// so Edges:0 here means "never ran" rather than "ran and found
+	// nothing". omitempty keeps every existing report byte-identical
+	// while no framework is excluded.
+	Disabled bool `json:"disabled,omitempty"`
+	// RepoGated counts edges this pass produced that were refused
+	// because the repository owning the edge's source node excluded the
+	// pass from its own index.frameworks.allow. Distinct from Disabled:
+	// the pass ran, and it still landed edges in the repositories that
+	// did admit it. Edges is reported net of these.
+	RepoGated int `json:"repo_gated,omitempty"`
 }
 
 // FrameworkSynthReport is the aggregate result of one
@@ -1089,6 +1123,12 @@ type FrameworkSynthReport struct {
 	// used only by cold/full executions. Scoped incremental passes keep their
 	// exact frontier store and leave this zero-valued.
 	FullReadCache FrameworkFullReadCacheStats `json:"full_read_cache,omitempty"`
+	// RepoGated totals the edge writes refused across every pass —
+	// synthesizers AND claiming resolvers — because the repository owning
+	// the source node excluded that pass in its own index.frameworks.allow.
+	// Zero, and absent from the report, for a workspace where no
+	// repository narrows anything.
+	RepoGated int `json:"repo_gated,omitempty"`
 }
 
 // scopedSynthesizer is the optional capability a FrameworkSynthesizer exposes
@@ -1102,8 +1142,8 @@ type scopedSynthesizer interface {
 // RunFrameworkSynthesizers runs every registered framework synthesizer
 // over g, in registration order, and returns the per-synthesizer and
 // total landed-edge counts. A nil graph is a no-op.
-func RunFrameworkSynthesizers(g graph.Store) FrameworkSynthReport {
-	return RunFrameworkSynthesizersScoped(g, nil)
+func RunFrameworkSynthesizers(g graph.Store, opts ...FrameworkSynthOption) FrameworkSynthReport {
+	return RunFrameworkSynthesizersScoped(g, nil, opts...)
 }
 
 // RunFrameworkSynthesizersScoped is RunFrameworkSynthesizers with an armed
@@ -1114,8 +1154,8 @@ func RunFrameworkSynthesizers(g graph.Store) FrameworkSynthReport {
 // claiming-resolver, family-gate, C# interface-dispatch, and receiver-gate tail
 // passes use the changed repositories plus their exact reverse dependency
 // frontier; nil scope retains full/cold whole-graph reconciliation.
-func RunFrameworkSynthesizersScoped(g graph.Store, scope map[string]bool) FrameworkSynthReport {
-	return runFrameworkSynthesizersScoped(g, scope, nil, false, true)
+func RunFrameworkSynthesizersScoped(g graph.Store, scope map[string]bool, opts ...FrameworkSynthOption) FrameworkSynthReport {
+	return runFrameworkSynthesizersScoped(g, scope, nil, false, true, resolveFrameworkSynthOptions(opts))
 }
 
 // RunFrameworkSynthesizersScopedWithCensus is the full-coverage batch form:
@@ -1128,8 +1168,9 @@ func RunFrameworkSynthesizersScopedWithCensus(
 	g graph.Store,
 	scope map[string]bool,
 	censusEligible bool,
+	opts ...FrameworkSynthOption,
 ) FrameworkSynthReport {
-	return runFrameworkSynthesizersScoped(g, scope, nil, censusEligible, true)
+	return runFrameworkSynthesizersScoped(g, scope, nil, censusEligible, true, resolveFrameworkSynthOptions(opts))
 }
 
 // RunFrameworkSynthesizersScopedForFiles is the exact incremental form. The
@@ -1141,8 +1182,9 @@ func RunFrameworkSynthesizersScopedForFiles(
 	scope map[string]bool,
 	filePaths []string,
 	csharpHierarchyChanged bool,
+	opts ...FrameworkSynthOption,
 ) FrameworkSynthReport {
-	return runFrameworkSynthesizersScoped(g, scope, filePaths, false, csharpHierarchyChanged)
+	return runFrameworkSynthesizersScoped(g, scope, filePaths, false, csharpHierarchyChanged, resolveFrameworkSynthOptions(opts))
 }
 
 func frameworkScopeForFiles(
@@ -1170,6 +1212,7 @@ func runFrameworkSynthesizersScoped(
 	filePaths []string,
 	censusEligible bool,
 	csharpHierarchyChanged bool,
+	o frameworkSynthOptions,
 ) FrameworkSynthReport {
 	rep := FrameworkSynthReport{}
 	if g == nil {
@@ -1209,12 +1252,29 @@ func runFrameworkSynthesizersScoped(
 		fullReadCache = newFrameworkFullReadCache()
 	}
 	rep.ScopeMillis = time.Since(scopeStart).Milliseconds()
+	// nil unless some repository narrowed its allow-list, so the common
+	// workspace pays nothing for per-repository enforcement.
+	repoGate := newFrameworkRepoGate(o.allowedByRepo)
 	for _, s := range defaultFrameworkSynthesizers() {
 		start := time.Now()
 		var n int
 		var bundle *frameworkPassCandidates
 		var passScope *frameworkScopedStore
-		if shouldRunFrameworkSynthesizer(s, executionScope, candidates) {
+		// The configured allow-list is checked ahead of the census gates
+		// so an excluded pass costs nothing at all.
+		// shouldRunFrameworkSynthesizer stays untouched: it answers "does
+		// this graph contain candidates", which is a different question
+		// from "may this pass run here".
+		disabled := !o.allowed.Allows(s.Name())
+		// o.allowed is the union: it answered only that SOME repository
+		// wants this pass. Repositories that excluded it are protected
+		// here instead, by gating the store the pass writes through —
+		// the batch layer flushes into gated, so a refused edge never
+		// reaches the backend. gated is g itself when nothing excludes
+		// this pass, which is the unconfigured hot path.
+		gated := newFrameworkRepoGateStore(g, repoGate, s.Name())
+		var gatedScope graph.Store
+		if !disabled && shouldRunFrameworkSynthesizer(s, executionScope, candidates) {
 			if sf, ok := s.(synthFunc); ok {
 				bundle = candidates.streams.passStreams(g, sf.name)
 				switch {
@@ -1222,28 +1282,40 @@ func runFrameworkSynthesizersScoped(
 					// Shared-stream form. streams exist only on a full-census
 					// run, where the execution store is the raw g for both
 					// the nil-scope and the attested full-coverage shapes.
-					n = runLegacyFrameworkSynthWithCache(g, fullReadCache, func(store graph.Store) int {
+					n = runLegacyFrameworkSynthWithCache(gated, fullReadCache, func(store graph.Store) int {
 						return sf.candFn(store, bundle)
 					})
 				case executionScope == nil:
-					n = runLegacyFrameworkSynthWithCache(g, fullReadCache, sf.fn)
+					n = runLegacyFrameworkSynthWithCache(gated, fullReadCache, sf.fn)
 				case sf.scopedFn != nil:
-					n = sf.scopedFn(g, executionScope)
+					n = sf.scopedFn(gated, executionScope)
 				default:
 					passScope = genericSeed.newPassStore()
-					n = runLegacyFrameworkSynth(passScope, sf.fn)
+					gatedScope = newFrameworkRepoGateStore(passScope, repoGate, s.Name())
+					n = runLegacyFrameworkSynth(gatedScope, sf.fn)
 				}
 			} else if ss, ok := s.(scopedSynthesizer); ok {
-				n = runLegacyFrameworkSynthWithCache(g, fullReadCache, func(store graph.Store) int {
+				n = runLegacyFrameworkSynthWithCache(gated, fullReadCache, func(store graph.Store) int {
 					return ss.synthesizeScoped(store, executionScope)
 				})
 			} else if executionScope == nil {
-				n = runLegacyFrameworkSynthWithCache(g, fullReadCache, s.Synthesize)
+				n = runLegacyFrameworkSynthWithCache(gated, fullReadCache, s.Synthesize)
 			} else {
 				panic("framework partial run has an unscoped synthesizer: " + s.Name())
 			}
 		}
-		count := SynthCount{Name: s.Name(), Edges: n, Millis: time.Since(start).Milliseconds()}
+		// Exactly one branch above ran, so at most one wrapper recorded
+		// drops. Report Edges net of them: the pass counts what it
+		// staged, not what the backend accepted.
+		repoGated := droppedFrameworkRepoEdges(gated) + droppedFrameworkRepoEdges(gatedScope)
+		if n -= repoGated; n < 0 {
+			n = 0
+		}
+		rep.RepoGated += repoGated
+		count := SynthCount{
+			Name: s.Name(), Edges: n, Millis: time.Since(start).Milliseconds(),
+			Disabled: disabled, RepoGated: repoGated,
+		}
 		if passScope != nil {
 			stats := passScope.stats()
 			count.ScopeRows = stats.RetainedRows
@@ -1274,11 +1346,14 @@ func runFrameworkSynthesizersScoped(
 	// external-call synthesis classifies the residual unresolved refs as
 	// external. Reported in registration order for determinism.
 	claimStart := time.Now()
-	claimed := RunClaimingResolversScoped(g, executionScope)
+	claimed, claimRepoGated := runClaimingResolversScopedCounted(g, executionScope, o)
+	rep.RepoGated += claimRepoGated
 	rep.ClaimMillis = time.Since(claimStart).Milliseconds()
 	for _, r := range defaultClaimingResolvers() {
 		n := claimed[r.Name()]
-		rep.Per = append(rep.Per, SynthCount{Name: r.Name(), Edges: n})
+		rep.Per = append(rep.Per, SynthCount{
+			Name: r.Name(), Edges: n, Disabled: !o.allowed.Allows(r.Name()),
+		})
 		rep.Total += n
 	}
 	// Receiver-type gate runs last: it corrects (demotes) already-bound C#
@@ -1570,37 +1645,73 @@ func defaultClaimingResolvers() []ClaimingResolver {
 // passes and whose Resolve lands a target wins. Returns the per-resolver
 // count of claimed edges. Unresolved edges are collected before resolving so
 // a resolver's ReindexEdges does not mutate a live iteration.
-func RunClaimingResolvers(g graph.Store) map[string]int {
-	return RunClaimingResolversScoped(g, nil)
+func RunClaimingResolvers(g graph.Store, opts ...FrameworkSynthOption) map[string]int {
+	return RunClaimingResolversScoped(g, nil, opts...)
 }
 
 // RunClaimingResolversScoped limits partial-index work to unresolved calls and
 // references sourced by changed repositories. Resolver precedence is retained:
 // each registered resolver receives only edges not claimed by an earlier one.
-func RunClaimingResolversScoped(g graph.Store, scope map[string]bool) map[string]int {
+func RunClaimingResolversScoped(g graph.Store, scope map[string]bool, opts ...FrameworkSynthOption) map[string]int {
+	claimed, _ := runClaimingResolversScopedCounted(g, scope, resolveFrameworkSynthOptions(opts))
+	return claimed
+}
+
+// runClaimingResolversScopedCounted also returns how many candidates the
+// per-repository gate refused. Claiming resolvers are gated on candidate
+// admission rather than through a gated store, so their refusals reach
+// the run report only if they are counted here — without this the
+// report's repo_gated silently covered synthesizers alone.
+//
+// The count is per (resolver, edge): an edge refused for two resolvers is
+// two refused writes, which is the same accounting the synthesizer side
+// uses.
+func runClaimingResolversScopedCounted(
+	g graph.Store,
+	scope map[string]bool,
+	o frameworkSynthOptions,
+) (map[string]int, int) {
 	out := map[string]int{}
 	if g == nil {
-		return out
+		return out, 0
 	}
+	repoGated := 0
 	resolvers := defaultClaimingResolvers()
 	if len(resolvers) == 0 {
-		return out
+		return out, repoGated
 	}
 	admissible := make([]ClaimingResolver, 0, len(resolvers))
 	for _, r := range resolvers {
+		if !o.allowed.Allows(r.Name()) {
+			continue
+		}
 		if claimingResolverAdmissible(g, r) {
 			admissible = append(admissible, r)
 		}
 	}
 	if len(admissible) == 0 {
-		return out
+		return out, repoGated
 	}
 	pending := scopedClaimingCandidates(g, scope, admissible)
+	// A claiming resolver rewrites an existing unresolved edge rather
+	// than adding one, so per-repository enforcement belongs here, on
+	// candidate admission — not on a gated store. An edge whose source
+	// repository excluded this resolver stays unresolved and remains
+	// available to a later resolver, exactly as if this one had declined
+	// to claim it.
+	repoGate := newFrameworkRepoGate(o.allowedByRepo)
 	claimed := make(map[*graph.Edge]bool)
 	for _, r := range admissible {
 		candidates := make([]*graph.Edge, 0, len(pending))
 		for _, e := range pending {
-			if !claimed[e] && r.Claims(e) {
+			if claimed[e] {
+				continue
+			}
+			if !repoGate.admits(e.From, r.Name()) {
+				repoGated++
+				continue
+			}
+			if r.Claims(e) {
 				candidates = append(candidates, e)
 			}
 		}
@@ -1623,5 +1734,5 @@ func RunClaimingResolversScoped(g graph.Store, scope map[string]bool) map[string
 			}
 		}
 	}
-	return out
+	return out, repoGated
 }

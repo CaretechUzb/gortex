@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/zzet/gortex/internal/frameworkgate"
 	"github.com/zzet/gortex/internal/parser"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -22,6 +23,13 @@ type HTTPExtractor struct {
 	// the alias pass. Sourced from index.http_client_aliases. See
 	// detectClientAliasConsumers for the supported call shapes.
 	ClientAliases []string
+	// AllowedFrameworks restricts which structural route passes may run,
+	// so a repository that does not use a framework stops paying for its
+	// detection and stops accruing its route contracts. Sourced from
+	// index.frameworks.allow; the zero value allows every pass. The
+	// per-line httpPatterns table is not affected — only the registered
+	// framework route passes are. See runFrameworkRoutePasses.
+	AllowedFrameworks frameworkgate.Set
 }
 
 var (

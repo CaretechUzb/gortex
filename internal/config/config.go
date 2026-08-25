@@ -11,6 +11,7 @@ import (
 
 	"github.com/spf13/viper"
 
+	"github.com/zzet/gortex/internal/frameworkgate"
 	"github.com/zzet/gortex/internal/llm"
 	"github.com/zzet/gortex/internal/platform"
 )
@@ -742,6 +743,18 @@ type IndexConfig struct {
 	// documented per-domain defaults" — cheap structural domains on,
 	// expensive ones off.
 	Coverage CoverageConfig `mapstructure:"coverage" yaml:"coverage,omitempty"`
+	// Frameworks narrows Gortex's built-in framework intelligence to an
+	// explicit allow-list. A repository that uses none of a given
+	// framework still pays for its passes on every index, and the
+	// heuristic edges an unused framework synthesizes are graph noise,
+	// so naming the frameworks a repository actually uses switches the
+	// rest off across all three of Gortex's framework registries at
+	// once — the extract-time route passes (Django urlpatterns, Rails
+	// resources, Odoo @http.route, ...), the post-resolution dispatch
+	// synthesizers (celery-dispatch, ngrx-effect, odoo, ...) and the
+	// claiming resolvers. Empty by default, which allows every
+	// framework. Configured under `index.frameworks` in .gortex.yaml.
+	Frameworks FrameworksConfig `mapstructure:"frameworks" yaml:"frameworks,omitempty"`
 	// HTTPClientAliases names project-defined wrapped HTTP-client
 	// functions so calls to them are recognised as HTTP consumer
 	// contracts (RoleConsumer) — without relying on the type-driven
@@ -811,6 +824,48 @@ type IndexConfig struct {
 	// keeps the size / class caps only. Configured under
 	// `index.skip_untracked_assets`.
 	SkipUntrackedAssets bool `mapstructure:"skip_untracked_assets" yaml:"skip_untracked_assets,omitempty"`
+}
+
+// FrameworksConfig restricts Gortex's framework intelligence to an
+// explicit allow-list. It gates all three registries with one list: the
+// extract-time route passes (internal/contracts), the post-resolution
+// dispatch synthesizers and the claiming resolvers (internal/resolver).
+//
+// A framework whose route pass and synthesizer share a name — `odoo`, or
+// `django` and its `django-descriptor` claimer — is admitted at every
+// layer by that single entry.
+//
+// Discover the valid names with `analyze kind=frameworks`, which lists
+// every registered pass across the three layers together with whether it
+// is currently active. An entry naming no registered pass is logged as a
+// warning and otherwise ignored, so a config written today keeps loading
+// after an upgrade retires or renames a pass — but note that on an
+// allow-list a typo silently DROPS the framework it meant to keep, which
+// is why the warning exists.
+type FrameworksConfig struct {
+	// Allow names the frameworks to run. Each entry is a pass name
+	// (`celery-dispatch`, `drupal`, `odoo`), a trailing-`*` prefix match
+	// (`godot*` admits godot-autoload, godot-preload-alias and
+	// godot-connection), or a bare `*` meaning "all". Matching is
+	// case-insensitive; `-`, `.` and `/` inside a name are literal, not
+	// glob metacharacters.
+	//
+	// An ABSENT or empty list allows every framework — the key narrows
+	// the registry, it never silently empties it. To run no framework at
+	// all, name the `none` sentinel explicitly.
+	//
+	// In a multi-repository workspace the whole-graph synthesis pass
+	// admits the UNION of every tracked repository's list, because that
+	// pass writes into one shared graph and a repository that did not
+	// narrow its own set must not lose edges on a sibling's say-so. A
+	// single repository with no list therefore re-admits the full
+	// registry. Route passes run per-repository during extraction and
+	// honour that repository's own list. Set the key in the global
+	// ~/.gortex/config.yaml to narrow the workspace as a whole.
+	//
+	// The GORTEX_FRAMEWORKS_ALLOW environment variable overrides this
+	// list with a comma-separated set of the same patterns.
+	Allow []string `mapstructure:"allow" yaml:"allow,omitempty"`
 }
 
 // ContentAdmissionConfig gates which large non-source artifacts enter the
@@ -1663,6 +1718,21 @@ func (i IndexConfig) ScopedGlobalPassesEnabledOrDefault() bool {
 		return true
 	}
 	return *i.ScopedGlobalPasses
+}
+
+// AllowedFrameworks resolves the configured framework allow-list into a
+// matcher, honouring the GORTEX_FRAMEWORKS_ALLOW env override.
+//
+// The override REPLACES the configured list rather than merging with it,
+// so a shell can both widen and narrow the set; an empty (but set)
+// variable therefore means "allow everything", matching an absent key.
+// The explicit read is required because viper's AutomaticEnv cannot split
+// a scalar env value into a []string config key.
+func (i IndexConfig) AllowedFrameworks() frameworkgate.Set {
+	if v, ok := os.LookupEnv("GORTEX_FRAMEWORKS_ALLOW"); ok {
+		return frameworkgate.New(strings.Split(v, ","))
+	}
+	return frameworkgate.New(i.Frameworks.Allow)
 }
 
 // EmbeddingProviderOrDefault returns the configured provider name,

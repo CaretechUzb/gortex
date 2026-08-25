@@ -928,6 +928,8 @@ func (s *Server) handleAnalyze(ctx context.Context, req mcp.CallToolRequest) (*m
 			return s.handleAnalyzeRoutes(ctx, req)
 		case "route_frameworks":
 			return s.handleAnalyzeRouteFrameworks(ctx, req)
+		case "frameworks":
+			return s.handleAnalyzeFrameworks(ctx, req)
 		case "drupal_hooks":
 			return s.handleAnalyzeDrupalHooks(ctx, req)
 		case "swiftui_views":
