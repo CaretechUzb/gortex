@@ -109,6 +109,10 @@ func anyAgentNamed(candidates []string) bool {
 // dispatch boundaries inside it, resolving candidate targets through the
 // caller's reader. Returns nil when the source can't be read or no dispatch is
 // found.
+// The session's overlay buffer substitutes for the on-disk file when the
+// request carries one: an overlay-served node's line range is a BUFFER
+// coordinate, and slicing the stale disk content by it reads a different
+// body and fabricates boundaries.
 func (s *Server) dynamicBoundariesForSymbol(ctx context.Context, r graph.Reader, node *graph.Node) []DynamicBoundary {
 	if node == nil || node.StartLine <= 0 {
 		return nil
@@ -117,11 +121,15 @@ func (s *Server) dynamicBoundariesForSymbol(ctx context.Context, r graph.Reader,
 	if err != nil {
 		return nil
 	}
-	content, err := os.ReadFile(absPath) //nolint:gosec // path resolved from the indexed graph
-	if err != nil {
-		return nil
+	text, ok := s.overlayContentFor(ctx, absPath)
+	if !ok {
+		raw, err := os.ReadFile(absPath) //nolint:gosec // path resolved from the indexed graph
+		if err != nil {
+			return nil
+		}
+		text = string(raw)
 	}
-	lines := strings.Split(string(content), "\n")
+	lines := strings.Split(text, "\n")
 	start := node.StartLine - 1
 	end := node.EndLine
 	if end <= 0 || end > len(lines) {
