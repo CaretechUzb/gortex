@@ -125,7 +125,11 @@ type UnresolvedEdgePager interface {
 //   - ResolveMutex() returns a backend-owned mutex that resolver
 //     instances (cross-repo, temporal, external) share to serialise
 //     their edge-mutation passes against each other and against the
-//     indexer's incremental rewrites. Every backend needs equivalent
+//     indexer's incremental rewrites. A resolve rewrites To / Kind /
+//     Origin on the store's live *Edge values before handing them to
+//     ReindexEdges, so a whole-graph pass that only SCANS edges has to
+//     hold this lock too — the pointers it walks are the same memory.
+//     Every backend needs equivalent
 //     coordination; the in-memory store uses its existing
 //     graph-wide resolveMu, disk backends keep a dedicated mutex
 //     alongside their own write serialisation. The returned pointer

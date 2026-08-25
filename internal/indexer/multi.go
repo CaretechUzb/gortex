@@ -3997,6 +3997,16 @@ func (mi *MultiIndexer) ReconcileContractEdges() int {
 		return 0
 	}
 
+	// reconcileMu excludes other reconciles; it says nothing about a resolve.
+	// A resolve pass mutates To / Kind / Origin on the *Edge values the store
+	// already holds and only then hands them to ReindexEdges, so on the
+	// in-memory backend every edge pointer this pass walks is live memory a
+	// concurrent ResolveAll is writing. ResolveMutex is the only thing
+	// ordering those writes, so every whole-graph derived pass takes it —
+	// clone detection, test edges, capability edges — and so must this one.
+	g.ResolveMutex().Lock()
+	defer g.ResolveMutex().Unlock()
+
 	// Replace the three derived edge generations with one backend delete. The
 	// old collect+RemoveEdge loops opened one SQLite mutation per relationship.
 	graph.EvictEdgesByKinds(g, []graph.EdgeKind{
