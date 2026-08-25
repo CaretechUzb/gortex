@@ -457,6 +457,7 @@ func (e *PythonExtractor) Extract(filePath string, src []byte) (*parser.Extracti
 	captureCeleryDispatch(result, root, filePath, src)
 	captureDjangoDescriptors(result, root, filePath, src)
 	captureFastAPIRouterRefs(result, root, filePath, src)
+	captureOdooManifest(result, root, filePath, src)
 	return result, nil
 }
 
@@ -665,6 +666,11 @@ func (e *PythonExtractor) emitClass(m parser.QueryResult, filePath, fileID strin
 	// ORM model attribution: emit EdgeModelsTable when the class
 	// inherits from a known ORM base (SQLAlchemy / Django).
 	detectPythonORMModel(def.Node, src, id, name, filePath, result)
+	// Odoo model attribution: tag the class with its `_name` identity
+	// and emit the _inherit / _inherits / comodel links that identity
+	// implies. Runs after the generic ORM pass because an Odoo class
+	// never satisfies pyClassLooksLikeORM, so the two never overlap.
+	detectOdooModel(def.Node, src, id, name, filePath, result)
 }
 
 // pyEmitBaseClassEdges emits one EdgeExtends per declared base class.

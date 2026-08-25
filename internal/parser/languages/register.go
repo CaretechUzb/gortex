@@ -54,6 +54,9 @@ func RegisterAll(reg *parser.Registry) {
 	// (which re-claims .xml for "xml" as the default) and routed only for
 	// their respective documents via the content sniff in
 	// detect_content.go.
+	// Odoo data / view / QWeb XML shares .xml with MyBatis, Spring and the
+	// generic XML extractor; sniff-routed only, via detect_content.go.
+	reg.Register(NewOdooXMLExtractor())
 	reg.Register(NewMyBatisExtractor())
 	reg.Register(NewSpringContextExtractor())
 	reg.Register(NewMarkdownExtractor())

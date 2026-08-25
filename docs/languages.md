@@ -275,6 +275,32 @@ A few extensions conflict across languages; the registration order in
 | `.d` | D | D import files (`.di`) |
 | `.as` | ActionScript | AssemblyScript (not supported) |
 
+`.xml` is shared by four extractors and routed by a **content sniff**
+(`internal/parser/detect_content.go`) rather than by registration order:
+Odoo data/view XML (`<odoo>`, `<openerp>`, or a `<templates>` root with
+`t-name`), MyBatis mappers, Spring bean definitions, and the generic XML
+extractor as the default.
+
+## Odoo
+
+Odoo is indexed as a single framework named `odoo` — it is never
+half-enabled, and one `index.frameworks.allow` entry governs the whole of
+it. Five layers cooperate:
+
+| Layer | Source | What it emits |
+|---|---|---|
+| Controllers | `@http.route(...)` | one HTTP provider contract per (path, method); path lists and multi-line decorators are honoured, and `<model("res.partner"):p>` converters are normalised with the model recorded in `odoo_path_models`. Odoo's method-less default is **GET + POST**, not Flask's GET-only. |
+| Models | `models.Model` / `TransientModel` / `AbstractModel` | the class is tagged with `odoo_model` (its `_name`), `_inherit` becomes `extends`, `_inherits` becomes `composes`, a table edge follows Odoo's `.`→`_` derivation, and every `fields.Many2one/One2many/Many2many` comodel becomes a `references` edge — the ER graph. Field nodes are minted here because Python emits none for class bodies. |
+| XML | `<record>`, `<template>`, `<t t-name>`, `<menuitem>`, `ref=`, `eval="ref(…)"`, `<function>` | resource nodes keyed by external ID, `inherit_id` as view inheritance, and calls into Python methods. Bare `ref="view_x"` inside module `sale` resolves as `sale.view_x`. |
+| Implicit external IDs | `model_<model>`, `field_<model>__<name>`, `module_<addon>` | the IDs the ORM mints for its own `ir.model` / `ir.model.fields` / `ir.module.module` rows, which no XML file declares and which security rules and access rows reference exclusively. They bind to the Python class, field node or manifest module — as a fallback, so a declared record of the same name always wins. `model_*` fans out across every addon declaring that `_name`. |
+| Manifest | `__manifest__.py` / `__openerp__.py` | a `KindModule` node named after the **directory** (not the manifest's human label), `depends` as module dependency edges, and `data`/`demo`/`assets` as edges to the real files. |
+| OWL client | `/** @odoo-module **/`, `odoo.define` | addon-aliased imports (`@web/core/registry`), pre-v15 `require("web.core")` matched against the name its `odoo.define(...)` declared, `registry.category("x").add(...)` providers meeting `useService("x")` consumers on one node, `patch(X.prototype, {...})` overrides, and `static template = "mod.tmpl"` binding a component to its QWeb markup. |
+
+Model detection is deliberately two-factor — a **qualified** Odoo base
+(`models.Model`, never a bare `Model`) **and** an Odoo attribute or field
+— so a same-named class in an unrelated codebase is not mistaken for a
+model.
+
 ## Adding a language
 
 Three paths, in order of decreasing effort:

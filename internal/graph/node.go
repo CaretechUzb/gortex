@@ -87,7 +87,9 @@ const (
 	// KindModule represents a single (ecosystem, name, version) tuple
 	// for an external dependency. Shared across files that import it.
 	// ID convention: `module::<ecosystem>:<name>@<version>`.
-	// Ecosystems: go, npm, pypi, cargo, maven, composer, gem, hex, nuget.
+	// Ecosystems: go, npm, pypi, cargo, maven, composer, gem, hex,
+	// nuget, odoo (one addon; its name is the addon DIRECTORY, and its
+	// dependencies are unversioned because a manifest never states one).
 	KindModule NodeKind = "module"
 	// KindTable represents a database table. ID convention:
 	// `db::<dialect>::<schema>.<table>`. Sourced from migrations, ORM
@@ -157,6 +159,13 @@ const (
 	// api_version, namespace, labels (truncated). Sourced from YAML
 	// extractors that detect K8s manifests by `apiVersion:` +
 	// `kind:` markers.
+	//
+	// Also used for Odoo's declarative XML objects, discriminated by an
+	// `odoo::` ID prefix: `odoo::record::<module>.<id>`,
+	// `odoo::template::<name>`, `odoo::menu::<module>.<id>`, with the
+	// external ID on Meta["odoo_xml_id"]. Reusing the kind rather than
+	// minting a parallel one keeps every resource-shaped query working
+	// on both; the ID prefix keeps the two populations separable.
 	KindResource NodeKind = "resource"
 	// KindKustomization represents a Kustomize overlay — one per
 	// `kustomization.yaml` / `kustomization.yml` file in a repo.
@@ -306,8 +315,8 @@ type Node struct {
 	StartColumn int            `json:"start_column,omitempty"`
 	EndColumn   int            `json:"end_column,omitempty"`
 	Language    string         `json:"language"`
-	Meta       map[string]any `json:"meta,omitempty"`
-	RepoPrefix string         `json:"repo_prefix,omitempty"`
+	Meta        map[string]any `json:"meta,omitempty"`
+	RepoPrefix  string         `json:"repo_prefix,omitempty"`
 	// WorkspaceID is the hard graph boundary slug. Two nodes with
 	// different WorkspaceIDs are not allowed to be matched as contract
 	// provider/consumer pairs and queries scope by it by default.
