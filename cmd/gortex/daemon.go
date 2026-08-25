@@ -1268,16 +1268,23 @@ func renderDaemonHeader(w io.Writer, st daemon.StatusResponse) {
 	t.AppendRow(table.Row{"uptime", formatDuration(time.Duration(st.UptimeSeconds) * time.Second)})
 	switch {
 	case st.Ready && st.EnrichmentComplete:
+		// The deriving suffix belongs on the otherwise-idle row too: a
+		// track after warmup leaves enrichment complete but the derived
+		// edges into the new repo still landing, and reporting a bare
+		// "ready" there is what made an incomplete graph look settled.
 		t.AppendRow(table.Row{
 			"state",
-			fmt.Sprintf("ready (warmup %s)", formatDuration(time.Duration(st.EnrichSeconds)*time.Second)),
+			fmt.Sprintf("ready (warmup %s)%s",
+				formatDuration(time.Duration(st.EnrichSeconds)*time.Second),
+				formatWorkspaceDerivation(st.DerivingWorkspace)),
 		})
 	case st.Ready:
 		t.AppendRow(table.Row{
 			"state",
-			fmt.Sprintf("ready — queryable (warmup %s);%s",
+			fmt.Sprintf("ready — queryable (warmup %s);%s%s",
 				formatDuration(time.Duration(st.WarmupSeconds)*time.Second),
-				formatEnrichmentProgress(st.Enrichment)),
+				formatEnrichmentProgress(st.Enrichment),
+				formatWorkspaceDerivation(st.DerivingWorkspace)),
 		})
 	default:
 		t.AppendRow(table.Row{"state", "warming up (socket reachable, resolving references)"})
@@ -1440,6 +1447,16 @@ func formatEnrichmentProgress(e *daemon.EnrichmentProgress) string {
 	}
 	return fmt.Sprintf(" enriching %d/%d (%s, %s)",
 		e.ReposDone, e.ReposTotal, e.Current.Repo, elapsed)
+}
+
+// formatWorkspaceDerivation renders the suffix warning that a repository
+// tracked since the last workspace pass is not yet fully bound. Empty
+// while no pass is pending, which is every ordinary status read.
+func formatWorkspaceDerivation(deriving bool) string {
+	if !deriving {
+		return ""
+	}
+	return "; deriving workspace edges (recently tracked repos not yet fully bound)"
 }
 
 // renderDaemonRepos writes the per-repo breakdown as a single table.

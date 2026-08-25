@@ -355,3 +355,42 @@ func TestRenderDaemonHeader_BinaryRow(t *testing.T) {
 		assert.NotContains(t, buf.String(), "binary")
 	})
 }
+
+// A repository tracked after warmup leaves enrichment complete while the
+// workspace derivation is still running. Reporting a bare "ready" there is
+// what let an under-bound graph look settled, so the suffix has to appear
+// on the settled row as well as the warming one.
+func TestRenderDaemonHeader_DerivingWorkspace(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		enriched bool
+	}{
+		{"after warmup", true},
+		{"during warmup", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := sampleStatus()
+			st.Ready = true
+			st.EnrichmentComplete = tc.enriched
+			st.DerivingWorkspace = true
+
+			var buf bytes.Buffer
+			renderDaemonHeader(&buf, st)
+			assert.Contains(t, buf.String(), "deriving workspace edges",
+				"a pending derivation must be visible in the state row")
+		})
+	}
+}
+
+// The suffix is silent in the ordinary case — every status read on a
+// settled daemon — or it becomes noise nobody reads.
+func TestRenderDaemonHeader_NoDerivationSuffixWhenIdle(t *testing.T) {
+	st := sampleStatus()
+	st.Ready = true
+	st.EnrichmentComplete = true
+	st.DerivingWorkspace = false
+
+	var buf bytes.Buffer
+	renderDaemonHeader(&buf, st)
+	assert.NotContains(t, buf.String(), "deriving workspace edges")
+}

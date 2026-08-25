@@ -190,6 +190,13 @@ type MultiIndexer struct {
 	// keeps the built-in default.
 	embedAPIConcurrency int
 
+	// rederive schedules the workspace-wide derivation passes after a
+	// repository is indexed outside a batch. See track_rederive.go: the
+	// passes attribute each derived edge to its source repo, so a newly
+	// tracked repo's inbound edges can only be recovered by re-running
+	// them across the whole workspace.
+	rederive workspaceRederiveScheduler
+
 	// semanticMgr is the semantic enrichment manager propagated to
 	// every per-repo Indexer. When nil (the default), per-repo
 	// deferred passes skip semantic enrichment — this is the root
@@ -1832,6 +1839,7 @@ func NewMultiIndexer(
 		logger:          logger,
 		newIndexer:      New,
 		shadowAdmission: processShadowAdmission,
+		rederive:        workspaceRederiveScheduler{debounce: postTrackRederiveDebounce},
 	}
 }
 
@@ -2741,6 +2749,10 @@ func (mi *MultiIndexer) TrackRepoCtx(ctx context.Context, entry config.RepoEntry
 
 	var result *IndexResult
 	installed := false
+	// Set inside the mutation, acted on after it: the workspace-wide
+	// derivation passes take the batch-transition gate themselves and
+	// must not be started from inside a topology mutation.
+	rederive := false
 	err = mi.coordinateRepositoryTopologyMutation(ctx, idx, func() error {
 		// Construction can precede a queued batch transition. Once the stable
 		// lane and transition generation are held, reapply the authoritative mode.
@@ -2810,6 +2822,13 @@ func (mi *MultiIndexer) TrackRepoCtx(ctx context.Context, entry config.RepoEntry
 		// after the loop (RunGlobalResolve does this for daemon warmup).
 		if !batchMode.deferGlobalPasses {
 			mi.ReconcileContractEdges()
+			// A batch runs the global passes once at EndBatch for every
+			// repo it indexed. Outside one, nothing else will: without
+			// this the repo joins the graph carrying only the edges its
+			// own extraction produced, and every derived edge the rest
+			// of the workspace owns into it stays missing until some
+			// unrelated full reindex happens to run.
+			rederive = true
 		}
 		return nil
 	})
@@ -2818,6 +2837,9 @@ func (mi *MultiIndexer) TrackRepoCtx(ctx context.Context, entry config.RepoEntry
 	}
 	if err != nil {
 		return nil, err
+	}
+	if rederive {
+		mi.scheduleWorkspaceRederive(prefix)
 	}
 	return result, nil
 }

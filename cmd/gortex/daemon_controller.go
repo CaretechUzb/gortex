@@ -1096,6 +1096,7 @@ func (c *realController) Status(ctx context.Context) (daemon.StatusResponse, err
 		LocalServerSlug:    c.localServerSlug(),
 		LSPRouter:          c.collectLSPRouterStatus(),
 		Enrichment:         c.collectEnrichmentProgress(),
+		DerivingWorkspace:  c.multiIndexer.WorkspaceRederivePending(),
 	}
 	if c.toolSurface != nil {
 		resp.ToolPreset, resp.ToolPresetMode, resp.LearnedTools = c.toolSurface()

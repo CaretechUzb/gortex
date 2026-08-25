@@ -201,6 +201,34 @@ gortex config exclude add testdata/ --repo backend  # Write to a RepoEntry
 gortex config exclude remove pkg/generated          # Remove from the same target
 ```
 
+### Tracking a repository into an existing workspace
+
+`gortex track` indexes the new repository and then re-runs the
+workspace-wide derivation passes in the background — framework dispatch
+synthesis, cross-repo edges, inferred implements/overrides, test and
+capability edges.
+
+That second step is not optional bookkeeping. Those passes attribute every
+derived edge to the repository owning its **source** node, so the edges
+that bind a newly tracked repo to the rest of the workspace belong to its
+*siblings*, not to it. Deriving only the tracked repo would leave them
+missing: an `untrack` + `track` of a shared dependency in a five-repo Odoo
+workspace was measured dropping that repo from 912,448 edges to 402,411,
+with no later daemon restart recovering them — a warm restart sees nodes
+already on disk and skips the passes.
+
+The pass costs minutes on a large workspace, so `track` returns before it
+finishes and `gortex daemon status` reports it:
+
+```
+state   ready (warmup 7m11s); deriving workspace edges (recently tracked repos not yet fully bound)
+```
+
+Queries work throughout; edges **into** the newly tracked repository are
+incomplete until the row goes quiet. A burst of tracks — `gortex daemon
+reload` adopting several repos — collapses into a bounded number of passes
+rather than one per repository.
+
 ### Deleted checkouts
 
 Tracking outlives the directory: nothing removes a repo entry when you

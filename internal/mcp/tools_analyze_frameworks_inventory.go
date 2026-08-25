@@ -136,12 +136,27 @@ func (s *Server) frameworkInventory() []frameworkInventoryRow {
 // frameworkAllowListsByRepo returns each tracked repository's allow-list.
 // A repository with no list is present with an unset Set, which allows
 // everything — that distinction is what makes the union rule visible.
+//
+// The prefixes come from the indexer, not from the config manager. The
+// config manager's workspace map only ever grows: it caches a prefix the
+// first time a `.gortex.yaml` is published for it and has no removal path,
+// so after `gortex untrack` the dead repo kept appearing in `allowed_in`
+// and kept voting in the union — a repository that had left the graph
+// still shown as governing which framework passes run in it.
 func (s *Server) frameworkAllowListsByRepo() map[string]frameworkgate.Set {
 	if s.configManager == nil {
 		return nil
 	}
+	prefixes := s.trackedRepoPrefixes()
+	if len(prefixes) == 0 {
+		// No indexer to ask — a bare-graph server, or nothing tracked
+		// yet. The config manager's view is then the only one there is,
+		// and it is still the right answer for discovery ("what would
+		// this config allow"), which is what this analyzer is for.
+		prefixes = s.configManager.WorkspacePrefixes()
+	}
 	out := map[string]frameworkgate.Set{}
-	for _, prefix := range s.configManager.WorkspacePrefixes() {
+	for _, prefix := range prefixes {
 		if cfg := s.configManager.GetRepoConfig(prefix); cfg != nil {
 			out[prefix] = cfg.Index.AllowedFrameworks()
 		}
