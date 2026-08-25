@@ -111,6 +111,13 @@ func TestRoutedProbeIsCountedAsAnExactWorktreeAnswer(t *testing.T) {
 // came from the base corpus.
 func TestUnroutedProbeIsCountedAsItsOwnFallback(t *testing.T) {
 	f := newProbeFixture(t)
+	// An unrouted answer also asks for a reconciliation, on a goroutine the
+	// probe deliberately does not wait for. Left live, that pass is still
+	// reading and writing the catalog when the test body ends and the fixture
+	// closes the store out from under it. What the nudge itself does is pinned
+	// by TestUnroutedProbeBurstReconcilesOncePerWindow; here it is stubbed so
+	// the counter is measured against nothing else running.
+	f.controller.probeReconcile = func(string) {}
 	probed := filepath.Join(f.worktreeRoot, probeFile)
 
 	before := viewmetrics.Read()
