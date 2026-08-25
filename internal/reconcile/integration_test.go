@@ -10,7 +10,26 @@ import (
 
 	"github.com/zzet/gortex/internal/gitstate"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/graphview"
 )
+
+// volumeEvidenceUsable reports whether this platform's path evidence carries
+// the volume identity a prunable confirmation is built on.
+//
+// It samples a directory that certainly exists and puts the result through the
+// classifier's own predicate, so the answer comes from gitstate's per-platform
+// path-identity seam rather than from a hardcoded list of operating systems. A
+// platform that grows an implementation of that seam flips this to true on its
+// own, and the strong expectations hanging off it start applying with no edit
+// here.
+func volumeEvidenceUsable(t *testing.T, dir string) bool {
+	t.Helper()
+	sample := gitstate.SamplePathEvidence(dir)
+	if !sample.RootExists {
+		t.Fatalf("volume evidence probe of %q found no such directory: %+v", dir, sample)
+	}
+	return SampledPathEvidence(sample).rootVolumeUsable()
+}
 
 // isolateGit pins the git environment for the whole test: no user or system
 // config, a fixed identity, no credential prompts. A developer's ~/.gitconfig
@@ -166,6 +185,22 @@ func TestReconcileFamilyAgainstRealGit(t *testing.T) {
 		t.Fatalf("real HEAD sample = %+v", row)
 	}
 
+	// Whether a deletion below can be proven at all is a platform property,
+	// probed through the seam rather than assumed from the operating system.
+	volumeEvidence := volumeEvidenceUsable(t, repo)
+	storedEvidence, ok, err := catalog.GetCheckoutPathEvidence(ctx, linked.CheckoutID)
+	if err != nil || !ok {
+		t.Fatalf("GetCheckoutPathEvidence = %v %v", ok, err)
+	}
+	// The persisted sample is the side of the comparison the classifier reads
+	// first, so it has to carry exactly as much as the platform can produce. A
+	// platform that can sample a volume token but stores none would otherwise
+	// quietly drop this test into the fail-closed arm below.
+	if got := StoredPathEvidence(storedEvidence).rootVolumeUsable(); got != volumeEvidence {
+		t.Fatalf("persisted root volume evidence usable = %v, want %v on this platform: %+v",
+			got, volumeEvidence, storedEvidence)
+	}
+
 	// Deleting the directory leaves git listing a prunable worktree whose root
 	// is gone from a volume that is still very much mounted.
 	if err := os.RemoveAll(worktree); err != nil {
@@ -187,11 +222,34 @@ func TestReconcileFamilyAgainstRealGit(t *testing.T) {
 
 	report = pass()
 	linkedAfter := find(report, adminName)
-	if linkedAfter.Classification.Evidence != EvidencePrunableConfirmed {
-		t.Fatalf("deleted directory classified %+v", linkedAfter.Classification)
-	}
-	if linkedAfter.Action != ActionRemovalGraceStarted {
-		t.Fatalf("deleted directory action = %q", linkedAfter.Action)
+	if volumeEvidence {
+		// The ancestor still sits on the volume the root sat on, so the
+		// absence is proven and the removal clock starts.
+		if linkedAfter.Classification.Evidence != EvidencePrunableConfirmed {
+			t.Fatalf("deleted directory classified %+v", linkedAfter.Classification)
+		}
+		if linkedAfter.Action != ActionRemovalGraceStarted {
+			t.Fatalf("deleted directory action = %q", linkedAfter.Action)
+		}
+	} else {
+		// Without volume identity a deleted root and an unmounted volume are
+		// the same observation, so the classifier fails closed: inaccessible,
+		// no removal evidence, and only the availability clock moves. That is
+		// the contract such a platform actually has, so it is pinned here
+		// rather than skipped.
+		class := linkedAfter.Classification
+		if class.Disposition != DispositionInaccessible || class.Evidence != EvidenceNone {
+			t.Fatalf("deleted directory classified %+v, want a fail-closed inaccessible verdict", class)
+		}
+		if class.Code != graphview.CodeCheckoutInaccessible {
+			t.Fatalf("deleted directory code = %q, want %q", class.Code, graphview.CodeCheckoutInaccessible)
+		}
+		if !strings.Contains(class.Detail, "no usable persisted root volume token") {
+			t.Fatalf("deleted directory detail = %q, want the missing-volume-token branch", class.Detail)
+		}
+		if linkedAfter.Action != ActionAvailabilityGraceStarted {
+			t.Fatalf("deleted directory action = %q, want the availability clock to start", linkedAfter.Action)
+		}
 	}
 	if linkedAfter.CheckoutID != linked.CheckoutID {
 		t.Fatalf("removal re-keyed the identity: %q, want %q", linkedAfter.CheckoutID, linked.CheckoutID)
@@ -208,10 +266,16 @@ func TestReconcileFamilyAgainstRealGit(t *testing.T) {
 	if linkedPruned.Classification.Evidence != EvidenceAuthoritativeOmission {
 		t.Fatalf("pruned worktree classified %+v", linkedPruned.Classification)
 	}
-	// The removal clock is already running, so nothing restarts it; the whole
-	// point of the second evidence class is that it confirms, not resets.
-	if linkedPruned.Action != ActionRemovalHeld {
-		t.Fatalf("pruned worktree action = %q, want the running clock held", linkedPruned.Action)
+	// Where the deletion was already proven the removal clock is running, so
+	// nothing restarts it; the whole point of the second evidence class is
+	// that it confirms, not resets. Where it could not be proven, git's
+	// omission is the first removal evidence there is and starts the clock.
+	wantPrunedAction := ActionRemovalHeld
+	if !volumeEvidence {
+		wantPrunedAction = ActionRemovalGraceStarted
+	}
+	if linkedPruned.Action != wantPrunedAction {
+		t.Fatalf("pruned worktree action = %q, want %q", linkedPruned.Action, wantPrunedAction)
 	}
 
 	// Recreating the worktree under the same administrative name gives the
