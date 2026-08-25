@@ -47,6 +47,17 @@ func newCatalogMCPServer(t *testing.T) (*Server, *indexer.MultiIndexer, *store_s
 		ConfigManager: cm,
 		MultiIndexer:  mi,
 	})
+	// Any tool call that reconciles a family leaves a build loop running for
+	// every automatic checkout it found. Registered last so LIFO cleanup runs
+	// it first: a coordinator may be part way through a build against this
+	// store, and closing the store — or unlinking the directory holding it —
+	// under a live build is the one teardown order that turns a background
+	// write into a failure.
+	t.Cleanup(func() {
+		if srv.lifecycle != nil {
+			_ = srv.lifecycle.Close()
+		}
+	})
 	return srv, mi, store.Catalog(), dir
 }
 
