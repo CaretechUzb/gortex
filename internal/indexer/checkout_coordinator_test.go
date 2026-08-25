@@ -1436,6 +1436,14 @@ func TestCheckoutLifecycleCollectsAForgottenCheckoutsPayload(t *testing.T) {
 	if err := os.RemoveAll(worktree); err != nil {
 		t.Fatalf("remove the worktree: %v", err)
 	}
+	// Where the platform cannot prove a deleted root is deleted, the deletion
+	// alone never starts the removal clock, so nothing would ever be forgotten
+	// and the payload this test is about would not be collectable. Pruning
+	// supplies git's own omission, which is the removal evidence such a
+	// platform has, and the collection below is unchanged.
+	if !volumeEvidenceUsable(t, main) {
+		runGit(t, main, "worktree", "prune")
+	}
 	if _, err := f.lc.Sweep(ctx); err != nil {
 		t.Fatalf("sweep after the removal: %v", err)
 	}

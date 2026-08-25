@@ -203,6 +203,30 @@ func (f *lifecycleFixture) close() {
 	_ = f.store.Close()
 }
 
+// volumeEvidenceUsable reports whether this platform's path evidence carries
+// the volume identity that separates "this root was deleted" from "the volume
+// it lived on is not mounted right now".
+//
+// It samples a directory that certainly exists and reads gitstate's
+// per-platform path-identity seam, so the answer comes from that seam rather
+// than from a hardcoded list of operating systems: a platform that grows an
+// implementation flips this to true on its own. The two conditions mirror the
+// classifier's own precondition for confirming a prunable worktree, and a
+// divergence between them cannot pass quietly — it lands the caller on the
+// wrong arm, where the evidence assertion fails.
+//
+// Where it is false, deleting a directory proves nothing and the janitor
+// correctly refuses to act on it; git's administrative record is the only
+// removal evidence such a platform has.
+func volumeEvidenceUsable(t *testing.T, dir string) bool {
+	t.Helper()
+	sample := gitstate.SamplePathEvidence(dir)
+	if !sample.RootExists {
+		t.Fatalf("volume evidence probe of %q found no such directory: %+v", dir, sample)
+	}
+	return sample.VolumeToken != "" && sample.VolumeKind != gitstate.VolumeKindUnsupported
+}
+
 // gitRepo creates a git repository with one Go file and returns its root.
 func (f *lifecycleFixture) gitRepo(name string) string {
 	f.t.Helper()
@@ -482,7 +506,19 @@ func TestCheckoutLifecycleSweepRemovesVanishedWorktree(t *testing.T) {
 	assert.Equal(t, 1, report.Families, "both checkouts share one family")
 	assert.Equal(t, 0, report.Removed)
 
+	// Which evidence class puts this checkout on the removal path is a
+	// platform property, probed through the path-identity seam.
+	wantEvidence := reconcile.EvidencePrunableConfirmed
 	require.NoError(t, os.RemoveAll(worktree))
+	if !volumeEvidenceUsable(t, main) {
+		// A deleted root and an unmounted volume are the same observation
+		// here, so the deletion alone is not evidence and the janitor holds.
+		// Pruning gives git's administrative omission instead, which is the
+		// other way onto the same removal path — everything below is the one
+		// janitor, reached by the evidence this platform actually has.
+		runGit(t, main, "worktree", "prune")
+		wantEvidence = reconcile.EvidenceAuthoritativeOmission
+	}
 
 	// The first sweep after the removal starts the removal clock. The
 	// checkout keeps its identity and its nodes until the clock expires.
@@ -491,7 +527,8 @@ func TestCheckoutLifecycleSweepRemovesVanishedWorktree(t *testing.T) {
 	assert.Equal(t, 0, graced.Removed, "a removal waits out its grace")
 	held := f.checkoutOf("sweep-wt")
 	assert.NotZero(t, held.RemovalDetectedAt, "the removal clock is running")
-	assert.Equal(t, string(reconcile.EvidencePrunableConfirmed), held.RemovalEvidence)
+	assert.Equal(t, string(wantEvidence), held.RemovalEvidence)
+	assert.Zero(t, held.UnavailableSince, "evidenced removal is not an outage")
 	assert.NotNil(t, f.mi.GetMetadata("sweep-wt"))
 
 	// Still inside the grace: a sweep must not act.
