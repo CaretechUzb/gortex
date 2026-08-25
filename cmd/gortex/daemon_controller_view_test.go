@@ -32,6 +32,18 @@ const (
 	probeFile       = "internal/live.go"
 )
 
+// probeFileKey is the key the store holds probeFile under: the repo prefix,
+// one '/', then the repo-relative remainder in the indexing machine's native
+// separators (see internal/graphpath).
+//
+// The two spellings coincide on POSIX and diverge on Windows, and the probe is
+// exactly the seam between them: fileGraphKey renders `prefix + "/" +
+// filepath.Rel(root, path)`, whose remainder carries the host separator.
+// Keying the corpus with the '/'-joined form describes a file a Windows daemon
+// never indexes, so the key the probe computes misses it and every coverage
+// assertion below reads as uncovered.
+var probeFileKey = probePrefix + "/" + filepath.FromSlash(probeFile)
+
 // probeFixture is the seeded catalog a probe resolves against, plus the paths
 // a caller probes with.
 type probeFixture struct {
@@ -60,20 +72,20 @@ func newProbeFixture(t *testing.T) *probeFixture {
 	// automatic worktree's generations compose over.
 	store.AddBatch([]*graph.Node{
 		{
-			ID:         probePrefix + "/" + probeFile + "::BaseOnly",
+			ID:         probeFileKey + "::BaseOnly",
 			Kind:       graph.KindFunction,
 			Name:       "BaseOnly",
-			FilePath:   probePrefix + "/" + probeFile,
+			FilePath:   probeFileKey,
 			RepoPrefix: probePrefix,
 			Language:   "go",
 			StartLine:  3,
 			EndLine:    5,
 		},
 		{
-			ID:         probePrefix + "/" + probeFile + "::AlsoBase",
+			ID:         probeFileKey + "::AlsoBase",
 			Kind:       graph.KindFunction,
 			Name:       "AlsoBase",
-			FilePath:   probePrefix + "/" + probeFile,
+			FilePath:   probeFileKey,
 			RepoPrefix: probePrefix,
 			Language:   "go",
 			StartLine:  7,
@@ -169,10 +181,10 @@ func (f *probeFixture) routeWorktree(t *testing.T) {
 	})
 	require.NoError(t, err)
 	dirtyHandle.AddBatch([]*graph.Node{{
-		ID:         probePrefix + "/" + probeFile + "::GenerationOnly",
+		ID:         probeFileKey + "::GenerationOnly",
 		Kind:       graph.KindFunction,
 		Name:       "GenerationOnly",
-		FilePath:   probePrefix + "/" + probeFile,
+		FilePath:   probeFileKey,
 		RepoPrefix: probePrefix,
 		Language:   "go",
 		StartLine:  3,
@@ -180,7 +192,7 @@ func (f *probeFixture) routeWorktree(t *testing.T) {
 	}}, nil)
 	require.NoError(t, dirtyHandle.SetFileMasks([]store_sqlite.FileMask{{
 		RepoPrefix: probePrefix,
-		FilePath:   probePrefix + "/" + probeFile,
+		FilePath:   probeFileKey,
 		Mode:       store_sqlite.OwnershipReplace,
 	}}))
 	require.NoError(t, f.store.PublishPayloadGeneration(ctx, dirtyID, 2001))
@@ -432,8 +444,13 @@ func TestSearchSymbolsWithoutAPathKeepsTheLegacyWireShape(t *testing.T) {
 
 	encoded, err := json.Marshal(result)
 	require.NoError(t, err)
+	// The hit carries the node's own file path, so the expectation is the key
+	// the corpus was seeded under rather than a '/'-spelled literal that only
+	// happens to be that key on POSIX.
+	wantPath, err := json.Marshal(probeFileKey)
+	require.NoError(t, err)
 	assert.JSONEq(t,
-		`{"hits":[{"name":"BaseOnly","kind":"function","file_path":"repo/internal/live.go","line":3}]}`,
+		`{"hits":[{"name":"BaseOnly","kind":"function","file_path":`+string(wantPath)+`,"line":3}]}`,
 		string(encoded))
 
 	// A miss keeps its shape too: the empty hit list, and nothing else.
