@@ -73,6 +73,22 @@ func newCheckoutAdminFixture(t *testing.T) *checkoutAdminFixture {
 	return fixture
 }
 
+// quiesce stops the family's build loops.
+//
+// Reconciliation starts a coordinator for every automatic checkout, and a
+// live coordinator repoints the route it finds at the layers it builds
+// itself: it clears the working-tree slot and puts the route back to pending
+// for the length of the rebuild. A test that installs a route by hand and
+// then reads it has to stop the loops first, or it races that rebuild.
+//
+// Closing writes nothing to the catalog — it is about the goroutines — and it
+// returns only once a cycle already in flight has finished, so no coordinator
+// can touch a route after it.
+func (f *checkoutAdminFixture) quiesce(t *testing.T) {
+	t.Helper()
+	require.NoError(t, f.srv.lifecycle.Close())
+}
+
 // families reads the listing tool's answer.
 func (f *checkoutAdminFixture) families(t *testing.T, args map[string]any) indexer.FamiliesOverview {
 	t.Helper()
@@ -134,13 +150,15 @@ func TestListCheckoutsReportsTheFamilyItsGraphsAndItsCheckouts(t *testing.T) {
 // and a path no checkout contains.
 func TestExplainViewWalksTheBindingChain(t *testing.T) {
 	f := newCheckoutAdminFixture(t)
+	// What is under test is the chain the binding walks, not the builder that
+	// fills it, so the builder is stopped before the chain is laid out by hand.
+	f.quiesce(t)
 	ctx := context.Background()
 	family := f.families(t, map[string]any{}).Families[0]
 	linked := checkoutNamed(t, family, "wt")
 
 	// A route with both slots filled is what makes a composed view answer.
-	// The generations are seeded rather than built: what is under test is the
-	// chain the binding walks, not the builder that fills it.
+	// The generations are seeded rather than built.
 	commitGen := seedGeneration(t, f.catalog, family.PrimaryGraphID, linked.CheckoutID, "commit")
 	dirtyGen := seedGeneration(t, f.catalog, family.PrimaryGraphID, linked.CheckoutID, "dirty")
 	require.NoError(t, f.catalog.UpsertCheckoutRoute(ctx, store_sqlite.CheckoutRoute{
