@@ -19,6 +19,7 @@ import (
 	"github.com/zzet/gortex/internal/embedding"
 	"github.com/zzet/gortex/internal/entrypoints"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/indexer/source"
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/progress"
@@ -2641,6 +2642,15 @@ func EffectiveRepoPrefix(cm *config.ConfigManager, entry config.RepoEntry) strin
 // TrackRepoCtx is TrackRepo with a context, allowing callers to pipe progress
 // reporters (via progress.WithReporter) through to the underlying Index call.
 func (mi *MultiIndexer) TrackRepoCtx(ctx context.Context, entry config.RepoEntry) (*IndexResult, error) {
+	return mi.trackRepoSourceCtx(ctx, entry, nil)
+}
+
+// trackRepoSourceCtx is TrackRepoCtx with a borrowed immutable content source.
+// A nil source preserves the legacy filesystem-backed behavior. The caller owns
+// the source and must keep it open until this method returns.
+func (mi *MultiIndexer) trackRepoSourceCtx(
+	ctx context.Context, entry config.RepoEntry, content source.ContentSource,
+) (*IndexResult, error) {
 	absPath, err := filepath.Abs(entry.Path)
 	if err != nil {
 		return nil, fmt.Errorf("resolving path %s: %w", entry.Path, err)
@@ -2714,6 +2724,7 @@ func (mi *MultiIndexer) TrackRepoCtx(ctx context.Context, entry config.RepoEntry
 	// mtime lookups — had to carry a branch for the unprefixed shape.
 	idx := mi.newPerRepoIndexerForMutation(ctx, cfg.Index)
 	idx.SetRepoPrefix(prefix)
+	setTrackContentSource(idx, content)
 	// Workspace / project slugs stamped on every node. Resolution
 	// order (highest priority first): RepoEntry.Workspace from the
 	// global config (lets users pin OSS repos without committing a
