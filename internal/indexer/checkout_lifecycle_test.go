@@ -203,6 +203,88 @@ func (f *lifecycleFixture) close() {
 	_ = f.store.Close()
 }
 
+func TestViewBuildGateWaitUntilOpenBlocksUntilOpen(t *testing.T) {
+	gate := NewViewBuildGate()
+	result := make(chan error, 1)
+	go func() {
+		result <- gate.WaitUntilOpen(context.Background())
+	}()
+
+	select {
+	case err := <-result:
+		t.Fatalf("WaitUntilOpen returned before Open: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	gate.Open()
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("WaitUntilOpen after Open: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("WaitUntilOpen did not return after Open")
+	}
+}
+
+func TestViewBuildGateWaitUntilOpenReady(t *testing.T) {
+	gate := NewViewBuildGate()
+	gate.Open()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := gate.WaitUntilOpen(ctx); err != nil {
+		t.Fatalf("WaitUntilOpen on an open gate: %v", err)
+	}
+}
+
+func TestViewBuildGateWaitUntilOpenHonorsCancellation(t *testing.T) {
+	gate := NewViewBuildGate()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := gate.WaitUntilOpen(ctx); err != context.Canceled {
+		t.Fatalf("WaitUntilOpen cancellation = %v, want %v", err, context.Canceled)
+	}
+}
+
+func TestViewBuildGateWaitUntilOpenDoesNotConsumeActiveSlot(t *testing.T) {
+	gate := NewViewBuildGate()
+	gate.Open()
+
+	release, err := gate.Acquire(context.Background(), ViewBuildBackground)
+	if err != nil {
+		t.Fatalf("Acquire active slot: %v", err)
+	}
+	defer release()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := gate.WaitUntilOpen(ctx); err != nil {
+		t.Fatalf("WaitUntilOpen while the active slot is occupied: %v", err)
+	}
+}
+
+func BenchmarkViewBuildGateWaitUntilOpenReady(b *testing.B) {
+	gate := NewViewBuildGate()
+	gate.Open()
+	ctx := context.Background()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := gate.WaitUntilOpen(ctx); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func TestCheckoutLifecycleCloseToleratesUninitializedTransitionOwner(t *testing.T) {
+	lifecycle := &CheckoutLifecycle{}
+	require.NoError(t, lifecycle.Close())
+	require.NoError(t, lifecycle.Close(), "Close remains idempotent")
+}
+
 // volumeEvidenceUsable reports whether this platform's path evidence carries
 // the volume identity that separates "this root was deleted" from "the volume
 // it lived on is not mounted right now".

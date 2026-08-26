@@ -345,11 +345,25 @@ func TestCommitAuthorizedDemotionRevalidatesBeforePublication(t *testing.T) {
 			t.Fatalf("GetCheckout after retry = %+v, %v, %v", checkout, found, readErr)
 		}
 		if checkout.EffectiveMode != CheckoutModeAutomatic || checkout.DesiredMode != CheckoutModeAutomatic ||
-			checkout.ActiveIntentTransitionID != "" {
+			checkout.ActiveIntentTransitionID != recovered.Transition.TransitionID {
 			t.Fatalf("committed checkout = %+v", checkout)
 		}
-		if _, found, err := f.catalog.GetIntentTransition(context.Background(), f.targetCheckoutID); err != nil || found {
-			t.Fatalf("committed transition = found %v, err %v", found, err)
+		standing, found, err := f.catalog.GetIntentTransition(ctx, f.targetCheckoutID)
+		if err != nil || !found || standing.TransitionID != recovered.Transition.TransitionID {
+			t.Fatalf("committed transition = %+v, found %v, err %v", standing, found, err)
+		}
+		if err := f.catalog.CompleteIntentTransition(ctx, f.targetCheckoutID, recovered.Transition.TransitionID); err != nil {
+			t.Fatalf("CompleteIntentTransition: %v", err)
+		}
+		checkout, found, readErr = f.catalog.GetCheckout(ctx, f.targetCheckoutID)
+		if readErr != nil || !found {
+			t.Fatalf("GetCheckout after completion = %+v, %v, %v", checkout, found, readErr)
+		}
+		if checkout.ActiveIntentTransitionID != "" {
+			t.Fatalf("completed checkout = %+v", checkout)
+		}
+		if _, found, err := f.catalog.GetIntentTransition(ctx, f.targetCheckoutID); err != nil || found {
+			t.Fatalf("completed transition = found %v, err %v", found, err)
 		}
 		if stored, found, err := f.catalog.GetCleanupEntry(context.Background(), cleanup.CleanupID); err != nil || !found || stored.Reason != cleanup.Reason {
 			t.Fatalf("committed cleanup = %+v, %v, %v", stored, found, err)

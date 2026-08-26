@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -1529,6 +1530,204 @@ func TestCatalogIntentTransitionIsSinglePerCheckout(t *testing.T) {
 	}
 	if _, ok, err := catalog.GetIntentTransition(ctx, "missing"); err != nil || ok {
 		t.Fatalf("rolled-back transition left a row: %v, %v", ok, err)
+	}
+}
+
+// TestCatalogModeTransitionAdmissionIsAtomicAndGuarded covers the durable
+// admission used by asynchronous promotion: the transition and tracking intent
+// appear together, compatible retries adopt one journal row, and stale or
+// incompatible requests write neither half.
+func TestCatalogModeTransitionAdmissionIsAtomicAndGuarded(t *testing.T) {
+	store := openCatalogStore(t)
+	ctx := context.Background()
+	catalog := store.Catalog()
+	seedFamilyAndCheckout(t, catalog, "fam", "wt", "inc-1")
+
+	transition := IntentTransition{
+		TransitionID: "transition-1", CheckoutID: "wt", Cause: "promote_checkout",
+		PriorDesiredMode: CheckoutModeAutomatic, PriorEffectiveMode: CheckoutModeAutomatic,
+		RequestedMode: CheckoutModeDedicated, PriorCheckoutState: CheckoutStateReady,
+		State: IntentTransitionPending, CreatedAt: 200, LastProgress: 200,
+	}
+	intent := TrackingIntent{
+		IntentID: "intent-1", CheckoutID: "wt", SourceKind: IntentSourceCLITrack,
+		SourceLocator: "/tmp/wt", Active: true, CreatedAt: 200,
+	}
+	standing, adopted, err := catalog.BeginIntentTransitionWithTrackingIntent(ctx,
+		BeginIntentTransitionRequest{Transition: transition, Incarnation: "inc-1", TrackingIntent: &intent})
+	if err != nil || adopted || standing.TransitionID != transition.TransitionID {
+		t.Fatalf("first admission = %+v, adopted=%v, err=%v", standing, adopted, err)
+	}
+
+	retry := transition
+	retry.TransitionID = "transition-2"
+	standing, adopted, err = catalog.BeginIntentTransitionWithTrackingIntent(ctx,
+		BeginIntentTransitionRequest{Transition: retry, Incarnation: "inc-1", TrackingIntent: &intent})
+	if err != nil || !adopted || standing.TransitionID != transition.TransitionID {
+		t.Fatalf("compatible retry = %+v, adopted=%v, err=%v", standing, adopted, err)
+	}
+	transitions, err := catalog.ListIntentTransitions(ctx)
+	if err != nil || len(transitions) != 1 {
+		t.Fatalf("transition journal = %+v, err=%v", transitions, err)
+	}
+	intents, err := catalog.ListTrackingIntents(ctx, "wt")
+	if err != nil || len(intents) != 1 || !intents[0].Active {
+		t.Fatalf("tracking intents = %+v, err=%v", intents, err)
+	}
+
+	incompatible := retry
+	incompatible.Cause = "different_operation"
+	otherIntent := intent
+	otherIntent.IntentID = "intent-2"
+	otherIntent.SourceLocator = "/tmp/other"
+	if _, _, err := catalog.BeginIntentTransitionWithTrackingIntent(ctx,
+		BeginIntentTransitionRequest{Transition: incompatible, Incarnation: "inc-1", TrackingIntent: &otherIntent}); !errors.Is(err, ErrCatalogStaleGuard) {
+		t.Fatalf("incompatible retry = %v, want ErrCatalogStaleGuard", err)
+	}
+	intents, err = catalog.ListTrackingIntents(ctx, "wt")
+	if err != nil || len(intents) != 1 {
+		t.Fatalf("incompatible admission wrote intent: %+v, err=%v", intents, err)
+	}
+
+	seedFamilyAndCheckout(t, catalog, "fam", "stale", "inc-2")
+	stale := transition
+	stale.TransitionID = "transition-stale"
+	stale.CheckoutID = "stale"
+	stale.PriorEffectiveMode = CheckoutModeDedicated
+	staleIntent := intent
+	staleIntent.IntentID = "intent-stale"
+	staleIntent.CheckoutID = "stale"
+	staleIntent.SourceLocator = "/tmp/stale"
+	if _, _, err := catalog.BeginIntentTransitionWithTrackingIntent(ctx,
+		BeginIntentTransitionRequest{Transition: stale, Incarnation: "inc-2", TrackingIntent: &staleIntent}); !errors.Is(err, ErrCatalogStaleGuard) {
+		t.Fatalf("stale admission = %v, want ErrCatalogStaleGuard", err)
+	}
+	if _, found, err := catalog.GetIntentTransition(ctx, "stale"); err != nil || found {
+		t.Fatalf("stale admission wrote transition: found=%v err=%v", found, err)
+	}
+	if intents, err := catalog.ListTrackingIntents(ctx, "stale"); err != nil || len(intents) != 0 {
+		t.Fatalf("stale admission wrote intent: %+v, err=%v", intents, err)
+	}
+}
+
+func TestCatalogAuthorizedDemotionPreservesTransitionUntilCleanupCompletes(t *testing.T) {
+	store := openCatalogStore(t)
+	ctx := context.Background()
+	catalog := store.Catalog()
+	if err := catalog.UpsertRepositoryFamily(ctx, RepositoryFamily{
+		FamilyID: "fam-demote", CommonDirIdentity: "fam-demote", State: "family_ready",
+		PrimaryEpoch: 7, CreatedAt: 1, LastSeen: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, checkout := range []Checkout{
+		{CheckoutID: "primary-wt", Incarnation: "primary-inc", FamilyID: "fam-demote",
+			RootPath: "/tmp/primary-wt", GitDir: "/tmp/primary-wt/.git", AdminName: "primary-wt",
+			State: CheckoutStateReady, DesiredMode: CheckoutModeDedicated,
+			EffectiveMode: CheckoutModeDedicated, HeadCommit: "c0ffee", HeadTree: "7ee7", LastSeen: 1},
+		{CheckoutID: "demoted-wt", Incarnation: "demoted-inc", FamilyID: "fam-demote",
+			RootPath: "/tmp/demoted-wt", GitDir: "/tmp/demoted-wt/.git", AdminName: "demoted-wt",
+			State: CheckoutStateReady, DesiredMode: CheckoutModeDedicated,
+			EffectiveMode: CheckoutModeDedicated, HeadCommit: "c0ffee", HeadTree: "7ee7", LastSeen: 1},
+	} {
+		if err := catalog.UpsertCheckout(ctx, checkout); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, graph := range []DedicatedGraph{
+		{GraphID: "primary-graph", OwnerCheckoutID: "primary-wt", RepoPrefix: "/tmp/primary-wt",
+			FamilyID: "fam-demote", IsPrimaryBase: true, State: "ready"},
+		{GraphID: "demoted-graph", OwnerCheckoutID: "demoted-wt", RepoPrefix: "/tmp/demoted-wt",
+			FamilyID: "fam-demote", State: "ready"},
+	} {
+		if err := catalog.UpsertDedicatedGraph(ctx, graph); err != nil {
+			t.Fatal(err)
+		}
+	}
+	transition := IntentTransition{
+		TransitionID: "demotion-transition", CheckoutID: "demoted-wt",
+		Cause: "explicit_untrack_demote", PriorDesiredMode: CheckoutModeDedicated,
+		PriorEffectiveMode: CheckoutModeDedicated, RequestedMode: CheckoutModeAutomatic,
+		PriorCheckoutState: CheckoutStateReady, SourceSnapshotHash: "demoted-graph:primary-graph:7",
+		State: IntentTransitionPending, CreatedAt: 2, LastProgress: 2,
+	}
+	if err := catalog.BeginIntentTransition(ctx, transition); err != nil {
+		t.Fatal(err)
+	}
+	if err := catalog.CommitAuthorizedDemotion(ctx, CommitAuthorizedDemotionRequest{
+		CheckoutID: "demoted-wt", Incarnation: "demoted-inc", FamilyID: "fam-demote",
+		TransitionID: transition.TransitionID, OwnedGraphID: "demoted-graph",
+		PrimaryGraphID: "primary-graph", ExpectedPrimaryEpoch: 7, RequiredPrimaryState: "ready",
+		State: CheckoutStateReady, LastSeen: 3,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	checkout, found, err := catalog.GetCheckout(ctx, "demoted-wt")
+	if err != nil || !found {
+		t.Fatalf("GetCheckout after commit: found=%v err=%v", found, err)
+	}
+	if checkout.EffectiveMode != CheckoutModeAutomatic ||
+		checkout.ActiveIntentTransitionID != transition.TransitionID {
+		t.Fatalf("post-commit checkout = %+v, want automatic with cleanup-pending transition", checkout)
+	}
+	standing, found, err := catalog.GetIntentTransition(ctx, "demoted-wt")
+	if err != nil || !found || standing.TransitionID != transition.TransitionID {
+		t.Fatalf("post-commit transition = %+v, found=%v err=%v", standing, found, err)
+	}
+	if err := catalog.CompleteIntentTransition(ctx, "demoted-wt", transition.TransitionID); err != nil {
+		t.Fatal(err)
+	}
+	checkout, found, err = catalog.GetCheckout(ctx, "demoted-wt")
+	if err != nil || !found || checkout.ActiveIntentTransitionID != "" {
+		t.Fatalf("checkout after completion = %+v, found=%v err=%v", checkout, found, err)
+	}
+	if _, found, err := catalog.GetIntentTransition(ctx, "demoted-wt"); err != nil || found {
+		t.Fatalf("transition after completion: found=%v err=%v", found, err)
+	}
+}
+
+func BenchmarkListIntentTransitions256(b *testing.B) {
+	store, err := Open(filepath.Join(b.TempDir(), "transitions.sqlite"))
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	catalog := store.Catalog()
+	if err := catalog.UpsertRepositoryFamily(ctx, RepositoryFamily{
+		FamilyID: "bench-family", CommonDirIdentity: "bench-family", State: "family_ready",
+		CreatedAt: 1, LastSeen: 1,
+	}); err != nil {
+		b.Fatal(err)
+	}
+	for i := 0; i < 256; i++ {
+		checkoutID := fmt.Sprintf("bench-wt-%03d", i)
+		if err := catalog.UpsertCheckout(ctx, Checkout{
+			CheckoutID: checkoutID, Incarnation: "inc-1", FamilyID: "bench-family",
+			RootPath: "/tmp/" + checkoutID, GitDir: "/tmp/" + checkoutID + "/.git",
+			AdminName: checkoutID, State: CheckoutStateReady,
+			DesiredMode: CheckoutModeAutomatic, EffectiveMode: CheckoutModeAutomatic,
+			HeadCommit: "c0ffee", HeadTree: "7ee7", LastSeen: 1,
+		}); err != nil {
+			b.Fatal(err)
+		}
+		if err := catalog.BeginIntentTransition(ctx, IntentTransition{
+			TransitionID: fmt.Sprintf("bench-transition-%03d", i), CheckoutID: checkoutID,
+			Cause: "promote_checkout", PriorDesiredMode: CheckoutModeAutomatic,
+			PriorEffectiveMode: CheckoutModeAutomatic, RequestedMode: CheckoutModeDedicated,
+			PriorCheckoutState: CheckoutStateReady, State: IntentTransitionPending,
+			CreatedAt: int64(i + 1), LastProgress: int64(i + 1),
+		}); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		transitions, err := catalog.ListIntentTransitions(ctx)
+		if err != nil || len(transitions) != 256 {
+			b.Fatalf("ListIntentTransitions = %d rows, err=%v", len(transitions), err)
+		}
 	}
 }
 

@@ -479,23 +479,43 @@ func (gc *GlobalConfig) AddRepo(entry RepoEntry) error {
 // RemoveRepo removes a repository entry from the top-level repos list by path.
 // The path is resolved to absolute for comparison.
 func (gc *GlobalConfig) RemoveRepo(path string) error {
+	removed, err := gc.RemoveRepoIfPresent(path)
+	if err != nil {
+		return err
+	}
+	if !removed {
+		return fmt.Errorf("repository not found: %s", path)
+	}
+	return nil
+}
+
+// RemoveRepoIfPresent removes a repository entry when it exists. Unlike
+// RemoveRepo, absence is a successful no-op so crash-recovery cleanup can be
+// replayed without weakening RemoveRepo's caller-visible not-found contract.
+func (gc *GlobalConfig) RemoveRepoIfPresent(path string) (bool, error) {
 	globalConfigMu.Lock()
 	defer globalConfigMu.Unlock()
 
 	absPath, err := filepath.Abs(path)
 	if err != nil {
-		return fmt.Errorf("resolving path %s: %w", path, err)
+		return false, fmt.Errorf("resolving path %s: %w", path, err)
 	}
 
+	targetInfo, targetStatErr := os.Stat(absPath)
 	for i, entry := range gc.Repos {
 		entryAbs := normalizePath(entry.Path)
-		if pathkey.SamePathIdentity(entryAbs, absPath) {
+		matched := pathkey.SamePathIdentity(entryAbs, absPath)
+		if !matched && targetStatErr == nil {
+			if entryInfo, statErr := os.Stat(entryAbs); statErr == nil {
+				matched = os.SameFile(entryInfo, targetInfo)
+			}
+		}
+		if matched {
 			gc.Repos = append(gc.Repos[:i], gc.Repos[i+1:]...)
-			return nil
+			return true, nil
 		}
 	}
-
-	return fmt.Errorf("repository not found: %s", path)
+	return false, nil
 }
 
 // DedupeRepos removes tracked-repo entries that name the same directory as

@@ -43,6 +43,29 @@ type ViewBuildGate struct {
 	interactiveBurst int
 }
 
+// WaitUntilOpen waits for daemon warmup without entering the derived-build
+// queue or consuming its single active slot.
+func (g *ViewBuildGate) WaitUntilOpen(ctx context.Context) error {
+	if g == nil {
+		return nil
+	}
+
+	g.mu.Lock()
+	if g.open {
+		g.mu.Unlock()
+		return nil
+	}
+	opened := g.opened
+	g.mu.Unlock()
+
+	select {
+	case <-opened:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // NewViewBuildGate returns a closed, single-build gate. Open releases warmup;
 // Acquire then serializes derived builds for the lifetime of the daemon.
 func NewViewBuildGate() *ViewBuildGate {

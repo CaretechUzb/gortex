@@ -350,8 +350,23 @@ func (l *CheckoutLifecycle) demote(
 			zap.String("checkout", checkout.CheckoutID),
 			zap.String("graph", authorization.OwnedGraphID), zap.Error(commitErr))
 	}
+
+	prefix := ""
+	if owned != nil {
+		prefix = owned.RepoPrefix
+	}
+	if _, _, err := l.evictRepoChecked(prefix, checkout.RootPath); err != nil {
+		// Publication already committed. Keep the automatic route live and the
+		// transition standing so restart can retry only the external cleanup.
+		l.sweepRetirements(ctx)
+		return fmt.Errorf("indexer: persist demoted checkout configuration: %w", err)
+	}
+	if err := l.catalog.CompleteIntentTransition(ctx, checkout.CheckoutID,
+		authorization.Transition.TransitionID); err != nil {
+		l.sweepRetirements(ctx)
+		return fmt.Errorf("indexer: complete demotion transition: %w", err)
+	}
 	l.sweepRetirements(ctx)
-	l.notifyTrackedSetChanged()
 	return nil
 }
 

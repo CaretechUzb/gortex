@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -518,6 +519,177 @@ func TestDemoteRefusesAStaleIncarnation(t *testing.T) {
 	assert.NotNil(t, f.mi.GetMetadata(tracked.Prefix), "its corpus is untouched")
 	assert.False(t, f.lc.SignalCheckout(tracked.CheckoutID, "test"),
 		"no coordinator was left behind for a checkout that is still dedicated")
+}
+
+func modeTransitionRunFor(t *testing.T, lifecycle *CheckoutLifecycle, transitionID string) *modeTransitionRun {
+	t.Helper()
+	lifecycle.transitionMu.Lock()
+	run := lifecycle.transitionRuns[transitionID]
+	lifecycle.transitionMu.Unlock()
+	require.NotNil(t, run, "transition %s has no lifecycle worker", transitionID)
+	return run
+}
+
+func awaitModeTransition(t *testing.T, lifecycle *CheckoutLifecycle, transitionID string) modeTransitionOutcome {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	outcome, err := waitModeTransition(ctx, modeTransitionRunFor(t, lifecycle, transitionID))
+	require.NoError(t, err)
+	return outcome
+}
+
+func TestPromotionWorkerCoalescesOneDurableTransition(t *testing.T) {
+	f := newFamilyFixture(t, "promote-coalesce")
+	defer f.close()
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var enteredOnce, releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
+	f.lc.indexBarrier = func() {
+		enteredOnce.Do(func() { close(entered) })
+		<-release
+	}
+
+	first, err := f.lc.StartPromoteCheckout(context.Background(), f.automatic.CheckoutID, TrackSourceMCP)
+	require.NoError(t, err)
+	require.True(t, first.Pending)
+	require.NotEmpty(t, first.TransitionID)
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("promotion worker did not reach the index barrier")
+	}
+	second, err := f.lc.StartPromoteCheckout(context.Background(), f.automatic.CheckoutID, TrackSourceMCP)
+	require.NoError(t, err)
+	assert.Equal(t, first.TransitionID, second.TransitionID)
+	assert.Same(t, modeTransitionRunFor(t, f.lc, first.TransitionID),
+		modeTransitionRunFor(t, f.lc, second.TransitionID))
+
+	releaseOnce.Do(func() { close(release) })
+	outcome := awaitModeTransition(t, f.lc, first.TransitionID)
+	require.NoError(t, outcome.err)
+	assert.Equal(t, first.TransitionID, outcome.promotion.TransitionID)
+
+	require.NoError(t, f.lc.resumeModeTransitions(context.Background()))
+	f.lc.transitionMu.Lock()
+	_, retained := f.lc.transitionRuns[first.TransitionID]
+	f.lc.transitionMu.Unlock()
+	assert.False(t, retained, "the authoritative empty journal prunes a completed run")
+}
+
+func TestSeedResumesDurablePromotion(t *testing.T) {
+	f := newFamilyFixture(t, "promote-restart")
+	defer f.close()
+	ctx := context.Background()
+
+	transition, err := f.lc.beginModeChange(ctx, f.automatic,
+		store_sqlite.CheckoutModeDedicated, promotionTransitionCause, &store_sqlite.TrackingIntent{
+			IntentID: "promote-restart-intent", CheckoutID: f.automatic.CheckoutID,
+			SourceKind: TrackSourceMCP, SourceLocator: f.automatic.RootPath,
+			Active: true, CreatedAt: f.clock.Now().Unix(),
+		})
+	require.NoError(t, err)
+	f.restart()
+	require.NoError(t, f.lc.Seed(ctx))
+
+	outcome := awaitModeTransition(t, f.lc, transition.TransitionID)
+	require.NoError(t, outcome.err)
+	checkout, found, err := f.catalog.GetCheckout(ctx, f.automatic.CheckoutID)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, store_sqlite.CheckoutModeDedicated, checkout.EffectiveMode)
+	_, pending, err := f.catalog.GetIntentTransition(ctx, f.automatic.CheckoutID)
+	require.NoError(t, err)
+	assert.False(t, pending)
+}
+
+func TestSeedResumesDemotionWithoutRestoringRevokedConfigIntent(t *testing.T) {
+	f := newFamilyFixture(t, "demote-restart")
+	defer f.close()
+	ctx := context.Background()
+
+	tracked, err := f.lc.Register(ctx, config.RepoEntry{Path: f.worktree}, TrackSourceCLI)
+	require.NoError(t, err)
+	require.NoError(t, tracked.CatalogErr)
+	checkout := f.checkoutOf(tracked.Prefix)
+	owned, primary, err := f.lc.familyGraphsFor(ctx, checkout)
+	require.NoError(t, err)
+	require.NotNil(t, owned)
+	require.NotNil(t, primary)
+	preview, err := f.lc.PreviewUntrack(ctx, f.worktree)
+	require.NoError(t, err)
+	authorization, err := f.lc.rec.AuthorizeDemotion(ctx, checkout,
+		owned.GraphID, primary.GraphID, preview.PrimaryEpoch)
+	require.NoError(t, err)
+	require.True(t, f.configLists(f.worktree), "cleanup has not removed the stale config entry yet")
+
+	f.restart()
+	gate := NewViewBuildGate()
+	f.lc.SetBuildGate(gate)
+	require.NoError(t, f.lc.Seed(ctx))
+	run := modeTransitionRunFor(t, f.lc, authorization.Transition.TransitionID)
+	require.Never(t, func() bool {
+		select {
+		case <-run.done:
+			return true
+		default:
+			return false
+		}
+	}, 100*time.Millisecond, 10*time.Millisecond, "worker crossed warmup gate")
+
+	restored, err := f.lc.Register(ctx,
+		config.RepoEntry{Path: f.main, Name: f.mainPrefix}, TrackSourceCLI)
+	require.NoError(t, err)
+	require.NoError(t, restored.CatalogErr)
+	gate.Open()
+
+	waitCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	outcome, err := waitModeTransition(waitCtx, run)
+	require.NoError(t, err)
+	require.NoError(t, outcome.err)
+	require.True(t, outcome.demoted)
+
+	demoted, found, err := f.catalog.GetCheckout(ctx, checkout.CheckoutID)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, store_sqlite.CheckoutModeAutomatic, demoted.EffectiveMode)
+	intents, err := f.catalog.ListTrackingIntents(ctx, checkout.CheckoutID)
+	require.NoError(t, err)
+	for _, intent := range intents {
+		assert.False(t, intent.Active, "restart reactivated revoked intent %+v", intent)
+	}
+	require.False(t, f.configLists(f.worktree),
+		"durable demotion replay must remove the persisted explicit worktree entry")
+}
+
+func TestCloseCancelsAndJoinsModeTransitionWorker(t *testing.T) {
+	f := newFamilyFixture(t, "promote-close")
+	defer f.close()
+
+	entered := make(chan struct{})
+	var once sync.Once
+	f.lc.indexBarrier = func() {
+		once.Do(func() { close(entered) })
+		<-f.lc.transitionCtx.Done()
+	}
+	started, err := f.lc.StartPromoteCheckout(context.Background(), f.automatic.CheckoutID, TrackSourceMCP)
+	require.NoError(t, err)
+	run := modeTransitionRunFor(t, f.lc, started.TransitionID)
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("promotion worker did not reach the index barrier")
+	}
+	require.NoError(t, f.lc.Close())
+	select {
+	case <-run.done:
+	case <-time.After(time.Second):
+		t.Fatal("Close returned before the transition worker joined")
+	}
+	assert.Error(t, run.outcome.err)
 }
 
 // --- set-primary --------------------------------------------------------

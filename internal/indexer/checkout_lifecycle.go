@@ -183,6 +183,17 @@ type CheckoutLifecycle struct {
 	// the same answer the last one gives.
 	batchDepth   int
 	batchPending bool
+
+	// transitionCtx owns promotion and demotion workers. Durable transition
+	// rows outlive request contexts; this context instead lives for exactly as
+	// long as the lifecycle, so a disconnected caller cannot abandon work and
+	// daemon shutdown can still stop it deliberately.
+	transitionCtx     context.Context
+	cancelTransitions context.CancelFunc
+	transitionMu      sync.Mutex
+	transitionRuns    map[string]*modeTransitionRun
+	transitionWG      sync.WaitGroup
+	transitionClosed  bool
 }
 
 // NewCheckoutLifecycle builds the lifecycle. It fails only on a missing
@@ -199,18 +210,22 @@ func NewCheckoutLifecycle(cfg CheckoutLifecycleConfig) (*CheckoutLifecycle, erro
 	if now == nil {
 		now = time.Now
 	}
+	transitionCtx, cancelTransitions := context.WithCancel(context.Background())
 	l := &CheckoutLifecycle{
-		mi:               cfg.MultiIndexer,
-		cfgMgr:           cfg.ConfigManager,
-		logger:           logger,
-		now:              now,
-		leases:           cfg.ViewLeases,
-		coordinators:     map[string]*CheckoutCoordinator{},
-		started:          map[string][]*CheckoutCoordinator{},
-		owed:             map[int64]struct{}{},
-		familyRetries:    map[string]familyRetry{},
-		refViewRetention: cfg.RefViews.withDefaults(),
-		indexBarrier:     cfg.indexBarrier,
+		mi:                cfg.MultiIndexer,
+		cfgMgr:            cfg.ConfigManager,
+		logger:            logger,
+		now:               now,
+		leases:            cfg.ViewLeases,
+		coordinators:      map[string]*CheckoutCoordinator{},
+		started:           map[string][]*CheckoutCoordinator{},
+		owed:              map[int64]struct{}{},
+		familyRetries:     map[string]familyRetry{},
+		refViewRetention:  cfg.RefViews.withDefaults(),
+		indexBarrier:      cfg.indexBarrier,
+		transitionCtx:     transitionCtx,
+		cancelTransitions: cancelTransitions,
+		transitionRuns:    map[string]*modeTransitionRun{},
 	}
 	if l.leases == nil {
 		l.leases = graphview.NewLeaseManager()
@@ -501,7 +516,12 @@ func (l *CheckoutLifecycle) recordCheckout(
 		}
 	}
 
-	if source != TrackSourceImplicit {
+	// A config entry may outlive an authorized demotion until its cleanup
+	// worker removes the dedicated corpus. On restart that stale entry must not
+	// resurrect the intent the durable transition already revoked.
+	restoreExplicitIntent := source != TrackSourceImplicit &&
+		!(seeding && existing != nil && existing.ActiveIntentTransitionID != "")
+	if restoreExplicitIntent {
 		intent := store_sqlite.TrackingIntent{
 			IntentID:      uuid.NewV7().String(),
 			CheckoutID:    identity.checkoutID,
@@ -759,8 +779,14 @@ func (l *CheckoutLifecycle) recordPathEvidence(
 
 // UntrackResult is what one explicit forget did.
 type UntrackResult struct {
-	Prefix       string
-	CheckoutID   string
+	Prefix     string
+	CheckoutID string
+	// TransitionID names a durable demotion. It is empty for immediate
+	// eviction, forget, and primary-closure plans.
+	TransitionID string
+	// Pending reports that a lifecycle-owned demotion worker is still running
+	// or left its durable transition available for a retry.
+	Pending      bool
 	NodesRemoved int
 	EdgesRemoved int
 	// Revoked names the intent sources that were withdrawn.
@@ -808,6 +834,19 @@ func (l *CheckoutLifecycle) Untrack(ctx context.Context, pathOrPrefix string) (U
 // replaced — so the confirm refuses rather than demoting or forgetting an
 // identity nobody was asked about. Nothing has been revoked at that point.
 func (l *CheckoutLifecycle) ApplyUntrack(ctx context.Context, preview UntrackPreview) (UntrackResult, error) {
+	return l.applyUntrack(ctx, preview, true)
+}
+
+// StartApplyUntrack durably admits a demotion and returns once its daemon-owned
+// worker is scheduled. Plans without a durable mode transition remain
+// synchronous. ApplyUntrack is the wait-by-default compatibility wrapper.
+func (l *CheckoutLifecycle) StartApplyUntrack(ctx context.Context, preview UntrackPreview) (UntrackResult, error) {
+	return l.applyUntrack(ctx, preview, false)
+}
+
+func (l *CheckoutLifecycle) applyUntrack(
+	ctx context.Context, preview UntrackPreview, wait bool,
+) (UntrackResult, error) {
 	out := UntrackResult{
 		Prefix:     preview.Prefix,
 		CheckoutID: preview.CheckoutID,
@@ -874,10 +913,22 @@ func (l *CheckoutLifecycle) ApplyUntrack(ctx context.Context, preview UntrackPre
 		if err != nil {
 			return out, err
 		}
-		if err := l.demote(opCtx, checkout, owned, authorization); err != nil {
-			return out, err
+		out.TransitionID = authorization.Transition.TransitionID
+		run := l.scheduleModeTransition(authorization.Transition)
+		if !wait {
+			out.Pending = true
+			return out, nil
 		}
-		out.Demoted = true
+		outcome, waitErr := waitModeTransition(ctx, run)
+		if waitErr != nil {
+			out.Pending = true
+			return out, waitErr
+		}
+		if outcome.err != nil {
+			out.Pending = true
+			return out, outcome.err
+		}
+		out.Demoted = outcome.demoted
 	case UntrackPlanPrimaryClosure:
 		revocation, err := l.rec.RetirePrimaryClosureExplicit(
 			opCtx, preview.GraphID, checkout.CheckoutID, checkout.Incarnation,
@@ -1109,6 +1160,9 @@ func (l *CheckoutLifecycle) Sweep(ctx context.Context) (SweepReport, error) {
 
 	var errs []error
 	if err := l.rec.Resume(ctx); err != nil {
+		errs = append(errs, err)
+	}
+	if err := l.resumeModeTransitions(ctx); err != nil {
 		errs = append(errs, err)
 	}
 	for _, fam := range l.knownFamilies(ctx) {
@@ -1682,6 +1736,16 @@ func (l *CheckoutLifecycle) Close() error {
 	if l == nil {
 		return nil
 	}
+	l.transitionMu.Lock()
+	if !l.transitionClosed {
+		l.transitionClosed = true
+		if l.cancelTransitions != nil {
+			l.cancelTransitions()
+		}
+	}
+	l.transitionMu.Unlock()
+	l.transitionWG.Wait()
+
 	l.retryMu.Lock()
 	for familyID, retry := range l.familyRetries {
 		retry.timer.Stop()
@@ -1914,34 +1978,45 @@ func (l *CheckoutLifecycle) orphanedGenerations(
 // mean every restart costs a worktree its view for a whole reconcile interval
 // — an hour, by default.
 func (l *CheckoutLifecycle) Seed(ctx context.Context) error {
-	if l == nil || l.rec == nil || l.cfgMgr == nil {
+	if l == nil || l.rec == nil {
 		return nil
 	}
 	var errs []error
+
+	// Finish cleanup that committed before a crash before reading config. A
+	// demotion may have flipped modes and journalled graph retirement while its
+	// stale config entry was still on disk; seeding that entry first would
+	// recreate the intent and graph the cleanup is about to remove.
+	if err := l.rec.Resume(ctx); err != nil {
+		errs = append(errs, err)
+	}
+
 	seeded := map[string]string{}
-	for _, entry := range l.cfgMgr.Global().Repos {
-		abs, err := filepath.Abs(entry.Path)
-		if err != nil {
-			abs = entry.Path
-		}
-		prefix := l.ResolvePrefix(abs)
-		if prefix == "" {
-			prefix = EffectiveRepoPrefix(l.cfgMgr, entry)
-		}
-		if prefix == "" {
-			continue
-		}
-		identity, err := l.recordCheckout(ctx, prefix, abs, TrackSourceConfig, true)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("seed %s: %w", abs, err))
-		}
-		if identity.familyID != "" {
-			if _, present := seeded[identity.familyID]; !present {
-				seeded[identity.familyID] = abs
+	if l.cfgMgr != nil {
+		for _, entry := range l.cfgMgr.Global().Repos {
+			abs, err := filepath.Abs(entry.Path)
+			if err != nil {
+				abs = entry.Path
+			}
+			prefix := l.ResolvePrefix(abs)
+			if prefix == "" {
+				prefix = EffectiveRepoPrefix(l.cfgMgr, entry)
+			}
+			if prefix == "" {
+				continue
+			}
+			identity, err := l.recordCheckout(ctx, prefix, abs, TrackSourceConfig, true)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("seed %s: %w", abs, err))
+			}
+			if identity.familyID != "" {
+				if _, present := seeded[identity.familyID]; !present {
+					seeded[identity.familyID] = abs
+				}
 			}
 		}
 	}
-	if err := l.rec.Resume(ctx); err != nil {
+	if err := l.resumeModeTransitions(ctx); err != nil {
 		errs = append(errs, err)
 	}
 	// The seeded families are reconciled once here rather than at the janitor's
@@ -1997,6 +2072,28 @@ func (h cleanupHooks) ReleaseGraph(ctx context.Context, graphID string) error {
 }
 
 // --- side effects -------------------------------------------------------
+
+// evictRepoChecked removes a repository from the live tracked set and persists
+// that removal. Durable transitions use the returned save error to stay
+// retryable instead of completing with stale explicit configuration.
+func (l *CheckoutLifecycle) evictRepoChecked(prefix, rootPath string) (nodesRemoved, edgesRemoved int, err error) {
+	if prefix != "" {
+		l.detachWatcher(prefix)
+		nodesRemoved, edgesRemoved = l.mi.UntrackRepo(prefix)
+	}
+	if l.cfgMgr != nil {
+		if rootPath != "" {
+			if _, err := l.cfgMgr.Global().RemoveRepoIfPresent(rootPath); err != nil {
+				return nodesRemoved, edgesRemoved, err
+			}
+		}
+		if err := l.cfgMgr.Global().Save(); err != nil {
+			return nodesRemoved, edgesRemoved, err
+		}
+	}
+	l.notifyTrackedSetChanged()
+	return nodesRemoved, edgesRemoved, nil
+}
 
 // evictRepo runs the repository teardown every caller shares: watcher first,
 // then the graph, then the persisted configuration, then the sessions.

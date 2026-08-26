@@ -200,7 +200,9 @@ func (c *Catalog) AuthorizeUntrack(ctx context.Context, req AuthorizeUntrackRequ
 // CommitAuthorizedDemotion performs the publication half of a demotion. The
 // family epoch and primary graph are checked again after the replacement layers
 // were built; a primary move during that build therefore leaves the checkout
-// dedicated and the authorization transition available for a retry.
+// dedicated and the authorization transition available for a retry. A
+// successful publication deliberately leaves that transition standing until
+// the caller persists external configuration cleanup and completes it.
 func (c *Catalog) CommitAuthorizedDemotion(ctx context.Context, req CommitAuthorizedDemotionRequest) error {
 	if err := validateCommitAuthorizedDemotionRequest(req); err != nil {
 		return err
@@ -261,8 +263,7 @@ func (c *Catalog) CommitAuthorizedDemotion(ctx context.Context, req CommitAuthor
 
 		result, err := tx.ExecContext(ctx, `
 UPDATE checkouts
-   SET state = ?, desired_mode = ?, effective_mode = ?, last_seen = ?, last_error = '',
-       active_intent_transition_id = NULL
+   SET state = ?, desired_mode = ?, effective_mode = ?, last_seen = ?, last_error = ''
  WHERE checkout_id = ? AND incarnation = ? AND active_intent_transition_id = ?`,
 			string(req.State), string(CheckoutModeAutomatic), string(CheckoutModeAutomatic), req.LastSeen,
 			req.CheckoutID, req.Incarnation, req.TransitionID)
@@ -276,20 +277,6 @@ UPDATE checkouts
 		if changed != 1 {
 			return fmt.Errorf("%w: checkout %s demotion transition %s", ErrCatalogStaleGuard,
 				req.CheckoutID, req.TransitionID)
-		}
-		result, err = tx.ExecContext(ctx,
-			`DELETE FROM intent_transitions WHERE transition_id = ? AND checkout_id = ?`,
-			req.TransitionID, req.CheckoutID)
-		if err != nil {
-			return err
-		}
-		changed, err = result.RowsAffected()
-		if err != nil {
-			return err
-		}
-		if changed != 1 {
-			return fmt.Errorf("%w: transition %s on checkout %s", ErrCatalogStaleGuard,
-				req.TransitionID, req.CheckoutID)
 		}
 		return nil
 	})
