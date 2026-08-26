@@ -12,6 +12,7 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/zzet/gortex/internal/gitcmd"
+	"github.com/zzet/gortex/internal/gitstate"
 	"go.uber.org/zap"
 )
 
@@ -46,6 +47,22 @@ type GitWatcher struct {
 	fireTimer      *time.Timer
 	loopStarted    bool
 	stopCalled     bool
+
+	// Worktree topology belongs to the shared git common directory, not to
+	// this checkout's private gitdir. The watcher observes the common
+	// worktrees directory, each admin child, and the checkout roots themselves
+	// so additions, removals, pruning and inaccessible roots all trigger a
+	// family reconciliation promptly.
+	gitDir            string
+	commonDir         string
+	worktreesDir      string
+	topologyTimer     *time.Timer
+	topologyChange    func(string)
+	topologyRefreshMu sync.Mutex
+	topologyPaths     map[string]struct{}
+	worktreeRoots     map[string]struct{}
+	worktreeAdminDirs map[string]struct{}
+
 	// reconciling single-flights reconcile: a ref event landing while
 	// one is in flight sets rerun instead of spawning a second
 	// concurrent reconcile from the same stale base (each AfterFunc
@@ -74,14 +91,26 @@ func NewGitWatcher(repoPath string, idx *Indexer, logger *zap.Logger) (*GitWatch
 		return nil, err
 	}
 	return &GitWatcher{
-		repoPath: absRepo,
-		indexer:  idx,
-		logger:   logger,
-		fsw:      fsw,
-		debounce: 300 * time.Millisecond,
-		done:     make(chan struct{}),
-		stopped:  make(chan struct{}),
+		repoPath:          absRepo,
+		indexer:           idx,
+		logger:            logger,
+		fsw:               fsw,
+		debounce:          300 * time.Millisecond,
+		done:              make(chan struct{}),
+		stopped:           make(chan struct{}),
+		topologyPaths:     make(map[string]struct{}),
+		worktreeRoots:     make(map[string]struct{}),
+		worktreeAdminDirs: make(map[string]struct{}),
 	}, nil
+}
+
+// OnWorktreeChange installs the callback used to reconcile the checkout
+// family after a topology change. The callback receives the watcher checkout
+// root, which is a stable selector for resolving the family.
+func (gw *GitWatcher) OnWorktreeChange(callback func(string)) {
+	gw.mu.Lock()
+	gw.topologyChange = callback
+	gw.mu.Unlock()
 }
 
 func (gw *GitWatcher) registeredIndexer() *Indexer {
@@ -119,20 +148,38 @@ func (gw *GitWatcher) Start() error {
 	if err != nil {
 		return fmt.Errorf("resolve .git dir for %s: %w", gw.repoPath, err)
 	}
-	// HEAD + refs/heads/ cover branch switches and same-branch
-	// commits; packed-refs covers the gc case where loose refs get
-	// packed and moved out of refs/heads. Missing files are not fatal
-	// — a fresh repo may not have packed-refs yet.
-	for _, rel := range []string{"HEAD", "packed-refs", "refs/heads"} {
-		path := filepath.Join(gitDir, rel)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	commonDir, err := resolveGitCommonDir(ctx, gw.repoPath)
+	cancel()
+	if err != nil {
+		return fmt.Errorf("resolve git common dir for %s: %w", gw.repoPath, err)
+	}
+	gw.mu.Lock()
+	gw.gitDir = filepath.Clean(gitDir)
+	gw.commonDir = filepath.Clean(commonDir)
+	gw.worktreesDir = filepath.Join(gw.commonDir, "worktrees")
+	gw.mu.Unlock()
+
+	// HEAD is private to a linked checkout. Branch refs and packed refs are
+	// shared by the whole family and therefore live under the common dir.
+	for _, path := range []string{
+		filepath.Join(gitDir, "HEAD"),
+		filepath.Join(commonDir, "packed-refs"),
+		filepath.Join(commonDir, "refs", "heads"),
+	} {
 		if _, err := os.Stat(path); err != nil {
 			continue
 		}
 		if err := gw.fsw.Add(path); err != nil {
-			gw.logger.Warn("git-watcher: failed to watch",
+			gw.logger.Warn("git-watcher: failed to watch ref state",
 				zap.String("path", path), zap.Error(err))
 		}
 	}
+
+	// Watching the common dir catches creation of its worktrees directory.
+	// The refresh adds that directory, each admin child, and each checkout root.
+	gw.addTopologyPath(commonDir)
+	gw.refreshTopologyWatches()
 
 	gw.lastSHA, _ = gw.currentSHA(context.Background())
 	gw.mu.Lock()
@@ -151,6 +198,12 @@ func (gw *GitWatcher) Stop() error {
 	started := gw.loopStarted
 	already := gw.stopCalled
 	gw.stopCalled = true
+	if gw.fireTimer != nil {
+		gw.fireTimer.Stop()
+	}
+	if gw.topologyTimer != nil {
+		gw.topologyTimer.Stop()
+	}
 	gw.mu.Unlock()
 	if already {
 		return nil
@@ -173,7 +226,13 @@ func (gw *GitWatcher) loop() {
 			if !ok {
 				return
 			}
-			gw.scheduleReconcile(event.Name)
+			if gw.isTopologyEvent(event) {
+				gw.refreshTopologyWatches()
+				gw.scheduleTopologyChange(event.Name)
+			}
+			if gw.isRefEvent(event.Name) {
+				gw.scheduleReconcile(event.Name)
+			}
 		case err, ok := <-gw.fsw.Errors:
 			if !ok {
 				return
@@ -190,12 +249,210 @@ func (gw *GitWatcher) loop() {
 func (gw *GitWatcher) scheduleReconcile(trigger string) {
 	gw.mu.Lock()
 	defer gw.mu.Unlock()
+	if gw.stopCalled {
+		return
+	}
 	if gw.fireTimer != nil {
 		gw.fireTimer.Stop()
 	}
 	gw.fireTimer = time.AfterFunc(gw.debounce, func() {
 		gw.reconcile(trigger)
 	})
+}
+
+func (gw *GitWatcher) scheduleTopologyChange(trigger string) {
+	gw.mu.Lock()
+	defer gw.mu.Unlock()
+	if gw.stopCalled {
+		return
+	}
+	if gw.topologyTimer != nil {
+		gw.topologyTimer.Stop()
+	}
+	gw.topologyTimer = time.AfterFunc(gw.debounce, func() {
+		// Re-sample after the burst settles. A common-dir create event can
+		// arrive before git has finished writing the new admin record.
+		gw.refreshTopologyWatches()
+		gw.mu.Lock()
+		callback := gw.topologyChange
+		stopped := gw.stopCalled
+		gw.mu.Unlock()
+		if stopped || callback == nil {
+			return
+		}
+		gw.logger.Debug("git-watcher: worktree topology changed", zap.String("trigger", trigger))
+		callback(gw.repoPath)
+	})
+}
+
+func (gw *GitWatcher) isRefEvent(name string) bool {
+	gw.mu.Lock()
+	gitDir, commonDir := gw.gitDir, gw.commonDir
+	gw.mu.Unlock()
+	name = filepath.Clean(name)
+	if name == filepath.Join(gitDir, "HEAD") || name == filepath.Join(commonDir, "packed-refs") {
+		return true
+	}
+	return pathWithin(filepath.Join(commonDir, "refs", "heads"), name)
+}
+
+func (gw *GitWatcher) isTopologyEvent(event fsnotify.Event) bool {
+	name := filepath.Clean(event.Name)
+	gw.mu.Lock()
+	worktreesDir := gw.worktreesDir
+	_, root := gw.worktreeRoots[name]
+	gw.mu.Unlock()
+	if root && event.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
+		return true
+	}
+	if worktreesDir == "" {
+		return false
+	}
+	if name == filepath.Clean(worktreesDir) {
+		return event.Op&(fsnotify.Create|fsnotify.Remove|fsnotify.Rename) != 0
+	}
+	rel, err := filepath.Rel(worktreesDir, name)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false
+	}
+	parts := strings.Split(rel, string(filepath.Separator))
+	if len(parts) == 1 {
+		// The administration directory for one linked worktree appeared or
+		// disappeared. Ordinary writes to its children are classified below.
+		return event.Op&(fsnotify.Create|fsnotify.Remove|fsnotify.Rename) != 0
+	}
+	if len(parts) != 2 {
+		return false
+	}
+	switch parts[1] {
+	case "HEAD", "gitdir", "commondir", "locked":
+		return true
+	default:
+		// In particular, a checkout coordinator refreshes the per-worktree
+		// index roughly every poll interval. Treating that payload write as a
+		// topology event created a permanent event storm and could consume the
+		// old controller debounce immediately before the one removal event.
+		return false
+	}
+}
+
+func pathWithin(root, candidate string) bool {
+	if root == "" || candidate == "" {
+		return false
+	}
+	rel, err := filepath.Rel(filepath.Clean(root), filepath.Clean(candidate))
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
+}
+
+func (gw *GitWatcher) addTopologyPath(path string) {
+	path = filepath.Clean(path)
+	if _, err := os.Stat(path); err != nil {
+		return
+	}
+	gw.mu.Lock()
+	defer gw.mu.Unlock()
+	if gw.stopCalled {
+		return
+	}
+	if _, exists := gw.topologyPaths[path]; exists {
+		return
+	}
+	if err := gw.fsw.Add(path); err != nil {
+		gw.logger.Warn("git-watcher: failed to watch worktree topology",
+			zap.String("path", path), zap.Error(err))
+		return
+	}
+	gw.topologyPaths[path] = struct{}{}
+}
+
+func (gw *GitWatcher) removeTopologyPath(path string) {
+	path = filepath.Clean(path)
+	gw.mu.Lock()
+	if _, exists := gw.topologyPaths[path]; !exists {
+		gw.mu.Unlock()
+		return
+	}
+	delete(gw.topologyPaths, path)
+	gw.mu.Unlock()
+	_ = gw.fsw.Remove(path)
+}
+
+func (gw *GitWatcher) refreshTopologyWatches() {
+	gw.topologyRefreshMu.Lock()
+	defer gw.topologyRefreshMu.Unlock()
+
+	gw.mu.Lock()
+	worktreesDir := gw.worktreesDir
+	previousRoots := clonePathSet(gw.worktreeRoots)
+	previousAdmins := clonePathSet(gw.worktreeAdminDirs)
+	gw.mu.Unlock()
+	if worktreesDir == "" {
+		return
+	}
+
+	desiredRoots := previousRoots
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	inventory, err := gitstate.Inventory(ctx, gw.repoPath)
+	cancel()
+	if err == nil {
+		desiredRoots = make(map[string]struct{}, len(inventory.Records))
+		for _, record := range inventory.Records {
+			if record.RootAccessible && !record.Bare {
+				desiredRoots[filepath.Clean(record.Path)] = struct{}{}
+			}
+		}
+	} else {
+		gw.logger.Debug("git-watcher: worktree inventory unavailable while refreshing watches", zap.Error(err))
+	}
+
+	desiredAdmins := make(map[string]struct{})
+	worktreesExists := false
+	if entries, readErr := os.ReadDir(worktreesDir); readErr == nil {
+		worktreesExists = true
+		for _, entry := range entries {
+			if entry.IsDir() {
+				desiredAdmins[filepath.Join(worktreesDir, entry.Name())] = struct{}{}
+			}
+		}
+	}
+
+	gw.mu.Lock()
+	gw.worktreeRoots = desiredRoots
+	gw.worktreeAdminDirs = desiredAdmins
+	gw.mu.Unlock()
+
+	for path := range previousRoots {
+		if _, keep := desiredRoots[path]; !keep {
+			gw.removeTopologyPath(path)
+		}
+	}
+	for path := range previousAdmins {
+		if _, keep := desiredAdmins[path]; !keep {
+			gw.removeTopologyPath(path)
+		}
+	}
+	if !worktreesExists {
+		gw.removeTopologyPath(worktreesDir)
+	} else {
+		gw.addTopologyPath(worktreesDir)
+	}
+	for path := range desiredAdmins {
+		gw.addTopologyPath(path)
+	}
+	for path := range desiredRoots {
+		gw.addTopologyPath(path)
+	}
+}
+
+func clonePathSet(source map[string]struct{}) map[string]struct{} {
+	cloned := make(map[string]struct{}, len(source))
+	for path := range source {
+		cloned[path] = struct{}{}
+	}
+	return cloned
 }
 
 // gitWatcherScopedResolveMaxFiles caps how many changed files a ref
@@ -489,6 +746,23 @@ func (gw *GitWatcher) rebaseInProgress() bool {
 		}
 	}
 	return false
+}
+
+// resolveGitCommonDir returns the shared git administrative directory for
+// the checkout family. Prefer git's absolute-path form and retain compatibility
+// with older git releases that only return a path relative to the checkout.
+func resolveGitCommonDir(ctx context.Context, repoPath string) (string, error) {
+	out, err := gitcmd.Output(ctx, repoPath, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	if err != nil {
+		out, err = gitcmd.Output(ctx, repoPath, "rev-parse", "--git-common-dir")
+		if err != nil {
+			return "", err
+		}
+	}
+	if !filepath.IsAbs(out) {
+		out = filepath.Join(repoPath, out)
+	}
+	return filepath.Clean(out), nil
 }
 
 // resolveGitDir returns the absolute path to the .git directory for a

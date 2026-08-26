@@ -526,6 +526,8 @@ func TestCheckoutLifecycleSweepRemovesVanishedWorktree(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 0, graced.Removed, "a removal waits out its grace")
 	held := f.checkoutOf("sweep-wt")
+	assert.Equal(t, store_sqlite.CheckoutStateRemovalGrace, held.State,
+		"queries must leave the vanished checkout's route during grace")
 	assert.NotZero(t, held.RemovalDetectedAt, "the removal clock is running")
 	assert.Equal(t, string(wantEvidence), held.RemovalEvidence)
 	assert.Zero(t, held.UnavailableSince, "evidenced removal is not an outage")
@@ -648,12 +650,11 @@ func TestCheckoutLifecycleSeedIsIdempotent(t *testing.T) {
 	assert.Len(t, intents, 1, "the intent is upserted on its source key, not duplicated")
 }
 
-// TestCheckoutLifecycleInaccessibleRootKeepsIdentity covers the boot case the
-// old check got wrong: a repository whose root cannot be reached is not gone.
-// It keeps its identity, enters availability handling, has its watcher
-// detached when the availability grace expires — and is never forgotten,
-// however long the outage lasts.
-func TestCheckoutLifecycleInaccessibleRootKeepsIdentity(t *testing.T) {
+// TestCheckoutLifecycleInaccessibleRootIsForgottenAfterGrace covers a checkout
+// whose root and Git directory disappear together. It receives one
+// availability grace and is then removed completely, including its persisted
+// configuration, rather than surviving as an unavailable shadow graph.
+func TestCheckoutLifecycleInaccessibleRootIsForgottenAfterGrace(t *testing.T) {
 	f := newLifecycleFixture(t)
 	defer f.close()
 	ctx := context.Background()
@@ -662,43 +663,33 @@ func TestCheckoutLifecycleInaccessibleRootKeepsIdentity(t *testing.T) {
 	tracked, err := f.lc.Register(ctx, config.RepoEntry{Path: root, Name: "offline-repo"}, TrackSourceCLI)
 	require.NoError(t, err)
 	require.NoError(t, tracked.CatalogErr)
-
-	// The whole checkout goes, shared git directory included — the shape a
-	// detached volume has, which is indistinguishable from a deletion.
 	require.NoError(t, os.RemoveAll(root))
 
 	graced, err := f.lc.Sweep(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, 0, graced.Removed)
 	require.Len(t, graced.Reports, 1)
-	assert.False(t, graced.Reports[0].InventoryUsable,
-		"git could not be read, so no record is missing — the inventory is")
+	assert.False(t, graced.Reports[0].InventoryUsable)
 
 	held := f.checkoutOf("offline-repo")
-	assert.Equal(t, tracked.CheckoutID, held.CheckoutID, "the identity survives the outage")
-	assert.Equal(t, tracked.Incarnation, held.Incarnation)
+	assert.Equal(t, tracked.CheckoutID, held.CheckoutID)
 	assert.Equal(t, store_sqlite.CheckoutStateAvailabilityGrace, held.State)
-	assert.Zero(t, held.RemovalDetectedAt, "an outage never starts the removal clock")
+	assert.Zero(t, held.RemovalDetectedAt, "inaccessibility uses only one grace clock")
 
-	// The availability grace expires: the layers are purged (today, the
-	// watcher is detached) but the checkout stays tracked.
 	f.clock.advance(lifecycleGrace.AvailabilityGrace + time.Second)
 	expired, err := f.lc.Sweep(ctx)
 	require.NoError(t, err)
-	assert.Equal(t, 0, expired.Removed)
-	unavailable := f.checkoutOf("offline-repo")
-	assert.Equal(t, store_sqlite.CheckoutStateUnavailable, unavailable.State)
-	assert.False(t, f.watcher.isAttached("offline-repo"), "an unreachable checkout is not watched")
-	assert.NotNil(t, f.mi.GetMetadata("offline-repo"), "its nodes are still served")
-
-	// However long the outage runs, an unreachable checkout is never
-	// forgotten: only evidence of removal may do that.
-	f.clock.advance(100 * lifecycleGrace.RemovalGrace)
-	long, err := f.lc.Sweep(ctx)
+	assert.Equal(t, 1, expired.Removed)
+	_, checkoutExists, err := f.catalog.GetCheckout(ctx, tracked.CheckoutID)
 	require.NoError(t, err)
-	assert.Equal(t, 0, long.Removed)
-	assert.Equal(t, tracked.CheckoutID, f.checkoutOf("offline-repo").CheckoutID)
-	assert.Contains(t, f.configPaths(), root, "nothing was dropped from the config")
+	assert.False(t, checkoutExists, "the checkout catalog row is removed")
+	assert.False(t, f.watcher.isAttached("offline-repo"), "its watcher is detached")
+	assert.Nil(t, f.mi.GetMetadata("offline-repo"), "its corpus is evicted")
+	assert.NotContains(t, f.configPaths(), root, "the removal is persisted")
+
+	f.restart()
+	require.NoError(t, f.lc.Seed(ctx))
+	assert.Nil(t, f.mi.GetMetadata("offline-repo"), "a restart does not resurrect it")
 }
 
 // TestCheckoutLifecycleImplicitRegistrationWritesNoIntent covers the

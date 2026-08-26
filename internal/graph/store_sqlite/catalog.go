@@ -529,6 +529,97 @@ SELECT intent_id, source_kind, source_locator, active, created_at, revoked_at, l
 	return out, nil
 }
 
+// RevokeTrackingIntents atomically withdraws every active intent when, and
+// only when, all of them belong to one of the caller-approved source kinds.
+// The preflight read and the update share the catalog write transaction, so a
+// cancellation or a non-revocable source cannot leave a partially revoked
+// checkout.
+func (c *Catalog) RevokeTrackingIntents(
+	ctx context.Context,
+	checkoutID string,
+	revokedAt int64,
+	revocableKinds []IntentSourceKind,
+) (revoked, blocked []TrackingIntent, err error) {
+	if checkoutID == "" {
+		return nil, nil, fmt.Errorf("%w: checkout_id is required", ErrCatalogInvalidValue)
+	}
+	allowed := make(map[IntentSourceKind]struct{}, len(revocableKinds))
+	for _, kind := range revocableKinds {
+		if err := requireCatalogValue("source_kind", kind, intentSourceKinds); err != nil {
+			return nil, nil, err
+		}
+		allowed[kind] = struct{}{}
+	}
+
+	var candidates []TrackingIntent
+	err = c.withTx(ctx, func(tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx, `
+SELECT intent_id, source_kind, source_locator, active, created_at, revoked_at, last_error
+  FROM tracking_intents WHERE checkout_id = ? ORDER BY source_kind, source_locator`, checkoutID)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			intent := TrackingIntent{CheckoutID: checkoutID}
+			var (
+				sourceKind string
+				active     int
+			)
+			if err := rows.Scan(&intent.IntentID, &sourceKind, &intent.SourceLocator, &active,
+				&intent.CreatedAt, &intent.RevokedAt, &intent.LastError); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			intent.SourceKind = IntentSourceKind(sourceKind)
+			intent.Active = active != 0
+			if !intent.Active {
+				continue
+			}
+			if _, ok := allowed[intent.SourceKind]; !ok {
+				blocked = append(blocked, intent)
+				continue
+			}
+			candidates = append(candidates, intent)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		if len(blocked) != 0 || len(candidates) == 0 {
+			return nil
+		}
+		result, err := tx.ExecContext(ctx, `
+UPDATE tracking_intents SET active = 0, revoked_at = ?
+ WHERE checkout_id = ? AND active = 1`, revokedAt, checkoutID)
+		if err != nil {
+			return err
+		}
+		changed, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if changed != int64(len(candidates)) {
+			return ErrCatalogStaleGuard
+		}
+		for i := range candidates {
+			candidates[i].Active = false
+			candidates[i].RevokedAt = revokedAt
+		}
+		revoked = candidates
+		return nil
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(blocked) != 0 {
+		return nil, blocked, nil
+	}
+	return revoked, nil, nil
+}
+
 // --- intent transitions ------------------------------------------------
 
 // BeginIntentTransition records the single in-flight mode change for a

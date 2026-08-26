@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"go.uber.org/zap"
@@ -79,6 +80,56 @@ type UntrackPreview struct {
 	Blockers []string
 }
 
+// resolveDestructivePrefix resolves only identities the caller named
+// explicitly. Unlike ResolvePrefix, it never interprets a bare, unknown token
+// relative to the daemon's working directory: doing that in a destructive
+// flow can turn a typo into a path inside an unrelated tracked repository.
+//
+// Exact live prefixes and exact durable graph prefixes are accepted. Filesystem
+// containment is accepted only for absolute paths, including paths whose
+// checkout is currently absent from the in-memory index but still has a
+// catalog identity.
+func (l *CheckoutLifecycle) resolveDestructivePrefix(ctx context.Context, pathOrPrefix string) (string, error) {
+	if l == nil || l.mi == nil || pathOrPrefix == "" {
+		return "", nil
+	}
+	if meta := l.mi.GetMetadata(pathOrPrefix); meta != nil {
+		return pathOrPrefix, nil
+	}
+	if l.catalog != nil {
+		graph, ok, err := l.catalog.GetDedicatedGraph(ctx, GraphIDFor(pathOrPrefix))
+		if err != nil {
+			return "", err
+		}
+		if ok && graph.RepoPrefix == pathOrPrefix {
+			return pathOrPrefix, nil
+		}
+	}
+	if !filepath.IsAbs(pathOrPrefix) {
+		return "", nil
+	}
+	if prefix := l.ResolvePrefix(pathOrPrefix); prefix != "" {
+		return prefix, nil
+	}
+	if l.catalog == nil {
+		return "", nil
+	}
+	checkout, found, err := l.checkoutForPath(ctx, pathOrPrefix)
+	if err != nil || !found {
+		return "", err
+	}
+	graphs, err := l.catalog.ListDedicatedGraphs(ctx, checkout.FamilyID)
+	if err != nil {
+		return "", err
+	}
+	for _, graph := range graphs {
+		if graph.OwnerCheckoutID == checkout.CheckoutID && graph.RepoPrefix != "" {
+			return graph.RepoPrefix, nil
+		}
+	}
+	return "", nil
+}
+
 // PreviewUntrack decides what untracking one path or prefix would do, and
 // enumerates what it would take with it.
 //
@@ -90,7 +141,10 @@ func (l *CheckoutLifecycle) PreviewUntrack(ctx context.Context, pathOrPrefix str
 	if l == nil || l.mi == nil {
 		return UntrackPreview{}, errors.New("indexer: checkout lifecycle is not wired")
 	}
-	prefix := l.ResolvePrefix(pathOrPrefix)
+	prefix, err := l.resolveDestructivePrefix(ctx, pathOrPrefix)
+	if err != nil {
+		return UntrackPreview{}, err
+	}
 	if prefix == "" {
 		return UntrackPreview{}, fmt.Errorf("%w: %s", ErrCheckoutNotTracked, pathOrPrefix)
 	}
@@ -157,7 +211,15 @@ func (l *CheckoutLifecycle) PreviewUntrack(ctx context.Context, pathOrPrefix str
 		}
 		return out, nil
 	}
+	family, found, err := l.catalog.GetRepositoryFamily(ctx, checkout.FamilyID)
+	if err != nil {
+		return out, err
+	}
+	if !found {
+		return out, fmt.Errorf("%w: family %s", store_sqlite.ErrCatalogNotFound, checkout.FamilyID)
+	}
 	out.Plan = UntrackPlanDemote
+	out.PrimaryEpoch = family.PrimaryEpoch
 	if owned != nil {
 		out.Closure = append(out.Closure, reconcile.Dependent{
 			Kind:   reconcile.DependentGraph,
@@ -240,33 +302,33 @@ func (l *CheckoutLifecycle) demote(
 	ctx context.Context,
 	checkout store_sqlite.Checkout,
 	owned *store_sqlite.DedicatedGraph,
-	primaryGraphID string,
+	authorization reconcile.DemotionAuthorization,
 ) error {
-	coordinator, err := l.buildCoordinator(ctx, primaryGraphID, checkout)
+	coordinator, err := l.buildCoordinator(ctx, authorization.PrimaryGraphID, checkout)
 	if err != nil {
 		return err
 	}
 	if coordinator == nil {
 		return fmt.Errorf("indexer: the primary graph %s cannot serve checkout %s yet",
-			primaryGraphID, checkout.CheckoutID)
+			authorization.PrimaryGraphID, checkout.CheckoutID)
 	}
-	if _, err := coordinator.RehomeTo(ctx, primaryGraphID); err != nil {
+	if _, err := coordinator.RehomeTo(ctx, authorization.PrimaryGraphID); err != nil {
 		_ = coordinator.Close()
 		return err
 	}
 
-	err = l.catalog.UpdateCheckoutState(ctx, store_sqlite.UpdateCheckoutStateRequest{
-		CheckoutID:    checkout.CheckoutID,
-		Incarnation:   checkout.Incarnation,
-		State:         store_sqlite.CheckoutStateReady,
-		DesiredMode:   store_sqlite.CheckoutModeAutomatic,
-		EffectiveMode: store_sqlite.CheckoutModeAutomatic,
-		LastSeen:      l.now().Unix(),
-	})
-	if err != nil {
+	// Offer the private graph's payload before the catalog transaction journals
+	// its retirement. The journal is the crash-recovery authority; this in-memory
+	// backlog merely lets the current process reclaim generations promptly.
+	if owned != nil {
+		l.oweRetirement(l.graphGenerations(ctx, owned.GraphID)...)
+	}
+	commit, commitErr := l.rec.CommitAuthorizedDemotion(ctx, checkout, authorization)
+	if commitErr != nil && !commit.Committed {
 		// The route the rehome installed describes a checkout that is still
 		// dedicated, so it is withdrawn again and the payload it named is
-		// offered back. Nothing a reader saw ever changed.
+		// offered back. Intent revocation is not lost: the durable transition
+		// remains and a retry adopts it.
 		l.oweRetirement(coordinator.DrainRetirements()...)
 		l.oweRoutedGenerations(ctx, checkout.CheckoutID)
 		if deleteErr := l.catalog.DeleteCheckoutRoute(ctx, checkout.CheckoutID); deleteErr != nil &&
@@ -276,20 +338,17 @@ func (l *CheckoutLifecycle) demote(
 		}
 		_ = coordinator.Close()
 		l.sweepRetirements(ctx)
-		return err
+		return commitErr
 	}
 	l.installCoordinator(checkout.CheckoutID, coordinator)
 
-	if owned != nil {
-		l.oweRetirement(l.graphGenerations(ctx, owned.GraphID)...)
-		if err := l.rec.RetireDedicatedGraph(ctx, owned.GraphID); err != nil {
-			// The checkout is already being served from the primary. What is
-			// left is a corpus nothing routes to, which the next sweep's
-			// reconciliation and the retirement backlog both keep insisting on.
-			l.logger.Warn("checkout lifecycle: the demoted corpus could not be retired",
-				zap.String("checkout", checkout.CheckoutID),
-				zap.String("graph", owned.GraphID), zap.Error(err))
-		}
+	if commitErr != nil {
+		// The mode flip and graph-retirement journal committed together.
+		// Queries already use the primary; Resume or the next retry finishes the
+		// graph cleanup without replaying the demotion.
+		l.logger.Warn("checkout lifecycle: demoted graph cleanup remains journalled",
+			zap.String("checkout", checkout.CheckoutID),
+			zap.String("graph", authorization.OwnedGraphID), zap.Error(commitErr))
 	}
 	l.sweepRetirements(ctx)
 	l.notifyTrackedSetChanged()

@@ -1,42 +1,50 @@
 package indexer
 
-import "sync"
+import (
+	"context"
+	"sync"
+)
 
-// The warmup gate over view build work.
-//
-// A warm restart brings everything back at once. The warmup tail re-resolves
-// the graph and runs the whole-graph passes, and at the same moment every
-// automatic checkout the catalog remembers wants its two layers built and
-// every ref view somebody selects wants a pass of its own. All of it goes
-// through one store writer and one process-global topology gate, so a restart
-// over a fully persisted graph can spend longer serializing view builds behind
-// the warmup than a cold index spends producing the graph in the first place.
-//
-// The gate defers the build half of that and nothing else. Registration,
-// catalog seeding, route reads and serving a generation that is already
-// published are not build work: they never consult the gate, so a warming
-// daemon keeps answering from whatever the last run left behind.
-//
-// A closed gate does not drop the work it holds. A coordinator cycle that
-// finds it closed reschedules itself onto the gate's own wake, and a ref
-// view's build keeps the claim it made — so the selection that made it is
-// still answered with a token to poll, later selections still coalesce onto
-// that token, and the pass runs the moment builds are admitted. Nothing has to
-// ask again.
+// ViewBuildPriority orders work waiting for the one derived-view build lane.
+// An interactive ref selection goes ahead of automatic refreshes that have not
+// started yet; an active build is never preempted.
+type ViewBuildPriority uint8
+
+const (
+	ViewBuildBackground ViewBuildPriority = iota
+	ViewBuildInteractive
+)
+
+type viewBuildWaiter struct {
+	ready    chan struct{}
+	granted  bool
+	canceled bool
+}
+
+// ViewBuildGate is both the daemon warmup latch and the shared admission lane
+// for derived generations. SQLite has one physical writer, so waking every
+// checkout and ref build at once only creates a queue inside writeMu while
+// starving control/catalog writes. Keeping that queue here makes it bounded,
+// cancellation-aware, and able to prefer user-requested ref views.
 type ViewBuildGate struct {
 	mu     sync.Mutex
 	open   bool
 	opened chan struct{}
+	active bool
+
+	interactive []*viewBuildWaiter
+	background  []*viewBuildWaiter
 }
 
-// NewViewBuildGate returns a gate that holds build work until Open.
+// NewViewBuildGate returns a closed, single-build gate. Open releases warmup;
+// Acquire then serializes derived builds for the lifetime of the daemon.
 func NewViewBuildGate() *ViewBuildGate {
 	return &ViewBuildGate{opened: make(chan struct{})}
 }
 
-// Open admits build work and wakes everything waiting on it. It is idempotent:
-// the daemon's warmup opens the gate once, and a second call from any other
-// path is a no-op rather than a double close.
+// Open admits build work and wakes everything waiting on warmup. It is
+// idempotent. Only one queued build is granted; subsequent work advances when
+// its predecessor releases the admission lease.
 func (g *ViewBuildGate) Open() {
 	if g == nil {
 		return
@@ -48,13 +56,87 @@ func (g *ViewBuildGate) Open() {
 	}
 	g.open = true
 	close(g.opened)
+	g.grantNextLocked()
 }
 
-// Admitted reports whether a build may start now.
-//
-// A nil gate admits everything. That is what every caller outside a daemon
-// warmup has — an embedded server, a CLI pass, a test — and none of them has a
-// warmup tail to defer to.
+// Acquire waits for warmup and for the shared derived-build lane. The returned
+// release function is idempotent and must be called. A nil gate admits work
+// immediately, preserving embedded and test callers that have no daemon gate.
+func (g *ViewBuildGate) Acquire(ctx context.Context, priority ViewBuildPriority) (func(), error) {
+	if g == nil {
+		return func() {}, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	waiter := &viewBuildWaiter{ready: make(chan struct{})}
+
+	g.mu.Lock()
+	if priority == ViewBuildInteractive {
+		g.interactive = append(g.interactive, waiter)
+	} else {
+		g.background = append(g.background, waiter)
+	}
+	g.grantNextLocked()
+	g.mu.Unlock()
+
+	select {
+	case <-waiter.ready:
+		var once sync.Once
+		return func() { once.Do(g.release) }, nil
+	case <-ctx.Done():
+		g.mu.Lock()
+		if waiter.granted {
+			g.mu.Unlock()
+			g.release()
+		} else {
+			waiter.canceled = true
+			g.grantNextLocked()
+			g.mu.Unlock()
+		}
+		return nil, ctx.Err()
+	}
+}
+
+func (g *ViewBuildGate) release() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if !g.active {
+		return
+	}
+	g.active = false
+	g.grantNextLocked()
+}
+
+func (g *ViewBuildGate) grantNextLocked() {
+	if !g.open || g.active {
+		return
+	}
+	for {
+		var waiter *viewBuildWaiter
+		switch {
+		case len(g.interactive) > 0:
+			waiter = g.interactive[0]
+			g.interactive = g.interactive[1:]
+		case len(g.background) > 0:
+			waiter = g.background[0]
+			g.background = g.background[1:]
+		default:
+			return
+		}
+		if waiter.canceled {
+			continue
+		}
+		g.active = true
+		waiter.granted = true
+		close(waiter.ready)
+		return
+	}
+}
+
+// Admitted reports only whether warmup has opened. Capacity is obtained with
+// Acquire; callers use this method to decide whether to return a labeled
+// deferred/building response without waiting for warmup.
 func (g *ViewBuildGate) Admitted() bool {
 	if g == nil {
 		return true
@@ -64,10 +146,8 @@ func (g *ViewBuildGate) Admitted() bool {
 	return g.open
 }
 
-// Opened is closed once builds are admitted. A caller that has already found
-// Admitted false waits on it; one that has not must not select on it, because
-// an open gate's channel is always ready and would spin a loop that treats it
-// as a wake.
+// Opened is closed once warmup admits builds. It remains for coordinator loop
+// wakeups; actual build admission is always obtained through Acquire.
 func (g *ViewBuildGate) Opened() <-chan struct{} {
 	if g == nil {
 		return admittedChannel
@@ -77,7 +157,6 @@ func (g *ViewBuildGate) Opened() <-chan struct{} {
 	return g.opened
 }
 
-// admittedChannel is what a nil gate's Opened answers with: already open.
 var admittedChannel = func() chan struct{} {
 	ch := make(chan struct{})
 	close(ch)

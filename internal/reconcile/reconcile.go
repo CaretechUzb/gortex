@@ -361,11 +361,19 @@ func (r *Reconciler) reconcileKnown(
 	case DispositionPresent:
 		entry.Action = r.applyPresent(ctx, pass, existing, record, &req)
 	case DispositionInaccessible:
-		action, err := r.applyInaccessible(ctx, pass, existing, &req)
+		action, gone, err := r.applyInaccessible(ctx, pass, existing, &req)
 		if err != nil {
 			return entry, err
 		}
 		entry.Action = action
+		if action == ActionGuardLost {
+			return entry, nil
+		}
+		if gone {
+			entry.State = ""
+			recordTransition(existing.State, "", class)
+			return entry, nil
+		}
 	case DispositionRemoved:
 		action, gone, err := r.applyRemoved(ctx, pass, existing, class, &req)
 		if err != nil {
@@ -383,6 +391,13 @@ func (r *Reconciler) reconcileKnown(
 			recordTransition(existing.State, "", class)
 			return entry, nil
 		}
+	}
+
+	switch entry.Action {
+	case ActionAvailabilityGraceStarted, ActionAvailabilityHeld:
+		entry.RetryAt = req.AvailabilityDeadline
+	case ActionRemovalGraceStarted, ActionRemovalHeld:
+		entry.RetryAt = req.RemovalDeadline
 	}
 
 	if err := r.catalog.UpdateCheckoutObservation(ctx, req); err != nil {
@@ -442,30 +457,27 @@ func (r *Reconciler) applyPresent(
 	return ActionReadyConfirmed
 }
 
-// applyInaccessible advances the availability clock only. The removal columns
-// are never touched here: time spent unreachable must not shorten the removal
-// grace a later removal is entitled to.
+// applyInaccessible advances the availability clock without starting a second
+// removal grace. Once the availability grace expires, the checkout is retired
+// exactly like an authoritatively removed worktree: an inaccessible worktree
+// must not leave a shadow graph or tracking state behind indefinitely.
 func (r *Reconciler) applyInaccessible(
 	ctx context.Context,
 	pass *familyPass,
 	existing store_sqlite.Checkout,
 	req *store_sqlite.UpdateCheckoutObservationRequest,
-) (CheckoutAction, error) {
+) (CheckoutAction, bool, error) {
 	now := pass.now.Unix()
-	switch {
-	case existing.UnavailableSince == 0:
+	if existing.UnavailableSince == 0 {
 		req.State = store_sqlite.CheckoutStateAvailabilityGrace
 		req.UnavailableSince = now
 		req.AvailabilityDeadline = pass.now.Add(r.cfg.AvailabilityGrace).Unix()
-		return ActionAvailabilityGraceStarted, nil
-	case existing.State == store_sqlite.CheckoutStateAvailabilityGrace && now >= existing.AvailabilityDeadline:
-		if err := r.purgeLayersOnce(ctx, existing); err != nil {
-			return "", err
-		}
-		req.State = store_sqlite.CheckoutStateUnavailable
-		return ActionMarkedUnavailable, nil
+		return ActionAvailabilityGraceStarted, false, nil
 	}
-	return ActionAvailabilityHeld, nil
+	if existing.AvailabilityDeadline == 0 || now < existing.AvailabilityDeadline {
+		return ActionAvailabilityHeld, false, nil
+	}
+	return r.retireCheckout(context.WithoutCancel(ctx), pass, existing)
 }
 
 // applyRemoved advances the removal clock only, and runs the right teardown
@@ -483,6 +495,10 @@ func (r *Reconciler) applyRemoved(
 	class Classification,
 	req *store_sqlite.UpdateCheckoutObservationRequest,
 ) (CheckoutAction, bool, error) {
+	// Removal grace is a serving state as well as a clock: once Git has
+	// authoritatively omitted this checkout, new readers must stop pinning its
+	// stale route and use the labeled, read-only family fallback immediately.
+	req.State = store_sqlite.CheckoutStateRemovalGrace
 	now := pass.now.Unix()
 	if existing.RemovalDetectedAt == 0 {
 		req.RemovalDetectedAt = now
@@ -494,6 +510,18 @@ func (r *Reconciler) applyRemoved(
 		return ActionRemovalHeld, false, nil
 	}
 
+	return r.retireCheckout(context.WithoutCancel(ctx), pass, existing)
+}
+
+// retireCheckout runs the guarded teardown shared by authoritative removal and
+// expired inaccessibility. The caller supplies a detached context after all
+// classification and identity guards have passed, so a request timeout cannot
+// strand a half-finished cleanup saga.
+func (r *Reconciler) retireCheckout(
+	ctx context.Context,
+	pass *familyPass,
+	existing store_sqlite.Checkout,
+) (CheckoutAction, bool, error) {
 	owned, err := r.ownedGraph(ctx, existing.FamilyID, existing.CheckoutID)
 	if err != nil {
 		return "", false, err

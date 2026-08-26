@@ -27,6 +27,14 @@ const (
 // re-created by the next pass over that source.
 var ErrIntentNotRevocable = errors.New("reconcile: tracking intent cannot be revoked by an explicit forget")
 
+// revocableIntentKinds is the single policy list shared by the public
+// predicate and the catalog's atomic revocation transaction.
+var revocableIntentKinds = []store_sqlite.IntentSourceKind{
+	store_sqlite.IntentSourceCLITrack,
+	store_sqlite.IntentSourceMCPTrack,
+	store_sqlite.IntentSourceManualConfig,
+}
+
 // RevocableIntent reports whether an explicit forget may withdraw an intent.
 //
 // The rule is about who owns the decision. An intent someone typed — a CLI
@@ -35,14 +43,12 @@ var ErrIntentNotRevocable = errors.New("reconcile: tracking intent cannot be rev
 // belongs to something else (a tracked project) is not: the membership is
 // still true after the forget, so revoking it here would only be undone.
 func RevocableIntent(kind store_sqlite.IntentSourceKind) bool {
-	switch kind {
-	case store_sqlite.IntentSourceCLITrack,
-		store_sqlite.IntentSourceMCPTrack,
-		store_sqlite.IntentSourceManualConfig:
-		return true
-	default:
-		return false
+	for _, candidate := range revocableIntentKinds {
+		if kind == candidate {
+			return true
+		}
 	}
+	return false
 }
 
 // IntentRevocation is what a forget preflight found and did.
@@ -68,36 +74,19 @@ func (r *Reconciler) RevokeTrackingIntents(ctx context.Context, checkoutID strin
 	if checkoutID == "" {
 		return IntentRevocation{}, fmt.Errorf("%w: revoking intents needs a checkout id", ErrSagaTarget)
 	}
-	intents, err := r.catalog.ListTrackingIntents(ctx, checkoutID)
+	revoked, blocked, err := r.catalog.RevokeTrackingIntents(
+		ctx,
+		checkoutID,
+		r.now().Unix(),
+		revocableIntentKinds,
+	)
+	out := IntentRevocation{Revoked: revoked, Blocked: blocked}
 	if err != nil {
-		return IntentRevocation{}, err
-	}
-	var out IntentRevocation
-	for _, intent := range intents {
-		if !intent.Active {
-			continue
-		}
-		if !RevocableIntent(intent.SourceKind) {
-			out.Blocked = append(out.Blocked, intent)
-		}
+		return out, err
 	}
 	if out.IsBlocked() {
 		return out, fmt.Errorf("%w: checkout %s is still wanted by %d intent(s)",
 			ErrIntentNotRevocable, checkoutID, len(out.Blocked))
-	}
-
-	now := r.now().Unix()
-	for _, intent := range intents {
-		if !intent.Active {
-			continue
-		}
-		revoked := intent
-		revoked.Active = false
-		revoked.RevokedAt = now
-		if err := r.catalog.UpsertTrackingIntent(ctx, revoked); err != nil {
-			return out, err
-		}
-		out.Revoked = append(out.Revoked, revoked)
 	}
 	return out, nil
 }

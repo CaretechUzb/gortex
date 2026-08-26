@@ -85,6 +85,77 @@ func seedFamilyAndCheckout(t *testing.T, catalog *Catalog, familyID, checkoutID,
 	}
 }
 
+// TestCatalogRevokeTrackingIntentsIsAtomic proves both refusal and cancellation
+// leave the whole intent set active, while an admitted revocation updates the
+// set in one transaction.
+func TestCatalogRevokeTrackingIntentsIsAtomic(t *testing.T) {
+	catalog := openCatalogStore(t).Catalog()
+	const checkoutID = "checkout-intents"
+	seedFamilyAndCheckout(t, catalog, "family-intents", checkoutID, "incarnation-intents")
+	ctx := context.Background()
+	intents := []TrackingIntent{
+		{IntentID: "intent-cli", CheckoutID: checkoutID, SourceKind: IntentSourceCLITrack, SourceLocator: "cli", Active: true, CreatedAt: 10},
+		{IntentID: "intent-mcp", CheckoutID: checkoutID, SourceKind: IntentSourceMCPTrack, SourceLocator: "mcp", Active: true, CreatedAt: 11},
+		{IntentID: "intent-project", CheckoutID: checkoutID, SourceKind: IntentSourceProjectMembership, SourceLocator: "project", Active: true, CreatedAt: 12},
+	}
+	for _, intent := range intents {
+		if err := catalog.UpsertTrackingIntent(ctx, intent); err != nil {
+			t.Fatalf("UpsertTrackingIntent(%s): %v", intent.IntentID, err)
+		}
+	}
+
+	revoked, blocked, err := catalog.RevokeTrackingIntents(ctx, checkoutID, 20, []IntentSourceKind{
+		IntentSourceCLITrack,
+		IntentSourceMCPTrack,
+	})
+	if err != nil {
+		t.Fatalf("blocked RevokeTrackingIntents: %v", err)
+	}
+	if len(revoked) != 0 || len(blocked) != 1 || blocked[0].SourceKind != IntentSourceProjectMembership {
+		t.Fatalf("blocked revocation = revoked %#v, blocked %#v", revoked, blocked)
+	}
+	assertActive := func(want bool, wantRevokedAt int64) {
+		t.Helper()
+		got, err := catalog.ListTrackingIntents(context.Background(), checkoutID)
+		if err != nil {
+			t.Fatalf("ListTrackingIntents: %v", err)
+		}
+		if len(got) != len(intents) {
+			t.Fatalf("got %d intents, want %d", len(got), len(intents))
+		}
+		for _, intent := range got {
+			if intent.Active != want || intent.RevokedAt != wantRevokedAt {
+				t.Fatalf("intent %s active/revoked_at = %v/%d, want %v/%d", intent.IntentID, intent.Active, intent.RevokedAt, want, wantRevokedAt)
+			}
+		}
+	}
+	assertActive(true, 0)
+
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, _, err := catalog.RevokeTrackingIntents(cancelled, checkoutID, 21, []IntentSourceKind{
+		IntentSourceCLITrack,
+		IntentSourceMCPTrack,
+		IntentSourceProjectMembership,
+	}); err == nil {
+		t.Fatal("cancelled RevokeTrackingIntents unexpectedly succeeded")
+	}
+	assertActive(true, 0)
+
+	revoked, blocked, err = catalog.RevokeTrackingIntents(ctx, checkoutID, 22, []IntentSourceKind{
+		IntentSourceCLITrack,
+		IntentSourceMCPTrack,
+		IntentSourceProjectMembership,
+	})
+	if err != nil {
+		t.Fatalf("admitted RevokeTrackingIntents: %v", err)
+	}
+	if len(revoked) != len(intents) || len(blocked) != 0 {
+		t.Fatalf("admitted revocation = revoked %#v, blocked %#v", revoked, blocked)
+	}
+	assertActive(false, 22)
+}
+
 // seedBuildingGeneration creates one generation in the building state.
 func seedBuildingGeneration(t *testing.T, catalog *Catalog, graphID string) int64 {
 	t.Helper()

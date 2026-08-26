@@ -231,9 +231,9 @@ func TestReconcileFamilyInventoryFailureNeverRemoves(t *testing.T) {
 	}
 }
 
-// TestAvailabilityGraceExpiresAtTheDeadline walks ready -> grace -> unavailable
-// under a fake clock, and proves the layer purge happens once and only at the
-// transition.
+// TestAvailabilityGraceExpiresAtTheDeadline walks ready -> grace -> forgotten
+// under a fake clock. An inaccessible worktree is removed at the one grace
+// deadline; it does not survive as an unavailable shadow graph.
 func TestAvailabilityGraceExpiresAtTheDeadline(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		cfg := Config{AvailabilityGrace: 30 * time.Second, RemovalGrace: 5 * time.Minute}
@@ -247,8 +247,6 @@ func TestAvailabilityGraceExpiresAtTheDeadline(t *testing.T) {
 			t.Fatalf("fresh identity is in state %q", allocated.State)
 		}
 
-		// The volume goes away: git still lists the worktree, the root cannot
-		// be statted, and nothing proves a deletion.
 		unreachable := presentRecord("wt", "/repo/wt")
 		unreachable.RootAccessible = false
 		unreachable.RootErr = errors.New("device not configured")
@@ -265,40 +263,37 @@ func TestAvailabilityGraceExpiresAtTheDeadline(t *testing.T) {
 			t.Fatalf("availability clock = (%d, %d), want (%d, %d)",
 				row.UnavailableSince, row.AvailabilityDeadline, time.Now().Unix(), wantDeadline)
 		}
+		if entry.RetryAt != wantDeadline {
+			t.Fatalf("retry deadline = %d, want %d", entry.RetryAt, wantDeadline)
+		}
 
-		// One second short of the deadline nothing moves.
 		synctest.Sleep(cfg.AvailabilityGrace - time.Second)
 		entry = f.entry(f.reconcile(), "wt")
 		if entry.Action != ActionAvailabilityHeld || entry.State != store_sqlite.CheckoutStateAvailabilityGrace {
 			t.Fatalf("one second before the deadline = %+v", entry)
 		}
+		if entry.RetryAt != wantDeadline {
+			t.Fatalf("held retry deadline = %d, want %d", entry.RetryAt, wantDeadline)
+		}
 		if n := f.hooks.countPrefix("purge:"); n != 0 {
 			t.Fatalf("layers purged %d times before the deadline", n)
 		}
 
-		// Exactly at the deadline it expires.
 		synctest.Sleep(time.Second)
 		entry = f.entry(f.reconcile(), "wt")
-		if entry.Action != ActionMarkedUnavailable || entry.State != store_sqlite.CheckoutStateUnavailable {
+		if entry.Action != ActionForgotten || entry.State != "" {
 			t.Fatalf("at the deadline = %+v", entry)
 		}
+		f.assertNoCheckoutRows(allocated.CheckoutID)
 		if n := f.hooks.countPrefix("purge:"); n != 1 {
 			t.Fatalf("layers purged %d times at the deadline, want 1", n)
 		}
 
-		// Identity, family and clocks survive the purge; only the layers went.
-		row = f.checkout(allocated.CheckoutID)
-		if row.Incarnation != allocated.Incarnation || row.UnavailableSince == 0 {
-			t.Fatalf("purge disturbed the identity or the clock: %+v", row)
-		}
-
-		// Staying unreachable does not purge again, however many passes run.
 		for range 3 {
 			synctest.Sleep(time.Minute)
-			if entry := f.entry(f.reconcile(), "wt"); entry.Action != ActionAvailabilityHeld {
-				t.Fatalf("later pass = %q, want held", entry.Action)
-			}
+			f.reconcile()
 		}
+		f.assertNoCheckoutRows(allocated.CheckoutID)
 		if n := f.hooks.countPrefix("purge:"); n != 1 {
 			t.Fatalf("layers purged %d times overall, want exactly 1", n)
 		}
@@ -350,26 +345,26 @@ func TestAvailabilityRecoveryKeepsIdentity(t *testing.T) {
 }
 
 // TestRemovalClockIsIndependentOfAvailability is the two-axis rule: a checkout
-// that has been unreachable for far longer than its removal grace still gets a
-// full, fresh removal window once a removal is actually evidenced.
+// inside availability grace still gets a full, fresh removal window once an
+// authoritative removal is evidenced.
 func TestRemovalClockIsIndependentOfAvailability(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		cfg := Config{AvailabilityGrace: 30 * time.Second, RemovalGrace: 2 * time.Minute}
+		cfg := Config{AvailabilityGrace: 10 * time.Minute, RemovalGrace: 2 * time.Minute}
 		f := newFixture(t, cfg)
 		f.seedPrimaryGraph("graph-primary")
 		f.git.setRecords(presentRecord("wt", "/repo/wt"))
 		f.git.samples["/repo/wt"] = gitSampleExisting(volumeA)
 		allocated := f.entry(f.reconcile(), "wt")
 
-		// Spend an hour unreachable: the availability clock expires long ago.
+		// Start the availability clock, but remain inside that grace when Git
+		// later provides authoritative removal evidence.
 		unreachable := presentRecord("wt", "/repo/wt")
 		unreachable.RootAccessible = false
 		unreachable.RootErr = errors.New("device not configured")
 		f.git.setRecords(unreachable)
 		f.git.samples["/repo/wt"] = gitSampleAbsent(volumeB)
 		f.reconcile()
-		synctest.Sleep(time.Hour)
-		f.reconcile()
+		synctest.Sleep(time.Minute)
 		unavailableSince := f.checkout(allocated.CheckoutID).UnavailableSince
 
 		// Now git prunes it away: a removal is evidenced for the first time.
@@ -383,6 +378,9 @@ func TestRemovalClockIsIndependentOfAvailability(t *testing.T) {
 			t.Fatalf("evidence = %q", entry.Classification.Evidence)
 		}
 		row := f.checkout(allocated.CheckoutID)
+		if entry.State != store_sqlite.CheckoutStateRemovalGrace || row.State != store_sqlite.CheckoutStateRemovalGrace {
+			t.Fatalf("removal grace state = report %q catalog %q", entry.State, row.State)
+		}
 		if row.RemovalDetectedAt != removalStarted.Unix() {
 			t.Fatalf("removal_detected_at = %d, want %d", row.RemovalDetectedAt, removalStarted.Unix())
 		}

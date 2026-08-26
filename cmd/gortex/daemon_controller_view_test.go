@@ -412,6 +412,26 @@ func TestProbeOfDedicatedCheckoutReadsTheBaseCorpus(t *testing.T) {
 	assert.Equal(t, []string{"BaseOnly"}, symbolNames(found.Hits))
 }
 
+func TestProbeOfDedicatedCheckoutInRemovalGraceIsLabeledFallback(t *testing.T) {
+	f := newProbeFixture(t)
+	ctx := context.Background()
+	checkout, found, err := f.catalog.GetCheckout(ctx, probePrimaryID)
+	require.NoError(t, err)
+	require.True(t, found)
+	checkout.State = store_sqlite.CheckoutStateRemovalGrace
+	require.NoError(t, f.catalog.UpsertCheckout(ctx, checkout))
+
+	result, err := f.controller.SearchSymbols(ctx, daemon.SearchSymbolsParams{
+		Query: "BaseOnly", Path: filepath.Join(f.primaryRoot, probeFile),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"BaseOnly"}, symbolNames(result.Hits))
+	require.NotNil(t, result.View)
+	assert.Equal(t, daemon.ProbeViewBase, result.View.Kind)
+	assert.False(t, result.View.Exact)
+	assert.Equal(t, string(store_sqlite.CheckoutStateRemovalGrace), result.View.FallbackReason)
+}
+
 // TestProbeOfUntrackedPathIsUnchanged pins that a path no checkout owns still
 // reads the base corpus. It is the ordinary case for every directory nobody
 // has tracked, and nothing about routed views may change it.
@@ -503,4 +523,50 @@ func TestProbeMatchesAPathSpelledThroughASymlink(t *testing.T) {
 // exists on the wire and nothing on this side implements it.
 func TestControllerAnswersTheFileCoverageVerb(t *testing.T) {
 	var _ daemon.FileCoverageController = newProbeFixture(t).controller
+}
+
+func TestTopologyNudgeRunsImmediatelyAndKeepsATrailingEvent(t *testing.T) {
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	calls := make(chan string, 3)
+	controller := &realController{
+		// A recent probe nudge must not suppress a filesystem event.
+		probeNudgedAt: map[string]time.Time{"family": time.Now()},
+	}
+	controller.probeReconcile = func(familyID string) {
+		calls <- familyID
+		if len(calls) == 1 {
+			close(firstStarted)
+			<-releaseFirst
+		}
+	}
+
+	controller.nudgeFamilyTopology("family")
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("topology reconciliation did not start promptly")
+	}
+
+	// A burst during the active pass is coalesced to exactly one trailing
+	// reconciliation rather than discarded by the probe debounce.
+	controller.nudgeFamilyTopology("family")
+	controller.nudgeFamilyTopology("family")
+	close(releaseFirst)
+
+	for want := 0; want < 2; want++ {
+		select {
+		case familyID := <-calls:
+			if familyID != "family" {
+				t.Fatalf("reconciled family %q, want family", familyID)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("received %d reconciliation calls, want two", want)
+		}
+	}
+	select {
+	case familyID := <-calls:
+		t.Fatalf("unexpected third reconciliation for %q", familyID)
+	case <-time.After(25 * time.Millisecond):
+	}
 }

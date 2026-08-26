@@ -105,6 +105,32 @@ func TestGenerationMaskRoundTrip(t *testing.T) {
 	}
 }
 
+func TestSetProducerStatesValidatesBatchBeforeWriting(t *testing.T) {
+	derived := openMaskStore(t).AtGeneration(1)
+	invalid := []ProducerCompleteness{
+		{Producer: "syntax", State: ProducerStateComplete},
+		{Producer: "resolver", State: ProducerState("unknown")},
+	}
+	if err := derived.SetProducerStates(invalid); !errors.Is(err, ErrGenerationMaskInvalidValue) {
+		t.Fatalf("SetProducerStates(invalid) = %v, want ErrGenerationMaskInvalidValue", err)
+	}
+	if states, err := derived.ProducerStates(); err != nil || len(states) != 0 {
+		t.Fatalf("invalid producer batch wrote %+v (err %v)", states, err)
+	}
+
+	valid := []ProducerCompleteness{
+		{Producer: "syntax", State: ProducerStateComplete},
+		{Producer: "resolver", State: ProducerStateIncomplete, Reason: "closure truncated"},
+	}
+	if err := derived.SetProducerStates(valid); err != nil {
+		t.Fatalf("SetProducerStates(valid): %v", err)
+	}
+	states, err := derived.ProducerStates()
+	if err != nil || len(states) != len(valid) {
+		t.Fatalf("ProducerStates = %+v (err %v), want %d rows", states, err, len(valid))
+	}
+}
+
 // TestGenerationMaskWritesRefuseBaseHandle pins the typed refusal, including
 // for an empty batch: a caller that never derived a handle must find out on the
 // first call, not on the first row.

@@ -56,6 +56,11 @@ func noopRelease() {}
 // reconciliation dozens of times a minute while the first one still runs.
 const probeReconcileDebounce = 30 * time.Second
 
+type topologyNudgeState struct {
+	running bool
+	pending bool
+}
+
 // resolveProbeView decides which graph answers a probe about path.
 //
 // The order is the catalog's: a path no checkout owns and a checkout served
@@ -109,9 +114,24 @@ func (c *realController) selectProbeView(ctx context.Context, path string) probe
 		return base
 	}
 
+	if binding.Matched && binding.CheckoutState != string(store_sqlite.CheckoutStateReady) {
+		// Availability and removal grace are read-only fallbacks even for a
+		// checkout that was dedicated. The path is not live, so presenting its
+		// retained corpus as an exact working-copy view would make stale data
+		// indistinguishable from the checkout itself.
+		return probeView{
+			answer:      fallbackProbeView(daemon.ProbeViewBase, binding.CheckoutID, binding.RepoPrefix, binding.CheckoutState),
+			repoPrefix:  binding.RepoPrefix,
+			searchScope: binding.RepoPrefix,
+			root:        binding.RootPath,
+			servable:    true,
+			release:     noopRelease,
+		}
+	}
+
 	if !binding.Matched || binding.EffectiveMode != string(store_sqlite.CheckoutModeAutomatic) {
-		// A dedicated checkout, the family primary, and every untracked path
-		// are read from the indexed corpus directly, unscoped, exactly as
+		// A live dedicated checkout, the family primary, and every untracked
+		// path are read from the indexed corpus directly, unscoped, exactly as
 		// they were before routed views existed.
 		base.answer = exactProbeView(daemon.ProbeViewBase, binding.CheckoutID, binding.RepoPrefix)
 		base.repoPrefix = binding.RepoPrefix
@@ -351,6 +371,56 @@ func (c *realController) nudgeFamily(familyID string) {
 		return
 	}
 	go run(familyID)
+}
+
+// nudgeFamilyTopology reconciles a filesystem topology event immediately.
+//
+// GitWatcher has already debounce-coalesced the fsnotify burst. This layer
+// single-flights duplicate watchers in the same family and remembers one
+// trailing pass when an event arrives during a reconciliation. Remembering the
+// trailing edge is essential: removal of the last linked worktree also removes
+// the watched administration directory, so there may be no later event to
+// recover a dropped nudge.
+func (c *realController) nudgeFamilyTopology(familyID string) {
+	if c == nil || familyID == "" {
+		return
+	}
+	run := c.probeReconcile
+	if run == nil {
+		if c.lifecycle == nil {
+			return
+		}
+		run = c.reconcileFamilyForProbe
+	}
+
+	c.topologyNudgeMu.Lock()
+	if c.topologyNudges == nil {
+		c.topologyNudges = make(map[string]*topologyNudgeState)
+	}
+	if state := c.topologyNudges[familyID]; state != nil {
+		state.pending = true
+		c.topologyNudgeMu.Unlock()
+		return
+	}
+	c.topologyNudges[familyID] = &topologyNudgeState{running: true}
+	c.topologyNudgeMu.Unlock()
+
+	go func() {
+		for {
+			run(familyID)
+
+			c.topologyNudgeMu.Lock()
+			state := c.topologyNudges[familyID]
+			if state != nil && state.pending {
+				state.pending = false
+				c.topologyNudgeMu.Unlock()
+				continue
+			}
+			delete(c.topologyNudges, familyID)
+			c.topologyNudgeMu.Unlock()
+			return
+		}
+	}()
 }
 
 // claimFamilyNudge reports whether this caller won the right to reconcile the

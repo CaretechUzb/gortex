@@ -162,12 +162,26 @@ type PayloadGenerationRequest struct {
 //
 // A second begin naming the same layer and the same inputs adopts the
 // generation already in flight instead of minting a second one; the returned
-// handle addresses that generation. See AdoptOrCreateViewGeneration.
+// handle addresses that generation. Call BeginPayloadGenerationWithStatus
+// when the caller must distinguish those two outcomes.
 func (s *Store) BeginPayloadGeneration(ctx context.Context, req PayloadGenerationRequest) (int64, *Store, error) {
+	generationID, handle, _, err := s.BeginPayloadGenerationWithStatus(ctx, req)
+	return generationID, handle, err
+}
+
+// BeginPayloadGenerationWithStatus is BeginPayloadGeneration with the catalog's
+// adoption verdict preserved. adopted is true when the returned handle belongs
+// to an already-building generation with the same complete input identity.
+// Callers that use the verdict must still serialize identical builds: adoption
+// does not transfer ownership away from a live writer.
+func (s *Store) BeginPayloadGenerationWithStatus(
+	ctx context.Context,
+	req PayloadGenerationRequest,
+) (generationID int64, handle *Store, adopted bool, err error) {
 	if ctx == nil {
-		return 0, nil, fmt.Errorf("%w: nil context", ErrCatalogInvalidValue)
+		return 0, nil, false, fmt.Errorf("%w: nil context", ErrCatalogInvalidValue)
 	}
-	generationID, _, err := s.Catalog().AdoptOrCreateViewGeneration(ctx, ViewGeneration{
+	generationID, adopted, err = s.Catalog().AdoptOrCreateViewGeneration(ctx, ViewGeneration{
 		OwnerKind:            req.OwnerKind,
 		GraphID:              req.GraphID,
 		LayerID:              req.LayerID,
@@ -184,10 +198,10 @@ func (s *Store) BeginPayloadGeneration(ctx context.Context, req PayloadGeneratio
 		CreatedAt:            req.CreatedAt,
 	})
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, false, err
 	}
 	s.setPayloadSeal(generationID, payloadSealOpen)
-	return generationID, s.AtGeneration(generationID), nil
+	return generationID, s.AtGeneration(generationID), adopted, nil
 }
 
 // PublishPayloadGeneration validates a building generation and moves it to

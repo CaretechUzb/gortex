@@ -1,7 +1,6 @@
 package store_sqlite
 
 import (
-	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -289,22 +288,30 @@ func (s *Store) EdgeSourceMasks() ([]EdgeSourceMask, error) {
 // SetProducerState records one producer's contribution state for this
 // generation. One row per producer, replaced by each report.
 func (s *Store) SetProducerState(row ProducerCompleteness) error {
+	return s.SetProducerStates([]ProducerCompleteness{row})
+}
+
+// SetProducerStates records a generation's producer states atomically. The
+// batch form avoids opening one SQLite write transaction per producer while a
+// derived view is being prepared.
+func (s *Store) SetProducerStates(rows []ProducerCompleteness) error {
 	if err := s.requireDerivedGeneration(); err != nil {
 		return err
 	}
-	if err := requireMaskID("producer", row.Producer); err != nil {
-		return err
+	for _, row := range rows {
+		if err := requireMaskID("producer", row.Producer); err != nil {
+			return err
+		}
+		if err := requireMaskValue("state", row.State, producerStates); err != nil {
+			return err
+		}
 	}
-	if err := requireMaskValue("state", row.State, producerStates); err != nil {
-		return err
-	}
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	_, err := s.execActiveWriteLocked(context.Background(), `
-INSERT OR REPLACE INTO generation_producer_completeness
-  (view_gen, producer, state, reason) VALUES (?, ?, ?, ?)`,
-		s.viewGen, row.Producer, string(row.State), row.Reason)
-	return err
+	return s.writeMaskRows(`INSERT OR REPLACE INTO generation_producer_completeness
+  (view_gen, producer, state, reason) VALUES `,
+		len(rows), func(i int) []any {
+			row := rows[i]
+			return []any{s.viewGen, row.Producer, string(row.State), row.Reason}
+		})
 }
 
 // ProducerStates returns every producer's contribution state for this

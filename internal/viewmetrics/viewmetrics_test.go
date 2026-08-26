@@ -62,6 +62,20 @@ func TestRegistryClampsAnUndeclaredLabelValue(t *testing.T) {
 	}
 }
 
+func TestRemovalGraceIsALifecycleMetricState(t *testing.T) {
+	r := New()
+	r.Count(CheckoutTransitionTotal, StateReady, StateRemovalGrace, EvidenceAuthoritativeOmission)
+
+	key := CheckoutTransitionTotal + "{from=checkout_ready,to=removal_grace,evidence=authoritative_omission}"
+	got := r.Snapshot().Counters
+	if got[key] != 1 {
+		t.Fatalf("removal-grace transition = %v, want %q recorded once", got, key)
+	}
+	if got[CheckoutTransitionTotal+"{from=checkout_ready,to="+LabelOther+",evidence=authoritative_omission}"] != 0 {
+		t.Fatalf("removal_grace collapsed into the other bucket: %v", got)
+	}
+}
+
 func TestRegistryTracksGaugesBothWays(t *testing.T) {
 	r := New()
 	r.AddGauge(LeasesHeld, 3)

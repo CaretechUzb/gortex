@@ -129,6 +129,7 @@ const (
 	StateNone                   = "none"
 	StateReady                  = "checkout_ready"
 	StateAvailabilityGrace      = "availability_grace"
+	StateRemovalGrace           = "removal_grace"
 	StateUnavailable            = "checkout_unavailable"
 	StateReconciling            = "reconciling"
 	StateDemoting               = "demoting"
@@ -141,6 +142,7 @@ var checkoutStates = []string{
 	StateNone,
 	StateReady,
 	StateAvailabilityGrace,
+	StateRemovalGrace,
 	StateUnavailable,
 	StateReconciling,
 	StateDemoting,

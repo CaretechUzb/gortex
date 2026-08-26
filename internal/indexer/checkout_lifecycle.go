@@ -113,6 +113,11 @@ type CheckoutLifecycleConfig struct {
 // A store with no catalog — or a repository git does not administer — still
 // works: the catalog steps are skipped and the real side effects (index,
 // watcher, config, invalidation) happen exactly as they did before.
+type familyRetry struct {
+	deadline int64
+	timer    *time.Timer
+}
+
 type CheckoutLifecycle struct {
 	mi      *MultiIndexer
 	cfgMgr  *config.ConfigManager
@@ -122,6 +127,12 @@ type CheckoutLifecycle struct {
 	rec     *reconcile.Reconciler
 	logger  *zap.Logger
 	now     func() time.Time
+
+	// retryMu owns one deadline timer per family. Filesystem events start the
+	// grace; these timers guarantee its expiry is reconciled even when Git is
+	// otherwise quiet.
+	retryMu       sync.Mutex
+	familyRetries map[string]familyRetry
 
 	// coordMu guards the coordinator registry alone. It is separate from mu
 	// because dropping a coordinator waits for its in-flight build, and
@@ -197,6 +208,7 @@ func NewCheckoutLifecycle(cfg CheckoutLifecycleConfig) (*CheckoutLifecycle, erro
 		coordinators:     map[string]*CheckoutCoordinator{},
 		started:          map[string][]*CheckoutCoordinator{},
 		owed:             map[int64]struct{}{},
+		familyRetries:    map[string]familyRetry{},
 		refViewRetention: cfg.RefViews.withDefaults(),
 		indexBarrier:     cfg.indexBarrier,
 	}
@@ -837,33 +849,53 @@ func (l *CheckoutLifecycle) ApplyUntrack(ctx context.Context, preview UntrackPre
 		}
 	}
 
-	revocation, err := l.rec.RevokeTrackingIntents(ctx, preview.CheckoutID)
-	if err != nil {
-		return out, err
-	}
-	for _, intent := range revocation.Revoked {
-		out.Revoked = append(out.Revoked, string(intent.SourceKind))
-	}
-
-	// The eviction happens inside the saga, so its counts are read off the
-	// repository's last index before it runs — which is the same estimate
-	// the store's own repo purge reports.
+	// The eviction happens inside the cleanup sagas, so capture the last index
+	// before authorizing one. Authorization is the first write: its catalog
+	// transaction rechecks every preview guard, preflights every active intent,
+	// then revokes revocable intent and records either the cleanup journal or
+	// the demotion transition atomically.
 	before := l.mi.GetMetadata(preview.Prefix)
+	opCtx := context.WithoutCancel(ctx)
+	appendRevoked := func(revocation reconcile.IntentRevocation) {
+		for _, intent := range revocation.Revoked {
+			out.Revoked = append(out.Revoked, string(intent.SourceKind))
+		}
+	}
 
 	switch preview.Plan {
 	case UntrackPlanDemote:
-		if err := l.demote(ctx, checkout, owned, primary.GraphID); err != nil {
+		ownedGraphID := ""
+		if owned != nil {
+			ownedGraphID = owned.GraphID
+		}
+		authorization, err := l.rec.AuthorizeDemotion(
+			opCtx, checkout, ownedGraphID, primary.GraphID, preview.PrimaryEpoch)
+		appendRevoked(authorization.Revocation)
+		if err != nil {
+			return out, err
+		}
+		if err := l.demote(opCtx, checkout, owned, authorization); err != nil {
 			return out, err
 		}
 		out.Demoted = true
 	case UntrackPlanPrimaryClosure:
-		if err := l.rec.RetirePrimaryClosure(ctx, preview.GraphID, preview.PrimaryEpoch); err != nil {
+		revocation, err := l.rec.RetirePrimaryClosureExplicit(
+			opCtx, preview.GraphID, checkout.CheckoutID, checkout.Incarnation,
+			checkout.FamilyID, preview.PrimaryEpoch)
+		appendRevoked(revocation)
+		if err != nil {
+			return out, err
+		}
+	case UntrackPlanForget:
+		revocation, err := l.rec.ForgetCheckoutExplicit(
+			opCtx, checkout.CheckoutID, checkout.Incarnation,
+			checkout.FamilyID, preview.GraphID)
+		appendRevoked(revocation)
+		if err != nil {
 			return out, err
 		}
 	default:
-		if err := l.rec.ForgetCheckout(ctx, checkout.CheckoutID, checkout.Incarnation); err != nil {
-			return out, err
-		}
+		return out, fmt.Errorf("indexer: unsupported untrack plan %q", preview.Plan)
 	}
 
 	if before != nil {
@@ -1087,6 +1119,7 @@ func (l *CheckoutLifecycle) Sweep(ctx context.Context) (SweepReport, error) {
 		}
 		out.Families++
 		out.Reports = append(out.Reports, report)
+		l.scheduleFamilyRetry(report)
 		for _, checkout := range report.Checkouts {
 			switch checkout.Action {
 			case reconcile.ActionForgotten, reconcile.ActionPrimaryClosureRetired:
@@ -1132,19 +1165,79 @@ func recordSweepGauges(report SweepReport) {
 	viewmetrics.SetGauge(viewmetrics.RemovalClocks, int64(removal))
 }
 
-// reconcileFamilyNow reconciles one family and applies the coordinator
-// dispositions it reports, without waiting for the janitor.
-//
-// Registration and startup are the two moments a family's shape is known to
-// have changed, and the janitor's tick is an hour away by default: a worktree
-// that already existed when its repository was tracked, or that a restart
-// found already registered, would otherwise have no routed view for that whole
-// hour. Every decision is still the reconciler's — this only asks it now
-// rather than later.
-//
-// A failure is logged and dropped. The sweep asks the same question again, and
-// a registration that indexed a repository must not be reported as failed
-// because a sibling worktree could not be probed.
+// scheduleFamilyRetry arms the earliest grace deadline in one family. A later
+// report replaces or cancels the timer, so filesystem events and scheduled
+// expiry share the same single reconciliation path.
+func (l *CheckoutLifecycle) scheduleFamilyRetry(report reconcile.FamilyReport) {
+	deadline := int64(0)
+	for _, checkout := range report.Checkouts {
+		if checkout.RetryAt > 0 && (deadline == 0 || checkout.RetryAt < deadline) {
+			deadline = checkout.RetryAt
+		}
+	}
+	l.scheduleFamilyRetryAt(report.FamilyID, deadline)
+}
+
+func (l *CheckoutLifecycle) scheduleFamilyRetryAt(familyID string, deadline int64) {
+	if l == nil || familyID == "" {
+		return
+	}
+	l.retryMu.Lock()
+	defer l.retryMu.Unlock()
+	if current, ok := l.familyRetries[familyID]; ok {
+		if current.deadline == deadline {
+			return
+		}
+		current.timer.Stop()
+		delete(l.familyRetries, familyID)
+	}
+	if deadline <= 0 {
+		return
+	}
+	delay := time.Unix(deadline, 0).Sub(l.now())
+	if delay <= 0 {
+		delay = time.Millisecond
+	}
+	timer := time.AfterFunc(delay, func() {
+		l.runFamilyRetry(familyID, deadline)
+	})
+	l.familyRetries[familyID] = familyRetry{deadline: deadline, timer: timer}
+}
+
+func (l *CheckoutLifecycle) runFamilyRetry(familyID string, deadline int64) {
+	l.retryMu.Lock()
+	current, ok := l.familyRetries[familyID]
+	if !ok || current.deadline != deadline {
+		l.retryMu.Unlock()
+		return
+	}
+	delete(l.familyRetries, familyID)
+	l.retryMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	_, err := l.ReconcileFamily(ctx, familyID)
+	cancel()
+	if err == nil || errors.Is(err, store_sqlite.ErrCatalogNotFound) {
+		return
+	}
+	l.logger.Warn("checkout lifecycle: scheduled family reconciliation failed",
+		zap.String("family", familyID), zap.Error(err))
+	l.scheduleFamilyRetryAt(familyID, l.now().Add(5*time.Second).Unix())
+}
+
+func familyReportRemoved(report reconcile.FamilyReport) bool {
+	for _, checkout := range report.Checkouts {
+		switch checkout.Action {
+		case reconcile.ActionForgotten, reconcile.ActionPrimaryClosureRetired:
+			return true
+		}
+	}
+	return false
+}
+
+// reconcileFamilyNow reconciles one family and applies its coordinator
+// dispositions immediately. Failures stay best-effort for registration and
+// startup; the next topology event or scheduled sweep asks again.
 func (l *CheckoutLifecycle) reconcileFamilyNow(ctx context.Context, familyID, fallbackDir string) {
 	if l == nil || l.rec == nil || familyID == "" {
 		return
@@ -1156,6 +1249,11 @@ func (l *CheckoutLifecycle) reconcileFamilyNow(ctx context.Context, familyID, fa
 		return
 	}
 	l.applyCoordinators(ctx, report)
+	l.scheduleFamilyRetry(report)
+	if familyReportRemoved(report) {
+		l.saveConfig("reconcile")
+		l.notifyTrackedSetChanged()
+	}
 }
 
 // familyProbe is one family and the directory to read its inventory from.
@@ -1280,6 +1378,7 @@ func (l *CheckoutLifecycle) applyCoordinators(ctx context.Context, report reconc
 		}
 		if report.PrimaryGraphID == "" || entry.State != store_sqlite.CheckoutStateReady {
 			l.dropCoordinator(entry.CheckoutID)
+			l.withdrawStaleRoute(ctx, entry.CheckoutID)
 			continue
 		}
 		checkout, found, err := l.catalog.GetCheckout(ctx, entry.CheckoutID)
@@ -1583,6 +1682,13 @@ func (l *CheckoutLifecycle) Close() error {
 	if l == nil {
 		return nil
 	}
+	l.retryMu.Lock()
+	for familyID, retry := range l.familyRetries {
+		retry.timer.Stop()
+		delete(l.familyRetries, familyID)
+	}
+	l.retryMu.Unlock()
+
 	l.coordMu.Lock()
 	coordinators := make([]*CheckoutCoordinator, 0, len(l.coordinators))
 	for _, coordinator := range l.coordinators {
@@ -1859,8 +1965,8 @@ type cleanupHooks struct{ l *CheckoutLifecycle }
 // builds, and the generations it routed stay in the catalog for the retirement
 // path to collect rather than being deleted from under a reader here. For a
 // checkout served from the corpus it is the live file watcher, so purging is
-// detaching it — the checkout keeps its identity and its nodes, it just stops
-// absorbing filesystem events while it is unreachable.
+// detaching it before the enclosing retirement saga removes the checkout's
+// identity and any dedicated corpus it owns.
 func (h cleanupHooks) PurgeCheckoutLayers(ctx context.Context, checkoutID, _ string) error {
 	h.l.oweRoutedGenerations(ctx, checkoutID)
 	h.l.dropCoordinator(checkoutID)

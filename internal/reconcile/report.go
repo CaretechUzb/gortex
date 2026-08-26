@@ -24,8 +24,9 @@ const (
 	// ActionAvailabilityHeld means the checkout is still unreachable and the
 	// availability axis did not move this pass.
 	ActionAvailabilityHeld CheckoutAction = "availability_held"
-	// ActionMarkedUnavailable means the availability deadline passed and the
-	// checkout's layers were purged.
+	// ActionMarkedUnavailable is retained for catalog/report compatibility with
+	// older daemons. New passes retire an inaccessible checkout when its grace
+	// expires instead of leaving this terminal state behind.
 	ActionMarkedUnavailable CheckoutAction = "marked_unavailable"
 	// ActionRemovalGraceStarted means a removal was evidenced and the removal
 	// clock was started.
@@ -70,6 +71,10 @@ type CheckoutReport struct {
 	State store_sqlite.CheckoutState
 	// Classification is the verdict the action followed from.
 	Classification Classification
+	// RetryAt is the Unix deadline when this family must be reconciled again
+	// even if no filesystem event arrives. It is set while a removal or
+	// availability grace is active.
+	RetryAt int64
 	// Detail explains a pass-level decision the classification alone does not
 	// — why an accessible checkout stayed ephemeral, for instance.
 	Detail string
@@ -81,8 +86,9 @@ type FamilyReport struct {
 	FamilyID string
 	// CommonDir is the shared git directory the pass worked against.
 	CommonDir string
-	// InventoryUsable is false when git could not be trusted this pass, which
-	// is why no checkout of the family was removed.
+	// InventoryUsable is false when git could not be trusted this pass. A first
+	// such observation starts availability grace; a later pass at its deadline
+	// may still retire the inaccessible checkout.
 	InventoryUsable bool
 	// PrimaryGraphID is the family's primary dedicated graph, empty when it
 	// has none.

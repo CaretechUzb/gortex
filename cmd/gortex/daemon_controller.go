@@ -73,6 +73,14 @@ type realController struct {
 	// must never queue behind a track / reload / enrichment.
 	probeNudgeMu  sync.Mutex
 	probeNudgedAt map[string]time.Time
+	// topologyNudgeMu owns the event-driven reconciliation single-flight.
+	// Filesystem topology events must not share the probe's 30-second rate
+	// limiter: the final event can be the removal of the watched directory,
+	// so dropping it can leave a stale checkout until the hourly janitor.
+	// A running family records one trailing pass, coalescing event bursts
+	// without losing their final state.
+	topologyNudgeMu sync.Mutex
+	topologyNudges  map[string]*topologyNudgeState
 	// probeReconcile is the reconciliation a probe asks for when a working
 	// copy has no composed view. nil routes to the lifecycle's own per-family
 	// path; tests substitute it to observe the debounce.
@@ -1751,6 +1759,20 @@ func (c *realController) AttachWatcher(mw *indexer.MultiWatcher) {
 			return live
 		}
 		return nil
+	})
+	if mw == nil {
+		return
+	}
+	mw.OnWorktreeChange(func(repoPrefix, _ string) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		familyID, err := c.lifecycle.ResolveFamilyID(ctx, repoPrefix)
+		cancel()
+		if err != nil {
+			c.logger.Debug("worktree topology event could not resolve family",
+				zap.String("repo", repoPrefix), zap.Error(err))
+			return
+		}
+		c.nudgeFamilyTopology(familyID)
 	})
 }
 

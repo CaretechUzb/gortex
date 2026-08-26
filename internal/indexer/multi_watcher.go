@@ -40,7 +40,8 @@ type MultiWatcher struct {
 	// degradedCb is fanned out to every per-repo Watcher (and re-applied at
 	// AddRepo) so a watcher entering a degraded state — inotify / FD
 	// exhaustion — pushes a single health notice through the daemon.
-	degradedCb func(reason string)
+	degradedCb       func(reason string)
+	worktreeChangeCb func(repoPrefix, rootPath string)
 }
 
 // NewMultiWatcher creates a MultiWatcher that watches all configured repos.
@@ -123,6 +124,14 @@ func (mw *MultiWatcher) configureGitWatcher(prefix string, gw *GitWatcher) {
 	}
 	gw.batchReindex = func(paths []string) (*IndexResult, error) {
 		return mw.multi.IncrementalReindexRepo(prefix, paths)
+	}
+	mw.callbackMu.Lock()
+	callback := mw.worktreeChangeCb
+	mw.callbackMu.Unlock()
+	if callback != nil {
+		gw.OnWorktreeChange(func(rootPath string) {
+			callback(prefix, rootPath)
+		})
 	}
 }
 
@@ -368,6 +377,38 @@ func (mw *MultiWatcher) OnDegraded(cb func(reason string)) {
 
 	for _, w := range watchers {
 		w.OnDegraded(cb)
+	}
+}
+
+// OnWorktreeChange registers a callback for changes to a Git family's
+// checkout topology. Existing Git watchers are updated and nudged once so the
+// inventory-to-watch startup window cannot lose an addition.
+func (mw *MultiWatcher) OnWorktreeChange(cb func(repoPrefix, rootPath string)) {
+	mw.callbackMu.Lock()
+	mw.worktreeChangeCb = cb
+	mw.callbackMu.Unlock()
+
+	type registered struct {
+		prefix string
+		gw     *GitWatcher
+	}
+	mw.mu.Lock()
+	watchers := make([]registered, 0, len(mw.gitWatchers))
+	for prefix, gw := range mw.gitWatchers {
+		watchers = append(watchers, registered{prefix: prefix, gw: gw})
+	}
+	mw.mu.Unlock()
+
+	for _, watcher := range watchers {
+		prefix, gw := watcher.prefix, watcher.gw
+		if cb == nil {
+			gw.OnWorktreeChange(nil)
+			continue
+		}
+		gw.OnWorktreeChange(func(rootPath string) {
+			cb(prefix, rootPath)
+		})
+		go cb(prefix, gw.repoPath)
 	}
 }
 

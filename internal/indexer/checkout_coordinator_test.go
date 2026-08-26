@@ -1444,7 +1444,8 @@ func TestCheckoutLifecycleCollectsAForgottenCheckoutsPayload(t *testing.T) {
 	if !volumeEvidenceUsable(t, main) {
 		runGit(t, main, "worktree", "prune")
 	}
-	if _, err := f.lc.Sweep(ctx); err != nil {
+	grace, err := f.lc.Sweep(ctx)
+	if err != nil {
 		t.Fatalf("sweep after the removal: %v", err)
 	}
 	f.clock.advance(lifecycleGrace.RemovalGrace + time.Second)
@@ -1452,8 +1453,11 @@ func TestCheckoutLifecycleCollectsAForgottenCheckoutsPayload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sweep after the grace: %v", err)
 	}
-	if gone.Retired < 2 {
-		t.Fatalf("the sweep collected %d generations, want both slots of the forgotten checkout", gone.Retired)
+	// Entering removal grace withdraws the overlay route immediately so reads
+	// fall back to the base graph. That first sweep may therefore collect the
+	// payload before the checkout identity itself is forgotten at the deadline.
+	if retired := grace.Retired + gone.Retired; retired != 2 {
+		t.Fatalf("the sweeps collected %d generations, want both slots of the forgotten checkout exactly once", retired)
 	}
 	for _, generationID := range []int64{routed.CommitGenerationID, routed.DirtyGenerationID} {
 		if _, found, err := f.catalog.GetViewGeneration(ctx, generationID); err != nil || found {

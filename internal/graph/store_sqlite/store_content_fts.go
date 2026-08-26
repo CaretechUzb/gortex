@@ -490,6 +490,12 @@ SELECT rowid, repo_prefix, file_path FROM content_fts`)
 // improvement). Like BuildSymbolIndex it is a no-op for correctness — the
 // FTS index is maintained incrementally on every insert — and idempotent.
 func (s *Store) BuildContentIndex() error {
+	// Derived generations are immutable and invisible until publication. Their
+	// incremental FTS writes are already query-correct; optimizing the global
+	// virtual table once per generation only multiplies writer hold time.
+	if s.viewGen > 0 {
+		return nil
+	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	if s.coordinatedBulkLoad {

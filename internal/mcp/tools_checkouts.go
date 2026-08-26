@@ -178,10 +178,10 @@ func (s *Server) handleForgetCheckout(ctx context.Context, req mcp.CallToolReque
 	if err != nil {
 		return mcp.NewToolResultError("path is required"), nil
 	}
-	if s.lifecycle.ResolvePrefix(path) == "" {
+	preview, err := s.lifecycle.PreviewForget(ctx, path)
+	if errors.Is(err, indexer.ErrCheckoutNotTracked) {
 		return repoNotTrackedGuidance(path), nil
 	}
-	preview, err := s.lifecycle.PreviewForget(ctx, path)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}

@@ -745,9 +745,8 @@ const (
 // (shouldIndexForSearch, ftsTokensFor) so the corpus is identical whichever
 // path produced it.
 func (idx *Indexer) populateSymbolFTS(reporter progress.Reporter) error {
-	replacer, hasReplacer := idx.graph.(graph.SymbolFTSRepoReplacer)
 	stream, hasStream := idx.graph.(graph.ScopedProjectionSequencer)
-	if !hasReplacer || !hasStream {
+	if !hasStream {
 		return nil
 	}
 
@@ -758,7 +757,7 @@ func (idx *Indexer) populateSymbolFTS(reporter progress.Reporter) error {
 	}
 
 	written := 0
-	err := replacer.ReplaceSymbolFTS(repoPrefix, func(emit func([]graph.SymbolFTSItem) error) error {
+	produce := func(emit func([]graph.SymbolFTSItem) error) error {
 		items := make([]graph.SymbolFTSItem, 0, symbolFTSDirectChunkRows)
 		var pending uint64
 		flush := func() error {
@@ -773,7 +772,6 @@ func (idx *Indexer) populateSymbolFTS(reporter progress.Reporter) error {
 			pending = 0
 			return nil
 		}
-		var produceErr error
 		for node := range stream.NodesInScopeSeq([]string{repoPrefix}, nil) {
 			if node == nil || !idx.shouldIndexForSearch(node) {
 				continue
@@ -782,16 +780,37 @@ func (idx *Indexer) populateSymbolFTS(reporter progress.Reporter) error {
 			items = append(items, graph.SymbolFTSItem{NodeID: node.ID, Tokens: tokens})
 			pending += uint64(len(node.ID) + len(tokens) + 32)
 			if len(items) >= symbolFTSDirectChunkRows || pending >= symbolFTSDirectChunkBytes {
-				if produceErr = flush(); produceErr != nil {
-					break
+				if err := flush(); err != nil {
+					return err
 				}
 			}
 		}
-		if produceErr != nil {
-			return produceErr
-		}
 		return flush()
-	})
+	}
+
+	// A building generation is not visible through a route, so it does not
+	// need the base-corpus replacement's one giant transaction. Reset once and
+	// commit bounded batches instead, releasing SQLite's writer between chunks
+	// so lifecycle and ref-view heartbeat writes remain responsive.
+	derived := false
+	if scoped, ok := idx.graph.(interface{ ViewGeneration() int64 }); ok {
+		derived = scoped.ViewGeneration() > 0
+	}
+	var err error
+	if derived {
+		resetter, resetOK := idx.graph.(graph.SymbolFTSRepoResetter)
+		batcher, batchOK := idx.graph.(graph.SymbolFTSBatchUpserter)
+		if !resetOK || !batchOK {
+			return fmt.Errorf("indexer: symbol FTS backend lacks bounded reset/upsert capabilities")
+		}
+		if err = resetter.ResetSymbolFTS(repoPrefix); err == nil {
+			err = produce(batcher.BatchUpsertSymbolFTS)
+		}
+	} else if replacer, ok := idx.graph.(graph.SymbolFTSRepoReplacer); ok {
+		err = replacer.ReplaceSymbolFTS(repoPrefix, produce)
+	} else {
+		return nil
+	}
 	if err != nil {
 		return fmt.Errorf("indexer: rebuild symbol FTS: %w", err)
 	}

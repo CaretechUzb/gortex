@@ -496,9 +496,16 @@ func TestDemoteRefusesAStaleIncarnation(t *testing.T) {
 	require.NotNil(t, owned)
 	require.NotNil(t, primary)
 
+	family, found, err := f.catalog.GetRepositoryFamily(ctx, checkout.FamilyID)
+	require.NoError(t, err)
+	require.True(t, found)
+	authorization, err := f.lc.Reconciler().AuthorizeDemotion(
+		ctx, checkout, owned.GraphID, primary.GraphID, family.PrimaryEpoch)
+	require.NoError(t, err)
+
 	stale := checkout
 	stale.Incarnation = "incarnation-that-was-replaced"
-	err = f.lc.demote(ctx, stale, owned, primary.GraphID)
+	err = f.lc.demote(ctx, stale, owned, authorization)
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, store_sqlite.ErrCatalogStaleGuard), "got %v", err)
 

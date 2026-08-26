@@ -659,7 +659,12 @@ func (m *RefViewManager) runDetached(
 	go func() {
 		stop := m.heartbeat(buildCtx, build)
 		defer stop()
-		m.awaitBuildAdmission()
+		release, err := m.gate.Acquire(buildCtx, ViewBuildInteractive)
+		if err != nil {
+			done <- outcome{err: fmt.Errorf("indexer: wait for ref-view build admission: %w", err)}
+			return
+		}
+		defer release()
 		result, err := m.runBuild(buildCtx, req, view, build, base, resolved, identity)
 		done <- outcome{result: result, err: err}
 	}()
@@ -682,19 +687,6 @@ func (m *RefViewManager) runDetached(
 	m.logger.Debug("ref view manager: selection answered while its build runs on",
 		zap.String("ref_view", view.RefViewID), zap.String("build_token", build.BuildToken))
 	return m.building(view, build, resolved), nil
-}
-
-// awaitBuildAdmission parks a claimed build until builds are admitted.
-//
-// It waits on the gate alone. The build context carries no cancellation by
-// design — the pass outlives its request — and abandoning the wait on anything
-// else would leave the claim held by nobody, which is the one state every
-// later selection of that tree has to wait a liveness window out of.
-func (m *RefViewManager) awaitBuildAdmission() {
-	if m.gate.Admitted() {
-		return
-	}
-	<-m.gate.Opened()
 }
 
 // building is the answer a selection gives when the pass it claimed is still

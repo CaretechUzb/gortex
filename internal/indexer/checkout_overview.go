@@ -539,6 +539,23 @@ func (l *CheckoutLifecycle) ExplainView(ctx context.Context, path string) (ViewB
 		out.PrimaryGraphID = primary.GraphID
 	}
 
+	if checkout.State != store_sqlite.CheckoutStateReady {
+		// Grace is read-only and never exact. Prefer the family's primary even
+		// when this checkout used to be dedicated; if the missing checkout owns
+		// that primary, the same corpus remains a fallback rather than being
+		// presented as a live working-copy view.
+		fallback := primary
+		if fallback == nil {
+			fallback = owned
+		}
+		if fallback != nil {
+			out.GraphID, out.RepoPrefix = fallback.GraphID, fallback.RepoPrefix
+		}
+		out.Reason = "the checkout is " + string(checkout.State) + ", so its graph is available only as a read-only fallback"
+		out.Chain = append(out.Chain, "state is "+string(checkout.State)+": no checkout-specific layers are composed")
+		return out, nil
+	}
+
 	if checkout.EffectiveMode != store_sqlite.CheckoutModeAutomatic {
 		out.Reason = "the checkout is dedicated, so its own corpus answers directly"
 		out.Chain = append(out.Chain, "mode is "+string(checkout.EffectiveMode)+": no layers are composed")
@@ -555,11 +572,6 @@ func (l *CheckoutLifecycle) ExplainView(ctx context.Context, path string) (ViewB
 		return out, nil
 	}
 	out.GraphID, out.RepoPrefix = primary.GraphID, primary.RepoPrefix
-
-	if checkout.State != store_sqlite.CheckoutStateReady {
-		out.Reason = "the checkout is " + string(checkout.State) + ", so nothing is composed for it"
-		return out, nil
-	}
 
 	route, routed, err := l.catalog.GetCheckoutRoute(ctx, checkout.CheckoutID)
 	if err != nil {
@@ -673,7 +685,12 @@ func (l *CheckoutLifecycle) ReconcileFamily(ctx context.Context, familyID string
 		return reconcile.FamilyReport{}, err
 	}
 	l.applyCoordinators(ctx, report)
+	l.scheduleFamilyRetry(report)
 	l.sweepRetirements(ctx)
+	if familyReportRemoved(report) {
+		l.saveConfig("reconcile")
+		l.notifyTrackedSetChanged()
+	}
 	return report, nil
 }
 

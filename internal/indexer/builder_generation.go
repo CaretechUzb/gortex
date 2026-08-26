@@ -326,6 +326,8 @@ type SparseGenerationBuilder struct {
 	Semantic *semantic.Manager
 }
 
+const generationAbandonTimeout = 5 * time.Second
+
 // Build produces one sparse payload generation and publishes it.
 //
 // It does not route the generation: publishing says the payload is whole and
@@ -335,11 +337,10 @@ type SparseGenerationBuilder struct {
 //
 // Two builds naming the same layer and the same input fingerprints must not
 // run at once. The catalog coalesces such a begin onto the generation already
-// in flight, but BeginPayloadGeneration does not report which of the two
-// happened, so this builder cannot tell an adopted generation from a fresh one
-// and treats what it is handed as its own: it fills it, claims it, publishes
-// it, and on failure takes it out of the building state. Serialising identical
-// builds is the caller's to arrange.
+// in flight and reports that adoption to the builder. Serialising identical
+// builds is still the caller's responsibility: the verdict distinguishes a
+// pristine generation from one that may already carry partial payload; it does
+// not transfer ownership away from a live writer.
 func (b *SparseGenerationBuilder) Build(ctx context.Context, req BuildRequest) (int64, BuildReport, error) {
 	started := time.Now()
 	if err := b.validate(ctx, &req); err != nil {
@@ -351,7 +352,7 @@ func (b *SparseGenerationBuilder) Build(ctx context.Context, req BuildRequest) (
 		return 0, BuildReport{}, err
 	}
 
-	generationID, handle, err := b.Store.BeginPayloadGeneration(ctx, store_sqlite.PayloadGenerationRequest{
+	generationID, handle, adopted, err := b.Store.BeginPayloadGenerationWithStatus(ctx, store_sqlite.PayloadGenerationRequest{
 		OwnerKind:            req.Identity.OwnerKind,
 		GraphID:              req.Identity.GraphID,
 		LayerID:              req.Identity.LayerID,
@@ -377,12 +378,22 @@ func (b *SparseGenerationBuilder) Build(ctx context.Context, req BuildRequest) (
 	published := false
 	defer func() {
 		if !published {
-			b.abandon(ctx, generationID)
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), generationAbandonTimeout)
+			defer cancel()
+			b.abandon(cleanupCtx, generationID)
 		}
 	}()
 
-	if err := b.runPass(ctx, req, plan, handle, &report); err != nil {
-		return generationID, report, err
+	// A newly allocated generation cannot carry payload yet. When the plan has
+	// no files to index, the masks below completely describe a no-op or
+	// deletion-only layer, so constructing an Indexer would only run global
+	// passes over an empty graph. An adopted generation may contain rows from a
+	// build interrupted part way through and stays on the established recovery
+	// path instead of being assumed pristine.
+	if adopted || len(plan.indexed) > 0 {
+		if err := b.runPass(ctx, req, plan, handle, &report); err != nil {
+			return generationID, report, err
+		}
 	}
 	// Enrichment runs before the masks so anything it adds to the payload is
 	// covered by the claims derived from it, and before the producer states so
@@ -914,10 +925,8 @@ func (b *SparseGenerationBuilder) declareProducers(
 			}
 		}
 	}
-	for _, row := range rows {
-		if err := handle.SetProducerState(row); err != nil {
-			return fmt.Errorf("indexer: declare producer %q: %w", row.Producer, err)
-		}
+	if err := handle.SetProducerStates(rows); err != nil {
+		return fmt.Errorf("indexer: declare producers: %w", err)
 	}
 	report.Producers = rows
 	return nil

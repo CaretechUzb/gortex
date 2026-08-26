@@ -263,6 +263,12 @@ func (s *Server) prepareOverlayRequest(ctx context.Context) (context.Context, *g
 	if ctx == nil {
 		return ctx, nil, nil
 	}
+	if !requestViewFromContext(ctx).acceptsBufferOverlay() {
+		if OverlayViewFromContext(ctx) != nil {
+			return ctx, nil, fmt.Errorf("editor overlay is forbidden on a read-only grace fallback")
+		}
+		return ctx, nil, nil
+	}
 	snapshot, ok := overlayRequestSnapshotFromContext(ctx)
 	if ok && snapshot.sessionID != SessionIDFromContext(ctx) {
 		return ctx, nil, fmt.Errorf("overlay request snapshot belongs to session %q, not %q", snapshot.sessionID, SessionIDFromContext(ctx))

@@ -330,3 +330,156 @@ func TestRefViewDefersItsBuildUntilBuildsAreAdmitted(t *testing.T) {
 		t.Fatalf("build rows = %+v, want the single deferred attempt", rows)
 	}
 }
+
+type viewBuildAcquireResult struct {
+	release func()
+	err     error
+}
+
+func acquireViewBuildAsync(ctx context.Context, gate *ViewBuildGate, priority ViewBuildPriority) <-chan viewBuildAcquireResult {
+	result := make(chan viewBuildAcquireResult, 1)
+	go func() {
+		release, err := gate.Acquire(ctx, priority)
+		result <- viewBuildAcquireResult{release: release, err: err}
+	}()
+	return result
+}
+
+// TestViewBuildGateWarmupAndCapacity pins the two independent responsibilities
+// of the gate: Open is a one-way warmup latch, while Acquire remains a
+// single-build lane for the rest of the daemon's lifetime.
+func TestViewBuildGateWarmupAndCapacity(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		gate := NewViewBuildGate()
+		firstResult := acquireViewBuildAsync(context.Background(), gate, ViewBuildBackground)
+		synctest.Wait()
+		select {
+		case got := <-firstResult:
+			if got.release != nil {
+				got.release()
+			}
+			t.Fatalf("Acquire crossed the warmup latch before Open: err=%v", got.err)
+		default:
+		}
+
+		gate.Open()
+		synctest.Wait()
+		first := <-firstResult
+		if first.err != nil {
+			t.Fatalf("first Acquire after Open: %v", first.err)
+		}
+
+		secondResult := acquireViewBuildAsync(context.Background(), gate, ViewBuildBackground)
+		synctest.Wait()
+		select {
+		case got := <-secondResult:
+			if got.release != nil {
+				got.release()
+			}
+			t.Fatalf("second build entered the active lane: err=%v", got.err)
+		default:
+		}
+
+		first.release()
+		synctest.Wait()
+		second := <-secondResult
+		if second.err != nil {
+			t.Fatalf("second Acquire after release: %v", second.err)
+		}
+		second.release()
+		second.release() // A caller may safely defer and explicitly release.
+
+		third, err := gate.Acquire(context.Background(), ViewBuildBackground)
+		if err != nil {
+			t.Fatalf("Acquire after idempotent release: %v", err)
+		}
+		third()
+	})
+}
+
+// TestViewBuildGatePrefersInteractiveWaiters proves that priority applies only
+// to queued work: the active background build finishes, then the interactive
+// ref request overtakes a background refresh that was already waiting.
+func TestViewBuildGatePrefersInteractiveWaiters(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		gate := NewViewBuildGate()
+		gate.Open()
+		active, err := gate.Acquire(context.Background(), ViewBuildBackground)
+		if err != nil {
+			t.Fatalf("active Acquire: %v", err)
+		}
+
+		backgroundResult := acquireViewBuildAsync(context.Background(), gate, ViewBuildBackground)
+		synctest.Wait()
+		interactiveResult := acquireViewBuildAsync(context.Background(), gate, ViewBuildInteractive)
+		synctest.Wait()
+
+		active()
+		synctest.Wait()
+		var interactive viewBuildAcquireResult
+		select {
+		case got := <-backgroundResult:
+			if got.release != nil {
+				got.release()
+			}
+			t.Fatalf("background waiter overtook interactive waiter: err=%v", got.err)
+		case interactive = <-interactiveResult:
+		}
+		if interactive.err != nil {
+			t.Fatalf("interactive Acquire: %v", interactive.err)
+		}
+		select {
+		case got := <-backgroundResult:
+			if got.release != nil {
+				got.release()
+			}
+			t.Fatalf("background waiter entered beside interactive waiter: err=%v", got.err)
+		default:
+		}
+
+		interactive.release()
+		synctest.Wait()
+		background := <-backgroundResult
+		if background.err != nil {
+			t.Fatalf("background Acquire after interactive release: %v", background.err)
+		}
+		background.release()
+	})
+}
+
+// TestViewBuildGateSkipsCanceledWaiters verifies that cancellation removes a
+// queued claim logically: it returns context.Canceled and cannot consume the
+// lane when the active build later releases it.
+func TestViewBuildGateSkipsCanceledWaiters(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		gate := NewViewBuildGate()
+		gate.Open()
+		active, err := gate.Acquire(context.Background(), ViewBuildBackground)
+		if err != nil {
+			t.Fatalf("active Acquire: %v", err)
+		}
+
+		canceledCtx, cancel := context.WithCancel(context.Background())
+		canceledResult := acquireViewBuildAsync(canceledCtx, gate, ViewBuildInteractive)
+		synctest.Wait()
+		cancel()
+		synctest.Wait()
+		canceled := <-canceledResult
+		if canceled.err != context.Canceled {
+			t.Fatalf("canceled Acquire error = %v, want context.Canceled", canceled.err)
+		}
+		if canceled.release != nil {
+			t.Fatal("canceled Acquire returned a release function")
+		}
+
+		survivorResult := acquireViewBuildAsync(context.Background(), gate, ViewBuildBackground)
+		synctest.Wait()
+		active()
+		synctest.Wait()
+		survivor := <-survivorResult
+		if survivor.err != nil {
+			t.Fatalf("Acquire behind canceled waiter: %v", survivor.err)
+		}
+		survivor.release()
+	})
+}

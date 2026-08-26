@@ -21,8 +21,13 @@ const (
 	// CheckoutStateAvailabilityGrace means the path stopped answering but its
 	// availability deadline has not expired, so nothing is torn down yet.
 	CheckoutStateAvailabilityGrace CheckoutState = "availability_grace"
-	// CheckoutStateUnavailable means the grace window expired with the path
-	// still unreachable.
+	// CheckoutStateRemovalGrace means Git authoritatively stopped listing the
+	// checkout but its removal deadline has not expired. Queries fall back to
+	// the family primary while the identity remains recoverable.
+	CheckoutStateRemovalGrace CheckoutState = "removal_grace"
+	// CheckoutStateUnavailable is a legacy persisted value from releases that
+	// retained an inaccessible checkout after grace. Current reconciliation
+	// retires it at the deadline; accepting the value keeps upgrades readable.
 	CheckoutStateUnavailable CheckoutState = "checkout_unavailable"
 	// CheckoutStateReconciling means a reconciler is bringing the checkout's
 	// effective mode in line with its desired mode.
@@ -41,6 +46,7 @@ const (
 var checkoutStates = []CheckoutState{
 	CheckoutStateReady,
 	CheckoutStateAvailabilityGrace,
+	CheckoutStateRemovalGrace,
 	CheckoutStateUnavailable,
 	CheckoutStateReconciling,
 	CheckoutStateDemoting,

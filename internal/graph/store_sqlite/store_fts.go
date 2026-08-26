@@ -590,6 +590,12 @@ func backfillSymbolFTSRowidMap(db *sql.DB) error {
 // error is ignored because the index is already correct without it.
 // Idempotent — safe to call any number of times.
 func (s *Store) BuildSymbolIndex() error {
+	// A generation's rows are correct as soon as its bounded inserts commit.
+	// FTS5 optimize is global maintenance, so running it for every unpublished
+	// generation turns a view burst into repeated whole-table writer holds.
+	if s.viewGen > 0 {
+		return nil
+	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	if s.coordinatedBulkLoad {

@@ -570,6 +570,147 @@ func TestBuildingRouteFallsBackToTheBase(t *testing.T) {
 	}
 }
 
+func worktreeViewArgs() map[string]any {
+	return map[string]any{"view": map[string]any{"kind": "worktree", "checkout_id": viewTestWorktree}}
+}
+
+func TestRemovalGraceFallsBackForEligibleGraphSearchWithoutBuffers(t *testing.T) {
+	stack := newViewStack(t)
+	stack.setWorktreeState(t, store_sqlite.CheckoutStateRemovalGrace)
+
+	manager := daemon.NewOverlayManager(time.Hour)
+	stack.srv.SetOverlayManager(manager)
+	if err := manager.RegisterWithID(viewTestSession, ""); err != nil {
+		t.Fatalf("register overlay session: %v", err)
+	}
+	if err := manager.Push(viewTestSession, daemon.OverlayFile{
+		Path:    "repo/edit.go",
+		Content: "package repo\n\nfunc GraceBufferMustNotLeak() {}\n",
+	}, nil); err != nil {
+		t.Fatalf("push overlay: %v", err)
+	}
+
+	var reader graph.Reader
+	res, err := stack.callWithView(t, stack.worktreeRoot, "search_symbols", worktreeViewArgs(),
+		func(ctx context.Context) (*mcplib.CallToolResult, error) {
+			prepared, overlay, err := stack.srv.prepareOverlayRequest(ctx)
+			if err != nil {
+				return nil, err
+			}
+			if overlay != nil {
+				return nil, errors.New("nested facade preparation composed an editor overlay over grace fallback")
+			}
+			reader = stack.srv.readerFor(prepared)
+			return mcplib.NewToolResultText(`{"ok":true}`), nil
+		})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("eligible grace search was refused: %s", viewResultText(t, res))
+	}
+	if !hasNode(reader, "repo/edit.go::Old") {
+		t.Error("the grace fallback did not read the primary base corpus")
+	}
+	if hasNode(reader, "repo/added.go::Fresh") {
+		t.Error("the unavailable checkout's generation leaked into the grace fallback")
+	}
+	if hasNode(reader, "repo/edit.go::GraceBufferMustNotLeak") {
+		t.Error("a session buffer composed over the read-only grace fallback")
+	}
+
+	rider := resultFreshness(t, res)
+	wantActual := "base:" + stack.graphID
+	if rider["requested_view"] != "worktree:"+viewTestWorktree || rider["actual_view"] != wantActual {
+		t.Errorf("rider = %v, want worktree request and %q answer", rider, wantActual)
+	}
+	if rider["exact"] != false || rider["fallback_reason"] != string(store_sqlite.CheckoutStateRemovalGrace) {
+		t.Errorf("rider = %v, want labeled removal-grace fallback", rider)
+	}
+	if rider["graph_id"] != stack.graphID || rider["checkout_id"] != viewTestWorktree {
+		t.Errorf("rider identity = %v, want graph %q checkout %q", rider, stack.graphID, viewTestWorktree)
+	}
+	if rider["requested_state"] != string(store_sqlite.CheckoutStateReady) ||
+		rider["actual_state"] != string(store_sqlite.CheckoutStateRemovalGrace) {
+		t.Errorf("rider state = %v, want ready -> removal_grace", rider)
+	}
+}
+
+func TestGraceFallbackRequiresAReadyPrimary(t *testing.T) {
+	stack := newViewStack(t)
+	stack.setWorktreeState(t, store_sqlite.CheckoutStateRemovalGrace)
+	stack.setPrimaryGraphState(t, "graph_building")
+
+	res, err := stack.callWithView(t, stack.worktreeRoot, "search_symbols", worktreeViewArgs(),
+		captureReader(stack.srv, new(graph.Reader)))
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	assertToolError(t, res, graphview.CodePrimaryNotReady)
+}
+
+func TestGraceWorktreeSelectorKeepsExactFileAndWriteRequestsStrict(t *testing.T) {
+	stack := newViewStack(t)
+	stack.setWorktreeState(t, store_sqlite.CheckoutStateRemovalGrace)
+
+	for _, tool := range []string{"get_symbol", "read_file", "search_ast", "get_diagnostics", "edit_file", "change_contract"} {
+		t.Run(tool, func(t *testing.T) {
+			ran := false
+			res, err := stack.callWithView(t, stack.worktreeRoot, tool, worktreeViewArgs(),
+				func(context.Context) (*mcplib.CallToolResult, error) {
+					ran = true
+					return mcplib.NewToolResultText(`{"ok":true}`), nil
+				})
+			if err != nil {
+				t.Fatalf("call: %v", err)
+			}
+			assertToolError(t, res, graphview.CodeCheckoutInaccessible)
+			if ran {
+				t.Errorf("%s reached its handler during removal grace", tool)
+			}
+		})
+	}
+}
+
+func TestGraceFallbackPolicyUsesResolvedOperationEffects(t *testing.T) {
+	stack := newViewStack(t)
+	request := func(name string, args map[string]any) *mcplib.CallToolRequest {
+		req := &mcplib.CallToolRequest{}
+		req.Params.Name = name
+		req.Params.Arguments = args
+		return req
+	}
+
+	for _, tc := range []struct {
+		name string
+		args map[string]any
+		want bool
+	}{
+		{name: "search", args: map[string]any{"operation": "symbols"}, want: true},
+		{name: "search_symbols", want: true},
+		{name: "relations", args: map[string]any{"operation": "callers"}, want: true},
+		{name: "analyze", args: map[string]any{"kind": "architecture"}, want: true},
+		{name: "read", args: map[string]any{"operation": "source"}, want: false},
+		{name: "search", args: map[string]any{"operation": "ast"}, want: false},
+		{name: "analyze", args: map[string]any{"kind": "lint", "target": map[string]any{"file": "repo/edit.go"}}, want: false},
+		{name: "analyze", args: map[string]any{"kind": "temporal_verify"}, want: false},
+		{name: "edit", args: map[string]any{"operation": "file"}, want: false},
+		{name: "change_contract", want: false},
+	} {
+		label := "legacy"
+		if operation, _ := tc.args["operation"].(string); operation != "" {
+			label = operation
+		} else if kind, _ := tc.args["kind"].(string); kind != "" {
+			label = kind
+		}
+		t.Run(tc.name+"/"+label, func(t *testing.T) {
+			if got := stack.srv.requestAllowsGraceBaseFallback(request(tc.name, tc.args)); got != tc.want {
+				t.Errorf("requestAllowsGraceBaseFallback(%s, %v) = %v, want %v", tc.name, tc.args, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestWorktreeSelectorRefusalsCarryTheirOwnCode(t *testing.T) {
 	// A fresh map per call: the middleware strips the view argument, so a
 	// shared one would arrive empty on the second request.

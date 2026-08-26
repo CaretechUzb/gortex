@@ -160,7 +160,7 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		// overlay so a session's editor buffers layer on top of whatever
 		// answers here. The lease the materialized view holds is released
 		// with the request, on the same lifecycle that discards the overlay.
-		view, viewErr := s.resolveRequestView(ctx, selector)
+		view, viewErr := s.resolveRequestView(ctx, selector, s.requestViewPolicy(&req))
 		if viewErr != nil {
 			return mcp.NewToolResultError(viewErr.Error()), nil
 		}
@@ -179,7 +179,7 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		if refused := s.evaluateRequestCapabilities(ctx, &req, capabilities); refused != nil {
 			return refused, nil
 		}
-		if injectOverlay {
+		if injectOverlay && view.acceptsBufferOverlay() {
 			var err error
 			ctx, _, err = s.prepareOverlayRequest(ctx)
 			if err != nil {

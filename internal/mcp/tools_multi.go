@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -228,16 +229,15 @@ func (s *Server) handleUntrackRepository(ctx context.Context, req mcp.CallToolRe
 		return mcp.NewToolResultError("checkout lifecycle is not wired"), nil
 	}
 
-	// Untracking something already untracked is a no-op the agent can act on,
-	// not a session-ending failure — return success-shaped guidance.
-	if s.lifecycle.ResolvePrefix(path) == "" {
-		return repoNotTrackedGuidance(path), nil
-	}
-
 	// What an untrack of this path does is a property of the catalog, so it is
-	// read before anything is torn down. A plan that removes rows is shown and
+	// read before anything is torn down. The lifecycle uses the fail-closed
+	// destructive resolver; an unknown token is guidance, never a path relative
+	// to the daemon's working directory. A plan that removes rows is shown and
 	// not run; a plan that keeps the checkout is the ordinary untrack.
 	preview, err := s.lifecycle.PreviewUntrack(ctx, path)
+	if errors.Is(err, indexer.ErrCheckoutNotTracked) {
+		return repoNotTrackedGuidance(path), nil
+	}
 	if err != nil {
 		return untrackFailure(path, err), nil
 	}

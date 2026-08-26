@@ -47,6 +47,11 @@ type requestView struct {
 	// routed checkout's root. Empty for a view of a committed tree, which is
 	// the whole difference a filesystem-backed capability turns on.
 	viewRoot string
+	// suppressBufferOverlay is set only for an unavailable checkout's
+	// primary-base fallback. Grace answers must exclude both persisted dirty
+	// state and session buffers; a normal cold-build fallback may still compose
+	// the caller's live editor buffers over its lower view.
+	suppressBufferOverlay bool
 
 	// mu guards the annotations the request collects while it runs. The
 	// capability evaluation writes before the handler starts, but a handler
@@ -104,6 +109,14 @@ func (v *requestView) annotations() ([]graphview.CapabilityStatus, []graphview.C
 // routed reports whether a composed checkout view — rather than the base
 // corpus — answers this request.
 func (v *requestView) routed() bool { return v != nil && v.reader != nil }
+
+// acceptsBufferOverlay reports whether session-local editor buffers may layer
+// over this answer. A grace fallback deliberately returns the stable primary
+// graph only: composing the disappeared checkout's buffers would make the
+// response look inexact while still leaking the unavailable working copy.
+func (v *requestView) acceptsBufferOverlay() bool {
+	return v == nil || !v.suppressBufferOverlay
+}
 
 // close releases the generations the view leased and the git child its file
 // surface holds. Idempotent and nil-safe.
@@ -209,6 +222,122 @@ func takeViewSelector(req *mcp.CallToolRequest) (graphview.Selector, error) {
 	return graphview.ParseSelector(fields["kind"], fields["graph_id"], fields["checkout_id"], fields["value"])
 }
 
+// requestViewPolicy carries the operation-level guarantees that affect view
+// selection. It is derived after parameter reconciliation, from the same
+// facade operation/effect registry that dispatch and mutation authorization
+// use, so a spelling alias cannot accidentally widen grace access.
+type requestViewPolicy struct {
+	allowGraceBaseFallback bool
+}
+
+func (s *Server) requestViewPolicy(req *mcp.CallToolRequest) requestViewPolicy {
+	return requestViewPolicy{allowGraceBaseFallback: s.requestAllowsGraceBaseFallback(req)}
+}
+
+// requestAllowsGraceBaseFallback admits only read-effect graph/search
+// operations. Exact source/file reads, filesystem-backed search, LSP work, and
+// every write effect stay strict while the checkout is unavailable.
+func (s *Server) requestAllowsGraceBaseFallback(req *mcp.CallToolRequest) bool {
+	if s == nil || s.facades == nil || req == nil || requestTargetsFile(req) {
+		return false
+	}
+
+	name := req.Params.Name
+	if isFacadeToolName(name) {
+		spec, ok := s.viewFacadeOperation(req)
+		return ok && graceFallbackSpecEligible(spec)
+	}
+
+	specs := s.facades.byLegacy[name]
+	if len(specs) == 0 {
+		return false
+	}
+	for _, spec := range specs {
+		// A legacy handler may be reachable through operations with different
+		// effects (change_contract is the canonical example). Ambiguity must
+		// fail closed rather than choosing whichever mapping was registered
+		// first.
+		if !graceFallbackSpecEligible(spec) {
+			return false
+		}
+	}
+	return true
+}
+
+// viewFacadeOperation resolves the compact request exactly as handleFacade
+// does up to dispatch. Keeping grace authorization on the selected operation
+// is what lets analyze reads fall back without admitting its administrative
+// kinds.
+func (s *Server) viewFacadeOperation(req *mcp.CallToolRequest) (facadeOperationSpec, bool) {
+	name := req.Params.Name
+	args := req.GetArguments()
+	operation := resolveFacadeOperationAlias(name, normalizeFacadeOperation(req.GetString("operation", "")))
+	if name == "analyze" {
+		operation = requestedAnalyzeKind(args)
+		if operation == "" {
+			operation = "help"
+		}
+	}
+	if operation == "" {
+		operation = inferFacadeOperation(name, args)
+	}
+	if operation == "" {
+		operation = defaultFacadeOperation(name)
+	}
+	if name == "read" {
+		operation = normalizeFacadeReadOperation(operation, args)
+	}
+	return s.capabilityOperation(name, operation)
+}
+
+func graceFallbackSpecEligible(spec facadeOperationSpec) bool {
+	if spec.Effect != facadeEffectRead || spec.Facade == "read" {
+		return false
+	}
+	caps := capabilityDefaultsFor(spec.Legacy)
+	if len(caps) == 0 {
+		return false
+	}
+	for _, capability := range caps {
+		switch capability {
+		case graphview.CapSourceSnapshot,
+			graphview.CapSourceConfig,
+			graphview.CapSearchText,
+			graphview.CapLSPReferences,
+			graphview.CapLSPDiagnostics,
+			graphview.CapLSPHover,
+			graphview.CapLSPRename,
+			graphview.CapLSPCodeActions:
+			return false
+		}
+	}
+	return true
+}
+
+// requestTargetsFile catches facade selectors and legacy file arguments before
+// they are lowered. The capability filter above catches known file engines;
+// this guard covers graph/analysis operations whose ordinary family default is
+// broader than one request's concrete target.
+func requestTargetsFile(req *mcp.CallToolRequest) bool {
+	if req == nil {
+		return false
+	}
+	args, ok := req.Params.Arguments.(map[string]any)
+	if !ok {
+		return false
+	}
+	if _, present := args["file"]; present {
+		return true
+	}
+	for _, container := range []string{"target", "to", "source", "context"} {
+		fields, _ := args[container].(map[string]any)
+		if _, present := fields["file"]; present {
+			return true
+		}
+	}
+	return false
+}
+
 // resolveRequestView decides what this request reads through.
 //
 // Precedence is explicit selector, then the session's cwd binding, then the
@@ -218,8 +347,12 @@ func takeViewSelector(req *mcp.CallToolRequest) (graphview.Selector, error) {
 // Materialization is per request. Caching it across requests needs the route
 // epoch as the key — a route flip has to invalidate the cached stack — and
 // that is the optimization this deliberately leaves for later.
-func (s *Server) resolveRequestView(ctx context.Context, selector graphview.Selector) (*requestView, error) {
-	view, err := s.selectRequestView(ctx, selector)
+func (s *Server) resolveRequestView(
+	ctx context.Context,
+	selector graphview.Selector,
+	policy requestViewPolicy,
+) (*requestView, error) {
+	view, err := s.selectRequestView(ctx, selector, policy)
 	s.recordRequestView(view, err)
 	return view, err
 }
@@ -286,7 +419,11 @@ func requestViewKind(view *requestView) string {
 
 // selectRequestView is resolveRequestView's decision, split out so the
 // recording above wraps every path through it exactly once.
-func (s *Server) selectRequestView(ctx context.Context, selector graphview.Selector) (*requestView, error) {
+func (s *Server) selectRequestView(
+	ctx context.Context,
+	selector graphview.Selector,
+	policy requestViewPolicy,
+) (*requestView, error) {
 	if s == nil || s.materializer == nil {
 		if selector.Kind == graphview.SelectorAuto {
 			return nil, nil
@@ -298,7 +435,7 @@ func (s *Server) selectRequestView(ctx context.Context, selector graphview.Selec
 	case graphview.SelectorAuto:
 		return s.viewForSessionCWD(ctx)
 	case graphview.SelectorWorktree:
-		return s.viewForWorktreeSelector(ctx, selector)
+		return s.viewForWorktreeSelector(ctx, selector, policy)
 	case graphview.SelectorBase:
 		return s.viewForBaseSelector(ctx, selector)
 	case graphview.SelectorGitRef, graphview.SelectorCommit:
@@ -342,7 +479,11 @@ func (s *Server) viewForSessionCWD(ctx context.Context) (*requestView, error) {
 // viewForWorktreeSelector serves an explicitly named checkout. Every refusal
 // is reported with its own code: the caller asked for one specific view and
 // must never be handed a different one.
-func (s *Server) viewForWorktreeSelector(ctx context.Context, selector graphview.Selector) (*requestView, error) {
+func (s *Server) viewForWorktreeSelector(
+	ctx context.Context,
+	selector graphview.Selector,
+	policy requestViewPolicy,
+) (*requestView, error) {
 	catalog := s.materializer.Catalog
 	checkout, found, err := catalog.GetCheckout(ctx, selector.CheckoutID)
 	switch {
@@ -357,13 +498,52 @@ func (s *Server) viewForWorktreeSelector(ctx context.Context, selector graphview
 		return nil, err
 	}
 	if checkout.State != store_sqlite.CheckoutStateReady {
-		return nil, graphview.NewViewError(graphview.CodeCheckoutInaccessible,
+		stateErr := graphview.NewViewError(graphview.CodeCheckoutInaccessible,
 			fmt.Sprintf("checkout %q is %s", checkout.CheckoutID, string(checkout.State)))
+		if !policy.allowGraceBaseFallback || !checkoutStateAllowsBaseFallback(checkout.State) {
+			return nil, stateErr
+		}
+		primary, primaryErr := s.familyPrimary(ctx, checkout.FamilyID)
+		if primaryErr != nil {
+			return nil, primaryErr
+		}
+		return graceBaseFallback(selector, checkout, primary)
 	}
-	if err := s.familyHasPrimary(ctx, checkout.FamilyID); err != nil {
+	if _, err := s.familyPrimary(ctx, checkout.FamilyID); err != nil {
 		return nil, err
 	}
 	return s.materializeRequestView(ctx, selector, checkout, true)
+}
+
+func checkoutStateAllowsBaseFallback(state store_sqlite.CheckoutState) bool {
+	switch state {
+	case store_sqlite.CheckoutStateAvailabilityGrace,
+		store_sqlite.CheckoutStateRemovalGrace,
+		store_sqlite.CheckoutStateUnavailable:
+		return true
+	default:
+		return false
+	}
+}
+
+// graceBaseFallback serves only the sealed primary corpus. It does not carry a
+// routed reader or a filesystem root, and suppressBufferOverlay keeps session
+// buffers from reintroducing the unavailable checkout above the base.
+func graceBaseFallback(
+	selector graphview.Selector,
+	checkout store_sqlite.Checkout,
+	primary store_sqlite.DedicatedGraph,
+) (*requestView, error) {
+	rider := graphview.NewViewRider(selector)
+	actual := graphview.Selector{Kind: graphview.SelectorBase, GraphID: primary.GraphID}
+	if err := rider.MarkFallback(actual.String(), string(checkout.State)); err != nil {
+		return nil, err
+	}
+	rider.GraphID = primary.GraphID
+	rider.CheckoutID = checkout.CheckoutID
+	rider.RequestedState = string(store_sqlite.CheckoutStateReady)
+	rider.ActualState = string(checkout.State)
+	return &requestView{rider: rider, suppressBufferOverlay: true}, nil
 }
 
 // viewForBaseSelector pins the request to a named base graph. A dedicated
@@ -475,21 +655,26 @@ func (s *Server) viewFamilies(ctx context.Context) []string {
 	return out
 }
 
-// familyHasPrimary refuses a family with no primary base graph. Every
-// automatic checkout is served from the family's shared lane, so a family
-// without one has nothing to compose a view over.
-func (s *Server) familyHasPrimary(ctx context.Context, familyID string) error {
+// familyPrimary resolves the one primary base and requires it to be ready.
+// Automatic routes and grace fallbacks share this invariant: naming a primary
+// row is not enough when its graph cannot truthfully answer yet.
+func (s *Server) familyPrimary(ctx context.Context, familyID string) (store_sqlite.DedicatedGraph, error) {
 	graphs, err := s.materializer.Catalog.ListDedicatedGraphs(ctx, familyID)
 	if err != nil {
-		return graphview.WrapViewError(graphview.CodeCheckoutInaccessible,
+		return store_sqlite.DedicatedGraph{}, graphview.WrapViewError(graphview.CodeCheckoutInaccessible,
 			fmt.Sprintf("list the graphs of family %q", familyID), err)
 	}
 	for _, dedicated := range graphs {
-		if dedicated.IsPrimaryBase {
-			return nil
+		if !dedicated.IsPrimaryBase {
+			continue
 		}
+		if dedicated.State != reconcile.GraphStateReady {
+			return store_sqlite.DedicatedGraph{}, graphview.NewViewError(graphview.CodePrimaryNotReady,
+				fmt.Sprintf("primary graph %q is %s", dedicated.GraphID, dedicated.State))
+		}
+		return dedicated, nil
 	}
-	return graphview.NewViewError(graphview.CodeNoPrimary,
+	return store_sqlite.DedicatedGraph{}, graphview.NewViewError(graphview.CodeNoPrimary,
 		fmt.Sprintf("family %q has no primary base graph", familyID))
 }
 
@@ -612,6 +797,10 @@ func viewRiderFields(view *requestView) map[string]any {
 		fields["fallback_reason"] = view.rider.FallbackReason
 	}
 	for name, value := range map[string]string{
+		"graph_id":         view.rider.GraphID,
+		"checkout_id":      view.rider.CheckoutID,
+		"requested_state":  view.rider.RequestedState,
+		"actual_state":     view.rider.ActualState,
 		"view_fingerprint": view.rider.ViewFingerprint,
 		"requested_ref":    view.rider.RequestedRef,
 		"resolved_ref":     view.rider.ResolvedRef,

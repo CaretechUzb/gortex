@@ -486,6 +486,17 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 	reason := c.reason
 	c.mu.Unlock()
 
+	release, err := c.gate.Acquire(ctx, ViewBuildBackground)
+	if err != nil {
+		out := CheckoutCycle{Err: fmt.Errorf("indexer: wait for checkout build admission: %w", err)}
+		recordCoordinatorCycle(out)
+		if c.cycleDone != nil {
+			c.cycleDone(out)
+		}
+		return
+	}
+	defer release()
+
 	c.cycleMu.Lock()
 	out := c.reconcile(ctx)
 	c.cycleMu.Unlock()
@@ -623,6 +634,12 @@ func (c *CheckoutCoordinator) RehomeTo(ctx context.Context, graphID string) (Che
 	if c == nil {
 		return out, errors.New("indexer: no coordinator to rehome")
 	}
+	release, err := c.gate.Acquire(ctx, ViewBuildInteractive)
+	if err != nil {
+		return out, fmt.Errorf("indexer: wait for checkout build admission: %w", err)
+	}
+	defer release()
+
 	c.cycleMu.Lock()
 	defer c.cycleMu.Unlock()
 
