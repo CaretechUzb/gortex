@@ -939,7 +939,12 @@ func (e *Engine) gatherBackendCandidates(query string, limit int, opts QueryOpti
 	// where every surviving candidate is resolved through the composed
 	// reader and anything the view hides falls out.
 	if viewLayered {
-		textResults = e.viewTextCandidates(query, limit*2, textResults)
+		textResults = e.viewTextCandidates(
+			query,
+			limit*2,
+			textResults,
+			viewBaseTextRefill(backend, query, repoAllowList(opts.RepoAllow)),
+		)
 	}
 
 	// Collect every ID NOT covered by the bundle path (vector hits +

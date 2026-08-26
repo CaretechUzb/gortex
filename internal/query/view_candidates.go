@@ -61,19 +61,125 @@ func (e *Engine) viewLayersActive() bool { return len(e.viewLayers) > 0 }
 // this function's job — every surviving id is materialised through the
 // composed reader by the caller, which also drops whatever the view hides that
 // ownership alone did not catch.
-func (e *Engine) viewTextCandidates(query string, limit int, base []search.SearchResult) []search.SearchResult {
-	sources := make([][]search.SearchResult, 0, len(e.viewLayers)+1)
-	sources = append(sources, base)
-	for _, layer := range e.viewLayers {
+func (e *Engine) viewTextCandidates(
+	query string,
+	limit int,
+	base []search.SearchResult,
+	refillBase func(int) []search.SearchResult,
+) []search.SearchResult {
+	if limit <= 0 {
+		return nil
+	}
+
+	fetch := limit
+	if len(base) > fetch {
+		fetch = len(base)
+	}
+	raw := make([][]search.SearchResult, len(e.viewLayers)+1)
+	exhausted := make([]bool, len(raw))
+	raw[0] = base
+	exhausted[0] = refillBase == nil || len(base) < fetch
+	for i, layer := range e.viewLayers {
 		if layer.Search == nil {
-			sources = append(sources, nil)
+			exhausted[i+1] = true
 			continue
 		}
-		sources = append(sources, layer.Search.Search(query, limit))
+		raw[i+1] = layer.Search.Search(query, fetch)
+		exhausted[i+1] = len(raw[i+1]) < fetch
 	}
-	e.composeViewSources(sources)
-	RecordViewSearchSources(viewmetrics.CorpusSymbol, sources)
-	return MergeRankedSources(sources, func(r search.SearchResult) string { return r.ID })
+
+	compose := func() ([][]search.SearchResult, []search.SearchResult) {
+		sources := append([][]search.SearchResult(nil), raw...)
+		e.composeViewSources(sources)
+		merged := MergeRankedSources(sources, func(r search.SearchResult) string { return r.ID })
+		return sources, merged
+	}
+	finish := func(sources [][]search.SearchResult, merged []search.SearchResult) []search.SearchResult {
+		RecordViewSearchSources(viewmetrics.CorpusSymbol, sources)
+		if len(merged) > limit {
+			merged = merged[:limit]
+		}
+		return merged
+	}
+
+	for {
+		sources, merged := compose()
+		if len(merged) >= limit {
+			return finish(sources, merged)
+		}
+
+		nextFetch := fetch * 2
+		if nextFetch <= fetch {
+			return finish(sources, merged)
+		}
+		active := false
+		grew := false
+		for i := range raw {
+			if exhausted[i] {
+				continue
+			}
+			active = true
+			previous := len(raw[i])
+			if i == 0 {
+				raw[i] = refillBase(nextFetch)
+			} else {
+				raw[i] = e.viewLayers[i-1].Search.Search(query, nextFetch)
+			}
+			if len(raw[i]) > previous {
+				grew = true
+			}
+			exhausted[i] = len(raw[i]) < nextFetch || len(raw[i]) <= previous
+		}
+		if !active {
+			return finish(sources, merged)
+		}
+		fetch = nextFetch
+		if !grew {
+			// Use the most recent answers even when a backend could not grow;
+			// then stop rather than reissuing the same capped query forever.
+			sources, merged = compose()
+			return finish(sources, merged)
+		}
+	}
+}
+
+// viewBaseTextRefill repeats only the indexed corpus's text lane at a deeper
+// width. Bundle search is preferred because it preserves repository narrowing
+// and never wakes the vector channel merely to refill masked BM25 candidates.
+func viewBaseTextRefill(backend search.Backend, query string, repoAllow []string) func(int) []search.SearchResult {
+	return func(limit int) []search.SearchResult {
+		if backend == nil || limit <= 0 {
+			return nil
+		}
+		if len(repoAllow) > 0 {
+			if scoped, ok := backend.(search.ScopedSymbolBundleSearcherBackend); ok {
+				if bundles := scoped.SearchSymbolBundlesScoped(query, repoAllow, limit); bundles != nil {
+					return viewBundleResults(bundles)
+				}
+			}
+		}
+		if bundled, ok := backend.(search.SymbolBundleSearcherBackend); ok {
+			if bundles := bundled.SearchSymbolBundles(query, limit); bundles != nil {
+				return viewBundleResults(bundles)
+			}
+		}
+		if channels, ok := backend.(search.ChannelSearcher); ok {
+			text, _ := channels.SearchChannels(query, limit)
+			return text
+		}
+		return backend.Search(query, limit)
+	}
+}
+
+func viewBundleResults(bundles []search.SymbolBundle) []search.SearchResult {
+	out := make([]search.SearchResult, 0, len(bundles))
+	for _, bundle := range bundles {
+		if bundle.Node == nil {
+			continue
+		}
+		out = append(out, search.SearchResult{ID: bundle.Node.ID, Score: bundle.Score})
+	}
+	return out
 }
 
 // RecordViewSearchSources counts one composite search and how many of the
@@ -174,10 +280,13 @@ func (e *Engine) hiddenAboveSource(source int, id string) bool {
 // position inside its own source, which is the one quantity every corpus
 // expresses on the same scale: "the best answer this corpus has" means the
 // same thing whether the corpus holds four files or forty thousand. The
-// sources are interleaved by that position, and a tie at one position is
-// resolved toward the higher layer — the layer nearer what the caller is
-// actually reading, and the only one that can carry content nothing below it
-// has.
+// sources are interleaved by that position. Equal-rank hits are ordered by
+// logical identity when one is available, a deterministic tie-break that does
+// not grant either the indexed corpus or an overlay a blanket priority.
+//
+// Duplicate ownership is decided separately from relevance: the highest source
+// carrying an identity supplies that identity's payload, at that source's own
+// rank. This is the only overlay priority the merge applies.
 //
 // This is an interim policy. The successor is exact per-view corpus
 // statistics: with the document frequencies of the composed view rather than
@@ -186,48 +295,79 @@ func (e *Engine) hiddenAboveSource(source int, id string) bool {
 // position is the honest merge.
 //
 // id extracts the identity a duplicate is recognised by; pass nil, or return
-// "", to keep every entry. Ranking within one source is preserved, so a source
-// whose entries all outrank another's still comes out ahead of it.
+// "", to keep every entry. Ranking within one source is preserved.
 func MergeRankedSources[T any](sources [][]T, id func(T) string) []T {
 	total := 0
-	for _, s := range sources {
-		total += len(s)
+	for _, source := range sources {
+		total += len(source)
 	}
 	if total == 0 {
 		return nil
 	}
+
+	// A later source is a higher layer. Resolve duplicate ownership before
+	// ranking so a lower copy cannot win merely because it ranked earlier in
+	// its own stale corpus.
+	var owner map[string]int
+	if id != nil {
+		owner = make(map[string]int, total)
+		for source, items := range sources {
+			for _, item := range items {
+				if key := id(item); key != "" {
+					owner[key] = source
+				}
+			}
+		}
+	}
+
 	type entry struct {
-		item   T
-		rank   int
-		source int
+		item    T
+		key     string
+		rank    int
+		source  int
+		ordinal int
 	}
 	entries := make([]entry, 0, total)
-	for si, s := range sources {
-		for rank, item := range s {
-			entries = append(entries, entry{item: item, rank: rank, source: si})
+	ordinal := 0
+	for source, items := range sources {
+		for rank, item := range items {
+			key := ""
+			if id != nil {
+				key = id(item)
+				if key != "" && owner[key] != source {
+					ordinal++
+					continue
+				}
+			}
+			entries = append(entries, entry{
+				item: item, key: key, rank: rank, source: source, ordinal: ordinal,
+			})
+			ordinal++
 		}
 	}
 	sort.SliceStable(entries, func(i, j int) bool {
 		if entries[i].rank != entries[j].rank {
 			return entries[i].rank < entries[j].rank
 		}
-		return entries[i].source > entries[j].source
+		if entries[i].key != "" && entries[j].key != "" && entries[i].key != entries[j].key {
+			return entries[i].key < entries[j].key
+		}
+		return entries[i].ordinal < entries[j].ordinal
 	})
-	out := make([]T, 0, total)
+
+	out := make([]T, 0, len(entries))
 	var seen map[string]struct{}
 	if id != nil {
-		seen = make(map[string]struct{}, total)
+		seen = make(map[string]struct{}, len(entries))
 	}
-	for _, e := range entries {
-		if id != nil {
-			if key := id(e.item); key != "" {
-				if _, dup := seen[key]; dup {
-					continue
-				}
-				seen[key] = struct{}{}
+	for _, candidate := range entries {
+		if candidate.key != "" {
+			if _, duplicate := seen[candidate.key]; duplicate {
+				continue
 			}
+			seen[candidate.key] = struct{}{}
 		}
-		out = append(out, e.item)
+		out = append(out, candidate.item)
 	}
 	return out
 }
