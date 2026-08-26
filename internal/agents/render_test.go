@@ -242,3 +242,39 @@ func TestRenderRestoresUnsetEnvironment(t *testing.T) {
 		t.Errorf("CLAUDE_CONFIG_DIR leaked out of the render as %q; it was unset before", v)
 	}
 }
+
+// TestNormalizeRenderScrubsTheSlashSpelledPath binds the second
+// replacement in normalizeRender, which nothing else can.
+//
+// A rendered manifest carries '/'-spelled paths even on Windows —
+// shellSafeHookBinary normalises unconditionally, and an @-include is
+// document content rather than a filesystem call — while the values handed
+// to normalizeRender are native. Scrubbing only the native spelling
+// therefore leaves a machine-specific absolute in the manifest, and
+// TestAgentsRenderGolden catches it only in cmd/gortex, which the Windows
+// job does not test.
+//
+// On linux/macos both spellings are the same string and this passes with
+// either implementation; on Windows it fails without the ToSlash pass.
+// That asymmetry is the point, and it is why the assertion lives in
+// internal/agents, which the Windows job already runs.
+func TestNormalizeRenderScrubsTheSlashSpelledPath(t *testing.T) {
+	home := filepath.Join(string(filepath.Separator)+"sandbox", "home")
+	root := filepath.Join(string(filepath.Separator)+"sandbox", "repo")
+
+	// The body is what a renderer emits: forward slashes, whatever the OS.
+	body := "@" + filepath.ToSlash(home) + "/.gortex/instructions/active.md\n" +
+		"root=" + filepath.ToSlash(root) + "\n"
+
+	got := normalizeRender(body, home, root)
+
+	if !strings.Contains(got, "@$HOME/.gortex/instructions/active.md") {
+		t.Errorf("the slash-spelled home survived normalizeRender:\n%s", got)
+	}
+	if !strings.Contains(got, "root=$ROOT") {
+		t.Errorf("the slash-spelled root survived normalizeRender:\n%s", got)
+	}
+	if strings.Contains(got, filepath.ToSlash(home)) || strings.Contains(got, filepath.ToSlash(root)) {
+		t.Errorf("a machine-specific absolute is still in the manifest:\n%s", got)
+	}
+}
