@@ -36,7 +36,8 @@ var extractorVersions = map[string]int{
 	"scala":  2,                                      // explicitly instantiated generic calls emit call edges
 	"go":     3,                                      // generic instantiations are marked so indexing a func value cannot bind (was: generic calls emit call edges)
 	"cpp":    2,                                      // templated and namespace-qualified calls emit call edges
-	"swift":  2,                                      // generic calls and ordinary member calls emit call edges
+	"swift":  2, // generic calls and ordinary member calls emit call edges
+	"julia":  2, // bespoke tree-sitter extractor replaces the regex extractor (fields, exports, qualified methods, broadcast/macro calls)
 }
 
 // extractorSaltExtLang maps a lower-case file extension to the language
@@ -87,6 +88,7 @@ var extractorSaltExtLang = map[string]string{
 	".exs":    "elixir",
 	".sh":     "bash",
 	".bash":   "bash",
+	".jl":     "julia",
 }
 
 // ExtractorLangForFile returns the extractor-staleness language key for a
