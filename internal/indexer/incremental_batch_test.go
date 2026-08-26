@@ -339,3 +339,44 @@ func TestIncrementalMultiFileBatchKeepsFailedFileAndCommitsSiblings(t *testing.T
 }
 
 var _ graph.FileBatchEvicter = (*incrementalBatchCountingStore)(nil)
+
+func TestIncrementalReindexKeepsMutationReceiptExact(t *testing.T) {
+	dir := t.TempDir()
+	files := map[string]string{
+		"a.go": "package receipt\n\nfunc A() { B() }\n",
+		"b.go": "package receipt\n\nfunc B() {}\n",
+	}
+	paths := make([]string, 0, len(files))
+	for name, content := range files {
+		path := filepath.Join(dir, name)
+		writeFile(t, path, content)
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+
+	g := graph.New()
+	idx := newTestIndexer(g)
+	_, err := idx.Index(dir)
+	require.NoError(t, err)
+
+	future := time.Now().Add(3 * time.Second)
+	for _, path := range paths {
+		content := "package receipt\n\nfunc A() { B(); Added() }\nfunc Added() {}\n"
+		if filepath.Base(path) == "b.go" {
+			content = "package receipt\n\nfunc B() int { return 1 }\n"
+		}
+		require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+		require.NoError(t, os.Chtimes(path, future, future))
+	}
+
+	result, receipt, _, err := idx.incrementalReindexPathsWithReceiptMode(dir, paths, incrementalPathMode{})
+	require.NoError(t, err)
+	require.Empty(t, result.FailedFiles)
+	require.NotNil(t, receipt)
+	require.Truef(t, receipt.Complete,
+		"structural incremental reindex voided the mutation receipt (%s) — forces the whole-graph fallback resolve", receipt.IncompleteReason)
+	require.True(t, receipt.ResolutionRelevant)
+	for _, name := range []string{"a.go", "b.go"} {
+		require.Contains(t, receipt.ResolutionFiles(), name)
+	}
+}
