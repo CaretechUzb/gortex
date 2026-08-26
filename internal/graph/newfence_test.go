@@ -5,6 +5,7 @@ import (
 	"go/parser"
 	"go/token"
 	"io/fs"
+	"os"
 	"path"
 	"path/filepath"
 	"sort"
@@ -78,6 +79,13 @@ func TestNewIsFencedToIndexerStaging(t *testing.T) {
 			if _, skip := fenceSkippedDirs[d.Name()]; skip {
 				return filepath.SkipDir
 			}
+			nested, gitErr := nestedGitCheckout(root, p)
+			if gitErr != nil {
+				return gitErr
+			}
+			if nested {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		name := d.Name()
@@ -129,6 +137,58 @@ func TestNewIsFencedToIndexerStaging(t *testing.T) {
 		if _, ok := seen[p]; !ok {
 			t.Errorf("%s no longer constructs the in-memory Store — drop it from the allow list", p)
 		}
+	}
+}
+
+// nestedGitCheckout reports whether dir starts a Git repository/worktree below
+// root. Repository-wide fences must not inspect a second checkout merely
+// because an agent placed that checkout under this one's filesystem tree.
+func nestedGitCheckout(root, dir string) (bool, error) {
+	if filepath.Clean(root) == filepath.Clean(dir) {
+		return false, nil
+	}
+	_, err := os.Lstat(filepath.Join(dir, ".git"))
+	switch {
+	case err == nil:
+		return true, nil
+	case os.IsNotExist(err):
+		return false, nil
+	default:
+		return false, err
+	}
+}
+
+func TestNestedGitCheckoutDetection(t *testing.T) {
+	root := t.TempDir()
+	nested := filepath.Join(root, "nested")
+	ordinary := filepath.Join(root, "ordinary")
+	for _, dir := range []string{nested, ordinary} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(nested, ".git"), []byte("gitdir: elsewhere\n"), 0o644); err != nil {
+		t.Fatalf("write nested .git file: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		dir  string
+		want bool
+	}{
+		{name: "root", dir: root, want: false},
+		{name: "ordinary directory", dir: ordinary, want: false},
+		{name: "nested worktree", dir: nested, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := nestedGitCheckout(root, tc.dir)
+			if err != nil {
+				t.Fatalf("nestedGitCheckout: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("nestedGitCheckout(%q) = %v, want %v", tc.dir, got, tc.want)
+			}
+		})
 	}
 }
 
