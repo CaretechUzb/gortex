@@ -224,3 +224,35 @@ func TestMutationReceiptEvictFilesNonreferenceableOnlyStaysNeutral(t *testing.T)
 	}
 	assertReceiptContains(t, "changed files", receipt.ChangedFiles, "doc.md")
 }
+
+// A restub write — a surviving caller's edge parked under an unresolved stub
+// by the re-parse flow, carrying the stashed provenance — must not enter
+// UnresolvedFiles: the forward file pass re-resolves without restoring the
+// stash (demoting the tier), while the name/incoming frontier restores it.
+// The stub still marks the receipt resolution-relevant and contributes its
+// name so that frontier runs.
+func TestMutationReceiptRestubWriteStaysOutOfUnresolvedFiles(t *testing.T) {
+	g := New()
+	def := &Node{ID: "repo/a.go::A", Kind: KindFunction, Name: "A", QualName: "pkg.A", FilePath: "a.go", RepoPrefix: "repo"}
+	caller := &Node{ID: "repo/keep.go::Keep", Kind: KindFunction, Name: "Keep", FilePath: "keep.go", RepoPrefix: "repo"}
+	e := &Edge{From: caller.ID, To: def.ID, Kind: EdgeCalls, FilePath: "keep.go", Line: 3, Origin: OriginLSPResolved, Confidence: 1}
+	g.AddBatch([]*Node{def, caller}, []*Edge{e})
+
+	token := g.BeginMutationReceipt()
+	oldTo := e.To
+	StashRestubProvenance(e)
+	e.To = UnresolvedMarker + "A"
+	g.ReindexEdges([]EdgeReindex{{Edge: e, OldTo: oldTo}})
+	receipt := g.EndMutationReceipt(token)
+
+	if !receipt.Complete {
+		t.Fatalf("restub write must not void the receipt: %+v", receipt)
+	}
+	if !receipt.ResolutionRelevant {
+		t.Fatalf("a parked stub still needs the name frontier: %+v", receipt)
+	}
+	if slices.Contains(receipt.UnresolvedFiles, "keep.go") {
+		t.Fatalf("restubbed caller file leaked into UnresolvedFiles (forward pass would demote its tier): %+v", receipt)
+	}
+	assertReceiptContains(t, "target names", receipt.TargetNames, "A")
+}

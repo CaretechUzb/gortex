@@ -2914,7 +2914,13 @@ func (g *Graph) reindexEdge(e *Edge, oldTo string, oldKind EdgeKind) {
 	if receiptActive {
 		defer g.endReceiptMutation()
 	}
-	g.markMutationReceiptsIncomplete()
+	if receiptActive {
+		// Mirror the SQLite reindex recorder: only a write that leaves the
+		// edge at an unresolved target creates resolver work; replacing a
+		// stub with a resolved target creates none. The source-node lookup
+		// happens before the shard write locks below.
+		g.recordReindexedEdgeForReceipts(e)
+	}
 	// Must lock the From shard too — we mutate sFrom.outEdgeIdx below,
 	// and without its lock a concurrent AddEdge on From panics the
 	// runtime with "concurrent map read and map write".

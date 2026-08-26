@@ -286,6 +286,13 @@ func (g *Graph) recordAddedEdgeForReceipts(e *Edge, exactFile string) {
 			continue
 		}
 		acc.resolutionRelevant = true
+		if HasRestubProvenance(e) {
+			// A restubbed surviving edge is rebound by the incoming/name
+			// frontier, which restores its stashed provenance; its source
+			// file must not join UnresolvedFiles, or the forward file pass
+			// re-resolves it first and the restored tier is lost.
+			continue
+		}
 		if exactFile != "" {
 			acc.unresolvedFiles[exactFile] = struct{}{}
 		} else {
@@ -350,3 +357,25 @@ func (g *Graph) markMutationReceiptsIncomplete() {
 }
 
 var _ MutationReceiptStore = (*Graph)(nil)
+
+// recordReindexedEdgeForReceipts describes one in-place edge retarget to the
+// active receipts, mirroring sqliteReindexReceipt: only a write that leaves
+// the edge at an unresolved target creates work for the resolver catch-up —
+// replacing a stub with a resolved target creates none. The empty-FilePath
+// fallback reads the source node's file, the same identity the SQLite
+// recorder preloads.
+func (g *Graph) recordReindexedEdgeForReceipts(e *Edge) {
+	if e == nil || g.mutationReceipts.activeCount.Load() == 0 {
+		return
+	}
+	if !IsUnresolvedTarget(e.To) {
+		return
+	}
+	file := e.FilePath
+	if file == "" {
+		if src := g.GetNode(e.From); src != nil {
+			file = src.FilePath
+		}
+	}
+	g.recordAddedEdgeForReceipts(e, file)
+}

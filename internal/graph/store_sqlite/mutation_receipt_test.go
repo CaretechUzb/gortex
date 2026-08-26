@@ -841,3 +841,40 @@ func TestSQLiteMutationReceiptEvictFilesNonreferenceableOnlyStaysNeutral(t *test
 	}
 	assertSQLiteReceiptContains(t, "changed files", receipt.ChangedFiles, "doc.md")
 }
+
+// SQLite twin of the graph-side restub-write pin: the parked stub keeps the
+// receipt complete and resolution-relevant, contributes its name, and keeps
+// the surviving caller's file out of UnresolvedFiles.
+func TestSQLiteMutationReceiptRestubWriteStaysOutOfUnresolvedFiles(t *testing.T) {
+	store := openMutationReceiptStore(t)
+	store.AddBatch([]*graph.Node{
+		{ID: "repo/a.go::A", Kind: graph.KindFunction, Name: "A", QualName: "pkg.A", FilePath: "a.go", RepoPrefix: "repo"},
+		{ID: "repo/keep.go::Keep", Kind: graph.KindFunction, Name: "Keep", FilePath: "keep.go", RepoPrefix: "repo"},
+	}, []*graph.Edge{{
+		From: "repo/keep.go::Keep", To: "repo/a.go::A", Kind: graph.EdgeCalls,
+		FilePath: "keep.go", Line: 3, Origin: graph.OriginLSPResolved, Confidence: 1,
+	}})
+	in := store.GetInEdgesByNodeIDs([]string{"repo/a.go::A"})
+	if len(in["repo/a.go::A"]) != 1 {
+		t.Fatalf("expected one incoming edge, got %d", len(in["repo/a.go::A"]))
+	}
+	e := in["repo/a.go::A"][0]
+
+	token := store.BeginMutationReceipt()
+	oldTo := e.To
+	graph.StashRestubProvenance(e)
+	e.To = graph.UnresolvedMarker + "A"
+	store.ReindexEdges([]graph.EdgeReindex{{Edge: e, OldTo: oldTo}})
+	receipt := store.EndMutationReceipt(token)
+
+	if !receipt.Complete {
+		t.Fatalf("restub write must not void the receipt: %+v", receipt)
+	}
+	if !receipt.ResolutionRelevant {
+		t.Fatalf("a parked stub still needs the name frontier: %+v", receipt)
+	}
+	if slices.Contains(receipt.UnresolvedFiles, "keep.go") {
+		t.Fatalf("restubbed caller file leaked into UnresolvedFiles (forward pass would demote its tier): %+v", receipt)
+	}
+	assertSQLiteReceiptContains(t, "target names", receipt.TargetNames, "A")
+}
