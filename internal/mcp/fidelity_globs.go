@@ -99,6 +99,20 @@ func matchFidelityGlob(pattern, rel string) bool {
 	pattern = filepath.ToSlash(pattern)
 	rel = filepath.ToSlash(rel)
 
+	// `**` in any position, matching zero or more whole segments. The
+	// branches below only ever recognised it bare, leading or trailing, so
+	// a middle `**` fell through to path.Match and came back
+	// segment-bounded — `internal/**/*_test.go`, the example in the
+	// find_files schema, missed every file more than one directory down.
+	//
+	// This runs first and only ever adds a match: every branch below is
+	// left exactly as it was, so the directory-prefix rules and the
+	// basename fallback keep deciding everything they decided before.
+	if strings.Contains(pattern, "**") &&
+		matchGlobstarSegments(strings.Split(pattern, "/"), strings.Split(rel, "/")) {
+		return true
+	}
+
 	// Trailing `/**` (or bare `**`): match the directory and the whole
 	// subtree beneath it.
 	if pattern == "**" {
@@ -127,6 +141,35 @@ func matchFidelityGlob(pattern, rel string) bool {
 	}
 
 	return matchSegmentGlob(pattern, rel)
+}
+
+// matchGlobstarSegments matches a segment-split pattern against a
+// segment-split path, giving `**` its usual meaning: zero or more whole
+// segments, wherever it appears. Every other segment is matched with
+// path.Match, so a single `*` stays inside its own segment.
+//
+// Zero segments is deliberate — `internal/**/*_test.go` has to match
+// `internal/foo_test.go` as well as `internal/a/b/c_test.go`, or the
+// pattern means something different at each depth.
+func matchGlobstarSegments(pattern, rel []string) bool {
+	for len(pattern) > 0 {
+		if pattern[0] == "**" {
+			for i := 0; i <= len(rel); i++ {
+				if matchGlobstarSegments(pattern[1:], rel[i:]) {
+					return true
+				}
+			}
+			return false
+		}
+		if len(rel) == 0 {
+			return false
+		}
+		if ok, _ := path.Match(pattern[0], rel[0]); !ok {
+			return false
+		}
+		pattern, rel = pattern[1:], rel[1:]
+	}
+	return len(rel) == 0
 }
 
 // matchSegmentGlob applies the single-segment glob semantics shared

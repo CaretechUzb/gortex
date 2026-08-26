@@ -140,3 +140,69 @@ func TestIsSubsequence(t *testing.T) {
 	require.False(t, isSubsequence("abc", "acb"))
 	require.False(t, isSubsequence("xyz", "abc"))
 }
+
+// setupFindFilesGlobstarServer indexes one file at each depth the
+// find_files schema's own example — `internal/**/*_test.go` — has to
+// reach, plus the two shapes it must not reach. It is separate from
+// setupFindFilesServer because the tests there assert exact counts.
+func setupFindFilesGlobstarServer(t *testing.T) *Server {
+	t.Helper()
+	dir := t.TempDir()
+	write := func(rel, body string) {
+		full := filepath.Join(dir, filepath.FromSlash(rel))
+		require.NoError(t, os.MkdirAll(filepath.Dir(full), 0o755))
+		require.NoError(t, os.WriteFile(full, []byte(body), 0o644))
+	}
+	write("internal/direct_test.go", "package internal\n\nfunc TestDirect() {}\n")
+	write("internal/sub/one_test.go", "package sub\n\nfunc TestOne() {}\n")
+	write("internal/a/b/deep_test.go", "package b\n\nfunc TestDeep() {}\n")
+	write("internal/sub/production.go", "package sub\n\nfunc Produce() {}\n")
+	write("cmd/outside_test.go", "package cmd\n\nfunc TestOutside() {}\n")
+
+	g := graph.New()
+	reg := testRegistry()
+	cfg := config.Default()
+	idx := indexer.New(g, reg, cfg.Index, zap.NewNop())
+	_, err := idx.Index(dir)
+	require.NoError(t, err)
+	eng := query.NewEngine(g)
+	return NewServer(eng, g, idx, nil, zap.NewNop(), nil)
+}
+
+// TestFindFiles_GlobstarCrossesSegmentsAtAnyDepth holds the tool to the
+// contract its own schema advertises: `**` crosses segments, in the
+// middle of a pattern as much as at either end.
+//
+// The example in the description is `internal/**/*_test.go`, and before
+// the globstar matcher a middle `**` fell through to path.Match and came
+// back segment-bounded — it matched exactly one directory level and
+// silently missed everything deeper. On Windows the older filepath.Match
+// happened to match the deep paths, because '/' is an ordinary character
+// there, so this is also the case that must not quietly change verdict
+// between platforms.
+func TestFindFiles_GlobstarCrossesSegmentsAtAnyDepth(t *testing.T) {
+	srv := setupFindFilesGlobstarServer(t)
+
+	resp := decodeFindFiles(t, callTool(t, srv, "find_files",
+		map[string]any{"glob": "internal/**/*_test.go"}))
+
+	got := map[string]bool{}
+	for _, f := range resp.Files {
+		got[f.Path] = true
+	}
+
+	for _, want := range []string{
+		"internal/direct_test.go",   // zero segments between: the direct child
+		"internal/sub/one_test.go",  // one level down
+		"internal/a/b/deep_test.go", // two levels down — the case that regressed
+	} {
+		require.Truef(t, got[want], "%q should match internal/**/*_test.go; got %v", want, resp.Files)
+	}
+	for _, unwanted := range []string{
+		"internal/sub/production.go", // right subtree, wrong basename
+		"cmd/outside_test.go",        // right basename, wrong subtree
+	} {
+		require.Falsef(t, got[unwanted], "%q must not match internal/**/*_test.go", unwanted)
+	}
+	require.Equal(t, 3, resp.Count, "exactly the three test files under internal/")
+}

@@ -29,7 +29,7 @@ func (s *Server) registerFindFilesTool() {
 				"kind:file (which cannot return file nodes). Returns repo-relative paths with the repo prefix and "+
 				"language, ready to hand to get_file_summary / read_file. Pass format:\"gcx\" for the compact wire format."),
 			mcp.WithString("query", mcp.Description("Filename or path substring to match (case-insensitive). Ranked basename-exact > prefix > substring > path-substring.")),
-			mcp.WithString("glob", mcp.Description("Path glob over the repo-relative path. `*` stays within a segment, `**` crosses segments, a bare basename pattern like `*_test.go` matches basenames. ANDed with `query` when both are given.")),
+			mcp.WithString("glob", mcp.Description("Path glob over the repo-relative path. `*` stays within a segment, `**` crosses segments anywhere, `dir/*` is a directory prefix (whole subtree), a bare basename pattern like `*_test.go` matches basenames. ANDed with `query` when both are given.")),
 			mcp.WithBoolean("fuzzy", mcp.Description("Also accept fuzzy subsequence matches of `query` against the basename (e.g. \"tcgo\" matches \"tools_coding.go\"). Lowest-ranked. Default false.")),
 			mcp.WithString("path", mcp.Description("Restrict to one or more anchored sub-path prefixes (comma-separated), repo-root-relative — the monorepo-service slice.")),
 			mcp.WithString("repo", mcp.Description("Restrict to a single repository prefix.")),
