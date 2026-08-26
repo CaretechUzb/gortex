@@ -3,6 +3,7 @@ package resolver
 import (
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
 )
@@ -135,6 +136,13 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 	hierarchySources := g.GetNodesByIDs(hierarchySourceIDs)
 	hierarchyByName := g.FindNodesByNames(hierarchyNames)
 	children := map[string][]string{}
+	// Direct implementors' stamped CLOSED type arguments per interface
+	// (extractor: target_type_args on generic base-list entries) — the
+	// evidence half of the G9 gate: an IBoxStore<Crate> receiver never
+	// dispatches into the IBoxStore<Widget> implementor. Absent for
+	// non-generic bases, open generics, transitive descendants, and
+	// non-simple arguments — absence always means "do not filter".
+	implArgs := map[string]map[string]string{}
 	for _, e := range hierarchyEdges {
 		if e == nil || e.From == "" || e.To == "" {
 			continue
@@ -150,6 +158,16 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 			}
 		}
 		children[toID] = append(children[toID], e.From)
+		if e.Meta != nil {
+			if args, _ := e.Meta["target_type_args"].(string); args != "" {
+				m := implArgs[e.From]
+				if m == nil {
+					m = map[string]string{}
+					implArgs[e.From] = m
+				}
+				m[toID] = args
+			}
+		}
 	}
 	if len(children) == 0 {
 		return 0
@@ -249,8 +267,10 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 
 	// Build families and the member → families index.
 	type family struct {
-		ifaceID string
-		members []string
+		ifaceID   string
+		ifaceName string // short interface name, for matching a receiver's declared field type
+		members   []string
+		implArgs  map[string]string // member method ID → its DIRECT implementor's stamped type args ("" absent = never filter)
 	}
 	var families []family
 	famsOfMember := map[string][]int{}
@@ -261,12 +281,14 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 		for _, id := range ag.nodeIDs {
 			anchorSet[id] = true
 		}
+		memberArgs := map[string]string{}
 		implCount := 0
 		for _, sub := range descendants(ag.ifaceID) {
 			byName := membersByType[sub]
 			if byName == nil {
 				continue
 			}
+			subArgs := implArgs[sub][ag.ifaceID]
 			for _, m := range byName[ag.name] {
 				if m == nil || anchorSet[m.ID] {
 					continue
@@ -276,6 +298,9 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 					continue
 				}
 				memberIDs = append(memberIDs, m.ID)
+				if subArgs != "" {
+					memberArgs[m.ID] = subArgs
+				}
 				implCount++
 			}
 		}
@@ -285,7 +310,10 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 			continue
 		}
 		idx := len(families)
-		families = append(families, family{ifaceID: ag.ifaceID, members: memberIDs})
+		families = append(families, family{
+			ifaceID: ag.ifaceID, ifaceName: csharpShortTypeName(ag.ifaceID),
+			members: memberIDs, implArgs: memberArgs,
+		})
 		for _, id := range memberIDs {
 			famsOfMember[id] = append(famsOfMember[id], idx)
 		}
@@ -326,6 +354,7 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 
 	var batch []*graph.Edge
 	seen := map[string]bool{}
+	receiverFieldTypes := map[string]string{} // per (caller,file,line) cache of the receiver field's declared type text
 	for _, e := range callEdges {
 		if e == nil || e.IsSpeculative() || graph.IsUnresolvedTarget(e.To) {
 			continue
@@ -361,6 +390,18 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 				continue
 			}
 			f := families[fi]
+			// Constructed-interface gate (G9): the source site's own type
+			// arguments — a sibling site bound to a stamped implementor
+			// carries that implementor's args; a through-interface site
+			// carries its receiver FIELD's declared args when the receiver
+			// evidence names one. "" means unknown — never filter. A
+			// family with no stamps at all (every non-generic interface,
+			// and the whole graph until a reindex) can never filter, so
+			// it never pays the receiver lookup either.
+			srcArgs := f.implArgs[e.To]
+			if srcArgs == "" && len(f.implArgs) > 0 {
+				srcArgs = csharpReceiverDeclaredArgs(g, e, f.ifaceName, receiverFieldTypes)
+			}
 			for _, member := range f.members {
 				// Skip the member the call already reaches — and the CALLER
 				// itself: a family member forwarding through its own
@@ -370,6 +411,16 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 				// binder's edge to mint, never this synthesizer's.
 				if member == e.To || member == e.From {
 					continue
+				}
+				// A site with known constructed args never fans into an
+				// implementor stamped with DIFFERENT args — they implement
+				// different constructed interfaces. Members without a stamp
+				// (the interface member itself, open generics, transitive
+				// implementors) always stay in.
+				if srcArgs != "" {
+					if ma := f.implArgs[member]; ma != "" && ma != srcArgs {
+						continue
+					}
 				}
 				k := csharpCallSiteKey(e.From, member, e.FilePath, e.Line)
 				if existing[k] || seen[k] {
@@ -570,6 +621,134 @@ func containsInt(xs []int, v int) bool {
 		}
 	}
 	return false
+}
+
+// csharpShortTypeName reduces a type node ID to its bare type name:
+// `file.cs::Ns.IBoxStore` → IBoxStore.
+func csharpShortTypeName(id string) string {
+	if i := strings.LastIndex(id, "::"); i >= 0 {
+		id = id[i+2:]
+	}
+	if i := strings.LastIndex(id, "."); i >= 0 {
+		id = id[i+1:]
+	}
+	return id
+}
+
+// csharpReceiverDeclaredArgs recovers the CLOSED type arguments a
+// through-interface call site's receiver declares, for the G9 gate:
+// `_store.Fetch(...)` on a field declared `IBoxStore<Crate> _store`
+// answers "Crate". Evidence-gated at every step — any absence answers ""
+// (never filter):
+//
+//   - the receiver name comes from the bound edge's own receiver_name
+//     meta, or from the extraction's unresolved companion edge for the
+//     SAME member name at the same site (the enrichment/LSP tiers bind a
+//     NEW edge and leave the companion, receiver evidence and all,
+//     alongside); a site the extractor marked receiver_ambiguous — two
+//     same-named calls on one line — contributes nothing;
+//   - the field is looked up on the caller's own type (bare receivers
+//     only — the exact shape the field-identifier emitter covers) and
+//     must actually be a field/constant node;
+//   - the arguments come from the extractor's field_type_args stamp,
+//     which already applied the open/closed rules (enclosing-chain type
+//     parameters, non-simple arguments) at the one place the full
+//     syntax context is visible — this pass never re-parses type text;
+//   - the field's declared type must still name THIS family's interface
+//     (short-name comparison against field_type — the one remaining
+//     name-based trust, see the caller).
+//
+// Typed LOCALS are a named remainder: the tenv strips generics before
+// receiver_type is stamped, so local-receiver sites keep the full
+// fan-out until the extractor carries local type arguments too.
+func csharpReceiverDeclaredArgs(g graph.Store, e *graph.Edge, ifaceName string, cache map[string]string) string {
+	if e == nil || e.From == "" {
+		return ""
+	}
+	cacheKey := e.From + "\x00" + e.FilePath + "\x00" + strconv.Itoa(e.Line) + "\x00" + ifaceName
+	if v, ok := cache[cacheKey]; ok {
+		return v
+	}
+	args := ""
+	if field := csharpReceiverField(g, e); field != nil {
+		ft, _ := field.Meta["field_type"].(string)
+		prefix := strings.TrimSpace(ft)
+		if lt := strings.Index(prefix, "<"); lt > 0 {
+			prefix = prefix[:lt]
+		}
+		if i := strings.LastIndex(prefix, "."); i >= 0 {
+			prefix = prefix[i+1:]
+		}
+		if prefix == ifaceName {
+			args, _ = field.Meta["field_type_args"].(string)
+		}
+	}
+	cache[cacheKey] = args
+	return args
+}
+
+// csharpReceiverField resolves the call site's receiver to a field (or
+// constant) node of the caller's own type, or nil when the receiver is
+// not an unambiguous bare same-type field.
+func csharpReceiverField(g graph.Store, e *graph.Edge) *graph.Node {
+	name := ""
+	if e.Meta != nil {
+		if amb, _ := e.Meta["receiver_ambiguous"].(bool); amb {
+			return nil
+		}
+		name, _ = e.Meta["receiver_name"].(string)
+	}
+	if name == "" {
+		// The bound edge (enrichment/LSP tiers) carries no receiver
+		// evidence; the extraction's unresolved companion for the same
+		// member name at the same site does. Match the member name so a
+		// different call sharing the line can never lend its receiver.
+		memberName := csharpShortTypeName(e.To)
+		companionTo := "unresolved::*." + memberName
+		for _, out := range g.GetOutEdges(e.From) {
+			if out == nil || out.Kind != graph.EdgeCalls || out.To != companionTo {
+				continue
+			}
+			if out.FilePath != e.FilePath || out.Line != e.Line || out.Meta == nil {
+				continue
+			}
+			if amb, _ := out.Meta["receiver_ambiguous"].(bool); amb {
+				return nil
+			}
+			if rn, _ := out.Meta["receiver_name"].(string); rn != "" {
+				name = rn
+				break
+			}
+		}
+	}
+	if name == "" || strings.ContainsAny(name, ".(") {
+		return nil
+	}
+	ownerID := csharpEnclosingTypeID(e.From)
+	if ownerID == "" {
+		return nil
+	}
+	field := g.GetNodesByIDs([]string{ownerID + "." + name})[ownerID+"."+name]
+	if field == nil || field.Meta == nil ||
+		(field.Kind != graph.KindField && field.Kind != graph.KindConstant) {
+		return nil
+	}
+	return field
+}
+
+// csharpEnclosingTypeID strips the member segment off a method node ID:
+// `file.cs::Flow.Pull` → `file.cs::Flow`. Empty when the ID carries no
+// member segment after the symbol separator.
+func csharpEnclosingTypeID(methodID string) string {
+	sep := strings.LastIndex(methodID, "::")
+	if sep < 0 {
+		return ""
+	}
+	dot := strings.LastIndex(methodID, ".")
+	if dot <= sep+2 {
+		return ""
+	}
+	return methodID[:dot]
 }
 
 func csharpResolveHierarchyTargetPrefetched(from *graph.Node, unresolvedTo string, byName map[string][]*graph.Node) string {

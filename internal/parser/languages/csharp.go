@@ -644,6 +644,31 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 	// already covered by emitCSharpBaseList, so it is not re-emitted here.
 	emitCSharpReferenceForms(root, src, filePath, fileID, result)
 
+	// Two same-named member calls on ONE line (`_a.Fetch(_b.Fetch(1))`)
+	// dedupe to a single stored edge — identical (from, to, kind, file,
+	// line) — carrying one arbitrary receiver's evidence. Mark those sites
+	// so no downstream consumer applies one receiver's typing to the other
+	// call's edge (the dispatch gate's receiver evidence in particular).
+	type csharpCallSite struct {
+		name string
+		line int
+	}
+	memberSiteReceiver := map[csharpCallSite]string{}
+	memberSiteAmbiguous := map[csharpCallSite]bool{}
+	for _, c := range calls {
+		if !c.isMember || c.receiver == "" {
+			continue
+		}
+		key := csharpCallSite{c.name, c.line}
+		if prev, ok := memberSiteReceiver[key]; ok {
+			if prev != c.receiver {
+				memberSiteAmbiguous[key] = true
+			}
+		} else {
+			memberSiteReceiver[key] = c.receiver
+		}
+	}
+
 	for _, c := range calls {
 		callerID := funcRanges.enclosing(c.line)
 		if callerID == "" {
@@ -700,6 +725,14 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 				// receiver. The extension binder needs that distinction
 				// before it can compare argument counts.
 				edge.Meta = map[string]any{"receiver_name": c.receiver}
+			}
+			// Stamped AFTER the receiver-evidence chain — every branch
+			// above assigns a fresh Meta map and would clobber it.
+			if memberSiteAmbiguous[csharpCallSite{c.name, c.line}] {
+				if edge.Meta == nil {
+					edge.Meta = map[string]any{}
+				}
+				edge.Meta["receiver_ambiguous"] = true
 			}
 			// Eviction restubs a member call to a bare unresolved name; the
 			// marker is what lets the resolver still route the rebind through
@@ -1445,6 +1478,11 @@ func (e *CSharpExtractor) emitField(m parser.QueryResult, filePath, fileID strin
 	fieldTypeRaw := csharpFieldDeclType(def.Node, src)
 	if fieldTypeRaw != "" {
 		meta["field_type"] = fieldTypeRaw
+		// Closed generic arguments of the declared type — the dispatch
+		// gate's receiver evidence (see csharp_base_type_args.go).
+		if args := csharpSimpleTypeArgsFromText(fieldTypeRaw, csharpUnstampableArgNames(def.Node, src)); args != "" {
+			meta["field_type_args"] = args
+		}
 	}
 	// A `const` field is a compile-time constant, not a mutable field —
 	// classify it as KindConstant so it joins the value-reference impact
@@ -1511,6 +1549,11 @@ func (e *CSharpExtractor) emitProperty(m parser.QueryResult, filePath, fileID st
 	if t := def.Node.ChildByFieldName("type"); t != nil {
 		propTypeRaw = strings.TrimSpace(t.Content(src))
 		meta["field_type"] = propTypeRaw
+		// Same closed-generic-arguments stamp fields carry (dispatch
+		// gate receiver evidence — csharp_base_type_args.go).
+		if args := csharpSimpleTypeArgsFromText(propTypeRaw, csharpUnstampableArgNames(def.Node, src)); args != "" {
+			meta["field_type_args"] = args
+		}
 	}
 	if doc := extractCSharpDoc(src, def.StartLine); doc != "" {
 		meta["doc"] = doc
@@ -1797,6 +1840,24 @@ func emitCSharpBaseList(typeID string, decl *sitter.Node, src []byte, filePath s
 	// the semantic engine applies), bypassing the discrimination below.
 	ifaceDecl := decl.Type() == "interface_declaration"
 	allowsBaseClass := csharpDeclAllowsBaseClass(decl)
+	// Names a base argument must never be compared by: type parameters of
+	// the declaring type AND every enclosing type (Relay<T> : IBoxStore<T>,
+	// or a type nested inside a generic outer), plus in-scope using
+	// aliases (opaque spellings).
+	declTypeParams := csharpUnstampableArgNames(decl, src)
+	// A base list closing the SAME erased target twice
+	// (Both : IBoxStore<Crate>, IBoxStore<Widget>) collapses to one stored
+	// edge — identical (from, to, kind, file, line) — so a stamp would
+	// arbitrarily keep one closure and suppress the other's implementors
+	// downstream. Count targets first; a repeated one stamps nothing.
+	baseNameCount := map[string]int{}
+	for i, _nc := 0, int(baseList.NamedChildCount()); i < _nc; i++ {
+		if entry := baseList.NamedChild(i); entry != nil {
+			if name, _ := csharpBaseTypeName(entry, src); name != "" {
+				baseNameCount[name]++
+			}
+		}
+	}
 	extendsTaken := false
 	for i, _nc := 0, int(baseList.NamedChildCount()); i < _nc; i++ {
 		entry := baseList.NamedChild(i)
@@ -1836,6 +1897,17 @@ func emitCSharpBaseList(typeID string, decl *sitter.Node, src []byte, filePath s
 		}
 		if fqn := csharpQualifiedTypeRef(raw); fqn != "" {
 			edge.Meta = map[string]any{"target_fqn": fqn}
+		}
+		// Closed generic arguments ride the edge so the dispatch fan-out
+		// can exclude type-impossible implementors — see the package doc
+		// in csharp_base_type_args.go for the conservative rules.
+		if baseNameCount[name] == 1 {
+			if args := csharpBaseTypeArgs(entry, src, declTypeParams); args != "" {
+				if edge.Meta == nil {
+					edge.Meta = map[string]any{}
+				}
+				edge.Meta["target_type_args"] = args
+			}
 		}
 		result.Edges = append(result.Edges, edge)
 	}
