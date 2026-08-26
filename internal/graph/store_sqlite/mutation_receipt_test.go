@@ -801,12 +801,21 @@ func TestSQLiteMutationReceiptEvictFilesCapturesExactFrontier(t *testing.T) {
 		From: "repo/keep.go::Keep", To: "repo/a.go::A", Kind: graph.EdgeCalls, FilePath: "keep.go", Line: 3,
 	}})
 
+	// Mirror the reindex composition: the surviving caller's edge is parked
+	// under an unresolved stub BEFORE the eviction, so no resolved incoming
+	// edge from a surviving source is deleted and the receipt can stay exact.
 	token := store.BeginMutationReceipt()
+	in := store.GetInEdgesByNodeIDs([]string{"repo/a.go::A"})
+	stub := in["repo/a.go::A"][0]
+	oldTo := stub.To
+	graph.StashRestubProvenance(stub)
+	stub.To = graph.UnresolvedMarker + "A"
+	store.ReindexEdges([]graph.EdgeReindex{{Edge: stub, OldTo: oldTo}})
 	nodes, edges := store.EvictFiles([]string{"a.go", "b.go"})
 	receipt := store.EndMutationReceipt(token)
 
-	if nodes != 2 || edges != 1 {
-		t.Fatalf("EvictFiles removed nodes=%d edges=%d, want 2/1", nodes, edges)
+	if nodes != 2 || edges != 0 {
+		t.Fatalf("EvictFiles removed nodes=%d edges=%d, want 2/0 (the restubbed edge no longer touches the doomed nodes)", nodes, edges)
 	}
 	if !receipt.Complete {
 		t.Fatalf("EvictFiles receipt incomplete (%q), want exact frontier: %+v", receipt.IncompleteReason, receipt)
@@ -877,4 +886,45 @@ func TestSQLiteMutationReceiptRestubWriteStaysOutOfUnresolvedFiles(t *testing.T)
 		t.Fatalf("restubbed caller file leaked into UnresolvedFiles (forward pass would demote its tier): %+v", receipt)
 	}
 	assertSQLiteReceiptContains(t, "target names", receipt.TargetNames, "A")
+}
+
+// SQLite twin: a bare eviction deleting a resolved incoming edge from a
+// surviving source fails the receipt closed, on every active window.
+func TestSQLiteMutationReceiptEvictSurvivingIncomingEdgeFailsClosed(t *testing.T) {
+	store := openMutationReceiptStore(t)
+	store.AddBatch([]*graph.Node{
+		{ID: "repo/a.go::A", Kind: graph.KindFunction, Name: "A", QualName: "pkg.A", FilePath: "a.go", RepoPrefix: "repo"},
+		{ID: "repo/keep.go::Keep", Kind: graph.KindFunction, Name: "Keep", FilePath: "keep.go", RepoPrefix: "repo"},
+	}, []*graph.Edge{{
+		From: "repo/keep.go::Keep", To: "repo/a.go::A", Kind: graph.EdgeCalls, FilePath: "keep.go", Line: 3,
+	}})
+
+	outer := store.BeginMutationReceipt()
+	inner := store.BeginMutationReceipt()
+	store.EvictFile("a.go")
+	store.AddNode(&graph.Node{ID: "repo/a.go::A", Kind: graph.KindFunction, Name: "A", QualName: "pkg.A", FilePath: "a.go", RepoPrefix: "repo"})
+	if receipt := store.EndMutationReceipt(inner); receipt.Complete {
+		t.Fatalf("inner receipt claimed complete over a deleted surviving caller edge: %+v", receipt)
+	}
+	if receipt := store.EndMutationReceipt(outer); receipt.Complete {
+		t.Fatalf("outer receipt claimed complete over a deleted surviving caller edge: %+v", receipt)
+	}
+}
+
+// SQLite twin of the non-referenceable case: a surviving file's import edge
+// to a doomed package node is deleted -- the receipt must not stay neutral.
+func TestSQLiteMutationReceiptEvictImportToNonreferenceableFailsClosed(t *testing.T) {
+	store := openMutationReceiptStore(t)
+	store.AddBatch([]*graph.Node{
+		{ID: "repo/a.go::pkg", Kind: graph.KindPackage, Name: "pkg", FilePath: "a.go", RepoPrefix: "repo"},
+		{ID: "repo/keep.go::Keep", Kind: graph.KindFunction, Name: "Keep", FilePath: "keep.go", RepoPrefix: "repo"},
+	}, []*graph.Edge{{
+		From: "repo/keep.go::Keep", To: "repo/a.go::pkg", Kind: graph.EdgeImports, FilePath: "keep.go",
+	}})
+
+	token := store.BeginMutationReceipt()
+	store.EvictFiles([]string{"a.go"})
+	if receipt := store.EndMutationReceipt(token); receipt.Complete {
+		t.Fatalf("receipt claimed complete over a deleted surviving import edge: %+v", receipt)
+	}
 }

@@ -80,23 +80,36 @@ func (s *Store) evictByPredicateResult(predicate string, arg any, exactReceipt b
 	// prepareSQLiteReindexReceiptTx makes for its identity read.
 	var receiptDelta *sqliteMutationReceiptAccumulator
 	if exactReceipt && s.hasActiveMutationReceiptsLocked() {
-		delta := newSQLiteMutationReceiptAccumulator()
-		rows, err := tx.QueryContext(ctx, `SELECT id, kind, name, qual_name, file_path FROM nodes WHERE `+predicate, arg)
-		if err == nil {
-			for rows.Next() {
-				var id, kind, name, qualName, filePath string
-				if err = rows.Scan(&id, &kind, &name, &qualName, &filePath); err != nil {
-					break
+		// A RESOLVED incoming edge from a surviving source is deleted by
+		// this eviction rather than parked under an unresolved stub, so no
+		// resolution pass can reconstruct it afterwards - no exact frontier
+		// exists and the receipt fails closed (receiptDelta stays nil). In
+		// the reindex composition restubIncomingRefs parks those edges
+		// first; their stub targets are not node IDs, so this probe finds
+		// nothing there and exactness is preserved.
+		survivorIncoming := true
+		probeErr := tx.QueryRowContext(ctx,
+			`SELECT EXISTS(SELECT 1 FROM edges WHERE to_id IN (SELECT id FROM nodes WHERE `+predicate+`) AND from_id NOT IN (SELECT id FROM nodes WHERE `+predicate+`))`,
+			arg, arg).Scan(&survivorIncoming)
+		if probeErr == nil && !survivorIncoming {
+			delta := newSQLiteMutationReceiptAccumulator()
+			rows, err := tx.QueryContext(ctx, `SELECT id, kind, name, qual_name, file_path FROM nodes WHERE `+predicate, arg)
+			if err == nil {
+				for rows.Next() {
+					var id, kind, name, qualName, filePath string
+					if err = rows.Scan(&id, &kind, &name, &qualName, &filePath); err != nil {
+						break
+					}
+					recordSQLiteEvictedNode(delta, id, kind, name, qualName, filePath)
 				}
-				recordSQLiteEvictedNode(delta, id, kind, name, qualName, filePath)
+				if err == nil {
+					err = rows.Err()
+				}
+				_ = rows.Close()
 			}
 			if err == nil {
-				err = rows.Err()
+				receiptDelta = delta
 			}
-			_ = rows.Close()
-		}
-		if err == nil {
-			receiptDelta = delta
 		}
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM semantic_binding_types WHERE `+predicate, arg); err != nil {
