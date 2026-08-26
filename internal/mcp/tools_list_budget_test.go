@@ -46,8 +46,12 @@ func serializeToolsList(t *testing.T, preset, mode string) (int, []string) {
 // growth, which had already eaten most of the diet slack. Measured after
 // the stamp: 96168 bytes. The assertion still bites on description
 // creep; the stamp is contract, not creep.
+//
+// Universal structured `view` publication adds a bounded per-tool schema
+// cost. Measured core cost is 97246 bytes; the rounded 97350 baseline keeps
+// sub-1% slack without hiding future growth.
 const (
-	corePresetBaselineBytes = 96500
+	corePresetBaselineBytes = 97350
 	fullPresetBaselineBytes = 289808
 )
 
@@ -79,7 +83,10 @@ const (
 // contract states what dispatch now surfaces — and read_file declared its
 // handler-honored max_chars option. Measured after both, on top of the
 // receipt/idempotency growth: 29313 bytes; ~390 bytes of slack.
-const agentPresetByteCeiling = 29700
+//
+// Re-based 29700 → 29900 for universal structured `view` publication.
+// Measured cost is 29832 bytes; the rounded margin remains below 1%.
+const agentPresetByteCeiling = 29900
 
 // localizationPresetByteCeiling is the hard budget for the diet
 // localization preset (the `localization` instruction profile's tool
@@ -97,7 +104,10 @@ const agentPresetByteCeiling = 29700
 // stamp (~27 bytes per tool) and read_file's max_chars declaration:
 // measured 21020 bytes, restoring ~300 bytes of slack the stamp had
 // eaten.
-const localizationPresetByteCeiling = 21350
+//
+// Re-based 21350 → 21450 for universal structured `view` publication.
+// Measured cost is 21389 bytes; the rounded margin remains below 1%.
+const localizationPresetByteCeiling = 21450
 
 // TestToolsListByteCeilings is the permanent measurement gate: it prints the
 // cold tools/list byte cost of every preset and asserts the agent preset

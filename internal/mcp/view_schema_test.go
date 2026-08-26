@@ -52,20 +52,22 @@ func TestViewSelectorPublishedOnEveryToolSchema(t *testing.T) {
 	require.Greater(t, len(legacyNames), 50, "conformance test must cover the registered legacy catalog")
 	for _, name := range legacyNames {
 		t.Run("legacy/"+name, func(t *testing.T) {
-			requirePublishedViewSelector(t, legacyTools[name].InputSchema.Properties)
+			require.Equal(t, compactViewSelectorSchema(), requirePublishedViewSelector(t, legacyTools[name].InputSchema.Properties))
 		})
 	}
 
 	for _, name := range facadeToolNames() {
 		t.Run("facade/"+name, func(t *testing.T) {
-			requirePublishedViewSelector(t, facadeToolDefinition(name).InputSchema.Properties)
+			require.Equal(t, compactViewSelectorSchema(), requirePublishedViewSelector(t, facadeToolDefinition(name).InputSchema.Properties))
 		})
 		for _, spec := range srv.facades.availableOperations(name) {
 			spec := spec
 			t.Run("capability/"+name+"."+spec.Operation, func(t *testing.T) {
 				capability := srv.facadeCapability(spec, true)
 				schema := facadeSchemaMapForTest(t, capability["input_schema"])
-				requirePublishedViewSelector(t, schema["properties"].(map[string]any))
+				published := requirePublishedViewSelector(t, schema["properties"].(map[string]any))
+				require.Len(t, published["oneOf"], 5, "capability must publish every selector shape")
+				require.Equal(t, facadeSchemaMapForTest(t, viewSelectorSchema()), facadeSchemaMapForTest(t, published))
 			})
 		}
 	}
@@ -77,7 +79,6 @@ func requirePublishedViewSelector(t testing.TB, properties map[string]any) map[s
 	require.True(t, published, "schema omitted the universal %q selector", viewArgName)
 	schema, ok := raw.(map[string]any)
 	require.True(t, ok, "schema published %q as %T", viewArgName, raw)
-	require.Len(t, schema["oneOf"], 5, "schema must publish auto, base, worktree, git_ref, and commit")
 	return schema
 }
 

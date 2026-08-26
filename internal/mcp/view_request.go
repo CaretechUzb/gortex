@@ -199,6 +199,7 @@ func viewSelectorSchema() map[string]any {
 		return schema
 	}
 	return map[string]any{
+		"type":        "object",
 		"description": "Select the graph view for this request; omit it (or use auto) to resolve from the session workspace.",
 		"oneOf": []any{
 			object(map[string]any{"kind": kind(string(graphview.SelectorAuto))}),
@@ -224,6 +225,12 @@ func viewSelectorSchema() map[string]any {
 	}
 }
 
+// compactViewSelectorSchema keeps tools/list bounded. The exact conditional
+// selector contract is available per operation through capabilities.
+func compactViewSelectorSchema() map[string]any {
+	return map[string]any{"type": "object"}
+}
+
 func publishViewSelectorSchema(tool *mcp.Tool) {
 	if tool == nil {
 		return
@@ -231,7 +238,7 @@ func publishViewSelectorSchema(tool *mcp.Tool) {
 	if tool.InputSchema.Properties == nil {
 		tool.InputSchema.Properties = make(map[string]any)
 	}
-	tool.InputSchema.Properties[viewArgName] = viewSelectorSchema()
+	tool.InputSchema.Properties[viewArgName] = compactViewSelectorSchema()
 }
 
 // takeViewSelector pulls the structured view argument off the request and
