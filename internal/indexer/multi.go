@@ -3134,6 +3134,16 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 			mi.ReconcileContractEdges()
 		}
 
+		// A full retrack stamped the freshness row itself; every other
+		// route leaves it at whatever the last full index recorded, so a
+		// repo whose HEAD advanced while the daemon was down stays
+		// "stale" in `gortex repos` even though this reconcile just
+		// proved the graph current. Runs once per reconcile, never on
+		// the watcher's per-save path.
+		if !result.FullRetrack {
+			idx.reconcileRepoIndexStateIfBehind(absPath)
+		}
+
 		mi.logger.Info("daemon: reconciled repo from snapshot",
 			zap.String("prefix", prefix),
 			zap.String("route", route),

@@ -101,6 +101,38 @@ func (idx *Indexer) reconcileRepoIndexState(rootAbs string) {
 	idx.persistRepoIndexState(nil, rootAbs, prevFP, nodes, edges)
 }
 
+// reconcileRepoIndexStateIfBehind restamps the freshness row when its
+// recorded SHA has fallen behind the working tree's HEAD, and does nothing
+// otherwise.
+//
+// The row has exactly two writers: a full (re)index, and the git watcher
+// when it observes a HEAD transition live. Commits that land while the
+// daemon is down fit neither. The files on disk then match their recorded
+// mtimes, so the next reconcile correctly finds nothing to reindex — and
+// the row keeps the SHA of the last full index forever, which is how
+// `gortex repos` came to report a repo stale whose graph was exactly
+// current.
+//
+// Callers must have just completed a reconcile: that pass is what proves
+// the graph reflects the working tree, and the working tree is at HEAD.
+// The probe is the cheap rev-parse, not repoHeadAndDirty — the `git status`
+// half is the slow one, and it is only needed on the restamp itself.
+func (idx *Indexer) reconcileRepoIndexStateIfBehind(rootAbs string) {
+	r, ok := graph.Store(idx.graph).(graph.RepoIndexStateReader)
+	if !ok {
+		return
+	}
+	prev, found, err := r.GetRepoIndexState(idx.repoPrefix)
+	if err != nil || !found {
+		return
+	}
+	head := repoHead(rootAbs)
+	if head == "" || head == prev.IndexedSHA {
+		return
+	}
+	idx.reconcileRepoIndexState(rootAbs)
+}
+
 // repoHeadAndDirty returns the working tree's current commit SHA and
 // whether it has uncommitted changes. Best-effort: a non-git directory or
 // any git error yields ("", false) — freshness provenance never blocks
