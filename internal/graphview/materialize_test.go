@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 )
 
@@ -19,8 +20,15 @@ const (
 // seedStackControlPlane installs the family, checkout and dedicated
 // graph a route hangs off. The route itself is left to each test, since
 // what a route points at is what most of them are about.
-func seedStackControlPlane(t *testing.T, store *store_sqlite.Store) {
+func seedStackControlPlane(t testing.TB, store *store_sqlite.Store, activeGenerations ...int64) {
 	t.Helper()
+	if len(activeGenerations) > 1 {
+		t.Fatalf("seedStackControlPlane: got %d active generations, want at most one", len(activeGenerations))
+	}
+	activeGeneration := int64(0)
+	if len(activeGenerations) == 1 {
+		activeGeneration = activeGenerations[0]
+	}
 	ctx := context.Background()
 	catalog := store.Catalog()
 	if err := catalog.UpsertRepositoryFamily(ctx, store_sqlite.RepositoryFamily{
@@ -51,11 +59,12 @@ func seedStackControlPlane(t *testing.T, store *store_sqlite.Store) {
 		t.Fatalf("UpsertCheckout: %v", err)
 	}
 	if err := catalog.UpsertDedicatedGraph(ctx, store_sqlite.DedicatedGraph{
-		GraphID:         testGraphID,
-		OwnerCheckoutID: testCheckoutID,
-		RepoPrefix:      stackRepo,
-		FamilyID:        testFamilyID,
-		State:           "graph_ready",
+		GraphID:            testGraphID,
+		OwnerCheckoutID:    testCheckoutID,
+		RepoPrefix:         stackRepo,
+		FamilyID:           testFamilyID,
+		ActiveGenerationID: activeGeneration,
+		State:              "graph_ready",
 	}); err != nil {
 		t.Fatalf("UpsertDedicatedGraph: %v", err)
 	}
@@ -64,7 +73,7 @@ func seedStackControlPlane(t *testing.T, store *store_sqlite.Store) {
 // routeStack points the checkout's route at a pair of generation slots.
 // A slot of 0 is an unset pointer, which is how a checkout with no
 // working-tree generation is routed.
-func routeStack(t *testing.T, store *store_sqlite.Store, commit, dirty int64, state store_sqlite.RouteState) {
+func routeStack(t testing.TB, store *store_sqlite.Store, commit, dirty int64, state store_sqlite.RouteState) {
 	t.Helper()
 	if err := store.Catalog().UpsertCheckoutRoute(context.Background(), store_sqlite.CheckoutRoute{
 		CheckoutID:         testCheckoutID,
@@ -91,6 +100,110 @@ func seedRoutedStack(t *testing.T, store *store_sqlite.Store) (commit, dirty int
 	seedStackControlPlane(t, store)
 	routeStack(t, store, commit, dirty, store_sqlite.RouteActive)
 	return commit, dirty
+}
+
+// writeStackBaseGeneration publishes a flat dedicated corpus. Every path is
+// claimed so generation-local search masks the stale shared corpus exactly as
+// graph reads do when the generation is used as a nonzero physical base.
+func writeStackBaseGeneration(t *testing.T, store *store_sqlite.Store) int64 {
+	t.Helper()
+	ctx := context.Background()
+	generationID, handle, err := store.BeginPayloadGeneration(ctx, store_sqlite.PayloadGenerationRequest{
+		OwnerKind:      "dedicated_graph",
+		GraphID:        testGraphID,
+		LayerID:        "layer-dedicated-base",
+		CheckoutID:     testCheckoutID,
+		GenerationKind: "dedicated",
+		TreeOID:        "tree-base",
+		CreatedAt:      500,
+	})
+	if err != nil {
+		t.Fatalf("BeginPayloadGeneration(base): %v", err)
+	}
+	seedStackCorpus(t, handle)
+	if err := handle.SetFileMasks([]store_sqlite.FileMask{
+		{RepoPrefix: stackRepo, FilePath: stackKeepFile, Mode: store_sqlite.OwnershipReplace},
+		{RepoPrefix: stackRepo, FilePath: stackDepFile, Mode: store_sqlite.OwnershipReplace},
+		{RepoPrefix: stackRepo, FilePath: stackEditFile, Mode: store_sqlite.OwnershipReplace},
+		{RepoPrefix: stackRepo, FilePath: stackGoneFile, Mode: store_sqlite.OwnershipReplace},
+	}); err != nil {
+		t.Fatalf("SetFileMasks(base): %v", err)
+	}
+	if err := store.PublishPayloadGeneration(ctx, generationID, 750); err != nil {
+		t.Fatalf("PublishPayloadGeneration(base): %v", err)
+	}
+	return generationID
+}
+
+func seedNonzeroBaseRoutedStack(t *testing.T, store *store_sqlite.Store) (base, commit, dirty int64) {
+	t.Helper()
+	seedStackCorpus(t, store)
+	// Poison an unchanged path in generation zero. A materializer that still
+	// hard-codes the shared corpus beneath the commit layer returns line 99;
+	// the dedicated base correctly returns line 5.
+	store.AddBatch([]*graph.Node{
+		stackSymbol(stackCallerID, "Caller", graph.KindFunction, stackDepFile, 99),
+	}, nil)
+	base = writeStackBaseGeneration(t, store)
+	commit = writeStackCommitGeneration(t, store, base)
+	dirty = writeStackDirtyGeneration(t, store, commit)
+	seedStackControlPlane(t, store, base)
+	routeStack(t, store, commit, dirty, store_sqlite.RouteActive)
+	return base, commit, dirty
+}
+
+// TestMaterializeCheckoutReadsNonzeroBaseAncestry compares the physical
+// base -> commit -> dirty stack with the same final graph indexed flat. The
+// existing fixture carries file overrides, a node tombstone, an edge-source
+// replacement, and a dirty override, so agreement covers every masking mode.
+func TestMaterializeCheckoutReadsNonzeroBaseAncestry(t *testing.T) {
+	store := openStackStore(t, "nonzero-base")
+	base, commit, dirty := seedNonzeroBaseRoutedStack(t, store)
+	flat := openStackStore(t, "nonzero-base-flat")
+	seedStackFlatCorpus(t, flat)
+
+	materializer := newTestMaterializer(store)
+	view, err := materializer.MaterializeCheckout(context.Background(), testCheckoutID)
+	if err != nil {
+		t.Fatalf("MaterializeCheckout: %v", err)
+	}
+	defer view.Close()
+
+	wantGenerations := []int64{base, commit, dirty}
+	if got := view.Generations(); !slicesEqualInt64(got, wantGenerations) {
+		t.Fatalf("Generations() = %v, want %v", got, wantGenerations)
+	}
+	sources := view.GenerationSources()
+	if len(sources) != len(wantGenerations) {
+		t.Fatalf("GenerationSources() has %d entries, want %d", len(sources), len(wantGenerations))
+	}
+	for index, want := range wantGenerations {
+		if sources[index].Generation != want {
+			t.Errorf("GenerationSources()[%d] = %d, want %d", index, sources[index].Generation, want)
+		}
+	}
+	if view.ID.BaseGeneration != commit {
+		t.Errorf("identity base generation = %d, want routed commit %d", view.ID.BaseGeneration, commit)
+	}
+	if got := view.Reader.GetNode(stackCallerID); got == nil || got.StartLine != 5 {
+		t.Fatalf("unchanged base node = %+v, want dedicated-base line 5", got)
+	}
+	if got := view.Reader.GetNode(stackStaleID); got != nil {
+		t.Fatalf("commit tombstone leaked node %+v", got)
+	}
+	assertReadersAgree(t, view.Reader, flat)
+}
+
+func slicesEqualInt64(left, right []int64) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 // TestMaterializeCheckoutReadsTheRoutedStack is the end-to-end: the
@@ -580,6 +693,102 @@ func TestMaterializeCheckoutLeaseBlocksRetirement(t *testing.T) {
 	}
 	if err := store.RetirePayloadGeneration(ctx, dirty, materializer.Leases.InUse); err != nil {
 		t.Fatalf("retire after Close: %v", err)
+	}
+}
+
+// TestMaterializeCheckoutLeasePinsNonzeroBase isolates the physical base
+// pin after catalog references have been removed. Retirement must still
+// refuse the base until the materialized view closes.
+func TestMaterializeCheckoutLeasePinsNonzeroBase(t *testing.T) {
+	ctx := context.Background()
+	store := openStackStore(t, "nonzero-base-lease")
+	base, commit, dirty := seedNonzeroBaseRoutedStack(t, store)
+	materializer := newTestMaterializer(store)
+	view, err := materializer.MaterializeCheckout(ctx, testCheckoutID)
+	if err != nil {
+		t.Fatalf("MaterializeCheckout: %v", err)
+	}
+	defer view.Close()
+
+	for _, generationID := range []int64{base, commit, dirty} {
+		if !materializer.Leases.InUse(generationID) {
+			t.Fatalf("generation %d is not leased", generationID)
+		}
+	}
+	deleteRoute(t, store)
+	deleteDedicatedGraph(t, store)
+	// Retire the upper layers without the lease callback solely to isolate the
+	// base pin. The view is not read again after its payload is dismantled.
+	if err := store.RetirePayloadGeneration(ctx, dirty, nil); err != nil {
+		t.Fatalf("retire dirty fixture: %v", err)
+	}
+	if err := store.RetirePayloadGeneration(ctx, commit, nil); err != nil {
+		t.Fatalf("retire commit fixture: %v", err)
+	}
+	if err := store.RetirePayloadGeneration(ctx, base, materializer.Leases.InUse); !errors.Is(err, store_sqlite.ErrPayloadGenerationInUse) {
+		t.Fatalf("retire leased base = %v, want %v", err, store_sqlite.ErrPayloadGenerationInUse)
+	}
+
+	view.Close()
+	if err := store.RetirePayloadGeneration(ctx, base, materializer.Leases.InUse); err != nil {
+		t.Fatalf("retire base after Close: %v", err)
+	}
+}
+
+// writeBenchmarkGeneration publishes an empty generation: the benchmark
+// measures catalog ancestry, pinning, and composition rather than fixture IO.
+func writeBenchmarkGeneration(t testing.TB, store *store_sqlite.Store, kind, layerID string, base int64) int64 {
+	t.Helper()
+	ctx := context.Background()
+	generationID, _, err := store.BeginPayloadGeneration(ctx, store_sqlite.PayloadGenerationRequest{
+		OwnerKind:        "dedicated_graph",
+		GraphID:          testGraphID,
+		LayerID:          layerID,
+		CheckoutID:       testCheckoutID,
+		GenerationKind:   kind,
+		BaseGenerationID: base,
+		TreeOID:          "tree-" + kind,
+		CreatedAt:        100,
+	})
+	if err != nil {
+		t.Fatalf("BeginPayloadGeneration(%s): %v", kind, err)
+	}
+	if err := store.PublishPayloadGeneration(ctx, generationID, 200); err != nil {
+		t.Fatalf("PublishPayloadGeneration(%s): %v", kind, err)
+	}
+	return generationID
+}
+
+func BenchmarkMaterializeCheckoutBaseGeneration(b *testing.B) {
+	for _, test := range []struct {
+		name        string
+		nonzeroBase bool
+	}{
+		{name: "generation0"},
+		{name: "nonzero_base", nonzeroBase: true},
+	} {
+		b.Run(test.name, func(b *testing.B) {
+			store := openStackStore(b, test.name)
+			base := int64(0)
+			if test.nonzeroBase {
+				base = writeBenchmarkGeneration(b, store, "dedicated", "bench-base", 0)
+			}
+			commit := writeBenchmarkGeneration(b, store, "commit", "bench-commit", base)
+			dirty := writeBenchmarkGeneration(b, store, "dirty", "bench-dirty", commit)
+			seedStackControlPlane(b, store, base)
+			routeStack(b, store, commit, dirty, store_sqlite.RouteActive)
+			materializer := newTestMaterializer(store)
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for iteration := 0; iteration < b.N; iteration++ {
+				view, err := materializer.MaterializeCheckout(context.Background(), testCheckoutID)
+				if err != nil {
+					b.Fatalf("MaterializeCheckout: %v", err)
+				}
+				view.Close()
+			}
+		})
 	}
 }
 

@@ -1044,7 +1044,7 @@ func (c *CheckoutCoordinator) resolveCommitLayer(
 	started := time.Now()
 	generationID, report, err := c.builder.BuildCommitLayer(ctx, CommitLayerRequest{
 		Identity:      identity,
-		Base:          c.store.AtGeneration(0),
+		Base:          c.store.AtGeneration(base.generationID),
 		RepoDir:       c.root,
 		BaseTreeOID:   base.treeOID,
 		TargetTreeOID: targetTree,
@@ -1246,7 +1246,7 @@ func (c *CheckoutCoordinator) reconcileDirtySlot(
 func (c *CheckoutCoordinator) buildDirtyLayerOver(
 	ctx context.Context, graphID string, commitGeneration int64,
 ) (int64, error) {
-	dirtyBase, err := c.commitLayerReader(commitGeneration)
+	dirtyBase, err := c.commitLayerReader(ctx, commitGeneration)
 	if err != nil {
 		return 0, err
 	}
@@ -1283,13 +1283,21 @@ func (c *CheckoutCoordinator) buildDirtyLayerOver(
 }
 
 // commitLayerReader is the reader a dirty-layer build computes its affected
-// closure against: the checkout's commit generation composed over the corpus.
-func (c *CheckoutCoordinator) commitLayerReader(commitGeneration int64) (LayerBase, error) {
+// closure against: the checkout's commit generation composed over the exact
+// base generation recorded in the catalog.
+func (c *CheckoutCoordinator) commitLayerReader(ctx context.Context, commitGeneration int64) (LayerBase, error) {
+	row, found, err := c.catalog.GetViewGeneration(ctx, commitGeneration)
+	if err != nil {
+		return nil, fmt.Errorf("indexer: read commit generation %d: %w", commitGeneration, err)
+	}
+	if !found || !servableGeneration(row.State) {
+		return nil, fmt.Errorf("indexer: commit generation %d is not servable", commitGeneration)
+	}
 	layer, err := graphview.NewGenerationLayer(c.store.AtGeneration(commitGeneration))
 	if err != nil {
 		return nil, fmt.Errorf("indexer: open commit generation %d: %w", commitGeneration, err)
 	}
-	corpus := c.store.AtGeneration(0)
+	corpus := c.store.AtGeneration(row.BaseGenerationID)
 	return commitLayerBase{
 		Reader: graph.NewOverlaidViewWithLayer(corpus, layer),
 		corpus: corpus,

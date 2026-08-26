@@ -82,9 +82,9 @@ type RepoView struct {
 	closeOnce   sync.Once
 }
 
-// Generations lists the payload generations this view holds a lease on,
-// bottom first: the commit generation, then the working-tree one when
-// the route named it.
+// Generations lists every payload generation this view holds a lease on,
+// bottom first: any dedicated base ancestry, the commit generation, then the
+// working-tree one when the route named it.
 func (v *RepoView) Generations() []int64 {
 	if v == nil {
 		return nil
@@ -95,9 +95,9 @@ func (v *RepoView) Generations() []int64 {
 }
 
 // GenerationSources lists the stack's generations bottom first, in the
-// order they compose: the commit generation, then the working-tree one
-// when the route named it. The indexed corpus underneath them is not in
-// the list — it is not a generation and the caller already reads it
+// order they compose: any dedicated base ancestry, the commit generation,
+// then the working-tree one when the route named it. Generation zero is not
+// in the list — it is the shared corpus and the caller already reads it
 // through its own handle.
 //
 // The sources are valid for as long as the view is: every handle is
@@ -212,16 +212,36 @@ func (m *Materializer) MaterializeCheckout(ctx context.Context, checkoutID strin
 // pinCheckoutRoute closes the gap between reading a route and leasing its
 // generations. A retirement can only pass its reference check after the route
 // moves; if that happened before these pins landed, the second read observes
-// the move and the caller retries without opening the old payload. If the route
-// is unchanged, the held pins make every later retirement attempt defer.
+// the move and the caller retries without opening the old payload. A provisional
+// pin protects the routed slots while their catalog ancestry is resolved; the
+// returned lease covers the whole base -> commit -> dirty chain.
 func (m *Materializer) pinCheckoutRoute(
 	ctx context.Context,
 	checkoutID string,
 	route store_sqlite.CheckoutRoute,
 	generations []int64,
 ) (*Lease, bool, error) {
-	lease := m.Leases.Acquire(generations...)
+	provisional := m.Leases.Acquire(generations...)
 	current, err := m.route(ctx, checkoutID)
+	if err != nil {
+		provisional.Release()
+		return nil, false, err
+	}
+	if current != route {
+		provisional.Release()
+		return nil, true, nil
+	}
+	ancestry, err := m.generationAncestry(ctx, generations)
+	if err != nil {
+		provisional.Release()
+		return nil, false, err
+	}
+	lease := m.Leases.Acquire(ancestry...)
+	provisional.Release()
+
+	// A route can move while ancestry is being resolved. Re-read it after the
+	// complete lease is held so the caller never opens a stale stack.
+	current, err = m.route(ctx, checkoutID)
 	if err != nil {
 		lease.Release()
 		return nil, false, err
@@ -231,6 +251,68 @@ func (m *Materializer) pinCheckoutRoute(
 		return nil, true, nil
 	}
 	return lease, false, nil
+}
+
+// pinGenerationAncestry closes the equivalent inspection gap for a ref view,
+// which has no checkout route to revalidate. Its requested generation is
+// provisionally pinned while the immutable BaseGenerationID chain is read.
+func (m *Materializer) pinGenerationAncestry(ctx context.Context, generations []int64) (*Lease, error) {
+	provisional := m.Leases.Acquire(generations...)
+	ancestry, err := m.generationAncestry(ctx, generations)
+	if err != nil {
+		provisional.Release()
+		return nil, err
+	}
+	lease := m.Leases.Acquire(ancestry...)
+	provisional.Release()
+	return lease, nil
+}
+
+// generationAncestry resolves the physical stack beneath the routed
+// generations. The first routed generation may sit on a dedicated full base;
+// later routed generations must form an exact chain above it.
+func (m *Materializer) generationAncestry(ctx context.Context, generations []int64) ([]int64, error) {
+	if len(generations) == 0 {
+		return nil, NewViewError(CodeViewBuilding, "the view has no generations")
+	}
+	ancestry := make([]int64, 0, len(generations)+1)
+	seen := make(map[int64]struct{}, len(generations)+1)
+	for generationID := generations[0]; generationID > 0; {
+		if _, duplicate := seen[generationID]; duplicate {
+			return nil, NewViewError(CodeViewBuilding,
+				fmt.Sprintf("generation ancestry contains a cycle at %d", generationID))
+		}
+		seen[generationID] = struct{}{}
+		row, err := m.servableGeneration(ctx, generationID)
+		if err != nil {
+			return nil, err
+		}
+		ancestry = append(ancestry, generationID)
+		generationID = row.BaseGenerationID
+	}
+	for left, right := 0, len(ancestry)-1; left < right; left, right = left+1, right-1 {
+		ancestry[left], ancestry[right] = ancestry[right], ancestry[left]
+	}
+
+	lower := generations[0]
+	for _, generationID := range generations[1:] {
+		if _, duplicate := seen[generationID]; duplicate {
+			return nil, NewViewError(CodeViewBuilding,
+				fmt.Sprintf("generation ancestry contains a cycle at %d", generationID))
+		}
+		row, err := m.servableGeneration(ctx, generationID)
+		if err != nil {
+			return nil, err
+		}
+		if row.BaseGenerationID != lower {
+			return nil, NewViewError(CodeViewBuilding, fmt.Sprintf(
+				"generation %d sits on %d, want %d", generationID, row.BaseGenerationID, lower))
+		}
+		seen[generationID] = struct{}{}
+		ancestry = append(ancestry, generationID)
+		lower = generationID
+	}
+	return ancestry, nil
 }
 
 // MaterializeRefView builds the view one ref-view generation serves.
@@ -268,7 +350,10 @@ func (m *Materializer) MaterializeRefView(
 		return nil, err
 	}
 	generations = []int64{generationID}
-	lease := m.Leases.Acquire(generations...)
+	lease, err := m.pinGenerationAncestry(ctx, generations)
+	if err != nil {
+		return nil, err
+	}
 	view, err = m.assemble(ctx, graphID, repoPrefix, generations, lease)
 	if err != nil {
 		lease.Release()
@@ -378,9 +463,10 @@ func (m *Materializer) repoPrefix(ctx context.Context, graphID string) (string, 
 // generations is the stack bottom first: the generation that names the
 // view's committed content, then any layer stacked over it — the
 // working-tree generation for a checkout, nothing at all for a ref view.
-// The bottom generation is composed onto the indexed corpus here and the
-// result is what ComposeRepoView receives as the base, so the identity's
-// base generation and the reader's base are the same content.
+// The routed commit generation remains the identity base. Its physical
+// BaseGenerationID ancestry is a storage concern: the oldest nonzero ancestor
+// is a flat dedicated corpus, any descendants compose above it, and all of them
+// are exposed and leased as generation sources.
 func (m *Materializer) assemble(
 	ctx context.Context,
 	graphID string,
@@ -388,25 +474,53 @@ func (m *Materializer) assemble(
 	generations []int64,
 	lease *Lease,
 ) (*RepoView, error) {
-	handles := make([]*store_sqlite.Store, 0, len(generations))
-	sources := make([]GenerationSource, 0, len(generations))
-
-	commitHandle, commitLayer, _, err := m.openGeneration(ctx, generations[0])
+	ancestry, err := m.generationAncestry(ctx, generations)
 	if err != nil {
 		return nil, err
 	}
-	handles = append(handles, commitHandle)
-	sources = append(sources, GenerationSource{
-		Generation: generations[0], Handle: commitHandle, Layer: commitLayer,
-	})
-	base := graph.NewOverlaidViewWithLayer(m.Store.AtGeneration(0), commitLayer)
+	routedStart := len(ancestry) - len(generations)
+	if routedStart < 0 {
+		return nil, NewViewError(CodeViewBuilding, "generation ancestry is incomplete")
+	}
+
+	handles := make([]*store_sqlite.Store, 0, len(ancestry))
+	sources := make([]GenerationSource, 0, len(ancestry))
+	open := func(generationID int64) (*store_sqlite.Store, *GenerationLayer, store_sqlite.ViewGeneration, error) {
+		handle, layer, row, openErr := m.openGeneration(ctx, generationID)
+		if openErr == nil {
+			handles = append(handles, handle)
+			sources = append(sources, GenerationSource{
+				Generation: generationID, Handle: handle, Layer: layer,
+			})
+		}
+		return handle, layer, row, openErr
+	}
+
+	var base graph.Reader = m.Store.AtGeneration(0)
+	firstOverlay := 0
+	if routedStart > 0 {
+		handle, _, _, err := open(ancestry[0])
+		if err != nil {
+			return nil, err
+		}
+		base = handle
+		firstOverlay = 1
+	}
+	for index := firstOverlay; index <= routedStart; index++ {
+		_, layer, _, err := open(ancestry[index])
+		if err != nil {
+			return nil, err
+		}
+		base = graph.NewOverlaidViewWithLayer(base, layer)
+	}
 
 	var (
 		layers    []graph.OverlayLayerReader
 		layerRefs []LayerRef
 	)
-	for _, generationID := range generations[1:] {
-		handle, layer, row, err := m.openGeneration(ctx, generationID)
+	for index := routedStart + 1; index < len(ancestry); index++ {
+		generationID := ancestry[index]
+		_, layer, row, err := open(generationID)
 		if err != nil {
 			return nil, err
 		}
@@ -414,10 +528,6 @@ func (m *Materializer) assemble(
 		if err != nil {
 			return nil, err
 		}
-		handles = append(handles, handle)
-		sources = append(sources, GenerationSource{
-			Generation: generationID, Handle: handle, Layer: layer,
-		})
 		layers = append(layers, layer)
 		layerRefs = append(layerRefs, ref)
 	}
@@ -438,7 +548,7 @@ func (m *Materializer) assemble(
 		ID:           id,
 		Reader:       reader,
 		Completeness: completeness,
-		generations:  generations,
+		generations:  ancestry,
 		sources:      sources,
 		lease:        lease,
 	}, nil

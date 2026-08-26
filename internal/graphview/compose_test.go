@@ -95,7 +95,7 @@ func stackFileMeta(path string, nodeCount int) graph.FileMetaRow {
 }
 
 // openStackStore opens an empty database for one test.
-func openStackStore(t *testing.T, name string) *store_sqlite.Store {
+func openStackStore(t testing.TB, name string) *store_sqlite.Store {
 	t.Helper()
 	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), name+".sqlite"))
 	if err != nil {
@@ -155,16 +155,24 @@ func seedStackCorpus(t *testing.T, store *store_sqlite.Store) {
 // the claims a file-granular layer cannot make: dep.go is masked by no
 // generation in the stack, yet one of its symbols moves and another
 // disappears.
-func writeStackCommitGeneration(t *testing.T, store *store_sqlite.Store) int64 {
+func writeStackCommitGeneration(t *testing.T, store *store_sqlite.Store, baseGenerations ...int64) int64 {
 	t.Helper()
+	if len(baseGenerations) > 1 {
+		t.Fatalf("writeStackCommitGeneration: got %d base generations, want at most one", len(baseGenerations))
+	}
+	baseGeneration := int64(0)
+	if len(baseGenerations) == 1 {
+		baseGeneration = baseGenerations[0]
+	}
 	generationID, handle, err := store.BeginPayloadGeneration(context.Background(), store_sqlite.PayloadGenerationRequest{
-		OwnerKind:      "dedicated_graph",
-		GraphID:        testGraphID,
-		LayerID:        stackCommitLayerID,
-		CheckoutID:     testCheckoutID,
-		GenerationKind: "commit",
-		TreeOID:        "tree-commit",
-		CreatedAt:      1000,
+		OwnerKind:        "dedicated_graph",
+		GraphID:          testGraphID,
+		LayerID:          stackCommitLayerID,
+		CheckoutID:       testCheckoutID,
+		GenerationKind:   "commit",
+		BaseGenerationID: baseGeneration,
+		TreeOID:          "tree-commit",
+		CreatedAt:        1000,
 	})
 	if err != nil {
 		t.Fatalf("BeginPayloadGeneration(commit): %v", err)

@@ -1197,6 +1197,74 @@ func TestCoordinatorCloseCancelsAnInFlightBuild(t *testing.T) {
 	})
 }
 
+// TestCommitLayerReaderUsesRecordedNonzeroBase pins the ancestry seam used by
+// dirty builds. An unchanged node must come from the commit generation's
+// catalog-recorded base, never from the shared generation-zero corpus.
+func TestCommitLayerReaderUsesRecordedNonzeroBase(t *testing.T) {
+	f := newCoordinatorFixture(t)
+	ctx := context.Background()
+	filePath := builderRepoPrefix + "/nonzero_base.go"
+	nodeID := filePath + "::BaseOnly"
+	nodeAt := func(line int) *graph.Node {
+		return &graph.Node{
+			ID:         nodeID,
+			Kind:       graph.KindFunction,
+			Name:       "BaseOnly",
+			FilePath:   filePath,
+			StartLine:  line,
+			EndLine:    line + 1,
+			Language:   "go",
+			RepoPrefix: builderRepoPrefix,
+		}
+	}
+
+	// Poison generation zero so the former hard-coded ancestry returns a
+	// deterministic wrong answer.
+	f.store.AddBatch([]*graph.Node{nodeAt(99)}, nil)
+	baseGeneration, baseHandle, err := f.store.BeginPayloadGeneration(ctx, store_sqlite.PayloadGenerationRequest{
+		OwnerKind:      checkoutLayerOwnerKind,
+		GraphID:        f.graphID,
+		LayerID:        "test-nonzero-base",
+		CheckoutID:     f.primaryID,
+		GenerationKind: "dedicated",
+		TreeOID:        "tree-nonzero-base",
+		CreatedAt:      1000,
+	})
+	if err != nil {
+		t.Fatalf("BeginPayloadGeneration(base): %v", err)
+	}
+	baseHandle.AddBatch([]*graph.Node{nodeAt(5)}, nil)
+	if err := f.store.PublishPayloadGeneration(ctx, baseGeneration, 1001); err != nil {
+		t.Fatalf("PublishPayloadGeneration(base): %v", err)
+	}
+
+	commitGeneration, _, err := f.store.BeginPayloadGeneration(ctx, store_sqlite.PayloadGenerationRequest{
+		OwnerKind:        checkoutLayerOwnerKind,
+		GraphID:          f.graphID,
+		LayerID:          "test-commit-over-nonzero-base",
+		CheckoutID:       f.checkoutID,
+		GenerationKind:   CommitLayerGenerationKind,
+		BaseGenerationID: baseGeneration,
+		TreeOID:          "tree-commit-over-nonzero-base",
+		CreatedAt:        1002,
+	})
+	if err != nil {
+		t.Fatalf("BeginPayloadGeneration(commit): %v", err)
+	}
+	if err := f.store.PublishPayloadGeneration(ctx, commitGeneration, 1003); err != nil {
+		t.Fatalf("PublishPayloadGeneration(commit): %v", err)
+	}
+
+	coordinator := &CheckoutCoordinator{store: f.store, catalog: f.catalog}
+	reader, err := coordinator.commitLayerReader(ctx, commitGeneration)
+	if err != nil {
+		t.Fatalf("commitLayerReader: %v", err)
+	}
+	if got := reader.GetNode(nodeID); got == nil || got.StartLine != 5 {
+		t.Fatalf("unchanged node = %+v, want catalog-recorded base line 5", got)
+	}
+}
+
 // --- the composed view --------------------------------------------------
 
 // coordinatorComposedReader stacks a checkout's two routed generations exactly
