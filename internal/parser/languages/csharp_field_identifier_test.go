@@ -84,3 +84,132 @@ func TestCSharpExtractor_FieldIdentifierUses(t *testing.T) {
 		}
 	}
 }
+
+// Field reads INSIDE lambda bodies. The original production miss that
+// motivated the field-identifier emitter reproduced with the field read
+// sitting inside a `() => { ... }` block lambda in a dictionary
+// initializer assigned in the constructor — post-fix, that exact shape
+// still answered zero edges. Pin both lambda positions: a block lambda
+// inside a collection-initializer entry (the production shape) and a
+// plain expression lambda in an ordinary method. The edge's owner is the
+// enclosing DECLARED member (ctor/method) — lambdas don't mint owners of
+// their own.
+func TestCSharpExtractor_FieldIdentifierUsesInsideLambdas(t *testing.T) {
+	src := []byte(`namespace App {
+    public class Store {
+        public int Read(Func<int, bool> f) { return 1; }
+    }
+    public class Reporter {
+        private readonly Store _lookup;
+        private readonly Dictionary<string, Func<string>> _tags;
+
+        public Reporter(Store lookup) {
+            _lookup = lookup;
+            _tags = new Dictionary<string, Func<string>>
+            {
+                { "A", () =>
+                    {
+                        var item = _lookup.Read(x => x > 0);
+                        return item.ToString();
+                    }
+                },
+            };
+        }
+
+        public int Direct() {
+            return _lookup.Read(x => x > 2);
+        }
+    }
+}
+`)
+	e := NewCSharpExtractor()
+	result, err := e.Extract("Reporter.cs", src)
+	require.NoError(t, err)
+
+	// The ctor owns two _lookup edges: the assignment write and the read
+	// from inside the initializer entry's block lambda.
+	ctor := accessEdges(result.Edges, "Reporter.cs::Reporter.<init>", "_lookup")
+	require.Len(t, ctor, 2, "ctor: assignment write + block-lambda call-receiver read")
+	kinds := map[graph.EdgeKind]int{}
+	for _, ed := range ctor {
+		kinds[ed.Kind]++
+	}
+	assert.Equal(t, 1, kinds[graph.EdgeWrites], "the `_lookup = lookup` assignment")
+	assert.Equal(t, 1, kinds[graph.EdgeReads], "the read inside the block lambda")
+
+	// An expression lambda argument does not swallow the receiving
+	// field's read in an ordinary method either.
+	direct := accessEdges(result.Edges, "Reporter.cs::Reporter.Direct", "_lookup")
+	require.Len(t, direct, 1, "expression-lambda argument: the field is still the call receiver")
+	assert.Equal(t, graph.EdgeReads, direct[0].Kind)
+}
+
+// fieldEdgesTo filters a result's EdgeReads/EdgeWrites by the unresolved
+// field name alone, owner-agnostic — for constructor shapes whose owner
+// IDs are the variable under test.
+func fieldEdgesTo(edges []*graph.Edge, name string) []*graph.Edge {
+	var out []*graph.Edge
+	for _, ed := range edges {
+		if ed.Kind != graph.EdgeReads && ed.Kind != graph.EdgeWrites {
+			continue
+		}
+		if ed.To == "unresolved::*."+name {
+			out = append(out, ed)
+		}
+	}
+	return out
+}
+
+// Constructor-shape coverage beyond the classic block-bodied instance
+// ctor: expression-bodied ctors, static ctors, and C# 12 primary
+// constructors all put field writes/reads in positions the emitter must
+// still own. Each class isolates one shape with its own field name so a
+// miss identifies itself.
+func TestCSharpExtractor_FieldIdentifierUsesAcrossCtorShapes(t *testing.T) {
+	src := []byte(`namespace App {
+    public class Store {
+        public void Add(int n) { }
+    }
+
+    public class ExprCtor {
+        private Store _expr;
+        public ExprCtor(Store s) => _expr = s;
+    }
+
+    public class StaticCtor {
+        private static Store _shared;
+        static StaticCtor() { _shared = new Store(); }
+        public void Use() { _shared.Add(1); }
+    }
+
+    public class Primary(Store s) {
+        private readonly Store _prim = s;
+        public void Use() { _prim.Add(2); }
+    }
+}
+`)
+	e := NewCSharpExtractor()
+	result, err := e.Extract("Ctors.cs", src)
+	require.NoError(t, err)
+
+	// Expression-bodied ctor: `=> _expr = s` writes the field.
+	expr := fieldEdgesTo(result.Edges, "_expr")
+	require.Len(t, expr, 1, "expression-bodied ctor assignment is one write")
+	assert.Equal(t, graph.EdgeWrites, expr[0].Kind)
+
+	// Static ctor write + ordinary static-field read.
+	shared := fieldEdgesTo(result.Edges, "_shared")
+	require.Len(t, shared, 2, "static-ctor write + Use() call-receiver read")
+	sharedKinds := map[graph.EdgeKind]int{}
+	for _, ed := range shared {
+		sharedKinds[ed.Kind]++
+	}
+	assert.Equal(t, 1, sharedKinds[graph.EdgeWrites])
+	assert.Equal(t, 1, sharedKinds[graph.EdgeReads])
+
+	// Primary-ctor class: the field is still usable from methods (the
+	// `= s` initializer itself is the declaration, not a tracked write).
+	prim := fieldEdgesTo(result.Edges, "_prim")
+	require.Len(t, prim, 1, "primary-ctor class: method call-receiver read")
+	assert.Equal(t, graph.EdgeReads, prim[0].Kind)
+}
