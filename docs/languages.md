@@ -11,7 +11,7 @@ Three engine tiers are used, in order of decreasing extraction depth:
   symbols, resolved call edges, ORM/contract/dataflow extraction, and accurate
   node ranges. Languages: Go, TypeScript, JavaScript, Python, Rust, Java, C#,
   Kotlin, Swift, Scala, PHP, Ruby, Elixir, C, C++, Dart, OCaml, Lua, Bash, SQL,
-  HTML, CSS, Markdown, OrgMode, Protobuf, YAML, TOML, HCL, Dockerfile.
+  HTML, CSS, Markdown, OrgMode, Protobuf, YAML, TOML, HCL, Dockerfile, Julia.
 - **regex** (~60 languages) — pattern-matched line scanning with indent / brace /
   keyword block heuristics. Captures top-level symbols and imports; call edges
   vary per language. Used where no upstream tree-sitter grammar is available
@@ -84,6 +84,7 @@ on interface nodes stores the expected method set for implementation matching.
 | Dart | Full | Full | Classes/Enums/Mixins/Extensions | Abstract interface | Full | Full | Full |
 | OCaml | Full | Full (class) | Types/Modules | Module types | open | Full | Full |
 | Lua | Full | Full (M.func/M:method) | - | - | require() | Full | Full |
+| Julia | Full (long + short form, `where` syntax) | Full (qualified `Base.show`, operators) | Structs/abstract/primitive + fields | - | Full (`using`/`import`/`include`, selective lists) | Full (incl. broadcast, macro calls) | `const` |
 
 ### Rust specifics
 
@@ -107,6 +108,27 @@ exports (`#[no_mangle]`, `#[wasm_bindgen]`, pyo3, napi). Declarations inside an
 language, so a missing definition is not a missing implementation.
 
 Recent extraction refinements (each covered by a per-feature CI golden): Java `@interface` annotation types index as interfaces and participate in implementation matching; Java `new T(){…}` and C# `new { … }` anonymous classes/types become synthetic type nodes with an `extends` edge (to the instantiated type, or to `object` for C#); JS/TS arrow-valued class fields (`x = () => {…}`) are emitted as callable methods; JS/TS named imports emit one `imports` edge per binding (alias-aware via `Edge.Alias`) and barrel re-exports emit `re_exports` edges; JS/TS cross-file imports resolve onto the target file/symbol for relative specifiers (`./x`, `../x`) and for `tsconfig.json` / `jsconfig.json` `compilerOptions.paths` / `baseUrl` path aliases (`@/lib/x`), so callers / usages / blast-radius span aliased imports the same as relative ones; chained / factory-call receivers (`New().Build()`) carry an inferred `receiver_type`. See [features.md](features.md) and [architecture.md](architecture.md) for the edge semantics.
+
+### Julia specifics
+
+`module` / `baremodule` index as `KindType` nodes (the graph's `KindModule`
+is reserved for ecosystem packages) and carry the module's `export` list in
+`Meta["exports"]`; definitions inside a module get `member_of` edges to it.
+Qualified method definitions (`function Base.show(...)`, `function Base.:+`)
+become `KindMethod` with `Meta["receiver"]`, mirroring the Lua `M.func`
+convention. Struct fields are `KindField` nodes with `member_of` into the
+struct; supertypes (`struct X <: Y`) emit `extends` edges with the full
+right-hand path in `Meta["base_path"]` (python extractor convention).
+
+`using M: a, b` / `import M as Alias` keep the module as the import target
+with the selected names / alias in the edge `Meta` for the resolver; all
+imports including `include("file.jl")` target `unresolved::import::<path>`.
+Calls attribute to the enclosing function-like definition (long form, short
+form, macro, or nested closure) and cover qualified (`Mod.f`) and broadcast
+(`f.(x)`, `Meta["broadcast"]`) callees plus macro invocations
+(`Meta["macro"]`). Operator calls (`a + b`) are not emitted — dispatch on
+operators is not statically attributable. Docstrings (preceding string
+literal or first body statement) attach as `Meta["doc"]`.
 
 ## Data, config, build
 
@@ -188,7 +210,6 @@ What is **not** covered:
 
 | Language | Extensions | What it extracts |
 |----------|------------|------------------|
-| Julia | `.jl` | `function`, `struct`, `module`, `using` / `import` |
 | R | `.r`, `.R` | Function defs; `library` / `require` / `source` |
 | MATLAB | `.mlx` | `function` (end-terminated), `classdef`, `import a.b.c` |
 | Mathematica | `.wl`, `.wls`, `.nb` | `name[args_] := body`, `SetDelayed`, `Get[…]` / `Needs[…]` |
