@@ -210,6 +210,7 @@ func facadeToolDefinitionWithOperations(name string, operations []string) mcpgo.
 	if property, ok := tool.InputSchema.Properties[discriminator].(map[string]any); ok && len(operations) > 0 {
 		property["enum"] = append([]string(nil), operations...)
 	}
+	publishViewSelectorSchema(&tool)
 	return tool
 }
 

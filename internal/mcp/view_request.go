@@ -166,8 +166,8 @@ func (s *Server) Materializer() *graphview.Materializer {
 }
 
 // viewArgName is the request-level argument every tool honours. It is read
-// and stripped by the request middleware, so no handler sees it and no tool
-// schema has to declare it.
+// and stripped by the request middleware, so no handler sees it. The shared
+// schema below publishes that middleware contract on every tool surface.
 const viewArgName = "view"
 
 // viewSelectorFields are the object keys a view argument may carry. Anything
@@ -175,6 +175,63 @@ const viewArgName = "view"
 // selector field would silently answer about a different view.
 var viewSelectorFields = map[string]bool{
 	"kind": true, "graph_id": true, "checkout_id": true, "value": true,
+}
+
+// viewSelectorSchema is the single public schema for the request-level view
+// selector. Each branch mirrors ParseSelector's field ownership, so clients
+// can construct a valid selector without guessing which identifiers combine.
+func viewSelectorSchema() map[string]any {
+	kind := func(value string) map[string]any {
+		return map[string]any{"type": "string", "const": value}
+	}
+	text := func(description string) map[string]any {
+		return map[string]any{"type": "string", "minLength": 1, "description": description}
+	}
+	object := func(properties map[string]any, required ...string) map[string]any {
+		schema := map[string]any{
+			"type":                 "object",
+			"properties":           properties,
+			"additionalProperties": false,
+		}
+		if len(required) > 0 {
+			schema["required"] = required
+		}
+		return schema
+	}
+	return map[string]any{
+		"description": "Select the graph view for this request; omit it (or use auto) to resolve from the session workspace.",
+		"oneOf": []any{
+			object(map[string]any{"kind": kind(string(graphview.SelectorAuto))}),
+			object(map[string]any{
+				"kind":     kind(string(graphview.SelectorBase)),
+				"graph_id": text("Dedicated graph identifier."),
+			}, "kind", "graph_id"),
+			object(map[string]any{
+				"kind":        kind(string(graphview.SelectorWorktree)),
+				"checkout_id": text("Registered checkout identifier."),
+			}, "kind", "checkout_id"),
+			object(map[string]any{
+				"kind":     kind(string(graphview.SelectorGitRef)),
+				"graph_id": text("Optional dedicated graph identifier."),
+				"value":    text("Full ref name, for example refs/heads/main."),
+			}, "kind", "value"),
+			object(map[string]any{
+				"kind":     kind(string(graphview.SelectorCommit)),
+				"graph_id": text("Optional dedicated graph identifier."),
+				"value":    text("Full lowercase Git object identifier."),
+			}, "kind", "value"),
+		},
+	}
+}
+
+func publishViewSelectorSchema(tool *mcp.Tool) {
+	if tool == nil {
+		return
+	}
+	if tool.InputSchema.Properties == nil {
+		tool.InputSchema.Properties = make(map[string]any)
+	}
+	tool.InputSchema.Properties[viewArgName] = viewSelectorSchema()
 }
 
 // takeViewSelector pulls the structured view argument off the request and

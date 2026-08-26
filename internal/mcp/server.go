@@ -3191,6 +3191,9 @@ func (s *Server) prepareTool(tool *mcp.Tool, handler server.ToolHandlerFunc) ser
 	// the full semantics live once in the server instructions legend. Runs
 	// before the split so deferred tools carry the compact schema too.
 	compactSharedToolParams(tool)
+	// View selection is handled and stripped by universal request middleware,
+	// but it is still part of every callable tool's public input contract.
+	publishViewSelectorSchema(tool)
 	// #597: dispatch reads only the keys it knows, so an unknown option
 	// used to vanish silently — the caller paid the full un-windowed
 	// response with no signal to self-correct. Close any structured schema
