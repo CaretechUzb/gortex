@@ -261,10 +261,22 @@ func TestRenderRestoresUnsetEnvironment(t *testing.T) {
 func TestNormalizeRenderScrubsTheSlashSpelledPath(t *testing.T) {
 	home := filepath.Join(string(filepath.Separator)+"sandbox", "home")
 	root := filepath.Join(string(filepath.Separator)+"sandbox", "repo")
+	exe := filepath.Join(string(filepath.Separator)+"tools", "bin", "gortex")
+
+	// The binary path is the third thing normalizeRender scrubs, and the
+	// one an adapter is most likely to have written through
+	// shellSafeHookBinary. Pinning gortexBinaryPaths keeps the assertion
+	// about the scrub rather than about whatever gortex happens to be
+	// installed on the machine running the test. No test in this package
+	// calls t.Parallel, so the swap cannot race one.
+	restore := gortexBinaryPaths
+	t.Cleanup(func() { gortexBinaryPaths = restore })
+	gortexBinaryPaths = func() []string { return []string{exe} }
 
 	// The body is what a renderer emits: forward slashes, whatever the OS.
 	body := "@" + filepath.ToSlash(home) + "/.gortex/instructions/active.md\n" +
-		"root=" + filepath.ToSlash(root) + "\n"
+		"root=" + filepath.ToSlash(root) + "\n" +
+		`"command": "` + filepath.ToSlash(exe) + ` hook"` + "\n"
 
 	got := normalizeRender(body, home, root)
 
@@ -274,7 +286,14 @@ func TestNormalizeRenderScrubsTheSlashSpelledPath(t *testing.T) {
 	if !strings.Contains(got, "root=$ROOT") {
 		t.Errorf("the slash-spelled root survived normalizeRender:\n%s", got)
 	}
-	if strings.Contains(got, filepath.ToSlash(home)) || strings.Contains(got, filepath.ToSlash(root)) {
-		t.Errorf("a machine-specific absolute is still in the manifest:\n%s", got)
+	if !strings.Contains(got, `"command": "gortex hook"`) {
+		t.Errorf("the slash-spelled executable survived normalizeRender:\n%s", got)
+	}
+	for _, leaked := range []string{
+		filepath.ToSlash(home), filepath.ToSlash(root), filepath.ToSlash(exe),
+	} {
+		if strings.Contains(got, leaked) {
+			t.Errorf("machine-specific absolute %q is still in the manifest:\n%s", leaked, got)
+		}
 	}
 }
