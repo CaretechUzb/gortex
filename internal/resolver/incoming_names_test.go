@@ -1,6 +1,7 @@
 package resolver
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -88,5 +89,31 @@ func TestResolveIncomingForNamesAmbiguousWildcardStaysUnresolved(t *testing.T) {
 
 	if !graph.IsUnresolvedTarget(pending.To) {
 		t.Fatalf("ambiguous member reference bound to %q, must stay parked", pending.To)
+	}
+}
+
+// The receipt consumers call the names pass on every apply, usually with no
+// pending edge parked under any requested name. That call must cost a probe,
+// not a graph-wide index build - this benchmark is the regression guard for
+// the probe-first fast path.
+func BenchmarkResolveIncomingForNamesNoPending(b *testing.B) {
+	g := graph.New()
+	nodes := make([]*graph.Node, 0, 2000)
+	for i := 0; i < 2000; i++ {
+		nodes = append(nodes, &graph.Node{
+			ID:         fmt.Sprintf("repo/f%d.go::Fn%d", i, i),
+			Kind:       graph.KindFunction,
+			Name:       fmt.Sprintf("Fn%d", i),
+			FilePath:   fmt.Sprintf("repo/f%d.go", i),
+			RepoPrefix: "repo",
+			Language:   "go",
+		})
+	}
+	g.AddBatch(nodes, nil)
+	r := New(g)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		r.ResolveIncomingForNames([]string{"NoSuchName"}, []string{"repo"})
 	}
 }

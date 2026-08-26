@@ -2914,9 +2914,6 @@ func (r *Resolver) ResolveIncomingForNames(names, repoPrefixes []string) *Resolv
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	clear := r.buildPassIndexes()
-	defer clear()
-
 	seen := make(map[string]struct{}, len(names))
 	var stubKeys []string
 	appendKeys := func(keys []string) {
@@ -2942,6 +2939,28 @@ func (r *Resolver) ResolveIncomingForNames(names, repoPrefixes []string) *Resolv
 	if len(stubKeys) == 0 {
 		return stats
 	}
+	// Probe the pending buckets before paying for the pass indexes: the
+	// receipt consumers call this on every apply, and the common case is
+	// that no edge is parked under any requested name. buildPassIndexes is
+	// graph-wide (it scales with the store, not with the request), so a
+	// no-work call must cost one bounded read instead.
+	pending := false
+	for _, edges := range r.graph.GetInEdgesByNodeIDs(stubKeys) {
+		for _, edge := range edges {
+			if edge != nil && graph.IsUnresolvedTarget(edge.To) {
+				pending = true
+				break
+			}
+		}
+		if pending {
+			break
+		}
+	}
+	if !pending {
+		return stats
+	}
+	clear := r.buildPassIndexes()
+	defer clear()
 	r.resolveIncomingStubKeysLocked(stubKeys, stats)
 	return stats
 }
