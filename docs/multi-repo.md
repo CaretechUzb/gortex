@@ -229,6 +229,15 @@ incomplete until the row goes quiet. A burst of tracks — `gortex daemon
 reload` adopting several repos — collapses into a bounded number of passes
 rather than one per repository.
 
+The pass holds the gates a repository mutation needs, so it yields to one
+rather than making it wait: a `track`, an `untrack`, a batch transition, or
+a daemon shutdown arriving mid-derivation cancels it at the next pass
+boundary and it re-runs afterwards. `daemon status` keeps reporting
+`deriving workspace edges` across the handover. Without that a single
+`gortex untrack` issued during a derivation waited the whole pass out —
+19.7 minutes on a two-repository workspace, with `gortex daemon stop`
+having to force-kill.
+
 ### Deleted checkouts
 
 Tracking outlives the directory: nothing removes a repo entry when you

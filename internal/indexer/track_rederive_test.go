@@ -172,3 +172,189 @@ func TestScheduleWorkspaceRederive_RequeuesWorkArrivingMidPass(t *testing.T) {
 	mi.rederive.mu.Unlock()
 	assert.True(t, queued, "the arriving track must be queued for another pass")
 }
+
+const (
+	rederiveDoneLog        = "workspace derivation complete (post-track)"
+	globalPassesDoneLog    = "global passes complete"
+	globalPassesAbortedLog = "global passes preempted"
+)
+
+// installFakeInFlightRederive puts the scheduler into the state a real
+// pass holds: running, cancellable, and owning the batch-transition write
+// side. The goroutine releases the gate only when its context is
+// cancelled, which is exactly the stall a topology mutation used to sit
+// behind. Returns a func the test can use to observe that it unwound.
+func installFakeInFlightRederive(t *testing.T, mi *MultiIndexer) (released <-chan struct{}) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+
+	s := &mi.rederive
+	s.mu.Lock()
+	s.running = true
+	s.cancel = cancel
+	s.wg.Add(1)
+	s.mu.Unlock()
+
+	started := make(chan struct{})
+	go func() {
+		defer s.wg.Done()
+		defer close(done)
+		mi.batchMutationGate.Lock()
+		close(started)
+		<-ctx.Done()
+		mi.batchMutationGate.Unlock()
+		s.mu.Lock()
+		s.running = false
+		s.cancel = nil
+		s.mu.Unlock()
+	}()
+	<-started
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	return done
+}
+
+// The regression. UntrackRepo takes the batch-transition read side and the
+// reachability topology writer, both of which a background derivation
+// holds for its whole run. Before preemption an untrack issued during one
+// waited the pass out — 19.7 minutes on a two-repo workspace, and
+// `daemon stop` had to force-kill. It must now stand the pass down first.
+func TestUntrackRepo_PreemptsWorkspaceDerivation(t *testing.T) {
+	repo := setupRepoWithTestAndIface(t, "repo-a")
+	mi, _ := newRederiveTestIndexer(t, 0)
+
+	_, err := mi.TrackRepoCtx(context.Background(), config.RepoEntry{Path: repo, Name: "repo-a"})
+	require.NoError(t, err)
+	mi.WaitWorkspaceRederive()
+
+	released := installFakeInFlightRederive(t, mi)
+
+	untracked := make(chan struct{})
+	go func() {
+		mi.UntrackRepo("repo-a")
+		close(untracked)
+	}()
+
+	select {
+	case <-untracked:
+	case <-time.After(10 * time.Second):
+		t.Fatal("UntrackRepo blocked behind the in-flight workspace derivation")
+	}
+	select {
+	case <-released:
+	case <-time.After(time.Second):
+		t.Fatal("the derivation was never cancelled")
+	}
+
+	mi.rederive.mu.Lock()
+	queued := mi.rederive.queued
+	mi.rederive.mu.Unlock()
+	assert.True(t, queued,
+		"the abandoned derivation is still owed to the graph and must be re-queued")
+}
+
+// A batch transition takes the same write side, so it needs the same
+// courtesy — otherwise a reload issued mid-derivation stalls the daemon.
+func TestBeginBatch_PreemptsWorkspaceDerivation(t *testing.T) {
+	mi, _ := newRederiveTestIndexer(t, 0)
+	released := installFakeInFlightRederive(t, mi)
+
+	begun := make(chan struct{})
+	go func() {
+		mi.BeginBatch()
+		close(begun)
+	}()
+
+	select {
+	case <-begun:
+	case <-time.After(10 * time.Second):
+		t.Fatal("BeginBatch blocked behind the in-flight workspace derivation")
+	}
+	<-released
+}
+
+// Close must cancel the pass, not wait for it. Waiting is what made
+// `daemon stop` take 153s and then force-kill.
+func TestStopWorkspaceRederive_CancelsInsteadOfWaiting(t *testing.T) {
+	mi, _ := newRederiveTestIndexer(t, 0)
+	installFakeInFlightRederive(t, mi)
+
+	stopped := make(chan struct{})
+	go func() {
+		mi.stopWorkspaceRederive()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(10 * time.Second):
+		t.Fatal("stopWorkspaceRederive waited for the pass instead of cancelling it")
+	}
+
+	assert.False(t, mi.WorkspaceRederivePending())
+	mi.scheduleWorkspaceRederive("repo-a")
+	mi.WaitWorkspaceRederive()
+	assert.False(t, mi.WorkspaceRederivePending(),
+		"a closed scheduler must refuse new passes")
+}
+
+// The boundary that makes preemption work at all: the global passes have
+// to observe the cancelled context, or cancelling only sets a flag nobody
+// reads and the gates stay held to the end.
+func TestRunGlobalGraphPasses_ReturnsAtFirstBoundaryWhenCancelled(t *testing.T) {
+	repo := setupRepoWithTestAndIface(t, "repo-a")
+	mi, logs := newRederiveTestIndexer(t, 0)
+
+	_, err := mi.TrackRepoCtx(context.Background(), config.RepoEntry{Path: repo, Name: "repo-a"})
+	require.NoError(t, err)
+	mi.WaitWorkspaceRederive()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	before := logs.FilterMessage(globalPassesDoneLog).Len()
+	mi.runGlobalGraphPasses(ctx, nil, false)
+
+	aborts := logs.FilterMessage(globalPassesAbortedLog).All()
+	require.Len(t, aborts, 1, "a cancelled run must log exactly one preemption")
+	assert.Equal(t, "infer_implements", aborts[0].ContextMap()["before_pass"],
+		"the very first boundary must be the one that returns")
+	assert.Equal(t, before, logs.FilterMessage(globalPassesDoneLog).Len(),
+		"a preempted run must not claim it completed")
+}
+
+// An uncancelled run must be untouched by any of the above — EndBatch and
+// the cold-index path both pass context.Background().
+func TestRunGlobalGraphPasses_UncancelledRunStillCompletes(t *testing.T) {
+	repo := setupRepoWithTestAndIface(t, "repo-a")
+	mi, logs := newRederiveTestIndexer(t, 0)
+
+	_, err := mi.TrackRepoCtx(context.Background(), config.RepoEntry{Path: repo, Name: "repo-a"})
+	require.NoError(t, err)
+	mi.WaitWorkspaceRederive()
+
+	before := logs.FilterMessage(globalPassesDoneLog).Len()
+	mi.runGlobalGraphPasses(context.Background(), nil, false)
+	assert.Equal(t, before+1, logs.FilterMessage(globalPassesDoneLog).Len())
+	assert.Zero(t, logs.FilterMessage(globalPassesAbortedLog).Len())
+}
+
+// runWorkspaceRederive must report the difference, so a status reader is
+// never told a preempted pass bound the graph.
+func TestRunWorkspaceRederive_ReportsPreemption(t *testing.T) {
+	mi, logs := newRederiveTestIndexer(t, 0)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	mi.runWorkspaceRederive(ctx, "repo-a")
+	assert.Zero(t, logs.FilterMessage(rederiveStartLog).Len(),
+		"an already-cancelled pass must not even start")
+
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	mi.runWorkspaceRederive(ctx2, "repo-a")
+	done := logs.FilterMessage(rederiveDoneLog).All()
+	require.Len(t, done, 1)
+	assert.Equal(t, false, done[0].ContextMap()["preempted"])
+}

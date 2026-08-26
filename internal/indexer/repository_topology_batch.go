@@ -65,6 +65,7 @@ func (mi *MultiIndexer) RunRepositoryTopologyBatch(
 	// Track/Reconcile calls use their stable lane without re-entering this gate;
 	// unmarked watcher, MCP, janitor, and global-pass mutations wait before any
 	// lane acquisition and therefore cannot form a lane/topology lock cycle.
+	mi.preemptWorkspaceRederive()
 	mi.batchMutationGate.Lock()
 	finishTopologyMutation := reach.BeginTopologyMutation(mi.graph)
 	batch := &repositoryTopologyBatch{owner: mi}

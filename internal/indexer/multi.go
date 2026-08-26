@@ -460,6 +460,9 @@ func (mi *MultiIndexer) SetOnRepoTracked(fn func(prefix, absPath string)) {
 // every Indexer already in mi.indexers. Pair with EndBatch; callers own the
 // matching global pass after their batch completes.
 func (mi *MultiIndexer) BeginBatch() {
+	// A background workspace derivation holds the write side for minutes.
+	// Ask it to stand down before queueing behind it; it re-runs after.
+	mi.preemptWorkspaceRederive()
 	mi.batchMutationGate.Lock()
 	defer mi.batchMutationGate.Unlock()
 
@@ -484,6 +487,7 @@ func (mi *MultiIndexer) BeginBatch() {
 // EndBatch; call RunDeferredPassesAllResult between the parallel parse and
 // EndBatch to run the deferred per-repo passes serially.
 func (mi *MultiIndexer) BeginParallelBatch() {
+	mi.preemptWorkspaceRederive()
 	mi.batchMutationGate.Lock()
 	defer mi.batchMutationGate.Unlock()
 
@@ -1530,6 +1534,26 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 	// "silent" span after resolve on a cold index.
 	globalStart := time.Now()
 
+	// abort is the preemption boundary. A post-track workspace derivation
+	// runs in the background holding the batch-transition write side and
+	// the reachability topology writer, and a repository track / untrack /
+	// batch transition needs both. Rather than make those wait out a
+	// multi-minute derivation, preemptWorkspaceRederive cancels ctx and the
+	// pass returns here, releasing the gates; the scheduler re-runs it once
+	// the mutation has landed. The derivation is idempotent and always
+	// covers the whole workspace, so an abandoned run costs time, not
+	// correctness. Every other caller passes context.Background(), so this
+	// is inert for EndBatch and the cold-index path.
+	abort := func(nextPass string) bool {
+		if ctx.Err() == nil {
+			return false
+		}
+		mi.logger.Info("global passes preempted",
+			zap.String("before_pass", nextPass),
+			zap.Duration("elapsed", time.Since(globalStart)))
+		return true
+	}
+
 	// Acquire the changed-repo scope once for the whole run and derive the two
 	// shapes the passes below consume. A nil scope means whole-graph — the
 	// fresh-index / one-off behaviour every pass keeps as its fallback — so an
@@ -1605,6 +1629,9 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 			zap.Error(err))
 	}
 
+	if abort("infer_implements") {
+		return
+	}
 	passStart("infer_implements")
 	implStart := time.Now()
 	implAdded := 0
@@ -1620,6 +1647,9 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 		zap.Int("added", implAdded),
 		zap.Bool("scoped", scope != nil),
 		zap.Duration("elapsed", time.Since(implStart)))
+	if abort("infer_overrides") {
+		return
+	}
 	passStart("infer_overrides")
 	overStart := time.Now()
 	overAdded := 0
@@ -1633,6 +1663,9 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 		zap.Int("added", overAdded),
 		zap.Bool("scoped", scope != nil),
 		zap.Duration("elapsed", time.Since(overStart)))
+	if abort("test_edges") {
+		return
+	}
 	passStart("test_edges")
 	testStart := time.Now()
 	marked, emitted := markTestSymbolsAndEmitEdgesScoped(mi.graph, scanPrefixes)
@@ -1640,6 +1673,9 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 		zap.Int("test_symbols", marked),
 		zap.Int("edges", emitted),
 		zap.Duration("elapsed", time.Since(testStart)))
+	if abort("entrypoint_hierarchy") {
+		return
+	}
 	passStart("entrypoint_hierarchy")
 	ctrlStart := time.Now()
 	// Seeds from already-stamped entry points, so cost is O(seed
@@ -1649,6 +1685,9 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 		mi.logger.Info("global pass: entry-point hierarchy",
 			zap.Int("stamped", ctrl),
 			zap.Duration("elapsed", time.Since(ctrlStart)))
+	}
+	if abort("capability_edges") {
+		return
 	}
 	passStart("capability_edges")
 	capStart := time.Now()
@@ -1687,6 +1726,9 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 		_, ok := scope[prefix]
 		return ok
 	}
+	if abort("clone_detect") {
+		return
+	}
 	passStart("clone_detect")
 	clonePassStart := time.Now()
 	cloneDetectElapsed := time.Duration(0)
@@ -1696,6 +1738,13 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 	for _, idx := range cloneIdx {
 		if !inCloneScope(idx.repoPrefix) {
 			continue
+		}
+		// Clone detection is the longest single pass on a large
+		// workspace, and it is a loop over repos — check between them
+		// as well as before, so a preempting mutation waits for one
+		// repository rather than all of them.
+		if abort("clone_detect:" + idx.repoPrefix) {
+			return
 		}
 		clonesDetected++
 		// Per-repo threshold, NOT a max-over-repos value: the batch must use
@@ -1746,6 +1795,9 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 	// a cross-repo synthesized call gets its parallel cross_repo_calls
 	// edge.
 	reporter.Report("framework dispatch synthesis (global)", 0, 0)
+	if abort("framework_synthesis") {
+		return
+	}
 	passStart("framework_synthesis")
 	// A full-coverage batch (cold index / full-workspace reconciliation)
 	// carries the caller's detached census attestation: admission censuses read
@@ -1773,6 +1825,9 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 	// stub passes so only genuinely un-indexed external targets are
 	// left to materialise into call-chain terminals.
 	reporter.Report("external-call synthesis (global)", 0, 0)
+	if abort("external_call_synthesis") {
+		return
+	}
 	passStart("external_call_synthesis")
 	extStart := time.Now()
 	extEnabled := mi.externalCallSynthesisEnabled()
@@ -1790,6 +1845,9 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 	// so the implements / extends edges they materialise across repo
 	// boundaries pick up their parallel cross_repo_* edges.
 	reporter.Report("cross-repo edges (global)", 0, 0)
+	if abort("cross_repo_edges") {
+		return
+	}
 	passStart("cross_repo_edges")
 	crStart := time.Now()
 	crossRepoEdges := 0
@@ -2686,6 +2744,11 @@ func (mi *MultiIndexer) TrackRepoCtx(ctx context.Context, entry config.RepoEntry
 		return nil, fmt.Errorf("%s; pass force to track it anyway", reason)
 	}
 
+	// Same reason as UntrackRepo: this call is about to take the gates a
+	// background derivation holds. Preempting also discards work that is
+	// about to be stale — the pass cannot see the repo being installed.
+	mi.preemptWorkspaceRederive()
+
 	identity, err := DetectIdentity(absPath)
 	if err != nil {
 		return nil, fmt.Errorf("detecting identity for %s: %w", absPath, err)
@@ -3190,6 +3253,13 @@ func (mi *MultiIndexer) UntrackRepo(repoPrefix string) (int, int) {
 	if mi.isClosed() {
 		return 0, 0
 	}
+	// Stand a background workspace derivation down before draining the
+	// lane. The teardown below takes the batch-transition read side and
+	// the reachability topology writer, both of which that pass holds for
+	// its whole run; without this an untrack issued mid-derivation waited
+	// it out (measured: 19.7 minutes on a two-repo workspace). The pass
+	// is re-queued, so the repo's departure is derived over afterwards.
+	mi.preemptWorkspaceRederive()
 	// Snapshot the exact live registry generation first. Legacy restores and
 	// direct-map fixtures may not have a stable lane yet; backfill one only
 	// while both metadata and Indexer pointers still match this generation.

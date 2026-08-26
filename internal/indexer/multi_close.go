@@ -35,6 +35,13 @@ func (mi *MultiIndexer) Close(ctx context.Context) error {
 		return nil
 	}
 
+	// Cancel any background workspace derivation before draining lanes.
+	// Waiting for it to FINISH is what made `daemon stop` force-kill; it
+	// holds the gates the teardown below needs, and it is a pure
+	// re-derivation, so abandoning it loses nothing that a later pass
+	// cannot redo.
+	mi.stopWorkspaceRederive()
+
 	mi.repositoryMutationMu.Lock()
 	mi.lifecycleClosed = true
 	coordinators := make([]*repositoryMutationCoordinator, 0, len(mi.repositoryMutations))
