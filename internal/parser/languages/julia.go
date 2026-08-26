@@ -1,148 +1,742 @@
 package languages
 
 import (
-	"regexp"
 	"strings"
 
+	juliaforest "github.com/alexaandru/go-sitter-forest/julia"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/parser"
+	sitter "github.com/zzet/gortex/internal/parser/tsitter"
 )
 
-// Julia has an explicit `end`-terminated block structure for functions
-// and modules plus a short one-line form `name(args) = body`. We cover
-// both forms, struct / abstract type / primitive type declarations,
-// macros, and the three import statements (`import`, `using`,
-// `include(...)`).
-var (
-	juliaFuncRe      = regexp.MustCompile(`(?m)^\s*function\s+(\w+)`)
-	juliaShortFuncRe = regexp.MustCompile(`(?m)^\s*(\w+)\s*\([^)]*\)\s*=[^=]`)
-	juliaStructRe    = regexp.MustCompile(`(?m)^\s*(?:mutable\s+)?struct\s+(\w+)`)
-	juliaAbstractRe  = regexp.MustCompile(`(?m)^\s*(?:abstract|primitive)\s+type\s+(\w+)`)
-	juliaModuleRe    = regexp.MustCompile(`(?m)^\s*(?:bare)?module\s+(\w+)`)
-	juliaMacroRe     = regexp.MustCompile(`(?m)^\s*macro\s+(\w+)`)
-	juliaImportRe    = regexp.MustCompile(`(?m)^\s*(?:import|using)\s+([\w.]+)`)
-	juliaIncludeRe   = regexp.MustCompile(`\binclude\s*\(\s*"([^"]+)"\s*\)`)
-	juliaCallRe      = regexp.MustCompile(`\b([A-Za-z_]\w*)\s*\(`)
-)
+// JuliaExtractor extracts Julia source through the tree-sitter-julia
+// grammar (vendored via alexaandru/go-sitter-forest), replacing the
+// original line-regex extractor.
+//
+// Covered definition forms:
+//   - `function f(...) ... end`, including `where`-parametrised
+//     signatures and qualified/ operator callees (`function Base.show`,
+//     `function Base.:+`)
+//   - short-form definitions `f(x) = body` and `f(x)::T where T = body`,
+//     including nested closures inside `begin` blocks
+//   - `macro m(...) ... end`
+//   - `struct` / `mutable struct` / `abstract type` / `primitive type`
+//     with parametric names (`struct Pair{T,S}`) and supertypes
+//     (`<: Living` → EdgeExtends), plus struct fields (KindField)
+//   - `module` / `baremodule` — KindType node whose Meta carries the
+//     module's `export` list; definitions inside get EdgeMemberOf
+//   - `const X = ...` constants (KindVariable)
+//
+// Imports: `using M`, `using M: a, b` (selected names in edge Meta),
+// `import M`, `import M as Alias` (alias in edge Meta), dotted import
+// paths, and `include("file.jl")` — all as EdgeImports to
+// `unresolved::import::<path>`.
+//
+// Calls: call_expression / broadcast_call_expression / macrocall
+// callees (identifier or qualified field_expression) attribute to the
+// enclosing function-like definition as EdgeCalls to
+// `unresolved::[Mod.]name`. Unicode identifiers (θ, σ̂), bang names
+// (`foo!`), and broadcast (`f.(x)`) are native grammar forms.
+//
+// Docstrings — a string literal directly preceding a definition, or the
+// first statement of a function/module body — attach as Meta["doc"].
+type JuliaExtractor struct {
+	lang *sitter.Language
+}
 
-// JuliaExtractor extracts Julia source using regex.
-type JuliaExtractor struct{}
-
-func NewJuliaExtractor() *JuliaExtractor { return &JuliaExtractor{} }
+func NewJuliaExtractor() *JuliaExtractor {
+	return &JuliaExtractor{lang: sitter.NewLanguage(juliaforest.GetLanguage())}
+}
 
 func (e *JuliaExtractor) Language() string     { return "julia" }
 func (e *JuliaExtractor) Extensions() []string { return []string{".jl"} }
 
+// juliaScope carries the enclosing context down the walk: the innermost
+// module (for EdgeMemberOf and export attachment) and the innermost
+// function-like definition (for call attribution).
+type juliaScope struct {
+	moduleID     string
+	functionID   string
+	functionName string
+	functionRecv string
+}
+
+type juliaWalkState struct {
+	filePath string
+	fileNode *graph.Node
+	result   *parser.ExtractionResult
+	seen     map[string]bool
+	nodes    map[string]*graph.Node
+}
+
 func (e *JuliaExtractor) Extract(filePath string, src []byte) (*parser.ExtractionResult, error) {
-	lines := strings.Split(string(src), "\n")
+	tree, err := parser.ParseFile(src, e.lang)
+	if err != nil {
+		return nil, err
+	}
+	defer tree.Close()
+
+	root := tree.RootNode()
 	result := &parser.ExtractionResult{}
 
 	fileNode := &graph.Node{
 		ID: filePath, Kind: graph.KindFile, Name: filePath,
-		FilePath: filePath, StartLine: 1, EndLine: len(lines),
+		FilePath: filePath, StartLine: 1, EndLine: int(root.EndPoint().Row) + 1,
 		Language: "julia",
 	}
 	result.Nodes = append(result.Nodes, fileNode)
 
-	seen := make(map[string]bool)
-	add := func(name string, kind graph.NodeKind, start, end int) {
-		if name == "" || isJuliaKeyword(name) {
-			return
-		}
-		id := filePath + "::" + name
-		if seen[id] {
-			return
-		}
-		seen[id] = true
-		result.Nodes = append(result.Nodes, &graph.Node{
-			ID: id, Kind: kind, Name: name,
-			FilePath: filePath, StartLine: start, EndLine: end,
-			Language: "julia",
-		})
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileNode.ID, To: id, Kind: graph.EdgeDefines,
-			FilePath: filePath, Line: start,
-		})
+	st := &juliaWalkState{
+		filePath: filePath,
+		fileNode: fileNode,
+		result:   result,
+		seen:     make(map[string]bool),
+		nodes:    map[string]*graph.Node{filePath: fileNode},
 	}
-
-	for _, m := range juliaModuleRe.FindAllSubmatchIndex(src, -1) {
-		name := string(src[m[2]:m[3]])
-		line := lineAt(src, m[0])
-		add(name, graph.KindType, line, findKeywordBlockEnd(lines, line, "end"))
-	}
-	for _, m := range juliaStructRe.FindAllSubmatchIndex(src, -1) {
-		name := string(src[m[2]:m[3]])
-		line := lineAt(src, m[0])
-		add(name, graph.KindType, line, findKeywordBlockEnd(lines, line, "end"))
-	}
-	for _, m := range juliaAbstractRe.FindAllSubmatchIndex(src, -1) {
-		name := string(src[m[2]:m[3]])
-		line := lineAt(src, m[0])
-		add(name, graph.KindType, line, line)
-	}
-	for _, m := range juliaFuncRe.FindAllSubmatchIndex(src, -1) {
-		name := string(src[m[2]:m[3]])
-		line := lineAt(src, m[0])
-		add(name, graph.KindFunction, line, findKeywordBlockEnd(lines, line, "end"))
-	}
-	for _, m := range juliaMacroRe.FindAllSubmatchIndex(src, -1) {
-		name := string(src[m[2]:m[3]])
-		line := lineAt(src, m[0])
-		add(name, graph.KindFunction, line, findKeywordBlockEnd(lines, line, "end"))
-	}
-	for _, m := range juliaShortFuncRe.FindAllSubmatchIndex(src, -1) {
-		name := string(src[m[2]:m[3]])
-		line := lineAt(src, m[0])
-		add(name, graph.KindFunction, line, line)
-	}
-
-	for _, m := range juliaImportRe.FindAllSubmatchIndex(src, -1) {
-		mod := string(src[m[2]:m[3]])
-		line := lineAt(src, m[0])
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileNode.ID, To: "unresolved::import::" + mod,
-			Kind: graph.EdgeImports, FilePath: filePath, Line: line,
-		})
-	}
-	for _, m := range juliaIncludeRe.FindAllSubmatchIndex(src, -1) {
-		path := string(src[m[2]:m[3]])
-		line := lineAt(src, m[0])
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileNode.ID, To: "unresolved::import::" + path,
-			Kind: graph.EdgeImports, FilePath: filePath, Line: line,
-		})
-	}
-
-	funcRanges := buildFuncRanges(result)
-	for _, m := range juliaCallRe.FindAllSubmatchIndex(src, -1) {
-		name := string(src[m[2]:m[3]])
-		if isJuliaKeyword(name) || name == "include" {
-			continue
-		}
-		line := lineAt(src, m[0])
-		callerID := findEnclosingFunc(funcRanges, line)
-		if callerID == "" || strings.HasSuffix(callerID, "::"+name) {
-			continue
-		}
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: callerID, To: "unresolved::" + name,
-			Kind: graph.EdgeCalls, FilePath: filePath, Line: line,
-		})
-	}
-
+	e.walk(root, src, juliaScope{}, st)
 	return result, nil
 }
 
-func isJuliaKeyword(s string) bool {
-	switch s {
-	case "if", "else", "elseif", "end", "for", "while", "do", "break", "continue",
-		"return", "function", "macro", "module", "baremodule", "struct", "mutable",
-		"abstract", "primitive", "type", "import", "using", "export", "let",
-		"local", "global", "const", "begin", "try", "catch", "finally", "throw",
-		"where", "in", "isa", "true", "false", "nothing", "missing":
-		return true
+// walk iterates a node's named children, dispatching definition / import
+// / call handlers and recursing with updated scope. pendingDoc is the
+// last sibling string literal (Julia docstring convention).
+func (e *JuliaExtractor) walk(n *sitter.Node, src []byte, scope juliaScope, st *juliaWalkState) {
+	pendingDoc := ""
+	for c := range n.NamedChildren() {
+		switch c.Type() {
+		case "string_literal":
+			pendingDoc = juliaDocText(c, src)
+
+		case "module_definition":
+			e.handleModule(c, src, scope, st, pendingDoc)
+			pendingDoc = ""
+
+		case "struct_definition", "abstract_definition", "primitive_definition":
+			e.handleType(c, src, scope, st, pendingDoc)
+			pendingDoc = ""
+
+		case "function_definition", "macro_definition":
+			e.handleFunction(c, src, scope, st, pendingDoc)
+			pendingDoc = ""
+
+		case "const_statement":
+			pendingDoc = ""
+			for a := range c.NamedChildren() {
+				if a.Type() == "assignment" {
+					e.handleAssignment(a, src, scope, st, true)
+				}
+			}
+
+		case "assignment":
+			e.handleAssignment(c, src, scope, st, false)
+			pendingDoc = ""
+
+		case "using_statement", "import_statement":
+			e.handleImport(c, src, st)
+			pendingDoc = ""
+
+		case "export_statement":
+			e.handleExport(c, src, scope, st)
+			pendingDoc = ""
+
+		case "call_expression", "broadcast_call_expression":
+			e.handleCall(c, src, scope, st)
+			e.walk(c, src, scope, st)
+			pendingDoc = ""
+
+		case "macrocall_expression":
+			e.handleMacroCall(c, src, scope, st)
+			e.walk(c, src, scope, st)
+			pendingDoc = ""
+
+		default:
+			pendingDoc = ""
+			e.walk(c, src, scope, st)
+		}
 	}
-	return false
+}
+
+// handleModule emits the module as a KindType node (legacy mapping;
+// graph.KindModule is reserved for ecosystem packages) and walks its
+// body with the module scope pushed.
+func (e *JuliaExtractor) handleModule(n *sitter.Node, src []byte, scope juliaScope, st *juliaWalkState, doc string) {
+	name := ""
+	if nn := n.ChildByFieldName("name"); nn != nil {
+		name = nn.Content(src)
+	}
+	inner := scope
+	if name != "" {
+		id := st.filePath + "::" + name
+		if !st.seen[id] {
+			st.seen[id] = true
+			node := &graph.Node{
+				ID: id, Kind: graph.KindType, Name: name,
+				FilePath:  st.filePath,
+				StartLine: int(n.StartPoint().Row) + 1,
+				EndLine:   int(n.EndPoint().Row) + 1,
+				Language:  "julia",
+			}
+			if doc != "" {
+				node.Meta = map[string]any{"doc": doc}
+			}
+			st.result.Nodes = append(st.result.Nodes, node)
+			st.nodes[id] = node
+			st.result.Edges = append(st.result.Edges, &graph.Edge{
+				From: st.fileNode.ID, To: id, Kind: graph.EdgeDefines,
+				FilePath: st.filePath, Line: int(n.StartPoint().Row) + 1,
+			})
+		}
+		inner.moduleID = id
+	}
+	e.walk(n, src, inner, st)
+}
+
+// juliaTypeHeadInfo decodes a `type_head` child: the declared name
+// (inside identifier / parametrized_type_expression / the lhs of the
+// `<:` binary_expression), its type parameters, and the supertype text.
+func juliaTypeHeadInfo(head *sitter.Node, src []byte) (name, super string, params []string) {
+	if head == nil || head.Type() != "type_head" {
+		return "", "", nil
+	}
+	c := head.NamedChild(0)
+	if c == nil {
+		return "", "", nil
+	}
+	if c.Type() == "binary_expression" {
+		// Named children are [lhs, operator, rhs] — the operator is a
+		// named node in this grammar, so address by position, not index 1.
+		lhs := c.NamedChild(0)
+		rhs := c.NamedChild(int(c.NamedChildCount()) - 1)
+		if lhs != nil {
+			name, params = juliaNameAndParams(lhs, src)
+		}
+		if rhs != nil && rhs.Type() != "operator" {
+			super = rhs.Content(src)
+		}
+		return name, super, params
+	}
+	name, params = juliaNameAndParams(c, src)
+	return name, "", params
+}
+
+// juliaNameAndParams extracts name + type parameters from an identifier
+// or a parametrized_type_expression (`Pair{T,S}`).
+func juliaNameAndParams(n *sitter.Node, src []byte) (string, []string) {
+	if n == nil {
+		return "", nil
+	}
+	switch n.Type() {
+	case "identifier":
+		return n.Content(src), nil
+	case "parametrized_type_expression":
+		var params []string
+		name := ""
+		for c := range n.NamedChildren() {
+			switch c.Type() {
+			case "identifier":
+				if name == "" {
+					name = c.Content(src)
+				}
+			case "curly_expression":
+				for g := range c.NamedChildren() {
+					if g.Type() == "identifier" {
+						params = append(params, g.Content(src))
+					}
+				}
+			}
+		}
+		return name, params
+	}
+	return "", nil
+}
+
+// handleType covers struct / mutable struct / abstract type /
+// primitive type: KindType node, EdgeExtends for the supertype (bare
+// name target + full path in Meta, matching the python extractor
+// convention), KindField nodes for struct members, and EdgeMemberOf for
+// definitions nested inside.
+func (e *JuliaExtractor) handleType(n *sitter.Node, src []byte, scope juliaScope, st *juliaWalkState, doc string) {
+	var head *sitter.Node
+	for c := range n.NamedChildren() {
+		if c.Type() == "type_head" {
+			head = c
+			break
+		}
+	}
+	name, super, _ := juliaTypeHeadInfo(head, src)
+	if name == "" {
+		e.walk(n, src, scope, st)
+		return
+	}
+
+	id := st.filePath + "::" + name
+	if !st.seen[id] {
+		st.seen[id] = true
+		node := &graph.Node{
+			ID: id, Kind: graph.KindType, Name: name,
+			FilePath:  st.filePath,
+			StartLine: int(n.StartPoint().Row) + 1,
+			EndLine:   int(n.EndPoint().Row) + 1,
+			Language:  "julia",
+		}
+		if doc != "" {
+			node.Meta = map[string]any{"doc": doc}
+		}
+		st.result.Nodes = append(st.result.Nodes, node)
+		st.nodes[id] = node
+		st.result.Edges = append(st.result.Edges, &graph.Edge{
+			From: st.fileNode.ID, To: id, Kind: graph.EdgeDefines,
+			FilePath: st.filePath, Line: int(n.StartPoint().Row) + 1,
+		})
+		if super != "" {
+			bare := super
+			if idx := strings.IndexAny(bare, "{"); idx > 0 {
+				bare = bare[:idx]
+			}
+			edge := &graph.Edge{
+				From: id, To: "unresolved::" + bare, Kind: graph.EdgeExtends,
+				FilePath: st.filePath, Line: int(n.StartPoint().Row) + 1,
+			}
+			if super != bare {
+				edge.Meta = map[string]any{"base_path": super}
+			}
+			st.result.Edges = append(st.result.Edges, edge)
+		}
+		if scope.moduleID != "" {
+			st.result.Edges = append(st.result.Edges, &graph.Edge{
+				From: id, To: scope.moduleID, Kind: graph.EdgeMemberOf,
+				FilePath: st.filePath, Line: int(n.StartPoint().Row) + 1,
+			})
+		}
+	}
+
+	// Struct fields: typed_expression (`x::T`) or bare identifier
+	// members at the top level of the struct body.
+	if n.Type() == "struct_definition" {
+		for c := range n.NamedChildren() {
+			if c.Type() == "type_head" {
+				continue
+			}
+			var fieldName string
+			switch c.Type() {
+			case "typed_expression":
+				if lhs := c.NamedChild(0); lhs != nil && lhs.Type() == "identifier" {
+					fieldName = lhs.Content(src)
+				}
+			case "identifier":
+				fieldName = c.Content(src)
+			}
+			if fieldName == "" {
+				continue
+			}
+			fid := id + "." + fieldName
+			if st.seen[fid] {
+				continue
+			}
+			st.seen[fid] = true
+			st.result.Nodes = append(st.result.Nodes, &graph.Node{
+				ID: fid, Kind: graph.KindField, Name: fieldName,
+				FilePath:  st.filePath,
+				StartLine: int(c.StartPoint().Row) + 1,
+				EndLine:   int(c.EndPoint().Row) + 1,
+				Language:  "julia",
+			})
+			st.result.Edges = append(st.result.Edges, &graph.Edge{
+				From: fid, To: id, Kind: graph.EdgeMemberOf,
+				FilePath: st.filePath, Line: int(c.StartPoint().Row) + 1,
+			})
+		}
+	}
+
+	e.walk(n, src, scope, st)
+}
+
+// juliaCalleeName decodes a call callee: bare identifier or qualified
+// field_expression (`Base.show`, `Base.:+`). Returns name, receiver.
+func juliaCalleeName(n *sitter.Node, src []byte) (name, receiver string) {
+	if n == nil {
+		return "", ""
+	}
+	switch n.Type() {
+	case "identifier":
+		return n.Content(src), ""
+	case "field_expression":
+		full := n.Content(src)
+		idx := strings.LastIndex(full, ".")
+		if idx <= 0 {
+			return strings.TrimPrefix(full, ":"), ""
+		}
+		receiver = full[:idx]
+		name = strings.TrimPrefix(full[idx+1:], ":") // Base.:+ → +
+		return name, receiver
+	case "quote_expression": // bare operator callee, e.g. `:+`
+		if inner := n.NamedChild(0); inner != nil {
+			return inner.Content(src), ""
+		}
+	}
+	return "", ""
+}
+
+// juliaUnwrapSignature returns the call_expression behind a `signature`
+// node, descending through `where_expression`.
+func juliaUnwrapSignature(sig *sitter.Node) *sitter.Node {
+	if sig == nil {
+		return nil
+	}
+	c := sig
+	if c.Type() == "signature" {
+		c = c.NamedChild(0)
+	}
+	if c == nil {
+		return nil
+	}
+	if c.Type() == "where_expression" {
+		c = c.NamedChild(0)
+	}
+	if c != nil && c.Type() == "call_expression" {
+		return c
+	}
+	return nil
+}
+
+// handleFunction covers `function f(...) end` and `macro m(...) end`.
+// The grammar has no named fields here: the first named child is the
+// `signature` wrapping the callee call_expression (optionally inside a
+// where_expression). Qualified callees become KindMethod with
+// Meta["receiver"] + EdgeMemberOf, mirroring the luau extractor.
+func (e *JuliaExtractor) handleFunction(n *sitter.Node, src []byte, scope juliaScope, st *juliaWalkState, doc string) {
+	call := juliaUnwrapSignature(n.NamedChild(0))
+	name, receiver := "", ""
+	if call != nil {
+		name, receiver = juliaCalleeName(call.NamedChild(0), src)
+	}
+
+	inner := scope
+	if name != "" {
+		kind := graph.KindFunction
+		id := st.filePath + "::" + name
+		if receiver != "" {
+			kind = graph.KindMethod
+			id = st.filePath + "::" + receiver + "." + name
+		}
+		if !st.seen[id] {
+			st.seen[id] = true
+			node := &graph.Node{
+				ID: id, Kind: kind, Name: name,
+				FilePath:  st.filePath,
+				StartLine: int(n.StartPoint().Row) + 1,
+				EndLine:   int(n.EndPoint().Row) + 1,
+				Language:  "julia",
+			}
+			meta := map[string]any{}
+			if receiver != "" {
+				meta["receiver"] = receiver
+			}
+			if n.Type() == "macro_definition" {
+				meta["macro"] = true
+			}
+			if doc != "" {
+				meta["doc"] = doc
+			}
+			if len(meta) > 0 {
+				node.Meta = meta
+			}
+			st.result.Nodes = append(st.result.Nodes, node)
+			st.nodes[id] = node
+			st.result.Edges = append(st.result.Edges, &graph.Edge{
+				From: st.fileNode.ID, To: id, Kind: graph.EdgeDefines,
+				FilePath: st.filePath, Line: int(n.StartPoint().Row) + 1,
+			})
+			if receiver != "" {
+				st.result.Edges = append(st.result.Edges, &graph.Edge{
+					From: id, To: st.filePath + "::" + receiver, Kind: graph.EdgeMemberOf,
+					FilePath: st.filePath, Line: int(n.StartPoint().Row) + 1,
+				})
+			}
+			if scope.moduleID != "" {
+				st.result.Edges = append(st.result.Edges, &graph.Edge{
+					From: id, To: scope.moduleID, Kind: graph.EdgeMemberOf,
+					FilePath: st.filePath, Line: int(n.StartPoint().Row) + 1,
+				})
+			}
+		}
+		inner.functionID = id
+		inner.functionName = name
+		inner.functionRecv = receiver
+	}
+	// Body docstring: first body statement that is a string literal.
+	bodyDoc := ""
+	if name != "" && doc == "" {
+		if second := n.NamedChild(1); second != nil && second.Type() == "string_literal" {
+			bodyDoc = juliaDocText(second, src)
+		}
+	}
+	if bodyDoc != "" {
+		if node, ok := st.nodes[inner.functionID]; ok && node.Meta == nil {
+			node.Meta = map[string]any{"doc": bodyDoc}
+		}
+	}
+	e.walk(n, src, inner, st)
+}
+
+// handleAssignment: `f(x) = body` (and `f(x) where T = body`) are
+// short-form function definitions — the LHS is a call_expression,
+// directly or under a where_expression. `const X = ...` arrives with
+// isConst and a plain identifier LHS.
+func (e *JuliaExtractor) handleAssignment(n *sitter.Node, src []byte, scope juliaScope, st *juliaWalkState, isConst bool) {
+	lhs := n.NamedChild(0)
+
+	// Short-form definition?
+	sig := lhs
+	if sig != nil && sig.Type() == "where_expression" {
+		sig = sig.NamedChild(0)
+	}
+	if sig != nil && sig.Type() == "call_expression" {
+		if name, receiver := juliaCalleeName(sig.NamedChild(0), src); name != "" {
+			e.emitShortFunction(n, sig, name, receiver, src, scope, st)
+			return
+		}
+	}
+
+	if isConst && lhs != nil && lhs.Type() == "identifier" {
+		name := lhs.Content(src)
+		id := st.filePath + "::" + name
+		if !st.seen[id] {
+			st.seen[id] = true
+			st.result.Nodes = append(st.result.Nodes, &graph.Node{
+				ID: id, Kind: graph.KindVariable, Name: name,
+				FilePath:  st.filePath,
+				StartLine: int(n.StartPoint().Row) + 1,
+				EndLine:   int(n.EndPoint().Row) + 1,
+				Language:  "julia",
+			})
+			st.result.Edges = append(st.result.Edges, &graph.Edge{
+				From: st.fileNode.ID, To: id, Kind: graph.EdgeDefines,
+				FilePath: st.filePath, Line: int(n.StartPoint().Row) + 1,
+			})
+		}
+	}
+
+	e.walk(n, src, scope, st)
+}
+
+func (e *JuliaExtractor) emitShortFunction(n, sig *sitter.Node, name, receiver string, src []byte, scope juliaScope, st *juliaWalkState) {
+	kind := graph.KindFunction
+	id := st.filePath + "::" + name
+	if receiver != "" {
+		kind = graph.KindMethod
+		id = st.filePath + "::" + receiver + "." + name
+	}
+	if !st.seen[id] {
+		st.seen[id] = true
+		node := &graph.Node{
+			ID: id, Kind: kind, Name: name,
+			FilePath:  st.filePath,
+			StartLine: int(n.StartPoint().Row) + 1,
+			EndLine:   int(n.EndPoint().Row) + 1,
+			Language:  "julia",
+		}
+		if receiver != "" {
+			node.Meta = map[string]any{"receiver": receiver}
+		}
+		st.result.Nodes = append(st.result.Nodes, node)
+		st.nodes[id] = node
+		st.result.Edges = append(st.result.Edges, &graph.Edge{
+			From: st.fileNode.ID, To: id, Kind: graph.EdgeDefines,
+			FilePath: st.filePath, Line: int(n.StartPoint().Row) + 1,
+		})
+		if receiver != "" {
+			st.result.Edges = append(st.result.Edges, &graph.Edge{
+				From: id, To: st.filePath + "::" + receiver, Kind: graph.EdgeMemberOf,
+				FilePath: st.filePath, Line: int(n.StartPoint().Row) + 1,
+			})
+		}
+		if scope.moduleID != "" {
+			st.result.Edges = append(st.result.Edges, &graph.Edge{
+				From: id, To: scope.moduleID, Kind: graph.EdgeMemberOf,
+				FilePath: st.filePath, Line: int(n.StartPoint().Row) + 1,
+			})
+		}
+	}
+	inner := scope
+	inner.functionID = id
+	inner.functionName = name
+	inner.functionRecv = receiver
+	e.walk(n, src, inner, st)
+}
+
+// handleImport covers `using M`, `using M: a, b`, `import M`,
+// `import M as Alias`, and dotted import paths. Selected names and
+// aliases ride on the edge Meta for the resolver to consume.
+func (e *JuliaExtractor) handleImport(n *sitter.Node, src []byte, st *juliaWalkState) {
+	emit := func(target string, meta map[string]any) {
+		if target == "" {
+			return
+		}
+		st.result.Edges = append(st.result.Edges, &graph.Edge{
+			From: st.fileNode.ID, To: "unresolved::import::" + target,
+			Kind:     graph.EdgeImports,
+			FilePath: st.filePath, Line: int(n.StartPoint().Row) + 1,
+			Meta: meta,
+		})
+	}
+	for c := range n.NamedChildren() {
+		switch c.Type() {
+		case "identifier":
+			emit(c.Content(src), nil)
+		case "import_path":
+			emit(c.Content(src), nil)
+		case "selected_import":
+			module, names := "", []string{}
+			for s := range c.NamedChildren() {
+				if s.Type() == "identifier" {
+					if module == "" {
+						module = s.Content(src)
+					} else {
+						names = append(names, s.Content(src))
+					}
+				}
+			}
+			meta := map[string]any{}
+			if len(names) > 0 {
+				meta["names"] = names
+			}
+			emit(module, meta)
+		case "import_alias":
+			path, alias := "", ""
+			for a := range c.NamedChildren() {
+				if a.Type() != "identifier" {
+					continue
+				}
+				if path == "" {
+					path = a.Content(src)
+				} else {
+					alias = a.Content(src)
+				}
+			}
+			meta := map[string]any{}
+			if alias != "" {
+				meta["alias"] = alias
+			}
+			emit(path, meta)
+		}
+	}
+}
+
+// handleExport records the module's public surface on the enclosing
+// module node's Meta (Julia export lists are only meaningful inside
+// modules).
+func (e *JuliaExtractor) handleExport(n *sitter.Node, src []byte, scope juliaScope, st *juliaWalkState) {
+	if scope.moduleID == "" {
+		return
+	}
+	node, ok := st.nodes[scope.moduleID]
+	if !ok {
+		return
+	}
+	names := []string{}
+	for c := range n.NamedChildren() {
+		if c.Type() == "identifier" {
+			names = append(names, c.Content(src))
+		}
+	}
+	if len(names) == 0 {
+		return
+	}
+	if node.Meta == nil {
+		node.Meta = map[string]any{}
+	}
+	prev, _ := node.Meta["exports"].([]string)
+	node.Meta["exports"] = append(prev, names...)
+}
+
+// handleCall emits EdgeCalls from the enclosing function to the callee
+// (bare or qualified). `include("f.jl")` becomes an import edge instead,
+// preserving the legacy extractor's contract.
+func (e *JuliaExtractor) handleCall(n *sitter.Node, src []byte, scope juliaScope, st *juliaWalkState) {
+	callee := n.NamedChild(0)
+	name, receiver := juliaCalleeName(callee, src)
+	if name == "" {
+		return
+	}
+	if name == "include" && receiver == "" {
+		if args := n.NamedChild(1); args != nil && args.Type() == "argument_list" {
+			if lit := args.NamedChild(0); lit != nil && lit.Type() == "string_literal" {
+				st.result.Edges = append(st.result.Edges, &graph.Edge{
+					From:     st.fileNode.ID,
+					To:       "unresolved::import::" + juliaUnquote(lit.Content(src)),
+					Kind:     graph.EdgeImports,
+					FilePath: st.filePath, Line: int(n.StartPoint().Row) + 1,
+				})
+			}
+		}
+		return
+	}
+	if scope.functionID == "" {
+		return
+	}
+	if scope.functionName == name && scope.functionRecv == receiver {
+		return // direct recursion
+	}
+	target := name
+	if receiver != "" {
+		target = receiver + "." + name
+	}
+	meta := map[string]any{}
+	if n.Type() == "broadcast_call_expression" {
+		meta["broadcast"] = true
+	}
+	edge := &graph.Edge{
+		From: scope.functionID, To: "unresolved::" + target,
+		Kind:     graph.EdgeCalls,
+		FilePath: st.filePath, Line: int(n.StartPoint().Row) + 1,
+	}
+	if len(meta) > 0 {
+		edge.Meta = meta
+	}
+	st.result.Edges = append(st.result.Edges, edge)
+}
+
+// handleMacroCall attributes `@macroname ...` invocations to the
+// enclosing function as calls to the bare macro name.
+func (e *JuliaExtractor) handleMacroCall(n *sitter.Node, src []byte, scope juliaScope, st *juliaWalkState) {
+	if scope.functionID == "" {
+		return
+	}
+	for c := range n.NamedChildren() {
+		if c.Type() != "macro_identifier" {
+			continue
+		}
+		for m := range c.NamedChildren() {
+			if m.Type() == "identifier" {
+				st.result.Edges = append(st.result.Edges, &graph.Edge{
+					From: scope.functionID, To: "unresolved::" + m.Content(src),
+					Kind:     graph.EdgeCalls,
+					Meta:     map[string]any{"macro": true},
+					FilePath: st.filePath, Line: int(n.StartPoint().Row) + 1,
+				})
+			}
+		}
+	}
+}
+
+// juliaDocText normalises a docstring string literal: strips quotes and
+// collapses to the first paragraph.
+func juliaDocText(n *sitter.Node, src []byte) string {
+	s := juliaUnquote(n.Content(src))
+	if i := strings.Index(s, "\n\n"); i > 0 {
+		s = s[:i]
+	}
+	return strings.TrimSpace(s)
+}
+
+func juliaUnquote(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.TrimPrefix(s, "\"\"\"")
+	s = strings.TrimSuffix(s, "\"\"\"")
+	s = strings.TrimPrefix(s, "\"")
+	s = strings.TrimSuffix(s, "\"")
+	return strings.TrimSpace(s)
 }
 
 var _ parser.Extractor = (*JuliaExtractor)(nil)
