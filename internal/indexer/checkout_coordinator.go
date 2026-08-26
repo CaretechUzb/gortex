@@ -218,6 +218,12 @@ type CheckoutCoordinator struct {
 	done   chan struct{}
 	once   sync.Once
 
+	// lifetime is canceled before Close waits. Every loop-owned admission and
+	// build derives from it, so removing a checkout cannot sit behind an
+	// unrelated generation for minutes.
+	lifetime       context.Context
+	cancelLifetime context.CancelFunc
+
 	// cycleMu serializes the loop's own cycles against a caller-driven
 	// transition. Both move this checkout's route, and a transition that
 	// builds off-route only keeps its promise if the loop cannot flip the
@@ -249,6 +255,11 @@ type CheckoutCoordinator struct {
 
 	cycleDone    func(CheckoutCycle)
 	dirtyBarrier func()
+
+	// cyclePreflight and cycleBarrier are focused test seams. Production uses
+	// settledWithoutBuild and has no barrier.
+	cyclePreflight func(context.Context) (CheckoutCycle, bool)
+	cycleBarrier   func(context.Context)
 }
 
 // retainedCommitLayer is one commit generation kept for re-routing, keyed by
@@ -293,30 +304,33 @@ func NewCheckoutCoordinator(cfg CheckoutCoordinatorConfig) (*CheckoutCoordinator
 	if logger == nil {
 		logger = zap.NewNop()
 	}
+	lifetime, cancelLifetime := context.WithCancel(context.Background())
 	c := &CheckoutCoordinator{
-		checkoutID:   cfg.CheckoutID,
-		root:         cfg.CheckoutRoot,
-		familyID:     cfg.FamilyID,
-		repoPrefix:   cfg.RepoPrefix,
-		workspaceID:  cfg.WorkspaceID,
-		projectID:    cfg.ProjectID,
-		store:        cfg.Store,
-		catalog:      cfg.Store.Catalog(),
-		builder:      cfg.Builder,
-		leases:       cfg.Leases,
-		logger:       logger,
-		gate:         cfg.Gate,
-		quiet:        cfg.Debounce,
-		poll:         cfg.PollInterval,
-		retain:       cfg.Retain,
-		configHash:   indexConfigHash(cfg.Config),
-		extractors:   extractorVersionsFingerprint(),
-		signal:       make(chan struct{}, 1),
-		stop:         make(chan struct{}),
-		done:         make(chan struct{}),
-		backlog:      map[int64]struct{}{},
-		cycleDone:    cfg.cycleDone,
-		dirtyBarrier: cfg.dirtyBarrier,
+		checkoutID:     cfg.CheckoutID,
+		root:           cfg.CheckoutRoot,
+		familyID:       cfg.FamilyID,
+		repoPrefix:     cfg.RepoPrefix,
+		workspaceID:    cfg.WorkspaceID,
+		projectID:      cfg.ProjectID,
+		store:          cfg.Store,
+		catalog:        cfg.Store.Catalog(),
+		builder:        cfg.Builder,
+		leases:         cfg.Leases,
+		logger:         logger,
+		gate:           cfg.Gate,
+		quiet:          cfg.Debounce,
+		poll:           cfg.PollInterval,
+		retain:         cfg.Retain,
+		configHash:     indexConfigHash(cfg.Config),
+		extractors:     extractorVersionsFingerprint(),
+		signal:         make(chan struct{}, 1),
+		stop:           make(chan struct{}),
+		done:           make(chan struct{}),
+		lifetime:       lifetime,
+		cancelLifetime: cancelLifetime,
+		backlog:        map[int64]struct{}{},
+		cycleDone:      cfg.cycleDone,
+		dirtyBarrier:   cfg.dirtyBarrier,
 	}
 	if c.quiet <= 0 {
 		c.quiet = defaultCheckoutQuietWindow
@@ -348,22 +362,35 @@ func (c *CheckoutCoordinator) Signal(reason string) {
 	}
 }
 
-// Close stops the loop and returns once it has.
-//
-// A cycle already in flight runs to completion rather than being cancelled.
-// Cancelling it would leave the generation it is filling in the building
-// state, and the catalog's coalescing rule hands a building generation with
-// matching inputs to the NEXT build of the same checkout — so an abandoned
-// half-filled payload would be adopted rather than collected. Waiting costs
-// one build; the alternative costs correctness.
+// Close stops the loop and waits for cooperative cancellation to finish.
 func (c *CheckoutCoordinator) Close() error {
+	return c.CloseContext(context.Background())
+}
+
+// CloseContext cancels queued admission and in-flight cooperative work before
+// waiting. The cancellation is permanent even when the caller's wait deadline
+// expires; a later CloseContext may wait for the same shutdown to finish.
+func (c *CheckoutCoordinator) CloseContext(ctx context.Context) error {
 	if c == nil {
 		return nil
 	}
-	c.once.Do(func() { close(c.stop) })
-	<-c.done
-	c.releaseTextSearcher()
-	return nil
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	c.once.Do(func() {
+		if c.cancelLifetime != nil {
+			c.cancelLifetime()
+		}
+		if c.stop != nil {
+			close(c.stop)
+		}
+	})
+	select {
+	case <-c.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // Running reports whether the loop goroutine is still there.
@@ -397,6 +424,8 @@ func (c *CheckoutCoordinator) Running() bool {
 // still has to answer for stop and for signals.
 func (c *CheckoutCoordinator) run() {
 	defer close(c.done)
+	defer c.releaseTextSearcher()
+	lifetime := c.lifetimeContext()
 
 	quiet := time.NewTimer(c.quiet)
 	stopTimer(quiet)
@@ -418,6 +447,8 @@ func (c *CheckoutCoordinator) run() {
 		select {
 		case <-c.stop:
 			return
+		case <-lifetime.Done():
+			return
 		case <-c.signal:
 			// Re-arm on every signal: the window is quiet time since the LAST
 			// claim that the checkout moved, not since the first.
@@ -433,14 +464,14 @@ func (c *CheckoutCoordinator) run() {
 				c.deferCycle()
 				continue
 			}
-			c.cycle(context.Background())
+			c.cycle(lifetime)
 		case <-admitted:
 			admitted = nil
 			if !claimed {
 				continue
 			}
 			claimed = false
-			c.cycle(context.Background())
+			c.cycle(lifetime)
 		}
 	}
 }
@@ -482,9 +513,24 @@ func stopTimer(t *time.Timer) {
 
 // cycle runs one reconcile pass and reports it.
 func (c *CheckoutCoordinator) cycle(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	c.mu.Lock()
 	reason := c.reason
 	c.mu.Unlock()
+
+	preflight := c.settledWithoutBuild
+	if c.cyclePreflight != nil {
+		preflight = c.cyclePreflight
+	}
+	if out, settled := preflight(ctx); settled {
+		recordCoordinatorCycle(out)
+		if c.cycleDone != nil {
+			c.cycleDone(out)
+		}
+		return
+	}
 
 	release, err := c.gate.Acquire(ctx, ViewBuildBackground)
 	if err != nil {
@@ -498,11 +544,22 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 	defer release()
 
 	c.cycleMu.Lock()
+	defer c.cycleMu.Unlock()
+	if c.cycleBarrier != nil {
+		c.cycleBarrier(ctx)
+	}
+	if err := ctx.Err(); err != nil {
+		out := CheckoutCycle{Err: err}
+		recordCoordinatorCycle(out)
+		if c.cycleDone != nil {
+			c.cycleDone(out)
+		}
+		return
+	}
 	out := c.reconcile(ctx)
-	c.cycleMu.Unlock()
 	recordCoordinatorCycle(out)
 	switch {
-	case out.Err != nil:
+	case out.Err != nil && !errors.Is(out.Err, context.Canceled):
 		c.logger.Warn("checkout coordinator: reconcile failed",
 			zap.String("checkout", c.checkoutID), zap.String("root", c.root),
 			zap.String("reason", reason), zap.Error(out.Err))
@@ -516,6 +573,53 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 	if c.cycleDone != nil {
 		c.cycleDone(out)
 	}
+}
+
+// settledWithoutBuild recognizes the overwhelmingly common poll result before
+// it queues for the one build lane. It performs the same identity and dirty
+// fingerprint checks as reconcile, but makes no catalog route change.
+func (c *CheckoutCoordinator) settledWithoutBuild(ctx context.Context) (CheckoutCycle, bool) {
+	var out CheckoutCycle
+	if err := ctx.Err(); err != nil {
+		return out, false
+	}
+	base, err := c.primaryBase(ctx)
+	if err != nil {
+		return out, false
+	}
+	sample, err := gitstate.SampleDirty(ctx, c.root)
+	if err != nil || sample.HeadTree == "" {
+		return out, false
+	}
+	route, found, err := c.catalog.GetCheckoutRoute(ctx, c.checkoutID)
+	if err != nil || !found || route.State != store_sqlite.RouteActive ||
+		route.GraphID != base.graphID || route.CommitGenerationID <= 0 || route.DirtyGenerationID <= 0 {
+		return out, false
+	}
+	commit, found, err := c.catalog.GetViewGeneration(ctx, route.CommitGenerationID)
+	if err != nil || !found || !servableGeneration(commit.State) ||
+		generationRowKey(commit) != generationIdentityKey(c.commitIdentity(base, sample.HeadTree)) {
+		return out, false
+	}
+	dirty, found, err := c.catalog.GetViewGeneration(ctx, route.DirtyGenerationID)
+	if err != nil || !found || !servableGeneration(dirty.State) ||
+		dirty.BaseGenerationID != commit.GenerationID || dirty.LowerViewFingerprint != sample.Fingerprint {
+		return out, false
+	}
+
+	c.noteDirtyFingerprint(sample.Fingerprint)
+	c.retainCommit(ctx, generationIdentityKey(c.commitIdentity(base, sample.HeadTree)), commit.GenerationID)
+	c.rememberRoutedDirty(dirty.GenerationID)
+	out.CommitGenerationID = commit.GenerationID
+	out.DirtyGenerationID = dirty.GenerationID
+	return out, true
+}
+
+func (c *CheckoutCoordinator) lifetimeContext() context.Context {
+	if c != nil && c.lifetime != nil {
+		return c.lifetime
+	}
+	return context.Background()
 }
 
 // recordCoordinatorCycle counts what one cycle did.
@@ -634,6 +738,15 @@ func (c *CheckoutCoordinator) RehomeTo(ctx context.Context, graphID string) (Che
 	if c == nil {
 		return out, errors.New("indexer: no coordinator to rehome")
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	stopLifetimeCancel := context.AfterFunc(c.lifetimeContext(), cancel)
+	defer func() {
+		stopLifetimeCancel()
+		cancel()
+	}()
 	release, err := c.gate.Acquire(ctx, ViewBuildInteractive)
 	if err != nil {
 		return out, fmt.Errorf("indexer: wait for checkout build admission: %w", err)

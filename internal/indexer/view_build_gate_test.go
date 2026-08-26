@@ -471,6 +471,12 @@ func TestViewBuildGateSkipsCanceledWaiters(t *testing.T) {
 		if canceled.release != nil {
 			t.Fatal("canceled Acquire returned a release function")
 		}
+		gate.mu.Lock()
+		queued := len(gate.interactive) + len(gate.background)
+		gate.mu.Unlock()
+		if queued != 0 {
+			t.Fatalf("canceled waiter remains in the admission queues: %d", queued)
+		}
 
 		survivorResult := acquireViewBuildAsync(context.Background(), gate, ViewBuildBackground)
 		synctest.Wait()
@@ -482,4 +488,102 @@ func TestViewBuildGateSkipsCanceledWaiters(t *testing.T) {
 		}
 		survivor.release()
 	})
+}
+
+// TestViewBuildGateBoundsInteractiveOvertaking proves that priority is
+// responsive rather than absolute: a continuously arriving interactive stream
+// cannot leave an already queued checkout refresh behind forever.
+func TestViewBuildGateBoundsInteractiveOvertaking(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		gate := NewViewBuildGate()
+		gate.Open()
+		active, err := gate.Acquire(context.Background(), ViewBuildBackground)
+		if err != nil {
+			t.Fatalf("active Acquire: %v", err)
+		}
+
+		type orderedGrant struct {
+			priority ViewBuildPriority
+			release  func()
+			err      error
+		}
+		grants := make(chan orderedGrant, maxInteractiveBuildBurst+2)
+		queue := func(priority ViewBuildPriority) {
+			go func() {
+				release, err := gate.Acquire(context.Background(), priority)
+				grants <- orderedGrant{priority: priority, release: release, err: err}
+			}()
+			synctest.Wait()
+		}
+
+		queue(ViewBuildBackground)
+		for range maxInteractiveBuildBurst + 1 {
+			queue(ViewBuildInteractive)
+		}
+		active()
+
+		got := make([]ViewBuildPriority, 0, maxInteractiveBuildBurst+2)
+		for range maxInteractiveBuildBurst + 2 {
+			synctest.Wait()
+			grant := <-grants
+			if grant.err != nil {
+				t.Fatalf("queued Acquire: %v", grant.err)
+			}
+			got = append(got, grant.priority)
+			grant.release()
+		}
+		for i := range maxInteractiveBuildBurst {
+			if got[i] != ViewBuildInteractive {
+				t.Fatalf("grant %d = %v, want interactive; order=%v", i, got[i], got)
+			}
+		}
+		if got[maxInteractiveBuildBurst] != ViewBuildBackground {
+			t.Fatalf("background grant remained starved after %d interactive grants: %v",
+				maxInteractiveBuildBurst, got)
+		}
+	})
+}
+
+func BenchmarkViewBuildGateHandoff(b *testing.B) {
+	gate := NewViewBuildGate()
+	gate.Open()
+	ctx := context.Background()
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			release, err := gate.Acquire(ctx, ViewBuildBackground)
+			if err != nil {
+				b.Fatal(err)
+			}
+			release()
+		}
+	})
+}
+
+func BenchmarkViewBuildGateCanceledAdmission(b *testing.B) {
+	gate := NewViewBuildGate()
+	gate.Open()
+	b.ReportAllocs()
+	for b.Loop() {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if _, err := gate.Acquire(ctx, ViewBuildBackground); err != context.Canceled {
+			b.Fatalf("Acquire error = %v, want context.Canceled", err)
+		}
+	}
+}
+
+func BenchmarkCheckoutCoordinatorSettledCycle(b *testing.B) {
+	gate := NewViewBuildGate() // Deliberately closed: settled cycles must not acquire it.
+	c := &CheckoutCoordinator{
+		gate: gate,
+		cyclePreflight: func(context.Context) (CheckoutCycle, bool) {
+			return CheckoutCycle{CommitGenerationID: 1, DirtyGenerationID: 2}, true
+		},
+	}
+	ctx := context.Background()
+	b.ReportAllocs()
+	for b.Loop() {
+		c.cycle(ctx)
+	}
 }

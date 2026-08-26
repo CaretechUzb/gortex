@@ -489,7 +489,17 @@ func TestCoordinatorLeavesASettledRouteAlone(t *testing.T) {
 	first := coordinatorReconcile(t, c)
 	epoch := f.route().RouteEpoch
 
-	second := coordinatorReconcile(t, c)
+	// Keep the build gate closed. A settled poll must finish from the read-only
+	// preflight instead of joining the derived-build queue.
+	c.gate = NewViewBuildGate()
+	var second CheckoutCycle
+	c.cycleDone = func(out CheckoutCycle) { second = out }
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	c.cycle(ctx)
+	if second.Err != nil {
+		t.Fatalf("settled preflight waited for build admission: %v", second.Err)
+	}
 	if second.CommitBuilt || second.DirtyBuilt || second.CommitReused {
 		t.Fatalf("a cycle on an unchanged checkout did work: %+v", second)
 	}
@@ -1138,22 +1148,23 @@ func TestCoordinatorRetiresACommitLayerTheCacheEvicts(t *testing.T) {
 
 // --- closing ------------------------------------------------------------
 
-// TestCoordinatorCloseWaitsForAnInFlightBuild pins what Close means: the cycle
-// in flight finishes, so the generation it was filling reaches a terminal
-// state instead of being left building for the next cycle to adopt.
-func TestCoordinatorCloseWaitsForAnInFlightBuild(t *testing.T) {
+// TestCoordinatorCloseCancelsAnInFlightBuild pins shutdown at the last safe
+// publication boundary. The dirty payload has been filled but is held before
+// publish; Close cancels its build context, waits for abandonment, and returns
+// without routing or publishing that canceled generation.
+func TestCoordinatorCloseCancelsAnInFlightBuild(t *testing.T) {
 	f := newCoordinatorFixture(t)
 
 	synctest.Test(t, func(t *testing.T) {
 		entered := make(chan struct{})
-		release := make(chan struct{})
 		var once sync.Once
-		c := f.coordinator(t, CheckoutCoordinatorConfig{
+		var c *CheckoutCoordinator
+		c = f.coordinator(t, CheckoutCoordinatorConfig{
 			Debounce: 300 * time.Millisecond,
 			dirtyBarrier: func() {
 				once.Do(func() {
 					close(entered)
-					<-release
+					<-c.lifetimeContext().Done()
 				})
 			},
 		})
@@ -1164,27 +1175,23 @@ func TestCoordinatorCloseWaitsForAnInFlightBuild(t *testing.T) {
 		closed := make(chan error, 1)
 		go func() { closed <- c.Close() }()
 		synctest.Wait()
-		select {
-		case err := <-closed:
-			t.Fatalf("Close returned (%v) while a build was still in flight", err)
-		default:
-		}
-
-		close(release)
 		if err := <-closed; err != nil {
 			t.Fatalf("Close: %v", err)
 		}
-
-		// The route the interrupted cycle published is whole: both slots name
-		// a generation that can be served.
-		route := f.route()
-		if route.CommitGenerationID == 0 || route.DirtyGenerationID == 0 {
-			t.Fatalf("close left a half-routed checkout: %+v", route)
+		if c.Running() {
+			t.Fatal("coordinator is still running after Close")
 		}
-		for _, id := range []int64{route.CommitGenerationID, route.DirtyGenerationID} {
-			row, found := f.generation(id)
-			if !found || !servableGeneration(row.State) {
-				t.Fatalf("routed generation %d is %q", id, row.State)
+
+		route := f.route()
+		if route.DirtyGenerationID != 0 {
+			t.Fatalf("close routed the canceled dirty generation: %+v", route)
+		}
+		for _, row := range f.generations() {
+			if row.State == store_sqlite.ViewGenerationBuilding {
+				t.Fatalf("close left generation %d building", row.GenerationID)
+			}
+			if row.GenerationKind == DirtyLayerGenerationKind && servableGeneration(row.State) {
+				t.Fatalf("canceled dirty generation %d was published as %q", row.GenerationID, row.State)
 			}
 		}
 	})

@@ -13,6 +13,12 @@ type ViewBuildPriority uint8
 const (
 	ViewBuildBackground ViewBuildPriority = iota
 	ViewBuildInteractive
+
+	// maxInteractiveBuildBurst bounds how many user-requested builds may pass a
+	// background build that is already waiting. Interactive work stays
+	// responsive without allowing a continuous ref-view stream to starve
+	// checkout reconciliation forever.
+	maxInteractiveBuildBurst = 4
 )
 
 type viewBuildWaiter struct {
@@ -32,8 +38,9 @@ type ViewBuildGate struct {
 	opened chan struct{}
 	active bool
 
-	interactive []*viewBuildWaiter
-	background  []*viewBuildWaiter
+	interactive      []*viewBuildWaiter
+	background       []*viewBuildWaiter
+	interactiveBurst int
 }
 
 // NewViewBuildGate returns a closed, single-build gate. Open releases warmup;
@@ -69,6 +76,9 @@ func (g *ViewBuildGate) Acquire(ctx context.Context, priority ViewBuildPriority)
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	waiter := &viewBuildWaiter{ready: make(chan struct{})}
 
 	g.mu.Lock()
@@ -91,6 +101,8 @@ func (g *ViewBuildGate) Acquire(ctx context.Context, priority ViewBuildPriority)
 			g.release()
 		} else {
 			waiter.canceled = true
+			g.interactive = removeViewBuildWaiter(g.interactive, waiter)
+			g.background = removeViewBuildWaiter(g.background, waiter)
 			g.grantNextLocked()
 			g.mu.Unlock()
 		}
@@ -114,24 +126,48 @@ func (g *ViewBuildGate) grantNextLocked() {
 	}
 	for {
 		var waiter *viewBuildWaiter
+		interactive := false
 		switch {
-		case len(g.interactive) > 0:
+		case len(g.interactive) > 0 &&
+			(len(g.background) == 0 || g.interactiveBurst < maxInteractiveBuildBurst):
 			waiter = g.interactive[0]
 			g.interactive = g.interactive[1:]
+			interactive = true
 		case len(g.background) > 0:
 			waiter = g.background[0]
 			g.background = g.background[1:]
+		case len(g.interactive) > 0:
+			waiter = g.interactive[0]
+			g.interactive = g.interactive[1:]
+			interactive = true
 		default:
 			return
 		}
 		if waiter.canceled {
 			continue
 		}
+		if interactive {
+			g.interactiveBurst++
+		} else {
+			g.interactiveBurst = 0
+		}
 		g.active = true
 		waiter.granted = true
 		close(waiter.ready)
 		return
 	}
+}
+
+func removeViewBuildWaiter(queue []*viewBuildWaiter, target *viewBuildWaiter) []*viewBuildWaiter {
+	for i, waiter := range queue {
+		if waiter != target {
+			continue
+		}
+		copy(queue[i:], queue[i+1:])
+		queue[len(queue)-1] = nil
+		return queue[:len(queue)-1]
+	}
+	return queue
 }
 
 // Admitted reports only whether warmup has opened. Capacity is obtained with
