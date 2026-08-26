@@ -165,31 +165,72 @@ func (m *Materializer) MaterializeCheckout(ctx context.Context, checkoutID strin
 		return nil, NewViewError(CodeInvalidViewSelector, "materialization needs a checkout id")
 	}
 
-	route, err := m.route(ctx, checkoutID)
-	if err != nil {
-		return nil, err
-	}
-	graphID = route.GraphID
-	repoPrefix, err := m.repoPrefix(ctx, route.GraphID)
-	if err != nil {
-		return nil, err
-	}
-	if route.CommitGenerationID <= 0 {
-		return nil, NewViewError(CodeViewBuilding,
-			fmt.Sprintf("checkout %q has no published commit generation", checkoutID))
-	}
+	// The route read and generation lease cannot be one SQLite/in-memory
+	// transaction. Pin the generations named by one route snapshot, then read
+	// the route again while those pins are held. If it moved, none of the old
+	// payload is opened and the current route gets another bounded attempt.
+	const routeSnapshotAttempts = 3
+	for attempt := 0; attempt < routeSnapshotAttempts; attempt++ {
+		route, routeErr := m.route(ctx, checkoutID)
+		if routeErr != nil {
+			return nil, routeErr
+		}
+		graphID = route.GraphID
+		if route.CommitGenerationID <= 0 {
+			return nil, NewViewError(CodeViewBuilding,
+				fmt.Sprintf("checkout %q has no published commit generation", checkoutID))
+		}
 
-	generations = []int64{route.CommitGenerationID}
-	if route.DirtyGenerationID > 0 {
-		generations = append(generations, route.DirtyGenerationID)
+		generations = []int64{route.CommitGenerationID}
+		if route.DirtyGenerationID > 0 {
+			generations = append(generations, route.DirtyGenerationID)
+		}
+		lease, moved, routeErr := m.pinCheckoutRoute(ctx, checkoutID, route, generations)
+		if routeErr != nil {
+			return nil, routeErr
+		}
+		if moved {
+			continue
+		}
+
+		repoPrefix, prefixErr := m.repoPrefix(ctx, route.GraphID)
+		if prefixErr != nil {
+			lease.Release()
+			return nil, prefixErr
+		}
+		view, err = m.assemble(ctx, route.GraphID, repoPrefix, generations, lease)
+		if err != nil {
+			lease.Release()
+			return nil, err
+		}
+		return view, nil
 	}
+	return nil, NewViewError(CodeViewBuilding,
+		fmt.Sprintf("the route of checkout %q kept changing while materializing", checkoutID))
+}
+
+// pinCheckoutRoute closes the gap between reading a route and leasing its
+// generations. A retirement can only pass its reference check after the route
+// moves; if that happened before these pins landed, the second read observes
+// the move and the caller retries without opening the old payload. If the route
+// is unchanged, the held pins make every later retirement attempt defer.
+func (m *Materializer) pinCheckoutRoute(
+	ctx context.Context,
+	checkoutID string,
+	route store_sqlite.CheckoutRoute,
+	generations []int64,
+) (*Lease, bool, error) {
 	lease := m.Leases.Acquire(generations...)
-	view, err = m.assemble(ctx, route.GraphID, repoPrefix, generations, lease)
+	current, err := m.route(ctx, checkoutID)
 	if err != nil {
 		lease.Release()
-		return nil, err
+		return nil, false, err
 	}
-	return view, nil
+	if current != route {
+		lease.Release()
+		return nil, true, nil
+	}
+	return lease, false, nil
 }
 
 // MaterializeRefView builds the view one ref-view generation serves.

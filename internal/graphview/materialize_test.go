@@ -130,6 +130,68 @@ func TestMaterializeCheckoutReadsTheRoutedStack(t *testing.T) {
 	assertReadersAgree(t, view.Reader, flat)
 }
 
+// TestPinCheckoutRouteRejectsASnapshotThatMovedBeforeLease makes the
+// route-read/lease race deterministic. The old stack is already unreferenced
+// and gone when its late pins land, so the pin handshake must reject the stale
+// snapshot without opening it; the ordinary materializer can then serve the
+// replacement route.
+func TestPinCheckoutRouteRejectsASnapshotThatMovedBeforeLease(t *testing.T) {
+	ctx := context.Background()
+	store := openStackStore(t, "route-snapshot")
+	oldCommit, oldDirty := seedRoutedStack(t, store)
+	materializer := newTestMaterializer(store)
+
+	oldRoute, found, err := store.Catalog().GetCheckoutRoute(ctx, testCheckoutID)
+	if err != nil || !found {
+		t.Fatalf("GetCheckoutRoute(old) = found %v, err %v", found, err)
+	}
+	newCommit := writeStackCommitGeneration(t, store)
+	newDirty := writeStackDirtyGeneration(t, store, newCommit)
+	if err := store.Catalog().FlipCheckoutRoute(ctx, store_sqlite.FlipCheckoutRouteRequest{
+		CheckoutID:         testCheckoutID,
+		ExpectedRouteEpoch: oldRoute.RouteEpoch,
+		GraphID:            testGraphID,
+		CommitGenerationID: newCommit,
+		DirtyGenerationID:  newDirty,
+		State:              store_sqlite.RouteActive,
+	}); err != nil {
+		t.Fatalf("FlipCheckoutRoute: %v", err)
+	}
+	if err := store.RetirePayloadGeneration(ctx, oldDirty, materializer.Leases.InUse); err != nil {
+		t.Fatalf("retire old dirty generation: %v", err)
+	}
+	if err := store.RetirePayloadGeneration(ctx, oldCommit, materializer.Leases.InUse); err != nil {
+		t.Fatalf("retire old commit generation: %v", err)
+	}
+
+	lease, moved, err := materializer.pinCheckoutRoute(ctx, testCheckoutID, oldRoute, []int64{oldCommit, oldDirty})
+	if err != nil {
+		t.Fatalf("pinCheckoutRoute: %v", err)
+	}
+	if lease != nil {
+		lease.Release()
+		t.Fatal("a moved route returned a lease")
+	}
+	if !moved {
+		t.Fatal("a moved route was accepted as current")
+	}
+	for _, generationID := range []int64{oldCommit, oldDirty} {
+		if materializer.Leases.InUse(generationID) {
+			t.Fatalf("old generation %d leaked a lease", generationID)
+		}
+	}
+
+	view, err := materializer.MaterializeCheckout(ctx, testCheckoutID)
+	if err != nil {
+		t.Fatalf("MaterializeCheckout(replacement): %v", err)
+	}
+	defer view.Close()
+	got := view.Generations()
+	if len(got) != 2 || got[0] != newCommit || got[1] != newDirty {
+		t.Fatalf("replacement generations = %v, want [%d %d]", got, newCommit, newDirty)
+	}
+}
+
 // TestMaterializeRefViewStacksOneLayer pins the shape of a view of committed
 // state: the graph's corpus with exactly one generation on it, named by that
 // generation and carrying no layer above it. A ref selector means the
