@@ -201,39 +201,43 @@ type storeCore struct {
 	bulkFinalizeObserver func(bulkFinalizeEvent)
 
 	// Prepared statements (compiled once in Open, closed in Close).
-	stmtInsertNode         *sql.Stmt
-	stmtGetNode            *sql.Stmt
-	stmtGetNodeByQual      *sql.Stmt
-	stmtFindByName         *sql.Stmt
-	stmtFindByNameInRepo   *sql.Stmt
-	stmtFileNodes          *sql.Stmt
-	stmtRepoNodes          *sql.Stmt
-	stmtAllNodes           *sql.Stmt
-	stmtNodeCount          *sql.Stmt
-	stmtRepoPrefixes       *sql.Stmt
-	stmtRepoStatsNodes     *sql.Stmt
-	stmtRepoStatsEdges     *sql.Stmt
-	stmtRepoNodeCount      *sql.Stmt
-	stmtRepoEdgeCount      *sql.Stmt
-	stmtAllRepoCountsNodes *sql.Stmt
-	stmtAllRepoCountsEdges *sql.Stmt
-	stmtAllRepoStateCounts *sql.Stmt
-	stmtStatsByKind        *sql.Stmt
-	stmtStatsByLanguage    *sql.Stmt
+	stmtInsertNode          *sql.Stmt
+	stmtGetNode             *sql.Stmt
+	stmtGetNodeByQual       *sql.Stmt
+	stmtFindByName          *sql.Stmt
+	stmtFindByNameInRepo    *sql.Stmt
+	stmtFileNodes           *sql.Stmt
+	stmtRepoNodes           *sql.Stmt
+	stmtAllNodes            *sql.Stmt
+	stmtGenerationAllNodes  *sql.Stmt
+	stmtNodeCount           *sql.Stmt
+	stmtGenerationNodeCount *sql.Stmt
+	stmtRepoPrefixes        *sql.Stmt
+	stmtRepoStatsNodes      *sql.Stmt
+	stmtRepoStatsEdges      *sql.Stmt
+	stmtRepoNodeCount       *sql.Stmt
+	stmtRepoEdgeCount       *sql.Stmt
+	stmtAllRepoCountsNodes  *sql.Stmt
+	stmtAllRepoCountsEdges  *sql.Stmt
+	stmtAllRepoStateCounts  *sql.Stmt
+	stmtStatsByKind         *sql.Stmt
+	stmtStatsByLanguage     *sql.Stmt
 
-	stmtInsertEdge       *sql.Stmt
-	unresolvedInserts    atomic.Uint64
-	stmtOutEdges         *sql.Stmt
-	stmtInEdges          *sql.Stmt
-	stmtRepoEdges        *sql.Stmt
-	stmtAllEdges         *sql.Stmt
-	stmtEdgeCount        *sql.Stmt
-	stmtRemoveEdge       *sql.Stmt
-	stmtUpdateEdgeOrigin *sql.Stmt
-	stmtUpdateEdgeAttrs  *sql.Stmt
-	stmtSelectEdgeOrigin *sql.Stmt
-	stmtDeleteEdgeByKey  *sql.Stmt
-	stmtEdgeExists       *sql.Stmt
+	stmtInsertEdge          *sql.Stmt
+	unresolvedInserts       atomic.Uint64
+	stmtOutEdges            *sql.Stmt
+	stmtInEdges             *sql.Stmt
+	stmtRepoEdges           *sql.Stmt
+	stmtAllEdges            *sql.Stmt
+	stmtGenerationAllEdges  *sql.Stmt
+	stmtEdgeCount           *sql.Stmt
+	stmtGenerationEdgeCount *sql.Stmt
+	stmtRemoveEdge          *sql.Stmt
+	stmtUpdateEdgeOrigin    *sql.Stmt
+	stmtUpdateEdgeAttrs     *sql.Stmt
+	stmtSelectEdgeOrigin    *sql.Stmt
+	stmtDeleteEdgeByKey     *sql.Stmt
+	stmtEdgeExists          *sql.Stmt
 }
 
 // Store is the SQLite-backed graph.Store implementation. It is a handle over
@@ -850,7 +854,8 @@ func (s *Store) Close() error {
 		s.stmtInsertNode, s.stmtGetNode, s.stmtGetNodeByQual,
 		s.stmtFindByName, s.stmtFindByNameInRepo,
 		s.stmtFileNodes, s.stmtRepoNodes,
-		s.stmtAllNodes, s.stmtNodeCount, s.stmtRepoPrefixes,
+		s.stmtAllNodes, s.stmtGenerationAllNodes,
+		s.stmtNodeCount, s.stmtGenerationNodeCount, s.stmtRepoPrefixes,
 		s.stmtRepoStatsNodes, s.stmtRepoStatsEdges,
 		s.stmtRepoNodeCount, s.stmtRepoEdgeCount,
 		s.stmtAllRepoCountsNodes, s.stmtAllRepoCountsEdges,
@@ -858,7 +863,8 @@ func (s *Store) Close() error {
 		s.stmtStatsByKind, s.stmtStatsByLanguage,
 		s.stmtInsertEdge, s.stmtOutEdges, s.stmtInEdges,
 		s.stmtRepoEdges,
-		s.stmtAllEdges, s.stmtEdgeCount, s.stmtRemoveEdge,
+		s.stmtAllEdges, s.stmtGenerationAllEdges,
+		s.stmtEdgeCount, s.stmtGenerationEdgeCount, s.stmtRemoveEdge,
 		s.stmtUpdateEdgeOrigin, s.stmtUpdateEdgeAttrs, s.stmtSelectEdgeOrigin, s.stmtDeleteEdgeByKey,
 		s.stmtEdgeExists,
 	}
@@ -869,6 +875,29 @@ func (s *Store) Close() error {
 	}
 	return errors.Join(bulkErr, checkpointErr, closeSQLitePools(s.db, s.writerDB))
 }
+
+const (
+	generationAllNodesSQL = `SELECT ` + lookupNodeCols + `
+FROM nodes INDEXED BY nodes_by_generation
+WHERE view_gen > 0 AND view_gen = ?
+ORDER BY id`
+	generationNodeCountSQL = `SELECT COUNT(*)
+FROM nodes INDEXED BY nodes_by_generation
+WHERE view_gen > 0 AND view_gen = ?`
+	generationAllEdgesSQL = `SELECT ` + lookupEdgeCols + `
+FROM edges INDEXED BY edges_by_generation
+WHERE view_gen > 0 AND view_gen = ?
+ORDER BY id`
+	generationEdgeCountSQL = `SELECT COUNT(*)
+FROM edges INDEXED BY edges_by_generation
+WHERE view_gen > 0 AND view_gen = ?`
+	generationNodesByKindSQL = `SELECT ` + lookupNodeCols + `
+FROM nodes INDEXED BY nodes_by_generation
+WHERE view_gen > 0 AND view_gen = ? AND kind = ?`
+	generationEdgesByKindSQL = `SELECT ` + lookupEdgeCols + `
+FROM edges INDEXED BY edges_by_generation
+WHERE view_gen > 0 AND view_gen = ? AND kind = ?`
+)
 
 func (s *Store) prepare() error {
 	var err error
@@ -911,11 +940,12 @@ func (s *Store) prepare() error {
 	// graph topology.
 	prepWrite(&s.stmtInsertNode,
 		`INSERT INTO nodes (`+nodeInsertColumns+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`+nodeUpsertClause)
-	// Every read below binds the handle's generation as a trailing residual
-	// conjunct. It is never woven into an existing index key, so each statement
-	// keeps the access path it already had; on nodes (WITHOUT ROWID) the
-	// primary-key suffix rides along in every secondary index entry, so the
-	// filter is covering there.
+	// Base reads bind the handle's generation as a trailing residual conjunct
+	// and keep their established access paths. Whole-generation reads have a
+	// second statement for derived handles: it restates view_gen > 0 literally
+	// and forces the matching partial index, so a sparse overlay never scans
+	// generation zero beside it. SQLite cannot infer a partial-index predicate
+	// from the bound view_gen parameter alone.
 	//
 	// This one is not a residual at all: it probes the nodes PRIMARY KEY
 	// exactly, and the conjuncts follow the key order, so the generation
@@ -945,8 +975,10 @@ func (s *Store) prepare() error {
 	// reproducible instead of merely happening to be stable.
 	prep(&s.stmtAllNodes,
 		`SELECT `+nodeCols+` FROM nodes WHERE view_gen = ? ORDER BY id`)
+	prep(&s.stmtGenerationAllNodes, generationAllNodesSQL)
 	prep(&s.stmtNodeCount,
 		`SELECT COUNT(*) FROM nodes WHERE view_gen = ?`)
+	prep(&s.stmtGenerationNodeCount, generationNodeCountSQL)
 	prep(&s.stmtRepoPrefixes,
 		`SELECT DISTINCT repo_prefix FROM nodes WHERE repo_prefix <> '' AND view_gen = ?`)
 
@@ -1016,8 +1048,10 @@ func (s *Store) prepare() error {
 	// and the clause adds no sorter — same reasoning as stmtAllNodes above.
 	prep(&s.stmtAllEdges,
 		`SELECT `+edgeCols+` FROM edges WHERE view_gen = ? ORDER BY id`)
+	prep(&s.stmtGenerationAllEdges, generationAllEdgesSQL)
 	prep(&s.stmtEdgeCount,
 		`SELECT COUNT(*) FROM edges WHERE view_gen = ?`)
+	prep(&s.stmtGenerationEdgeCount, generationEdgeCountSQL)
 	// The edge mutation statements all bind the handle's generation as a
 	// trailing residual conjunct: they rewrite or delete rows this handle
 	// owns, and an identical edge in another generation belongs to another
@@ -1845,7 +1879,11 @@ func (s *Store) GetRepoNodesByLanguage(repoPrefix, language string) []*graph.Nod
 }
 
 func (s *Store) AllNodes() []*graph.Node {
-	return s.queryNodes(s.stmtAllNodes, s.viewGen)
+	stmt := s.stmtAllNodes
+	if s.viewGen > baseViewGeneration {
+		stmt = s.stmtGenerationAllNodes
+	}
+	return s.queryNodes(stmt, s.viewGen)
 }
 
 func (s *Store) queryNodes(stmt *sql.Stmt, args ...any) []*graph.Node {
@@ -2044,7 +2082,11 @@ func (s *Store) GetOutEdgesForNodes(ids []string) map[string][]*graph.Edge {
 }
 
 func (s *Store) AllEdges() []*graph.Edge {
-	return s.queryEdges(s.stmtAllEdges, s.viewGen)
+	stmt := s.stmtAllEdges
+	if s.viewGen > baseViewGeneration {
+		stmt = s.stmtGenerationAllEdges
+	}
+	return s.queryEdges(stmt, s.viewGen)
 }
 
 // GetRepoEdges returns every edge whose source node has the given
@@ -2092,8 +2134,12 @@ func (s *Store) queryEdges(stmt *sql.Stmt, args ...any) []*graph.Edge {
 // -- counts and stats -----------------------------------------------------
 
 func (s *Store) NodeCount() int {
+	stmt := s.stmtNodeCount
+	if s.viewGen > baseViewGeneration {
+		stmt = s.stmtGenerationNodeCount
+	}
 	var n int
-	if err := s.stmtNodeCount.QueryRow(s.viewGen).Scan(&n); err != nil {
+	if err := stmt.QueryRow(s.viewGen).Scan(&n); err != nil {
 		panicOnFatal(err)
 		return 0
 	}
@@ -2101,8 +2147,12 @@ func (s *Store) NodeCount() int {
 }
 
 func (s *Store) EdgeCount() int {
+	stmt := s.stmtEdgeCount
+	if s.viewGen > baseViewGeneration {
+		stmt = s.stmtGenerationEdgeCount
+	}
 	var n int
-	if err := s.stmtEdgeCount.QueryRow(s.viewGen).Scan(&n); err != nil {
+	if err := stmt.QueryRow(s.viewGen).Scan(&n); err != nil {
 		panicOnFatal(err)
 		return 0
 	}
@@ -2513,11 +2563,19 @@ func isStoreClosedErr(err error) bool {
 // keep the structural advantage that the row count flowing through
 // scanEdge is proportional to the result, not the table.
 
-// EdgesByKind: indexed SELECT on the (kind) column.
+// EdgesByKind uses the kind index for the base corpus and the generation index
+// for derived views, where scanning a tiny layer is cheaper than scanning every
+// edge of the requested kind in generation zero and filtering afterward.
 func (s *Store) EdgesByKind(kind graph.EdgeKind) iter.Seq[*graph.Edge] {
 	return func(yield func(*graph.Edge) bool) {
-		out := s.queryEdgesSQL(`SELECT `+lookupEdgeCols+`
-FROM edges WHERE kind = ? AND view_gen = ?`, string(kind), s.viewGen)
+		query := `SELECT ` + lookupEdgeCols + `
+FROM edges WHERE kind = ? AND view_gen = ?`
+		args := []any{string(kind), s.viewGen}
+		if s.viewGen > baseViewGeneration {
+			query = generationEdgesByKindSQL
+			args = []any{s.viewGen, string(kind)}
+		}
+		out := s.queryEdgesSQL(query, args...)
 		for _, e := range out {
 			if !yield(e) {
 				return
@@ -2526,10 +2584,17 @@ FROM edges WHERE kind = ? AND view_gen = ?`, string(kind), s.viewGen)
 	}
 }
 
-// NodesByKind: indexed SELECT on the (kind) column.
+// NodesByKind follows the same base-versus-derived access-path split as
+// EdgesByKind; derived generations are intentionally sparse.
 func (s *Store) NodesByKind(kind graph.NodeKind) iter.Seq[*graph.Node] {
 	return func(yield func(*graph.Node) bool) {
-		out := s.queryNodesSQL(`SELECT `+lookupNodeCols+` FROM nodes WHERE kind = ? AND view_gen = ?`, string(kind), s.viewGen)
+		query := `SELECT ` + lookupNodeCols + ` FROM nodes WHERE kind = ? AND view_gen = ?`
+		args := []any{string(kind), s.viewGen}
+		if s.viewGen > baseViewGeneration {
+			query = generationNodesByKindSQL
+			args = []any{s.viewGen, string(kind)}
+		}
+		out := s.queryNodesSQL(query, args...)
 		for _, n := range out {
 			if !yield(n) {
 				return

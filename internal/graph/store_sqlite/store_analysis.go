@@ -159,13 +159,26 @@ WHERE e.kind = ? AND n.kind = ? AND n.meta IS NOT NULL AND e.view_gen = ?`
 // in-memory reference. Per-type lists are deduplicated by MethodID; the
 // scan is ordered by the edge PK so the first-seen winner is stable. An
 // empty graph (no qualifying rows) returns nil.
-func (s *Store) MemberMethodsByType() map[string][]graph.MemberMethodInfo {
-	q := `SELECT e.to_id, n.id, n.name, n.file_path, n.start_line, n.repo_prefix
+const memberMethodsByTypeSQL = `SELECT e.to_id, n.id, n.name, n.file_path, n.start_line, n.repo_prefix
 FROM edges e
 JOIN nodes n ON n.id = e.from_id AND n.view_gen = e.view_gen
 WHERE e.kind = ? AND n.kind = ? AND e.view_gen = ?
 ORDER BY e.id`
-	rows, err := s.db.Query(q, string(graph.EdgeMemberOf), string(graph.KindMethod), s.viewGen)
+
+const generationMemberMethodsByTypeSQL = `SELECT e.to_id, n.id, n.name, n.file_path, n.start_line, n.repo_prefix
+FROM edges AS e INDEXED BY edges_by_generation
+JOIN nodes n ON n.id = e.from_id AND n.view_gen = e.view_gen
+WHERE e.view_gen > 0 AND e.view_gen = ? AND e.kind = ? AND n.kind = ?
+ORDER BY e.id`
+
+func (s *Store) MemberMethodsByType() map[string][]graph.MemberMethodInfo {
+	q := memberMethodsByTypeSQL
+	args := []any{string(graph.EdgeMemberOf), string(graph.KindMethod), s.viewGen}
+	if s.viewGen > baseViewGeneration {
+		q = generationMemberMethodsByTypeSQL
+		args = []any{s.viewGen, string(graph.EdgeMemberOf), string(graph.KindMethod)}
+	}
+	rows, err := s.db.Query(q, args...)
 	if err != nil {
 		return nil
 	}
