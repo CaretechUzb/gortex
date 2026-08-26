@@ -380,3 +380,36 @@ func TestIncrementalReindexKeepsMutationReceiptExact(t *testing.T) {
 		require.Contains(t, receipt.ResolutionFiles(), name)
 	}
 }
+
+// The production shape of the receipt-exact eviction fix, on the production
+// backend: ONE file edited while an UNCHANGED file holds a resolved incoming
+// reference to it. The pre-evict restub reindexes that reference, the evict
+// describes its doomed nodes, the re-add records the successors - only the
+// SQLite backend keeps all three receipt-exact (the in-memory Graph's
+// reindexEdge still fails receipts closed, a documented asymmetry), so this
+// is the composition the perf claim actually rides on.
+func TestSQLiteIncrementalSingleFileEditKeepsMutationReceiptExact(t *testing.T) {
+	dir := t.TempDir()
+	defPath := filepath.Join(dir, "def.go")
+	callerPath := filepath.Join(dir, "caller.go")
+	writeFile(t, defPath, "package p\n\nfunc Foo() {}\n")
+	writeFile(t, callerPath, "package p\n\nfunc Bar() { Foo() }\n")
+
+	g := newSqliteGraph(t)
+	idx := newTestIndexer(g)
+	_, err := idx.Index(dir)
+	require.NoError(t, err)
+
+	future := time.Now().Add(3 * time.Second)
+	require.NoError(t, os.WriteFile(defPath, []byte("package p\n\nfunc Foo() int { return 1 }\n"), 0o644))
+	require.NoError(t, os.Chtimes(defPath, future, future))
+
+	result, receipt, _, err := idx.incrementalReindexPathsWithReceiptMode(dir, []string{defPath}, incrementalPathMode{})
+	require.NoError(t, err)
+	require.Empty(t, result.FailedFiles)
+	require.NotNil(t, receipt)
+	require.Truef(t, receipt.Complete,
+		"single-file edit with an external incoming reference voided the receipt (%s) on the SQLite backend", receipt.IncompleteReason)
+	require.True(t, receipt.ResolutionRelevant)
+	require.Contains(t, receipt.ResolutionFiles(), "def.go")
+}

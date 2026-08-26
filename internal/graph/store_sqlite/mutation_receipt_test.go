@@ -820,10 +820,8 @@ func TestSQLiteMutationReceiptEvictFilesCapturesExactFrontier(t *testing.T) {
 	assertSQLiteReceiptContains(t, "target names", receipt.TargetNames, "A", "pkg.A", "B")
 	assertSQLiteReceiptContains(t, "target ids", receipt.TargetIDs, "repo/a.go::A", "repo/b.go::B")
 	assertSQLiteReceiptContains(t, "changed files", receipt.ChangedFiles, "a.go", "b.go")
-	for _, banned := range []string{"keep.go"} {
-		if slices.Contains(receipt.DefinitionFiles, banned) {
-			t.Fatalf("unrelated file leaked into definition frontier: %+v", receipt)
-		}
+	if slices.Contains(receipt.DefinitionFiles, "keep.go") {
+		t.Fatalf("unrelated file leaked into definition frontier: %+v", receipt)
 	}
 }
 

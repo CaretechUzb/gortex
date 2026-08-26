@@ -74,26 +74,30 @@ func (s *Store) evictByPredicateResult(predicate string, arg any, exactReceipt b
 	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
 
 	ctx := context.Background()
+	// A failure in this receipt-only read degrades the receipt to incomplete
+	// (receiptDelta stays nil, the post-commit branch marks the fallback)
+	// rather than blocking the eviction itself - the same choice
+	// prepareSQLiteReindexReceiptTx makes for its identity read.
 	var receiptDelta *sqliteMutationReceiptAccumulator
 	if exactReceipt && s.hasActiveMutationReceiptsLocked() {
-		receiptDelta = newSQLiteMutationReceiptAccumulator()
+		delta := newSQLiteMutationReceiptAccumulator()
 		rows, err := tx.QueryContext(ctx, `SELECT id, kind, name, qual_name, file_path FROM nodes WHERE `+predicate, arg)
-		if err != nil {
-			return 0, 0, err
-		}
-		for rows.Next() {
-			var id, kind, name, qualName, filePath string
-			if err := rows.Scan(&id, &kind, &name, &qualName, &filePath); err != nil {
-				_ = rows.Close()
-				return 0, 0, err
+		if err == nil {
+			for rows.Next() {
+				var id, kind, name, qualName, filePath string
+				if err = rows.Scan(&id, &kind, &name, &qualName, &filePath); err != nil {
+					break
+				}
+				recordSQLiteEvictedNode(delta, id, kind, name, qualName, filePath)
 			}
-			recordSQLiteEvictedNode(receiptDelta, id, kind, name, qualName, filePath)
-		}
-		if err := rows.Err(); err != nil {
+			if err == nil {
+				err = rows.Err()
+			}
 			_ = rows.Close()
-			return 0, 0, err
 		}
-		_ = rows.Close()
+		if err == nil {
+			receiptDelta = delta
+		}
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM semantic_binding_types WHERE `+predicate, arg); err != nil {
 		return 0, 0, err
