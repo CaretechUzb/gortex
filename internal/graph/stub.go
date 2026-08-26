@@ -216,23 +216,37 @@ func IsUnresolvedTarget(id string) bool {
 // not; conflating the two would let a name coincidence masquerade as an
 // import-grounded reference.
 func UnresolvedNameCandidateIDs(n *Node) []string {
-	if n == nil || n.Name == "" {
+	if n == nil {
 		return nil
-	}
-	ids := []string{
-		UnresolvedMarker + n.Name,
-		UnresolvedMarker + "*." + n.Name,
 	}
 	prefix := n.RepoPrefix
 	if prefix == "" {
 		prefix = RepoPrefixOfID(n.ID)
 	}
-	if prefix == "" {
+	return UnresolvedNameCandidateIDsForName(n.Name, prefix)
+}
+
+// UnresolvedNameCandidateIDsForName is the name-owned expansion behind
+// UnresolvedNameCandidateIDs for callers that hold a bare name and repo
+// prefix instead of a node. Every consumer that enumerates the stubs a name
+// may be parked under must go through one of these two helpers: the four
+// forms (bare, wildcard member, and their repo-prefixed twins) are a single
+// contract, and a path that hand-builds a subset silently strands the
+// missing forms as permanently pending.
+func UnresolvedNameCandidateIDsForName(name, repoPrefix string) []string {
+	if name == "" {
+		return nil
+	}
+	ids := []string{
+		UnresolvedMarker + name,
+		UnresolvedMarker + "*." + name,
+	}
+	if repoPrefix == "" {
 		return ids
 	}
 	return append(ids,
-		prefix+"::"+UnresolvedMarker+n.Name,
-		prefix+"::"+UnresolvedMarker+"*."+n.Name,
+		repoPrefix+"::"+UnresolvedMarker+name,
+		repoPrefix+"::"+UnresolvedMarker+"*."+name,
 	)
 }
 

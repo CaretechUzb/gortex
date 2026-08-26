@@ -2919,21 +2919,23 @@ func (r *Resolver) ResolveIncomingForNames(names, repoPrefixes []string) *Resolv
 
 	seen := make(map[string]struct{}, len(names))
 	var stubKeys []string
-	appendKey := func(key string) {
-		if _, duplicate := seen[key]; duplicate {
-			return
+	appendKeys := func(keys []string) {
+		for _, key := range keys {
+			if _, duplicate := seen[key]; duplicate {
+				continue
+			}
+			seen[key] = struct{}{}
+			stubKeys = append(stubKeys, key)
 		}
-		seen[key] = struct{}{}
-		stubKeys = append(stubKeys, key)
 	}
 	for _, name := range names {
 		if name == "" {
 			continue
 		}
-		appendKey(graph.UnresolvedMarker + name)
+		appendKeys(graph.UnresolvedNameCandidateIDsForName(name, ""))
 		for _, prefix := range repoPrefixes {
 			if prefix != "" {
-				appendKey(prefix + "::" + graph.UnresolvedMarker + name)
+				appendKeys(graph.UnresolvedNameCandidateIDsForName(name, prefix))
 			}
 		}
 	}
@@ -2967,10 +2969,7 @@ func (r *Resolver) resolveIncomingLocked(filePath string, stats *ResolveStats) {
 			continue
 		}
 		seen[n.Name] = struct{}{}
-		stubKeys = append(stubKeys, graph.UnresolvedMarker+n.Name)
-		if n.RepoPrefix != "" {
-			stubKeys = append(stubKeys, n.RepoPrefix+"::"+graph.UnresolvedMarker+n.Name)
-		}
+		stubKeys = append(stubKeys, graph.UnresolvedNameCandidateIDs(n)...)
 	}
 	if len(stubKeys) == 0 {
 		return
