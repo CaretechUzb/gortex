@@ -198,6 +198,9 @@ func materializeCrossRepoCandidates(g graph.Store, rows []graph.CrossRepoCandida
 // kind list verbatim so single-repo graphs return no rows without a
 // whole-table scan.
 func crossRepoCandidates(g graph.Store) []graph.CrossRepoCandidateRow {
+	if !crossRepoPossible(g) {
+		return nil
+	}
 	baseKinds := graph.BaseKindsForCrossRepo()
 	if cap, ok := g.(graph.CrossRepoCandidates); ok {
 		return cap.CrossRepoCandidates(baseKinds)
@@ -206,6 +209,9 @@ func crossRepoCandidates(g graph.Store) []graph.CrossRepoCandidateRow {
 }
 
 func crossRepoCandidatesForRepos(g graph.Store, repoPrefixes []string) []graph.CrossRepoCandidateRow {
+	if !crossRepoPossible(g) {
+		return nil
+	}
 	baseKinds := graph.BaseKindsForCrossRepo()
 	if cap, ok := g.(graph.ScopedCrossRepoCandidates); ok {
 		return cap.CrossRepoCandidatesForRepos(baseKinds, repoPrefixes)
@@ -213,6 +219,10 @@ func crossRepoCandidatesForRepos(g graph.Store, repoPrefixes []string) []graph.C
 	return crossRepoCandidatesFallback(g, baseKinds, stringSet(repoPrefixes), nil)
 }
 
+// Deliberately NOT guarded by crossRepoPossible: this is the watcher's
+// per-save path, its candidate query is already bounded by the changed
+// files, and the guard's prefix scan reads every node row — a cost worth
+// paying once per workspace pass but not once per keystroke-save.
 func crossRepoCandidatesForMutationFiles(g graph.Store, edgeSourceFiles, incidentNodeFiles []string) []graph.CrossRepoCandidateRow {
 	baseKinds := graph.BaseKindsForCrossRepo()
 	if cap, ok := g.(graph.MutationScopedCrossRepoCandidates); ok {
@@ -222,8 +232,8 @@ func crossRepoCandidatesForMutationFiles(g graph.Store, edgeSourceFiles, inciden
 }
 
 // crossRepoPossible reports whether the graph can hold a cross-repo edge
-// at all. Below two distinct non-empty repository prefixes the answer is
-// no, and proving it costs one prefix lookup instead of a query.
+// at all. Below two distinct repositories the answer is no, and proving
+// it costs one prefix lookup instead of a query.
 //
 // The candidate queries below join BOTH endpoints of every
 // calls/implements/extends edge against `nodes` to read their
