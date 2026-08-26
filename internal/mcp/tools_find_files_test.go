@@ -158,6 +158,12 @@ func setupFindFilesGlobstarServer(t *testing.T) *Server {
 	write("internal/a/b/deep_test.go", "package b\n\nfunc TestDeep() {}\n")
 	write("internal/sub/production.go", "package sub\n\nfunc Produce() {}\n")
 	write("cmd/outside_test.go", "package cmd\n\nfunc TestOutside() {}\n")
+	// For the trailing-subtree composition: a globbed directory prefix
+	// (`src/**/internal`) followed by `/*`. None of these end in
+	// _test.go, so the counts asserted above are unaffected.
+	write("src/a/internal/x.go", "package internal\n\nfunc X() {}\n")
+	write("src/a/internal/sub/deep.go", "package sub\n\nfunc Deep() {}\n")
+	write("src/a/other/deep.go", "package other\n\nfunc Other() {}\n")
 
 	g := graph.New()
 	reg := testRegistry()
@@ -205,4 +211,30 @@ func TestFindFiles_GlobstarCrossesSegmentsAtAnyDepth(t *testing.T) {
 		require.Falsef(t, got[unwanted], "%q must not match internal/**/*_test.go", unwanted)
 	}
 	require.Equal(t, 3, resp.Count, "exactly the three test files under internal/")
+}
+
+// TestFindFiles_GlobstarComposesWithTrailingSubtree is the handler-level
+// half of the composition contract: `**` crosses directories and a
+// trailing `/*` covers a subtree, and the two have to work in one
+// pattern. `src/**/internal/*` resolved neither rule before — the segment
+// walk spent the final `*` on a single segment, and the legacy prefix
+// fallback reads `src/**/internal` literally.
+func TestFindFiles_GlobstarComposesWithTrailingSubtree(t *testing.T) {
+	srv := setupFindFilesGlobstarServer(t)
+
+	resp := decodeFindFiles(t, callTool(t, srv, "find_files",
+		map[string]any{"glob": "src/**/internal/*"}))
+
+	got := map[string]bool{}
+	for _, f := range resp.Files {
+		got[f.Path] = true
+	}
+
+	require.Truef(t, got["src/a/internal/x.go"],
+		"a direct child of the globbed prefix; got %v", resp.Files)
+	require.Truef(t, got["src/a/internal/sub/deep.go"],
+		"a deeply nested child — the case that regressed; got %v", resp.Files)
+	require.Falsef(t, got["src/a/other/deep.go"],
+		"a sibling directory that is not `internal` must not match")
+	require.Equal(t, 2, resp.Count, "exactly the two files under src/a/internal")
 }

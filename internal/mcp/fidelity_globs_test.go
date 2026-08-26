@@ -1,7 +1,9 @@
 package mcp
 
 import (
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -199,4 +201,89 @@ func TestGetEditingContext_FidelityGlobsOmit(t *testing.T) {
 	require.NotEmpty(t, sc, "source_compressed must be present")
 	assert.Contains(t, sc, "omitted", "omit rule must mark declarations")
 	assert.NotContains(t, sc, `strings.Split(t, ".")`, "omitted body must be gone")
+}
+
+// TestMatchFidelityGlob_RepeatedGlobstarsStayBounded is the regression
+// test for a denial-of-service, not a performance nicety.
+//
+// The matcher walks the pattern against the path, and a plain recursion
+// re-derives the same (pattern suffix, path suffix) pair once for every
+// way of reaching it — so each additional `**` multiplies the work. This
+// exact input ran for over a hundred seconds before the memo; `glob` is
+// user input and find_files evaluates it against every candidate file
+// before applying the result limit, so one request could hold a daemon
+// core indefinitely.
+//
+// The bound is deliberately loose. The memoised matcher answers this in
+// microseconds, so five seconds is roughly six orders of magnitude of
+// headroom — enough that a loaded or throttled runner cannot trip it,
+// while still failing outright if the exponential behavior returns.
+func TestMatchFidelityGlob_RepeatedGlobstarsStayBounded(t *testing.T) {
+	pattern := "a/" + strings.Repeat("**/", 12) + "z.go"
+	rel := "a/" + strings.Repeat("x/", 25) + "q.go"
+
+	done := make(chan bool, 1)
+	start := time.Now()
+	go func() { done <- matchFidelityGlob(pattern, rel) }()
+
+	select {
+	case got := <-done:
+		assert.False(t, got, "the path does not end in z.go, so this must not match")
+		assert.Lessf(t, time.Since(start), 5*time.Second,
+			"matchFidelityGlob(%q, ...) took %s — the globstar walk is enumerating again",
+			pattern, time.Since(start))
+	case <-time.After(5 * time.Second):
+		t.Fatalf("matchFidelityGlob(%q, ...) did not finish within 5s — "+
+			"a user-supplied glob can pin a daemon core", pattern)
+	}
+}
+
+// TestMatchFidelityGlob_GlobstarComposesWithTrailingSubtree pins the two
+// documented rules working together: `**` crosses directories anywhere,
+// and a trailing `/*` covers a whole subtree. Each held on its own, but
+// `src/**/internal/*` resolved neither — the segment walk spent the final
+// `*` on one segment, and the legacy prefix fallback cannot help because
+// it reads `src/**/internal` literally.
+//
+// This is also a Windows regression guard: the older filepath.Match
+// accepted the deep path here, because '/' is an ordinary character when
+// the separator is '\'.
+func TestMatchFidelityGlob_GlobstarComposesWithTrailingSubtree(t *testing.T) {
+	const pattern = "src/**/internal/*"
+
+	assert.True(t, matchFidelityGlob(pattern, "src/a/internal"),
+		"the directory itself, exactly as `internal/*` matches `internal`")
+	assert.True(t, matchFidelityGlob(pattern, "src/a/internal/x.go"),
+		"a direct child")
+	assert.True(t, matchFidelityGlob(pattern, "src/a/internal/sub/deep.go"),
+		"a deeply nested child — the case that regressed")
+	assert.True(t, matchFidelityGlob(pattern, "src/a/b/c/internal/deep/y.go"),
+		"the globstar itself spanning several directories")
+
+	assert.False(t, matchFidelityGlob(pattern, "src/a/other/deep.go"),
+		"a sibling directory that is not `internal`")
+	assert.False(t, matchFidelityGlob(pattern, "other/a/internal/x.go"),
+		"the anchored first segment still has to match")
+}
+
+// TestFidelityGlobDecideForPath_SubtreeComposition runs the same
+// composition through the consumer that fidelity rules actually reach, so
+// the contract is pinned at the level users configure rather than only at
+// the matcher.
+func TestFidelityGlobDecideForPath_SubtreeComposition(t *testing.T) {
+	rules := parseFidelityGlobs("src/**/internal/*:full,**:omit")
+
+	for _, rel := range []string{
+		"src/a/internal/x.go",
+		"src/a/internal/sub/deep.go",
+	} {
+		d := fidelityDecideForPath(rules, rel)
+		require.NotNilf(t, d, "%s matched no rule at all", rel)
+		assert.Equalf(t, elide.FidelityFull, d(elide.Decl{}), "%s should take the first rule", rel)
+	}
+
+	other := fidelityDecideForPath(rules, "src/a/other/deep.go")
+	require.NotNil(t, other)
+	assert.Equal(t, elide.FidelityOmit, other(elide.Decl{}),
+		"a path outside the subtree must fall through to the catch-all")
 }

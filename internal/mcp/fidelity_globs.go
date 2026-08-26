@@ -108,9 +108,14 @@ func matchFidelityGlob(pattern, rel string) bool {
 	// This runs first and only ever adds a match: every branch below is
 	// left exactly as it was, so the directory-prefix rules and the
 	// basename fallback keep deciding everything they decided before.
-	if strings.Contains(pattern, "**") &&
-		matchGlobstarSegments(strings.Split(pattern, "/"), strings.Split(rel, "/")) {
-		return true
+	//
+	// The gate keeps the common single-segment patterns (`*_test.go`) on
+	// the cheap path; the shapes that reach the matcher are the ones whose
+	// meaning it owns.
+	if strings.Contains(pattern, "**") || strings.HasSuffix(pattern, "/*") || pattern == "*" {
+		if matchGlobstarSegments(globPatternSegments(pattern), strings.Split(rel, "/")) {
+			return true
+		}
 	}
 
 	// Trailing `/**` (or bare `**`): match the directory and the whole
@@ -143,6 +148,34 @@ func matchFidelityGlob(pattern, rel string) bool {
 	return matchSegmentGlob(pattern, rel)
 }
 
+// globPatternSegments splits a pattern into the segments the matcher
+// consumes, with two normalisations.
+//
+// A trailing `*` becomes `**`. That is not a widening: this package has
+// always read `dir/*` as a directory prefix covering the whole subtree
+// (see matchSegmentGlob), which is the same reach as `dir/**`. Spelling
+// it that way is what lets the rule compose with a preceding globstar —
+// `src/**/internal/*` cannot be resolved by the legacy prefix fallback,
+// because that treats `src/**/internal` as a literal.
+//
+// Adjacent globstars collapse. `a/**/**/b` means exactly `a/**/b`, and
+// leaving the duplicates in multiplies the matcher's state space for no
+// added meaning — which is how a short pattern turned into minutes of CPU.
+func globPatternSegments(pattern string) []string {
+	segs := strings.Split(pattern, "/")
+	if n := len(segs); n > 0 && segs[n-1] == "*" {
+		segs[n-1] = "**"
+	}
+	out := make([]string, 0, len(segs))
+	for _, s := range segs {
+		if s == "**" && len(out) > 0 && out[len(out)-1] == "**" {
+			continue
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
 // matchGlobstarSegments matches a segment-split pattern against a
 // segment-split path, giving `**` its usual meaning: zero or more whole
 // segments, wherever it appears. Every other segment is matched with
@@ -151,25 +184,53 @@ func matchFidelityGlob(pattern, rel string) bool {
 // Zero segments is deliberate — `internal/**/*_test.go` has to match
 // `internal/foo_test.go` as well as `internal/a/b/c_test.go`, or the
 // pattern means something different at each depth.
+//
+// The walk is memoised on (pattern index, path index). Plain recursion
+// re-derives the same suffix pair once per way of reaching it, so each
+// extra `**` multiplies the work: a 42-byte pattern with twelve of them
+// against a 27-segment non-match ran for over a hundred seconds. The glob
+// is user input and find_files runs this against every candidate file
+// before applying the result limit, so that was a way to pin a daemon
+// core from a single request. With the memo the work is bounded by the
+// state count, O(len(pattern) * len(rel)^2) in the worst case, and the
+// same input returns in microseconds.
 func matchGlobstarSegments(pattern, rel []string) bool {
-	for len(pattern) > 0 {
-		if pattern[0] == "**" {
-			for i := 0; i <= len(rel); i++ {
-				if matchGlobstarSegments(pattern[1:], rel[i:]) {
-					return true
-				}
+	m, n := len(pattern), len(rel)
+
+	const (
+		unknown uint8 = iota
+		yes
+		no
+	)
+	memo := make([]uint8, (m+1)*(n+1))
+
+	var match func(i, j int) bool
+	match = func(i, j int) bool {
+		if i == m {
+			return j == n
+		}
+		slot := i*(n+1) + j
+		if v := memo[slot]; v != unknown {
+			return v == yes
+		}
+		res := false
+		if pattern[i] == "**" {
+			for t := j; t <= n && !res; t++ {
+				res = match(i+1, t)
 			}
-			return false
+		} else if j < n {
+			if ok, _ := path.Match(pattern[i], rel[j]); ok {
+				res = match(i+1, j+1)
+			}
 		}
-		if len(rel) == 0 {
-			return false
+		if res {
+			memo[slot] = yes
+		} else {
+			memo[slot] = no
 		}
-		if ok, _ := path.Match(pattern[0], rel[0]); !ok {
-			return false
-		}
-		pattern, rel = pattern[1:], rel[1:]
+		return res
 	}
-	return len(rel) == 0
+	return match(0, 0)
 }
 
 // matchSegmentGlob applies the single-segment glob semantics shared
