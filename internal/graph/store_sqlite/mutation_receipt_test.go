@@ -928,3 +928,39 @@ func TestSQLiteMutationReceiptEvictImportToNonreferenceableFailsClosed(t *testin
 		t.Fatalf("receipt claimed complete over a deleted surviving import edge: %+v", receipt)
 	}
 }
+
+func TestSQLiteMutationReceiptEvictAmbiguousImportPackageCandidateRecordsImportStub(t *testing.T) {
+	store := openMutationReceiptStore(t)
+	store.AddBatch([]*graph.Node{{
+		ID: "one::pkg", Kind: graph.KindPackage, Name: "pkg", QualName: "example/pkg",
+		FilePath: "a/one.go", RepoPrefix: "one",
+	}}, nil)
+
+	token := store.BeginMutationReceipt()
+	store.EvictFiles([]string{"a/one.go"})
+	receipt := store.EndMutationReceipt(token)
+
+	if !receipt.Complete || !receipt.ResolutionRelevant {
+		t.Fatalf("receipt = %+v, want a complete resolution-relevant delta", receipt)
+	}
+	assertSQLiteReceiptContains(t, "target names", receipt.TargetNames, "import::example/pkg", "import::pkg")
+	if want := []string{"a/one.go"}; !slices.Equal(receipt.ResolutionFiles(), want) {
+		t.Fatalf("resolution files = %v, want %v", receipt.ResolutionFiles(), want)
+	}
+}
+
+func TestSQLiteMutationReceiptEvictUnmappedImportCandidateKindFailsClosed(t *testing.T) {
+	store := openMutationReceiptStore(t)
+	store.AddBatch([]*graph.Node{{
+		ID: "one::mod", Kind: graph.KindModule, Name: "mod", QualName: "example/pkg",
+		FilePath: "m/mod.go", RepoPrefix: "one",
+	}}, nil)
+
+	token := store.BeginMutationReceipt()
+	store.EvictFiles([]string{"m/mod.go"})
+	receipt := store.EndMutationReceipt(token)
+
+	if receipt.Complete {
+		t.Fatalf("receipt = %+v, want incomplete: the kind is a qualified-name import candidate without an exact stub mapping", receipt)
+	}
+}

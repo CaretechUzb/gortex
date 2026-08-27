@@ -306,3 +306,39 @@ func TestMutationReceiptEvictImportToNonreferenceableFailsClosed(t *testing.T) {
 		t.Fatalf("receipt claimed complete over a deleted surviving import edge: %+v", receipt)
 	}
 }
+
+func TestMutationReceiptEvictAmbiguousImportPackageCandidateRecordsImportStub(t *testing.T) {
+	g := New()
+	g.AddBatch([]*Node{{
+		ID: "one::pkg", Kind: KindPackage, Name: "pkg", QualName: "example/pkg",
+		FilePath: "a/one.go", RepoPrefix: "one",
+	}}, nil)
+
+	token := g.BeginMutationReceipt()
+	g.EvictFile("a/one.go")
+	receipt := g.EndMutationReceipt(token)
+
+	if !receipt.Complete || !receipt.ResolutionRelevant {
+		t.Fatalf("receipt = %+v, want a complete resolution-relevant delta", receipt)
+	}
+	assertReceiptContains(t, "target names", receipt.TargetNames, "import::example/pkg", "import::pkg")
+	if want := []string{"a/one.go"}; !slices.Equal(receipt.ResolutionFiles(), want) {
+		t.Fatalf("resolution files = %v, want %v", receipt.ResolutionFiles(), want)
+	}
+}
+
+func TestMutationReceiptEvictUnmappedImportCandidateKindFailsClosed(t *testing.T) {
+	g := New()
+	g.AddBatch([]*Node{{
+		ID: "one::mod", Kind: KindModule, Name: "mod", QualName: "example/pkg",
+		FilePath: "m/mod.go", RepoPrefix: "one",
+	}}, nil)
+
+	token := g.BeginMutationReceipt()
+	g.EvictFile("m/mod.go")
+	receipt := g.EndMutationReceipt(token)
+
+	if receipt.Complete {
+		t.Fatalf("receipt = %+v, want incomplete: the kind is a qualified-name import candidate without an exact stub mapping", receipt)
+	}
+}

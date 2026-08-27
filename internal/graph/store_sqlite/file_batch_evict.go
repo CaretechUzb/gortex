@@ -163,12 +163,14 @@ func (s *Store) evictByPredicateResult(predicate string, arg any, exactReceipt b
 }
 
 // recordSQLiteEvictedNode describes one doomed node to a receipt delta. An
-// evicted referenceable definition is resolution-relevant the same way an
-// added one is: pending references naming it elsewhere may resolve
-// differently once it is gone (and, in the evict-then-readd reindex flow, the
-// re-add records the successor identity), so its file joins the definition
-// frontier and its names join the target set — mirroring
-// recordSQLiteChangedNodeIdentity's treatment of a vanished old identity.
+// evicted resolver candidate is resolution-relevant the same way an added
+// one is: pending references naming it elsewhere may resolve differently
+// once it is gone (and, in the evict-then-readd reindex flow, the re-add
+// records the successor identity), so its file joins the definition
+// frontier and the stub names graph.ReceiptNamesForEvictedSymbol maps it to
+// join the target set — mirroring recordSQLiteChangedNodeIdentity's
+// treatment of a vanished old identity. A candidate kind without an exact
+// stub mapping fails the receipt closed.
 func recordSQLiteEvictedNode(acc *sqliteMutationReceiptAccumulator, id, kind, name, qualName, filePath string) {
 	if acc == nil {
 		return
@@ -176,18 +178,21 @@ func recordSQLiteEvictedNode(acc *sqliteMutationReceiptAccumulator, id, kind, na
 	if filePath != "" {
 		acc.changedFiles[filePath] = struct{}{}
 	}
-	if !graph.IsReferenceableSymbol(graph.NodeKind(kind)) {
+	names, exact := graph.ReceiptNamesForEvictedSymbol(graph.NodeKind(kind), name, qualName)
+	if !exact {
+		acc.resolutionRelevant = true
+		acc.noteIncomplete("evicted_import_candidate_kind")
+		return
+	}
+	if len(names) == 0 {
 		return
 	}
 	acc.resolutionRelevant = true
 	if id != "" {
 		acc.targetIDs[id] = struct{}{}
 	}
-	if name != "" {
-		acc.targetNames[name] = struct{}{}
-	}
-	if qualName != "" {
-		acc.targetNames[qualName] = struct{}{}
+	for _, stubName := range names {
+		acc.targetNames[stubName] = struct{}{}
 	}
 	if filePath != "" {
 		acc.definitionFiles[filePath] = struct{}{}

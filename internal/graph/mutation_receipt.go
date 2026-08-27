@@ -303,11 +303,12 @@ func (g *Graph) recordAddedEdgeForReceipts(e *Edge, exactFile string) {
 
 // recordEvictedNodesForReceipts describes a bounded file-scoped eviction to
 // active receipts exactly instead of failing them closed. An evicted
-// referenceable definition is resolution-relevant the same way an added one
-// is: pending references naming it elsewhere may resolve differently once it
+// resolver candidate is resolution-relevant the same way an added one is:
+// pending references naming it elsewhere may resolve differently once it
 // is gone (and in the evict-then-readd reindex flow the re-add records the
-// successor identity), so its file joins the definition frontier and its
-// names join the target set.
+// successor identity), so its file joins the definition frontier and the
+// stub names ReceiptNamesForEvictedSymbol maps it to join the target set.
+// A candidate kind without an exact stub mapping fails the receipt closed.
 func (g *Graph) recordEvictedNodesForReceipts(nodes []*Node) {
 	if len(nodes) == 0 || g.mutationReceipts.activeCount.Load() == 0 {
 		return
@@ -322,18 +323,21 @@ func (g *Graph) recordEvictedNodesForReceipts(nodes []*Node) {
 			if n.FilePath != "" {
 				acc.changedFiles[n.FilePath] = struct{}{}
 			}
-			if !IsReferenceableSymbol(n.Kind) {
+			names, exact := ReceiptNamesForEvictedSymbol(n.Kind, n.Name, n.QualName)
+			if !exact {
+				acc.resolutionRelevant = true
+				acc.noteIncomplete("evicted_import_candidate_kind")
+				continue
+			}
+			if len(names) == 0 {
 				continue
 			}
 			acc.resolutionRelevant = true
 			if n.ID != "" {
 				acc.targetIDs[n.ID] = struct{}{}
 			}
-			if n.Name != "" {
-				acc.targetNames[n.Name] = struct{}{}
-			}
-			if n.QualName != "" {
-				acc.targetNames[n.QualName] = struct{}{}
+			for _, name := range names {
+				acc.targetNames[name] = struct{}{}
 			}
 			if n.FilePath != "" {
 				acc.definitionFiles[n.FilePath] = struct{}{}

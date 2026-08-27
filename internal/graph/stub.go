@@ -348,3 +348,52 @@ func IsReferenceableSymbol(k NodeKind) bool {
 	}
 	return false
 }
+
+// ImportStubNamePrefix is the name-space of import-resolution pending
+// stubs: an unresolved import edge targets
+// `unresolved::import::<path>` (or the repo-prefixed COPY-rewrite form),
+// so the receipt name that reaches that stub through
+// UnresolvedNameCandidateIDsForName is `import::<path>`.
+const ImportStubNamePrefix = "import::"
+
+// ReceiptNamesForEvictedSymbol maps one evicted node to the receipt
+// target names under which pending references to it may be parked, and
+// reports whether that mapping is exact. This is the single authority
+// for the eviction side of mutation receipts on every backend:
+//
+//   - a referenceable definition's pending references park under its
+//     bare name and qualified name;
+//   - a package is an import-resolution candidate (the resolver's
+//     qualified-name tier considers it), so its pending references park
+//     under the import-prefixed stub of its qualified name (and of its
+//     bare name, for stem-form specifiers);
+//   - any other kind carrying a qualified name also participates in the
+//     resolver's qualified-name candidate lookup but has no exact stub
+//     mapping yet — the receipt must fail closed rather than certify
+//     the eviction as resolution-irrelevant.
+//
+// Extractors set QualName almost exclusively on referenceable symbols
+// and packages, so the fail-closed branch is rare in practice.
+func ReceiptNamesForEvictedSymbol(kind NodeKind, name, qualName string) (names []string, exact bool) {
+	switch {
+	case IsReferenceableSymbol(kind):
+		if name != "" {
+			names = append(names, name)
+		}
+		if qualName != "" && qualName != name {
+			names = append(names, qualName)
+		}
+		return names, true
+	case kind == KindPackage:
+		if qualName != "" {
+			names = append(names, ImportStubNamePrefix+qualName)
+		}
+		if name != "" && name != qualName {
+			names = append(names, ImportStubNamePrefix+name)
+		}
+		return names, true
+	case qualName != "":
+		return nil, false
+	}
+	return nil, true
+}
