@@ -809,6 +809,18 @@ func repoNarrowAdmits(allowed map[string]bool, repoPrefix string) bool {
 	return repoPrefix == "" || allowed[repoPrefix]
 }
 
+// repoNarrowAdmitsNode is repoNarrowAdmits for a node whose kind is
+// known. It additionally admits shared rendezvous nodes, whose stamped
+// RepoPrefix records mint order rather than ownership — see
+// graph.SharedAcrossRepos. Callers holding a *graph.Node must prefer it
+// over the bare-prefix form so every repo-narrow predicate agrees.
+func repoNarrowAdmitsNode(allowed map[string]bool, n *graph.Node) bool {
+	if n == nil {
+		return false
+	}
+	return repoNarrowAdmits(allowed, n.RepoPrefix) || graph.SharedAcrossRepos(n)
+}
+
 // filterNodes returns only nodes whose RepoPrefix is in the allowed set.
 // If allowed is nil, returns the original slice unchanged.
 func filterNodes(nodes []*graph.Node, allowed map[string]bool) []*graph.Node {
@@ -817,7 +829,7 @@ func filterNodes(nodes []*graph.Node, allowed map[string]bool) []*graph.Node {
 	}
 	var out []*graph.Node
 	for _, n := range nodes {
-		if repoNarrowAdmits(allowed, n.RepoPrefix) {
+		if repoNarrowAdmitsNode(allowed, n) {
 			out = append(out, n)
 		}
 	}
@@ -951,7 +963,7 @@ func filterSubGraph(sg *query.SubGraph, allowed map[string]bool) *query.SubGraph
 	nodeIDs := make(map[string]bool)
 	var nodes []*graph.Node
 	for _, n := range sg.Nodes {
-		if repoNarrowAdmits(allowed, n.RepoPrefix) {
+		if repoNarrowAdmitsNode(allowed, n) {
 			nodes = append(nodes, n)
 			nodeIDs[n.ID] = true
 		}

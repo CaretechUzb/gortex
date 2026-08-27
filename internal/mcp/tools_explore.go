@@ -2853,7 +2853,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	// two steps — unscoped ranked, then unscoped BM25 — re-applying the
 	// repo boundary as a post-filter to preserve multi-repo hygiene.
 	repoAllowed := func(n *graph.Node) bool {
-		return len(resolved.RepoAllow) == 0 || repoNarrowAdmits(resolved.RepoAllow, n.RepoPrefix)
+		return len(resolved.RepoAllow) == 0 || repoNarrowAdmitsNode(resolved.RepoAllow, n)
 	}
 	if len(ranked) == 0 {
 		for _, c := range eng.SearchSymbolsRanked(searchQuery, fetch, query.QueryOptions{}, rctx) {
@@ -3443,7 +3443,7 @@ func exploreNodeWithinQueryScope(n *graph.Node, scope query.QueryOptions) bool {
 	if scope.ProjectID != "" && n.ProjectID != scope.ProjectID {
 		return false
 	}
-	if !repoNarrowAdmits(scope.RepoAllow, n.RepoPrefix) {
+	if !repoNarrowAdmitsNode(scope.RepoAllow, n) {
 		return false
 	}
 	return true
