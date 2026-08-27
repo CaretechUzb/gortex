@@ -32,7 +32,7 @@ var extractorVersions = map[string]int{
 	//   "go": 2,
 	"c":      generatedParserProjectionPolicyVersion, // generated parser projection covers all strictly detected table sizes
 	"php":    2,                                      // class/interface inheritance now emits typed structural edges
-	"csharp": 14,                                     // interface variance + global-using-alias stamps and qualifier/verbatim canonicalization for the dispatch gate review revision (was: field-identifier read/write edges + type-argument stamps)
+	"csharp": 15,                                     // canonical-identifier domain for the type-arg stamps (escapes, verbatim, alias meta), AST-derived field/property args, positional-record stamps, shadow-aware receiver_name (was: variance + global-alias stamps)
 	"scala":  2,                                      // explicitly instantiated generic calls emit call edges
 	"go":     3,                                      // generic instantiations are marked so indexing a func value cannot bind (was: generic calls emit call edges)
 	"cpp":    2,                                      // templated and namespace-qualified calls emit call edges
