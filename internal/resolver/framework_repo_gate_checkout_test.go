@@ -57,3 +57,38 @@ func TestFrameworkRepoGateStore_NoGroupingStaysInert(t *testing.T) {
 	assert.Empty(t, gated.CheckoutGroup("local"))
 	assert.False(t, newOdooSiblingCache(gated).active)
 }
+
+// Declaring FnValuePlaceholderEdges makes every gated store satisfy the
+// scanner interface, so it has to answer correctly for a store underneath
+// that does not implement it. Returning nil would panic the caller's range.
+func TestFrameworkRepoGateStore_FnValuePlaceholderFallbackIsSafe(t *testing.T) {
+	base := graph.New()
+	gated := &frameworkRepoGateStore{Store: storeWithoutFnValueScanner{base}, gate: &frameworkRepoGate{}, pass: "fn-value-callback"}
+
+	seq := gated.FnValuePlaceholderEdges()
+	require.NotNil(t, seq, "a nil sequence panics the caller's range")
+	count := 0
+	for range seq {
+		count++
+	}
+	assert.Zero(t, count)
+}
+
+// storeWithoutFnValueScanner hides the optional capability the way a
+// third-party Store would.
+type storeWithoutFnValueScanner struct{ graph.Store }
+
+func (s storeWithoutFnValueScanner) FnValuePlaceholderEdges() {}
+
+// The forwarding must reach the real index when the store has one — that is
+// the whole point, and an assertion that silently fails leaves the pass on
+// its wide fallback with nothing to show for it.
+func TestFrameworkRepoGateStore_ForwardsFnValuePlaceholderIndex(t *testing.T) {
+	base := graph.New()
+	gated := newFrameworkRepoGateStore(base, &frameworkRepoGate{}, "fn-value-callback", base)
+	if _, wrapped := gated.(*frameworkRepoGateStore); !wrapped {
+		t.Skip("nothing narrows this pass, so the store is unwrapped and forwarding is moot")
+	}
+	_, ok := gated.(graph.FnValuePlaceholderScanner)
+	assert.True(t, ok, "a gated store must still expose the fn-value placeholder index")
+}

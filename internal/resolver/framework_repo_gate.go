@@ -1,6 +1,8 @@
 package resolver
 
 import (
+	"iter"
+
 	"strings"
 
 	"github.com/zzet/gortex/internal/frameworkgate"
@@ -136,6 +138,41 @@ type frameworkRepoGateStore struct {
 	siblingSrc      any
 	dropped         int
 	droppedSiblings int
+}
+
+// FnValuePlaceholderEdges republishes the fn-value placeholder index.
+//
+// Same asymmetry as the checkout grouping below, and the same consequence.
+// EdgesByKind is part of graph.Store so embedding promotes it; the narrow
+// scanners are optional capabilities that are not, so a pass asking this
+// wrapper for one is told the store has none and falls back to a wide walk.
+// resolveFnValueCallbacks prefers this index on both its paths and was
+// silently taking the fallback on every framework run.
+//
+// Forwarding a READ capability from this wrapper is safe and is what the
+// promoted reads already do: this is a write gate over the real store, not
+// a scoping view. A pass that needs its reads narrowed to a frontier gets
+// that from frameworkScopedStore, which wraps the other way round.
+// A wrapper cannot advertise a capability conditionally, so declaring this
+// method makes every gated store satisfy the interface. It must therefore
+// answer correctly even when the store underneath does not implement it —
+// returning nil would panic the caller's range, and returning an empty
+// sequence would silently claim the graph holds no placeholders. The
+// fallback is the same walk the caller would have done for itself.
+func (v *frameworkRepoGateStore) FnValuePlaceholderEdges() iter.Seq[*graph.Edge] {
+	if scanner, ok := v.Store.(graph.FnValuePlaceholderScanner); ok {
+		return scanner.FnValuePlaceholderEdges()
+	}
+	return func(yield func(*graph.Edge) bool) {
+		for edge := range v.Store.EdgesByKind(graph.EdgeReferences) {
+			if edge == nil || !graph.IsFnValuePlaceholder(edge.To) {
+				continue
+			}
+			if !yield(edge) {
+				return
+			}
+		}
+	}
 }
 
 // CheckoutGroup and HasCheckoutGroups republish the checkout grouping that
