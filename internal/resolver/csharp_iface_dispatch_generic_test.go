@@ -725,7 +725,10 @@ func TestResolveCSharpInterfaceDispatch_ContravariantInterfaceNeverFilters(t *te
 
 // Review RED (revision 4a): `IBox<dynamic>` and `IBox<object>` construct
 // over the same underlying type (dynamic erases to object) - the gate must
-// fold them together and retain the edge.
+// fold them together and retain the edge. Re-review fix: the original
+// fixture implemented IBox<dynamic> directly, which the compiler refuses
+// (CS1966 - a class cannot implement a dynamic interface); the legal
+// orientation exercises the same fold from the receiver side.
 func TestResolveCSharpInterfaceDispatch_DynamicObjectSpellingsRetainTheEdge(t *testing.T) {
 	g := buildCSharpResolverGraph(t, map[string]string{
 		"Dyn.cs": `namespace App {
@@ -733,15 +736,15 @@ func TestResolveCSharpInterfaceDispatch_DynamicObjectSpellingsRetainTheEdge(t *t
     public interface IBox<T> {
         int Get(int id);
     }
-    public class DynBox : IBox<dynamic> {
+    public class ObjectBox : IBox<object> {
         public int Get(int id) { return 1; }
     }
     public class CrateBox : IBox<Crate> {
         public int Get(int id) { return 2; }
     }
     public class Flow {
-        private readonly IBox<object> _objects;
-        public Flow(IBox<object> o) { _objects = o; }
+        private readonly IBox<dynamic> _objects;
+        public Flow(IBox<dynamic> o) { _objects = o; }
         public int Pull() { return _objects.Get(1); }
     }
 }`,
@@ -754,7 +757,7 @@ func TestResolveCSharpInterfaceDispatch_DynamicObjectSpellingsRetainTheEdge(t *t
 	ResolveCSharpInterfaceDispatch(g)
 
 	targets := dispatchTargets(g, callerID)
-	assert.Contains(t, targets, "Dyn.cs::DynBox.Get",
+	assert.Contains(t, targets, "Dyn.cs::ObjectBox.Get",
 		"dynamic and object spell the same constructed interface - the edge stays")
 	assert.NotContains(t, targets, "Dyn.cs::CrateBox.Get",
 		"the genuinely different closure still filters")
