@@ -292,6 +292,8 @@ type BuildReport struct {
 	// build did not ask for it.
 	Enrichment EnrichmentOutcome
 
+	// PlanningDuration is the wall time spent selecting the sparse file set.
+	PlanningDuration time.Duration
 	// Duration is the wall time of the whole build.
 	Duration time.Duration
 }
@@ -347,9 +349,11 @@ func (b *SparseGenerationBuilder) Build(ctx context.Context, req BuildRequest) (
 		return 0, BuildReport{}, err
 	}
 
-	plan, report, err := b.planFileSet(req)
+	planningStarted := time.Now()
+	plan, report, err := b.planFileSetContext(ctx, req)
+	report.PlanningDuration = time.Since(planningStarted)
 	if err != nil {
-		return 0, BuildReport{}, err
+		return 0, report, err
 	}
 
 	generationID, handle, adopted, err := b.Store.BeginPayloadGenerationWithStatus(ctx, store_sqlite.PayloadGenerationRequest{
@@ -430,6 +434,8 @@ func (b *SparseGenerationBuilder) validate(ctx context.Context, req *BuildReques
 		return errors.New("indexer: sparse generation builder needs a logger")
 	case ctx == nil:
 		return errors.New("indexer: sparse generation build needs a context")
+	case ctx.Err() != nil:
+		return ctx.Err()
 	case req.Base == nil:
 		return errors.New("indexer: sparse generation build needs a base reader")
 	case req.Target == nil:
@@ -472,10 +478,23 @@ type buildPlan struct {
 // over, and is refused: silently dropping it would produce a generation that
 // masks nothing at a path the caller believes it replaced.
 func (b *SparseGenerationBuilder) planFileSet(req BuildRequest) (buildPlan, BuildReport, error) {
+	return b.planFileSetContext(context.Background(), req)
+}
+
+func (b *SparseGenerationBuilder) planFileSetContext(
+	ctx context.Context,
+	req BuildRequest,
+) (buildPlan, BuildReport, error) {
 	var report BuildReport
+	if err := ctx.Err(); err != nil {
+		return buildPlan{}, report, err
+	}
 	deleted := make(map[string]struct{})
 	present := make(map[string]struct{})
 	for _, change := range req.Changes {
+		if err := ctx.Err(); err != nil {
+			return buildPlan{}, report, err
+		}
 		clean := path.Clean(change.Path)
 		switch change.Kind {
 		case LayerPathDeleted:
@@ -494,21 +513,39 @@ func (b *SparseGenerationBuilder) planFileSet(req BuildRequest) (buildPlan, Buil
 	// caller that reported both halves of a replace. The target holds it, so
 	// the surviving claim is the add.
 	for p := range present {
+		if err := ctx.Err(); err != nil {
+			return buildPlan{}, report, err
+		}
 		delete(deleted, p)
 	}
 	for p := range present {
+		if err := ctx.Err(); err != nil {
+			return buildPlan{}, report, err
+		}
 		if _, err := req.Target.Stat(p); err != nil {
 			return buildPlan{}, report, fmt.Errorf(
 				"indexer: change set names %q as present but the target source does not hold it: %w", p, err)
 		}
+		if err := ctx.Err(); err != nil {
+			return buildPlan{}, report, err
+		}
 	}
 
-	closure := b.affectedClosure(req, present, deleted, &report)
+	closure, err := b.affectedClosureContext(ctx, req, present, deleted, &report)
+	if err != nil {
+		return buildPlan{}, report, err
+	}
 	indexedSet := make(map[string]struct{}, len(present)+len(closure))
 	for p := range present {
+		if err := ctx.Err(); err != nil {
+			return buildPlan{}, report, err
+		}
 		indexedSet[p] = struct{}{}
 	}
 	for _, p := range closure {
+		if err := ctx.Err(); err != nil {
+			return buildPlan{}, report, err
+		}
 		if _, gone := deleted[p]; gone {
 			continue
 		}
@@ -517,19 +554,35 @@ func (b *SparseGenerationBuilder) planFileSet(req BuildRequest) (buildPlan, Buil
 
 	var plan buildPlan
 	for p := range indexedSet {
+		if err := ctx.Err(); err != nil {
+			return buildPlan{}, report, err
+		}
 		plan.indexed = append(plan.indexed, p)
 	}
 	for p := range deleted {
+		if err := ctx.Err(); err != nil {
+			return buildPlan{}, report, err
+		}
 		plan.deleted = append(plan.deleted, p)
 	}
 	sort.Strings(plan.indexed)
 	sort.Strings(plan.deleted)
+	if err := ctx.Err(); err != nil {
+		return buildPlan{}, report, err
+	}
 	// A path reported deleted that the target still holds was folded into the
 	// present set above; the surviving list is what the generation claims.
 	report.DeletedFiles = len(plan.deleted)
 
 	for _, p := range plan.indexed {
-		if meta, err := req.Target.Stat(p); err == nil && meta.Size > 0 {
+		if err := ctx.Err(); err != nil {
+			return buildPlan{}, report, err
+		}
+		meta, statErr := req.Target.Stat(p)
+		if err := ctx.Err(); err != nil {
+			return buildPlan{}, report, err
+		}
+		if statErr == nil && meta.Size > 0 {
 			report.SourceBytes += meta.Size
 		}
 	}

@@ -2,13 +2,19 @@ package indexer
 
 import (
 	"context"
+	"errors"
+	"io"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
+
+	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/graphview"
+	"github.com/zzet/gortex/internal/indexer/source"
 )
 
 // The closure's reference-driven cases.
@@ -494,6 +500,153 @@ func assertProducerState(
 // publishes anyway and narrows the two producers whose completeness the cut
 // actually costs — local resolution, and the incoming-edge index that a
 // dependent past the cap would have contributed to.
+type closurePlanningBase struct {
+	LayerBase
+	fileNodeCalls  int
+	inEdgeCalls    int
+	outEdgeCalls   int
+	nodeCalls      int
+	afterFileNodes func()
+}
+
+func (b *closurePlanningBase) GetFileNodesByPaths(paths []string) map[string][]*graph.Node {
+	b.fileNodeCalls++
+	nodes := b.LayerBase.GetFileNodesByPaths(paths)
+	if b.afterFileNodes != nil {
+		b.afterFileNodes()
+	}
+	return nodes
+}
+
+func (b *closurePlanningBase) GetInEdgesByNodeIDs(ids []string) map[string][]*graph.Edge {
+	b.inEdgeCalls++
+	return b.LayerBase.GetInEdgesByNodeIDs(ids)
+}
+
+func (b *closurePlanningBase) GetOutEdgesByNodeIDs(ids []string) map[string][]*graph.Edge {
+	b.outEdgeCalls++
+	return b.LayerBase.GetOutEdgesByNodeIDs(ids)
+}
+
+func (b *closurePlanningBase) GetNodesByIDs(ids []string) map[string]*graph.Node {
+	b.nodeCalls++
+	return b.LayerBase.GetNodesByIDs(ids)
+}
+
+func (b *closurePlanningBase) calls() int {
+	return b.fileNodeCalls + b.inEdgeCalls + b.outEdgeCalls + b.nodeCalls
+}
+
+type closurePlanningSource map[string]source.FileMeta
+
+func (s closurePlanningSource) Open(path string) (io.ReadCloser, source.FileMeta, error) {
+	meta, ok := s[path]
+	if !ok {
+		return nil, source.FileMeta{}, source.ErrNotInSource
+	}
+	return io.NopCloser(strings.NewReader("package fixture\n")), meta, nil
+}
+
+func (s closurePlanningSource) Stat(path string) (source.FileMeta, error) {
+	meta, ok := s[path]
+	if !ok {
+		return source.FileMeta{}, source.ErrNotInSource
+	}
+	return meta, nil
+}
+
+func (s closurePlanningSource) Walk(ctx context.Context, yield func(source.FileMeta) error) error {
+	for _, meta := range s {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := yield(meta); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (closurePlanningSource) Identity() string { return "closure-planning" }
+func (closurePlanningSource) Close() error     { return nil }
+
+func benchmarkClosurePlanningFixture(fileCount int) (*SparseGenerationBuilder, *closurePlanningBase, BuildRequest) {
+	const repo = "bench"
+	baseGraph := graph.New()
+	seedPath := repo + "/seed.go"
+	seedID := seedPath + "::Seed"
+	baseGraph.AddNode(&graph.Node{
+		ID: seedID, Name: "Seed", Kind: graph.KindFunction,
+		FilePath: seedPath, RepoPrefix: repo,
+	})
+	target := make(closurePlanningSource, fileCount)
+	for i := 0; i < fileCount; i++ {
+		rel := "dep_" + strconv.Itoa(i) + ".go"
+		graphPath := repo + "/" + rel
+		id := graphPath + "::Dependency"
+		baseGraph.AddNode(&graph.Node{
+			ID: id, Name: "Dependency", Kind: graph.KindFunction,
+			FilePath: graphPath, RepoPrefix: repo,
+		})
+		baseGraph.AddEdge(&graph.Edge{
+			From: seedID, To: id, Kind: graph.EdgeCalls, FilePath: seedPath,
+		})
+		target[rel] = source.FileMeta{Path: rel, Size: 16}
+	}
+	base := &closurePlanningBase{LayerBase: baseGraph}
+	builder := &SparseGenerationBuilder{Logger: zap.NewNop()}
+	builder.Config.AffectedByReresolveMax = fileCount + 1
+	return builder, base, BuildRequest{
+		Base: base, Target: target, RepoPrefix: repo,
+	}
+}
+
+func TestAffectedClosureStopsAfterCanceledBaseRead(t *testing.T) {
+	builder, base, req := benchmarkClosurePlanningFixture(100)
+	deleted := map[string]struct{}{"seed.go": {}}
+	ctx, cancel := context.WithCancel(context.Background())
+	base.afterFileNodes = cancel
+
+	var report BuildReport
+	closure, err := builder.affectedClosureContext(ctx, req, nil, deleted, &report)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("affectedClosureContext error = %v, want context.Canceled", err)
+	}
+	if closure != nil {
+		t.Fatalf("closure = %v, want nil", closure)
+	}
+	if base.fileNodeCalls != 1 {
+		t.Fatalf("file-node calls = %d, want 1", base.fileNodeCalls)
+	}
+	if base.inEdgeCalls != 0 || base.outEdgeCalls != 0 || base.nodeCalls != 0 {
+		t.Fatalf("graph calls after cancellation: in=%d out=%d nodes=%d",
+			base.inEdgeCalls, base.outEdgeCalls, base.nodeCalls)
+	}
+}
+
+func BenchmarkSparsePlanningCanceledClosure(b *testing.B) {
+	const fileCount = 1000
+	builder, base, req := benchmarkClosurePlanningFixture(fileCount)
+	deleted := map[string]struct{}{"seed.go": {}}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		var report BuildReport
+		closure, err := builder.affectedClosureContext(ctx, req, nil, deleted, &report)
+		if !errors.Is(err, context.Canceled) {
+			b.Fatalf("affectedClosureContext error = %v, want context.Canceled", err)
+		}
+		if closure != nil {
+			b.Fatalf("closure = %v, want nil", closure)
+		}
+	}
+	b.StopTimer()
+	b.ReportMetric(float64(base.calls())/float64(b.N), "base_calls/op")
+}
+
 func TestClosureTruncationNarrowsProducers(t *testing.T) {
 	builderIsolateGit(t)
 	dir := builderTempDir(t, "repo")

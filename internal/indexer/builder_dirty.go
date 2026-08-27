@@ -106,11 +106,20 @@ func (b *SparseGenerationBuilder) BuildDirtyLayer(
 	identity.ProvenanceCommitOID = before.HeadCommit
 	identity.LowerViewFingerprint = before.Fingerprint
 
+	changes, err := dirtyLayerChangesContext(ctx, before)
+	if err != nil {
+		return 0, BuildReport{}, err
+	}
+	changes, err = dirtyLayerDiskTruthContext(ctx, changes, target)
+	if err != nil {
+		return 0, BuildReport{}, err
+	}
+
 	return b.Build(ctx, BuildRequest{
 		Identity:    identity,
 		Base:        req.Base,
 		Target:      target,
-		Changes:     dirtyLayerDiskTruth(dirtyLayerChanges(before), target),
+		Changes:     changes,
 		RootPath:    req.CheckoutRoot,
 		RepoPrefix:  req.RepoPrefix,
 		WorkspaceID: req.WorkspaceID,
@@ -181,8 +190,19 @@ func (b *SparseGenerationBuilder) confirmDirtySnapshot(
 // present that the working tree no longer holds — dirtyLayerDiskTruth settles
 // those against the checkout afterwards.
 func dirtyLayerChanges(snap gitstate.DirtySnapshot) []LayerPathChange {
+	changes, _ := dirtyLayerChangesContext(context.Background(), snap)
+	return changes
+}
+
+func dirtyLayerChangesContext(ctx context.Context, snap gitstate.DirtySnapshot) ([]LayerPathChange, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	byPath := make(map[string]LayerChangeKind, len(snap.Entries))
 	for _, entry := range snap.Entries {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if entry.Submodule || entry.Path == "" {
 			continue
 		}
@@ -209,10 +229,16 @@ func dirtyLayerChanges(snap gitstate.DirtySnapshot) []LayerPathChange {
 	}
 	changes := make([]LayerPathChange, 0, len(byPath))
 	for p, kind := range byPath {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		changes = append(changes, LayerPathChange{Path: p, Kind: kind})
 	}
 	sort.Slice(changes, func(i, j int) bool { return changes[i].Path < changes[j].Path })
-	return changes
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return changes, nil
 }
 
 // dirtyLayerDiskTruth rewrites a present claim into a deletion when the
@@ -238,13 +264,32 @@ func dirtyLayerChanges(snap gitstate.DirtySnapshot) []LayerPathChange {
 // an absent file, and turning one into a delete mask would hide the layer
 // below behind a permissions error.
 func dirtyLayerDiskTruth(changes []LayerPathChange, target source.ContentSource) []LayerPathChange {
+	changes, _ = dirtyLayerDiskTruthContext(context.Background(), changes, target)
+	return changes
+}
+
+func dirtyLayerDiskTruthContext(
+	ctx context.Context,
+	changes []LayerPathChange,
+	target source.ContentSource,
+) ([]LayerPathChange, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	for i := range changes {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if changes[i].Kind == LayerPathDeleted {
 			continue
 		}
-		if _, err := target.Stat(changes[i].Path); errors.Is(err, source.ErrNotInSource) {
+		_, statErr := target.Stat(changes[i].Path)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if errors.Is(statErr, source.ErrNotInSource) {
 			changes[i].Kind = LayerPathDeleted
 		}
 	}
-	return changes
+	return changes, nil
 }

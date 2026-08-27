@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"context"
 	"io"
 	"path"
 	"sort"
@@ -101,20 +102,42 @@ func (b *SparseGenerationBuilder) affectedClosure(
 	present, deleted map[string]struct{},
 	report *BuildReport,
 ) []string {
+	closure, _ := b.affectedClosureContext(context.Background(), req, present, deleted, report)
+	return closure
+}
+
+func (b *SparseGenerationBuilder) affectedClosureContext(
+	ctx context.Context,
+	req BuildRequest,
+	present, deleted map[string]struct{},
+	report *BuildReport,
+) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	limit := b.builderClosureCap()
 	report.ClosureCap = limit
 
 	seeds := make([]string, 0, len(present)+len(deleted))
 	for p := range present {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		seeds = append(seeds, builderGraphPath(req.RepoPrefix, p))
 	}
 	for p := range deleted {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		seeds = append(seeds, builderGraphPath(req.RepoPrefix, p))
 	}
 	if len(seeds) == 0 {
-		return nil
+		return nil, nil
 	}
 	sort.Strings(seeds)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	walk := &closureWalk{
 		b:       b,
@@ -125,6 +148,9 @@ func (b *SparseGenerationBuilder) affectedClosure(
 		chosen:  make(map[string]struct{}),
 	}
 	for _, graphPath := range seeds {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		walk.seeds[graphPath] = struct{}{}
 	}
 
@@ -134,27 +160,58 @@ func (b *SparseGenerationBuilder) affectedClosure(
 	// source file happened to sort earlier.
 	manifests := make(map[string]struct{})
 	walk.collectManifests(manifests)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	taken := walk.admitAll(manifests)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
-	seedNodeIDs := builderSeedNodeIDs(req.Base, seeds)
+	seedNodeIDs, err := builderSeedNodeIDsContext(ctx, req.Base, seeds)
+	if err != nil {
+		return nil, err
+	}
 	frontier := make(map[string]struct{})
-	b.collectDependents(req, seedNodeIDs, frontier)
-	b.collectDependencies(req, seeds, seedNodeIDs, frontier)
+	if err := b.collectDependents(ctx, req, seedNodeIDs, frontier); err != nil {
+		return nil, err
+	}
+	if err := b.collectDependencies(ctx, req, seeds, seedNodeIDs, frontier); err != nil {
+		return nil, err
+	}
 	walk.collectIntroduced(present, frontier)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	taken = append(taken, walk.admitAll(frontier)...)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	// Fixed point: every file the walk admits is asked what IT resolves into,
 	// and the answer feeds the next round. The loop terminates because
 	// admission is monotone and capped — a round that admits nothing new ends
 	// the walk, and one that hits the cap ends it too.
 	for len(taken) > 0 && !walk.truncated {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		next := make(map[string]struct{})
-		b.collectDependencies(req, taken, builderSeedNodeIDs(req.Base, taken), next)
+		nodeIDs, err := builderSeedNodeIDsContext(ctx, req.Base, taken)
+		if err != nil {
+			return nil, err
+		}
+		if err := b.collectDependencies(ctx, req, taken, nodeIDs, next); err != nil {
+			return nil, err
+		}
 		taken = walk.admitAll(next)
 	}
 
 	closure := append([]string(nil), walk.order...)
 	sort.Strings(closure)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if walk.truncated {
 		report.ClosureTruncated = true
 		b.Logger.Warn("indexer: sparse generation closure truncated",
@@ -164,7 +221,7 @@ func (b *SparseGenerationBuilder) affectedClosure(
 	}
 	report.ClosureFiles = len(closure)
 	report.ClosurePaths = closure
-	return closure
+	return closure, nil
 }
 
 // closureWalk is one build's closure in progress: what it has admitted, whether
@@ -729,11 +786,28 @@ func (w *closureWalk) buildDirIndexes() {
 // builderSeedNodeIDs reads every node the base layer carries at the given
 // paths, in one batched read.
 func builderSeedNodeIDs(base LayerBase, paths []string) []string {
+	ids, _ := builderSeedNodeIDsContext(context.Background(), base, paths)
+	return ids
+}
+
+func builderSeedNodeIDsContext(ctx context.Context, base LayerBase, paths []string) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	nodesByFile := base.GetFileNodesByPaths(paths)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	seen := make(map[string]struct{})
 	var ids []string
 	for _, graphPath := range paths {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		for _, node := range nodesByFile[graphPath] {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			if node == nil || node.ID == "" {
 				continue
 			}
@@ -744,55 +818,86 @@ func builderSeedNodeIDs(base LayerBase, paths []string) []string {
 			ids = append(ids, node.ID)
 		}
 	}
-	return ids
+	return ids, nil
 }
 
 // collectDependents adds the files whose resolved references point at a seed
 // node: one batched reverse-edge read plus the durable reverse lookup.
 func (b *SparseGenerationBuilder) collectDependents(
+	ctx context.Context,
 	req BuildRequest,
 	seedNodeIDs []string,
 	out map[string]struct{},
-) {
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if len(seedNodeIDs) == 0 {
-		return
+		return nil
 	}
 	sourceIDs := make(map[string]struct{})
-	for _, edges := range req.Base.GetInEdgesByNodeIDs(seedNodeIDs) {
+	edgesByNode := req.Base.GetInEdgesByNodeIDs(seedNodeIDs)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	for _, edges := range edgesByNode {
 		for _, edge := range edges {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			if edge == nil || !closureCarriesEdge(edge.Kind) || graph.IsUnresolvedTarget(edge.From) {
 				continue
 			}
 			sourceIDs[edge.From] = struct{}{}
 		}
 	}
-	builderAddNodeFiles(req.Base, sourceIDs, out)
+	if err := builderAddNodeFilesContext(ctx, req.Base, sourceIDs, out); err != nil {
+		return err
+	}
 
 	if reader, ok := req.Base.(graph.RefFactsReader); ok {
 		byFile, err := reader.LoadRefFactsByTargets(req.RepoPrefix, seedNodeIDs)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		if err != nil {
 			b.Logger.Debug("indexer: closure reverse fact lookup failed", zap.Error(err))
 		}
 		for graphPath := range byFile {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			if graphPath != "" {
 				out[graphPath] = struct{}{}
 			}
 		}
 	}
+	return nil
 }
 
 // collectDependencies adds the files the given files' resolved references
 // point at: one batched forward-edge read plus the durable per-file facts.
 func (b *SparseGenerationBuilder) collectDependencies(
+	ctx context.Context,
 	req BuildRequest,
 	files []string,
 	nodeIDs []string,
 	out map[string]struct{},
-) {
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	targetIDs := make(map[string]struct{})
 	if len(nodeIDs) > 0 {
-		for _, edges := range req.Base.GetOutEdgesByNodeIDs(nodeIDs) {
+		edgesByNode := req.Base.GetOutEdgesByNodeIDs(nodeIDs)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		for _, edges := range edgesByNode {
 			for _, edge := range edges {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
 				if edge == nil || !closureCarriesEdge(edge.Kind) || graph.IsUnresolvedTarget(edge.To) {
 					continue
 				}
@@ -802,16 +907,22 @@ func (b *SparseGenerationBuilder) collectDependencies(
 	}
 	if reader, ok := req.Base.(graph.RefFactsReader); ok {
 		facts, err := reader.LoadRefFactsByFiles(req.RepoPrefix, files)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		if err != nil {
 			b.Logger.Debug("indexer: closure forward fact lookup failed", zap.Error(err))
 		}
 		for _, fact := range facts {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			if fact.ToID != "" && !graph.IsUnresolvedTarget(fact.ToID) {
 				targetIDs[fact.ToID] = struct{}{}
 			}
 		}
 	}
-	builderAddNodeFiles(req.Base, targetIDs, out)
+	return builderAddNodeFilesContext(ctx, req.Base, targetIDs, out)
 }
 
 // closureCarriesEdge reports whether an edge of this kind names content in
@@ -848,16 +959,40 @@ func closureCarriesEdge(kind graph.EdgeKind) bool {
 // has no node under it: an edge may point at a symbol whose definition row was
 // evicted, and the ID still names the file the reference was resolved into.
 func builderAddNodeFiles(base LayerBase, ids map[string]struct{}, out map[string]struct{}) {
+	_ = builderAddNodeFilesContext(context.Background(), base, ids, out)
+}
+
+func builderAddNodeFilesContext(
+	ctx context.Context,
+	base LayerBase,
+	ids map[string]struct{},
+	out map[string]struct{},
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if len(ids) == 0 {
-		return
+		return nil
 	}
 	list := make([]string, 0, len(ids))
 	for id := range ids {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		list = append(list, id)
 	}
 	sort.Strings(list)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	nodes := base.GetNodesByIDs(list)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	for _, id := range list {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if node := nodes[id]; node != nil && node.FilePath != "" {
 			out[node.FilePath] = struct{}{}
 			continue
@@ -869,4 +1004,5 @@ func builderAddNodeFiles(base LayerBase, ids map[string]struct{}, out map[string
 			out[file] = struct{}{}
 		}
 	}
+	return nil
 }
