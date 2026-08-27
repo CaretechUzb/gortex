@@ -35,6 +35,14 @@ import (
 // edge at its final target is left alone, which is also what makes
 // the pass idempotent.
 //
+// Scoped (incremental) invocations run through frameworkScopedStore
+// with no bespoke scopedFn: the pass only sees nodes in the changed
+// frontier, so a cross-file join whose other half did not change joins
+// nothing — fail-open, never wrong. The one transient window: a fluent
+// fact whose file is out of scope cannot shadow the DbSet convention,
+// so an incremental run may land the convention name until the next
+// full settle rewires it. Full resolves see everything.
+//
 // Returns the number of edges synthesized or rewired.
 func ResolveCSharpEFCoreModels(g graph.Store) int {
 	if g == nil {
