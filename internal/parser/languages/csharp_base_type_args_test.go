@@ -306,6 +306,47 @@ func TestCSharpExtractor_GlobalAliasMetaIsCanonical(t *testing.T) {
 		"the alias identifier is stored canonically - verbatim prefix stripped")
 }
 
+// Re-review RED (P2): the synthesized positional-record property carries
+// field_type but no field_type_args, so `record Flow(IBox<Crate> Store)`
+// never narrows Store's dispatch. The same conservative rules apply: the
+// record's own type parameter is open, an alias is opaque.
+func TestCSharpExtractor_RecordPositionalPropTypeArgs(t *testing.T) {
+	src := []byte(`using MyCrate = App.Crate;
+
+namespace App {
+    public interface IBox<T> { }
+    public class Crate { }
+
+    public record Flow(IBox<Crate> Store, Crate Plain);
+    public record Open<T>(IBox<T> Store);
+    public record Aliased(IBox<MyCrate> Store);
+}
+`)
+	e := NewCSharpExtractor()
+	result, err := e.Extract("Rec.cs", src)
+	require.NoError(t, err)
+
+	store := fieldMeta(result.Nodes, "Rec.cs::Flow.Store")
+	require.NotNil(t, store)
+	assert.Equal(t, "IBox<Crate>", store["field_type"])
+	assert.Equal(t, "Crate", store["field_type_args"],
+		"a positional property is a first-class receiver - same stamp as an ordinary property")
+
+	plain := fieldMeta(result.Nodes, "Rec.cs::Flow.Plain")
+	require.NotNil(t, plain)
+	assert.NotContains(t, plain, "field_type_args")
+
+	open := fieldMeta(result.Nodes, "Rec.cs::Open.Store")
+	require.NotNil(t, open)
+	assert.NotContains(t, open, "field_type_args",
+		"the record's own type parameter is open - no stamp")
+
+	aliased := fieldMeta(result.Nodes, "Rec.cs::Aliased.Store")
+	require.NotNil(t, aliased)
+	assert.NotContains(t, aliased, "field_type_args",
+		"a using-alias argument is opaque - no stamp")
+}
+
 // fieldMeta returns the meta of the node with the given ID.
 func fieldMeta(result_nodes []*graph.Node, id string) map[string]any {
 	for _, n := range result_nodes {

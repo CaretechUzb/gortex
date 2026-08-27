@@ -904,7 +904,7 @@ func (e *CSharpExtractor) emitContainer(m parser.QueryResult, kind string, nodeK
 		e.emitCSharpEnumMembers(def.Node, src, filePath, id, name, result, seen)
 	}
 	if kind == "record" {
-		e.emitCSharpRecordPositionalProps(id, name, def.Node, src, filePath, fileID, result, seen)
+		e.emitCSharpRecordPositionalProps(id, name, def.Node, src, filePath, fileID, result, seen, fileAliases)
 	}
 }
 
@@ -916,7 +916,7 @@ func (e *CSharpExtractor) emitContainer(m parser.QueryResult, kind string, nodeK
 // in tree order: an explicit redeclaration of a positional property
 // (legal C# — it replaces the synthesized one) hits the seen guard and
 // stays a single node for the same logical member.
-func (e *CSharpExtractor) emitCSharpRecordPositionalProps(ownerID, ownerName string, decl *sitter.Node, src []byte, filePath, fileID string, result *parser.ExtractionResult, seen map[string]bool) {
+func (e *CSharpExtractor) emitCSharpRecordPositionalProps(ownerID, ownerName string, decl *sitter.Node, src []byte, filePath, fileID string, result *parser.ExtractionResult, seen map[string]bool, fileAliases map[string]bool) {
 	// The record's parameter_list is an unnamed child in this grammar —
 	// unlike method parameters, ChildByFieldName("parameters") finds
 	// nothing, so scan the direct children by type.
@@ -930,6 +930,9 @@ func (e *CSharpExtractor) emitCSharpRecordPositionalProps(ownerID, ownerName str
 	if params == nil {
 		return
 	}
+	// One set for every positional property: the enclosing chain is the
+	// same for all of them (the record's own type parameters included).
+	unstampable := csharpUnstampableArgNames(decl, src, fileAliases)
 	for i, _nc := 0, int(params.NamedChildCount()); i < _nc; i++ {
 		p := params.NamedChild(i)
 		if p == nil || p.Type() != "parameter" {
@@ -954,6 +957,12 @@ func (e *CSharpExtractor) emitCSharpRecordPositionalProps(ownerID, ownerName str
 		}
 		if t := p.ChildByFieldName("type"); t != nil {
 			meta["field_type"] = strings.TrimSpace(t.Content(src))
+			// Same closed-generic-arguments stamp ordinary fields and
+			// properties carry (dispatch gate receiver evidence) — a
+			// positional property is a first-class receiver.
+			if args := csharpTypeArgsFromTypeNode(t, src, unstampable); args != "" {
+				meta["field_type_args"] = args
+			}
 		}
 		result.Nodes = append(result.Nodes, &graph.Node{
 			ID: id, Kind: graph.KindField, Name: pname,
