@@ -329,11 +329,7 @@ func (mi *MultiIndexer) runWorkspaceRederive(ctx context.Context, frontier map[s
 
 	if ctx.Err() == nil {
 		mi.batchMutationGate.Lock()
-		// wholeGraphInference: the scoped implements / overrides inference
-		// loses cross-repo overrides on a single-repository frontier, and
-		// costs the same as the whole-graph form. See the note on
-		// runGlobalGraphPassesTopologyHeld.
-		mi.runGlobalGraphPasses(ctx, scope, false, true)
+		mi.runGlobalGraphPasses(ctx, scope, false)
 		mi.batchMutationGate.Unlock()
 	}
 

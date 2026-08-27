@@ -1455,7 +1455,7 @@ func (mi *MultiIndexer) EndBatch() {
 
 	// Keep the transition write side through the complete global pass: a
 	// watcher admitted before or during EndBatch runs wholly before or after it.
-	mi.runGlobalGraphPasses(context.Background(), state.scope, state.censusEligible, false)
+	mi.runGlobalGraphPasses(context.Background(), state.scope, state.censusEligible)
 	// This pass IS the derivation any repository tracked during the batch
 	// was waiting for. Scheduling another would double every cold index.
 	mi.ClearDeferredWorkspaceRederive()
@@ -1494,11 +1494,10 @@ func (mi *MultiIndexer) runGlobalGraphPasses(
 	ctx context.Context,
 	scope map[string]struct{},
 	censusEligible bool,
-	wholeGraphInference bool,
 ) {
 	finishTopologyMutation := reach.BeginTopologyMutation(mi.graph)
 	defer finishTopologyMutation(true)
-	mi.runGlobalGraphPassesTopologyHeld(ctx, scope, censusEligible, wholeGraphInference)
+	mi.runGlobalGraphPassesTopologyHeld(ctx, scope, censusEligible)
 }
 
 // fullCoverageGlobalPass reports whether the pass frontier covers the complete
@@ -1512,21 +1511,10 @@ func fullCoverageGlobalPass(scope map[string]struct{}, censusEligible bool) bool
 // runGlobalGraphPassesTopologyHeld runs with caller-owned topology and
 // scope/census state. It never reads or consumes armed batch fields; EndBatch
 // is their sole consumer.
-// wholeGraphInference forces the implements / overrides inference to its
-// full-coverage form even under a scope. The scoped form keeps a pair when
-// EITHER endpoint is in the scoped type set, which is complete for the
-// batch scopes it was written for, but it under-produces on a frontier of
-// one newly tracked repository: measured on a worktree of a tracked repo,
-// overrides into `odoo` came out at 111 against 243 for the same commit
-// derived whole-store, and every missing edge was cross-repo. The scoped
-// variants also buy nothing here — 0.07s + 7.7s scoped against 5.3s + 4.1s
-// whole-graph — so the post-track derivation opts out rather than trade a
-// correctness gap for no time.
 func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 	ctx context.Context,
 	scope map[string]struct{},
 	censusEligible bool,
-	wholeGraphInference bool,
 ) {
 	mi.globalPassMu.Lock()
 	defer mi.globalPassMu.Unlock()
@@ -1651,7 +1639,7 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 	implStart := time.Now()
 	implAdded := 0
 	switch {
-	case fullCoverage || wholeGraphInference:
+	case fullCoverage:
 		implAdded = r.InferImplements()
 	case len(scopedTypeIfaceIDs) > 0:
 		// Empty set => no type/interface changed in the batch => no inferred
@@ -1669,7 +1657,7 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 	overStart := time.Now()
 	overAdded := 0
 	switch {
-	case fullCoverage || wholeGraphInference:
+	case fullCoverage:
 		overAdded = r.InferOverrides()
 	case len(scopedTypeIfaceIDs) > 0:
 		overAdded = r.InferOverridesScoped(scopedTypeIfaceIDs)
@@ -2273,7 +2261,7 @@ func (mi *MultiIndexer) indexMultiRepo(repos []config.RepoEntry) (map[string]*In
 			// placeholder edges, and contract bridges are in place. RunDeferredPasses
 			// intentionally skips these so we don't pay an O(global) walk per
 			// repo (was the dominant cost at R≈100+).
-			mi.runGlobalGraphPassesTopologyHeld(context.Background(), nil, false, false)
+			mi.runGlobalGraphPassesTopologyHeld(context.Background(), nil, false)
 
 			return results, nil
 		}()
