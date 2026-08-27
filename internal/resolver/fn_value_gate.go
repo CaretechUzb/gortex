@@ -93,25 +93,6 @@ func resolveFnValueCallbacks(g graph.Store, scope map[string]bool) int {
 		for edge := range edges {
 			collect(edge)
 		}
-	} else if fp, ok := g.(graph.FnValuePlaceholderScanner); ok {
-		// Scoped, and the store can name the placeholders directly. The
-		// nil-scope branch above already prefers this projection; the
-		// scoped branch used to fall back to every source-owned edge of
-		// every changed repository, which on a newly tracked repository is
-		// its entire corpus — measured at 38s to collect nothing. Filtering
-		// the placeholder stream by the same repository set yields the same
-		// candidates: a candidate is a reference edge parked in the fn-value
-		// namespace, so candidates are a subset of the placeholders, and the
-		// Meta predicate in collect still rejects namespace-sharers.
-		for edge := range fp.FnValuePlaceholderEdges() {
-			if edge == nil || edge.Kind != graph.EdgeReferences {
-				continue
-			}
-			if !scope[graph.RepoPrefixOfID(edge.From)] {
-				continue
-			}
-			collect(edge)
-		}
 	} else {
 		// Scoped: walk only changed repositories' source-owned edges.
 		for prefix := range scope {
