@@ -111,6 +111,7 @@ const (
 	SynthMediatR             = "mediatr-dispatch"
 	SynthCSharpIfaceDispatch = "csharp-iface-dispatch"
 	SynthCSharpDIIfaces      = "csharp-di-implemented-interfaces"
+	SynthCSharpEFCoreModels  = "csharp-efcore-models"
 	SynthSidekiq             = "sidekiq-dispatch"
 	SynthLaravelEvent        = "laravel-event"
 	SynthFnPointerDispatch   = "fn-pointer-dispatch"
@@ -239,6 +240,7 @@ var frameworkSynthLanguageFamilies = map[string][]string{
 	SynthMediatR:             {"dotnet"},
 	SynthCSharpIfaceDispatch: {"dotnet"},
 	SynthCSharpDIIfaces:      {"dotnet"},
+	SynthCSharpEFCoreModels:  {"dotnet"},
 	SynthSidekiq:             {"ruby"},
 	SynthLaravelEvent:        {"php"},
 	SynthFnPointerDispatch:   {"c"},
@@ -941,6 +943,7 @@ func defaultFrameworkSynthesizers() []FrameworkSynthesizer {
 		// find_usages / get_callers result. After the implements-producing
 		// passes so the impl fan-out is complete.
 		synthFunc{name: SynthCSharpIfaceDispatch, fn: ResolveCSharpInterfaceDispatch, scopedFn: ResolveCSharpInterfaceDispatchScoped},
+		synthFunc{name: SynthCSharpEFCoreModels, fn: ResolveCSharpEFCoreModels},
 		// Sidekiq job dispatch: Worker.perform_async(...) → the worker's
 		// perform, namespace-aware. Include-gated, typed tier.
 		synthFunc{name: SynthSidekiq, fn: ResolveSidekiqCalls},
