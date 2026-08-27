@@ -141,6 +141,128 @@ func TestOdooRoutes_ModelConverterIsNormalised(t *testing.T) {
 	}
 }
 
+// The converter takes an optional second argument — a domain restricting
+// the records the slot matches — and that domain carries commas, quotes
+// and parens of its own. Requiring `)` straight after the model name left
+// this form unrewritten, which is exactly the unmatchable-ID failure the
+// converter rewrite exists to prevent.
+func TestOdooRoutes_ModelConverterWithDomain(t *testing.T) {
+	cs := odooContracts(t, `
+    @http.route('''/event/<model("event.event", "[('website_track', '=', True)]"):event>/track''', type='http', auth='public', methods=['GET'])
+    def track(self, event):
+        return None
+`)
+	if !hasOdooRoute(cs, "http::GET::/event/{p1}/track") {
+		t.Fatalf("domain-carrying converter not normalised, got %v", odooContractIDs(cs))
+	}
+	models, ok := odooRouteMeta(t, cs, "http::GET::/event/{p1}/track")["odoo_path_models"].(map[string]string)
+	if !ok || models["event"] != "event.event" {
+		t.Errorf("odoo_path_models = %v, want event→event.event", models)
+	}
+}
+
+// A domain compares, and `>` / `>=` are ordinary Odoo operators. Skipping
+// the domain with `[^>]*` halted on the operator, never reached the
+// converter's closing paren, and failed the match outright — so the path
+// kept its raw converter text and the slot → model link was lost too.
+func TestOdooRoutes_ModelConverterWithComparisonDomain(t *testing.T) {
+	for _, domain := range []string{
+		`"[('date_end', '>=', now)]"`,
+		`"[('seats_available', '>', 0)]"`,
+		`'[("date_end", ">=", now)]'`,
+	} {
+		cs := odooContracts(t, `
+    @http.route('''/event/<model("event.event", `+domain+`):event>/register''', type='http', auth='public', methods=['GET'])
+    def register(self, event):
+        return None
+`)
+		if !hasOdooRoute(cs, "http::GET::/event/{p1}/register") {
+			t.Fatalf("domain %s left the converter unrewritten, got %v", domain, odooContractIDs(cs))
+		}
+		models, ok := odooRouteMeta(t, cs, "http::GET::/event/{p1}/register")["odoo_path_models"].(map[string]string)
+		if !ok || models["event"] != "event.event" {
+			t.Errorf("domain %s: odoo_path_models = %v, want event→event.event", domain, models)
+		}
+	}
+}
+
+// Two converters in one path must stay two matches: a pattern that let the
+// first one run to the last `)` in the path would swallow both and report
+// the first model against the second slot.
+func TestOdooRoutes_TwoModelConvertersInOnePath(t *testing.T) {
+	cs := odooContracts(t, `
+    @http.route('/forum/<model("forum.forum"):forum>/post/<model("forum.post"):post>', type='http', auth='public', methods=['GET'])
+    def post(self, forum, post):
+        return None
+`)
+	if !hasOdooRoute(cs, "http::GET::/forum/{p1}/post/{p2}") {
+		t.Fatalf("two converters not both normalised, got %v", odooContractIDs(cs))
+	}
+	models, _ := odooRouteMeta(t, cs, "http::GET::/forum/{p1}/post/{p2}")["odoo_path_models"].(map[string]string)
+	if models["forum"] != "forum.forum" || models["post"] != "forum.post" {
+		t.Errorf("odoo_path_models = %v, want forum→forum.forum and post→forum.post", models)
+	}
+}
+
+// The plural converter is an ordinary sibling of the singular one and
+// takes a SINGLE colon, not the `::` an earlier comment claimed.
+func TestOdooRoutes_PluralModelConverter(t *testing.T) {
+	cs := odooContracts(t, `
+    @http.route('/files/<models("ir.attachment"):attachments>', type='http', auth='user', methods=['GET'])
+    def files(self, attachments):
+        return None
+`)
+	if !hasOdooRoute(cs, "http::GET::/files/{p1}") {
+		t.Fatalf("plural converter not normalised, got %v", odooContractIDs(cs))
+	}
+	models, _ := odooRouteMeta(t, cs, "http::GET::/files/{p1}")["odoo_path_models"].(map[string]string)
+	if models["attachments"] != "ir.attachment" {
+		t.Errorf("odoo_path_models = %v, want attachments→ir.attachment", models)
+	}
+}
+
+// A werkzeug converter argument is itself spelled `name=value`, so a
+// kwarg scan that does not span quoted regions reads `min=` as the start
+// of the decorator's keyword arguments, truncates the head mid-path, and
+// drops the whole route — path and methods= alike.
+func TestOdooRoutes_ConverterArgumentIsNotAKwarg(t *testing.T) {
+	cs := odooContracts(t, `
+    @http.route('/page/<int(min=1):page>', type='http', auth='public', methods=['GET'])
+    def page(self, page=1):
+        return None
+`)
+	if !hasOdooRoute(cs, "http::GET::/page/{p1}") {
+		t.Fatalf("converter argument dropped or mangled the route, got %v", odooContractIDs(cs))
+	}
+	if hasOdooRoute(cs, "http::POST::/page/{p1}") {
+		t.Errorf("methods= was lost with the truncated head, got %v", odooContractIDs(cs))
+	}
+}
+
+// Same shape inside the list form, and with a converter argument that is
+// itself quoted.
+func TestOdooRoutes_ConverterArgumentsInPathList(t *testing.T) {
+	cs := odooContracts(t, `
+    @http.route(['/l/<string(length=2):lang>', '/p/<int(min=1,max=9):n>'], type='http', auth='public', methods=['GET'])
+    def multi(self, lang=None, n=1):
+        return None
+`)
+	if !hasOdooRoute(cs, "http::GET::/l/{p1}") || !hasOdooRoute(cs, "http::GET::/p/{p1}") {
+		t.Fatalf("converter arguments broke the path list, got %v", odooContractIDs(cs))
+	}
+}
+
+// The domain form is written triple-quoted in real Odoo precisely because
+// it needs both quote styles; a scanner that closes on the first matching
+// single quote truncates the path mid-converter.
+func TestOdooStringLiterals_TripleQuoted(t *testing.T) {
+	got := odooStringLiterals(`'''/event/<model("event.event", "[('website_track', '=', True)]"):event>'''`)
+	want := `/event/<model("event.event", "[('website_track', '=', True)]"):event>`
+	if len(got) != 1 || got[0] != want {
+		t.Errorf("odooStringLiterals = %q, want [%q]", got, want)
+	}
+}
+
 // The bare @route(...) form is what `from odoo.http import route` gives.
 func TestOdooRoutes_BareRouteDecorator(t *testing.T) {
 	cs := odooContracts(t, `

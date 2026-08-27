@@ -44,11 +44,49 @@ import (
 // than Flask's GET-only.
 var odooRouteDecoratorRE = regexp.MustCompile(`@(?:[\w.]+\.)?http\.route\(|@route\(`)
 
-// odooModelConverterRE matches Odoo's record converters —
-// <model("res.partner"):partner> and the plural <models("...")::...> — so
-// they can be reduced to the bare slot name the shared normaliser
-// understands.
-var odooModelConverterRE = regexp.MustCompile(`<models?\(\s*["']([\w.]+)["']\s*\)\s*:\s*(\w+)\s*>`)
+// odooModelConverterRE matches Odoo's record converters — the singular
+// <model("res.partner"):partner> and the plural
+// <models("ir.attachment"):attachments> — so they can be reduced to the
+// bare slot name the shared normaliser understands. Both spellings take a
+// SINGLE colon; ModelConverter and ModelsConverter are ordinary werkzeug
+// converters registered side by side in base/models/ir_http.py.
+//
+// The converter also accepts an optional second argument, a domain
+// restricting the records the slot may match:
+//
+//	<model("event.event", "[('website_track', '=', True)]"):event>
+//
+// That domain carries commas, quotes and parentheses of its own, so the
+// first argument cannot simply be followed by `\)` — the tail has to be
+// skipped.
+//
+// Skipping it with a plain `[^>]*` does not work, because a `>` does NOT
+// only end the slot: Odoo domains compare with `>` and `>=` too.
+//
+//	<model("event.event", "[('date', '>=', today)]"):event>
+//
+// There `[^>]*` halts on the operator, never reaches the closing paren,
+// and the match fails outright — leaving the converter unrewritten and
+// the contract ID unmatchable, the exact failure this pass exists to
+// avoid. It also loses the slot → model link the converter carried.
+//
+// So the tail is scanned as "anything but a bare `>`, OR a whole quoted
+// string". A `>` inside a domain is quoted and rides along inside the
+// string alternative; a `>` that really does end the slot is bare and
+// still stops the scan — which is what keeps a path holding two
+// converters from being swallowed as one match.
+var odooModelConverterRE = regexp.MustCompile(`<models?\(\s*["']([\w.]+)["'](?:[^>"']|"[^"]*"|'[^']*')*\)\s*:\s*(\w+)\s*>`)
+
+// odooBuiltinConverterRE matches a stock werkzeug converter that carries
+// arguments — <int(min=1):page>, <string(length=2):lang> — so they can be
+// dropped before the shared normaliser runs. That normaliser understands
+// the bare <int:page> form but leaves a parenthesised one embedded,
+// minting `/page/<int(min=1){p1}>` rather than `/page/{p1}`.
+//
+// The record converters are reduced to plain slots first and no longer
+// look like this, so `model` / `models` never reach this pattern. The
+// argument tail is spanned the same quote-aware way, for the same reason.
+var odooBuiltinConverterRE = regexp.MustCompile(`<(\w+)\((?:[^>"']|"[^"]*"|'[^']*')*\)\s*:\s*(\w+)\s*>`)
 
 // odooKwargRE reads a simple `name='value'` keyword argument.
 var odooKwargRE = regexp.MustCompile(`\b(type|auth)\s*=\s*["'](\w+)["']`)
@@ -159,31 +197,81 @@ func odooRoutePaths(args string) []string {
 func odooStringLiterals(s string) []string {
 	var out []string
 	for i := 0; i < len(s); i++ {
-		q := s[i]
-		if q != '\'' && q != '"' {
+		if q := s[i]; q != '\'' && q != '"' {
 			continue
 		}
-		j := i + 1
-		for j < len(s) && s[j] != q {
-			if s[j] == '\\' {
-				j++
-			}
-			j++
-		}
-		if j >= len(s) {
+		body, end := odooLiteralEnd(s, i)
+		if end < 0 {
 			break
 		}
-		out = append(out, s[i+1:j])
-		i = j
+		out = append(out, body)
+		i = end
 	}
 	return out
 }
 
+// odooLiteralEnd spans the Python string literal opening at i, returning
+// its body and the index of its final closing-quote byte — or end < 0 if
+// the literal is unterminated.
+//
+// A TRIPLE-quoted literal is how Odoo writes a path whose domain argument
+// already spends both quote styles:
+//
+//	@http.route('''/event/<model("event.event", "[('x','=',True)]"):event>''')
+//
+// Scanned as a single quote, such a path ends at the first apostrophe
+// inside the domain and the route is registered as the truncated
+// `/event/<model("event.event", "[(` — the unmatchable contract ID this
+// whole pass exists to avoid. Both callers span literals through this one
+// function, so neither can drift back into that failure on its own.
+func odooLiteralEnd(s string, i int) (body string, end int) {
+	q := s[i]
+	if triple := strings.Repeat(string(q), 3); strings.HasPrefix(s[i:], triple) {
+		closeAt := strings.Index(s[i+3:], triple)
+		if closeAt < 0 {
+			return "", -1
+		}
+		return s[i+3 : i+3+closeAt], i + 3 + closeAt + 2
+	}
+	j := i + 1
+	for j < len(s) && s[j] != q {
+		if s[j] == '\\' {
+			j++
+		}
+		j++
+	}
+	if j >= len(s) {
+		return "", -1
+	}
+	return s[i+1 : j], j
+}
+
 // odooFirstKwargIndex finds where the keyword arguments begin — the first
 // `name=` that is not an `==`, `!=`, `<=` or `>=` comparison.
+//
+// Quoted regions are SPANNED rather than scanned, because a werkzeug
+// converter argument inside the path is itself spelled `name=value`:
+//
+//	@http.route('/page/<int(min=1):page>', type='http')
+//
+// Read as the start of the kwargs, that `min=` truncates the head to
+// `'/page/<int(`; odooStringLiterals then finds an unterminated literal
+// and gives up, so the route is dropped whole — path and methods= alike,
+// silently, rather than merely mis-normalised.
 func odooFirstKwargIndex(s string) int {
-	for i := 1; i < len(s)-1; i++ {
-		if s[i] != '=' || s[i+1] == '=' {
+	for i := 0; i < len(s); i++ {
+		if q := s[i]; q == '\'' || q == '"' {
+			_, end := odooLiteralEnd(s, i)
+			if end < 0 {
+				// An unterminated literal means the argument text is
+				// truncated or malformed; claiming a kwarg boundary
+				// inside it would truncate the path list too.
+				return -1
+			}
+			i = end
+			continue
+		}
+		if i == 0 || i+1 >= len(s) || s[i] != '=' || s[i+1] == '=' {
 			continue
 		}
 		switch s[i-1] {
@@ -225,6 +313,7 @@ func odooHandlerBelow(lines []string, from int, fileNodes []*graph.Node) string 
 // record converters before the shared path normaliser sees them.
 func (h *HTTPExtractor) buildOdooContract(filePath, method, path, symbolID, args string, lineNum int, lines []string, fileNodes []*graph.Node, lang string, tree *parser.ParseTree) Contract {
 	rewritten, pathModels := rewriteOdooModelConverters(path)
+	rewritten = odooBuiltinConverterRE.ReplaceAllString(rewritten, "<$1:$2>")
 	normPath, origNames := NormalizeHTTPPathWithParams(rewritten)
 
 	meta := map[string]any{
