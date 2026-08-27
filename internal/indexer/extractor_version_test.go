@@ -62,9 +62,13 @@ func TestStaleLangsDetection(t *testing.T) {
 		if got := ExtractorVersionStaleLangs(`{"csharp":10}`); !reflect.DeepEqual(got, []string{"csharp"}) {
 			t.Errorf("stored pre-params C# version = %v, want [csharp]", got)
 		}
+		// A store extracted before the EF Core ORM stamps must re-extract
+		// unchanged .cs files: the models_table pass reads facts ([Table]
+		// edges, ef_config_* and ef_fluent stamps) that only re-extraction
+		// can mint.
 		for _, path := range []string{"src/Handler.cs", "Views/Page.razor", "Views/Page.cshtml"} {
-			if got := merkleSaltFor(path); got != "csharp@12" {
-				t.Errorf("C# extractor salt for %s = %q, want csharp@12", path, got)
+			if got := merkleSaltFor(path); got != "csharp@13" {
+				t.Errorf("C# extractor salt for %s = %q, want csharp@13", path, got)
 			}
 		}
 		if got := merkleSaltFor("src/Handler.php"); got != "php@2" {
