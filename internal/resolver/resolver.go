@@ -2943,9 +2943,13 @@ func (r *Resolver) ResolveIncomingForNames(names, repoPrefixes []string) *Resolv
 	// receipt consumers call this on every apply, and the common case is
 	// that no edge is parked under any requested name. buildPassIndexes is
 	// graph-wide (it scales with the store, not with the request), so a
-	// no-work call must cost one bounded read instead.
+	// no-work call must cost one bounded read instead. The probe's
+	// materialized read is retained and handed to the resolution helper:
+	// it is exactly the batch that helper needs, and re-reading it doubled
+	// the hit path's store time and allocations at scale.
+	inByStub := r.graph.GetInEdgesByNodeIDs(stubKeys)
 	pending := false
-	for _, edges := range r.graph.GetInEdgesByNodeIDs(stubKeys) {
+	for _, edges := range inByStub {
 		for _, edge := range edges {
 			if edge != nil && graph.IsUnresolvedTarget(edge.To) {
 				pending = true
@@ -2961,7 +2965,7 @@ func (r *Resolver) ResolveIncomingForNames(names, repoPrefixes []string) *Resolv
 	}
 	clear := r.buildPassIndexes()
 	defer clear()
-	r.resolveIncomingStubKeysLocked(stubKeys, stats)
+	r.resolveIncomingStubEdgesLocked(stubKeys, inByStub, stats)
 	return stats
 }
 
@@ -3003,9 +3007,18 @@ func (r *Resolver) resolveIncomingStubKeysLocked(stubKeys []string, stats *Resol
 	if len(stubKeys) == 0 {
 		return
 	}
+	r.resolveIncomingStubEdgesLocked(stubKeys, r.graph.GetInEdgesByNodeIDs(stubKeys), stats)
+}
+
+// resolveIncomingStubEdgesLocked is resolveIncomingStubKeysLocked over a
+// caller-supplied incoming-edge batch, for callers that already materialized
+// the frontier (the names-pass probe). Caller holds r.mu.
+func (r *Resolver) resolveIncomingStubEdgesLocked(stubKeys []string, inByStub map[string][]*graph.Edge, stats *ResolveStats) {
+	if len(stubKeys) == 0 {
+		return
+	}
 	var reindexBatch []graph.EdgeReindex
 	var jobs []reindexJob
-	inByStub := r.graph.GetInEdgesByNodeIDs(stubKeys)
 	for _, key := range stubKeys {
 		for _, edge := range inByStub[key] {
 			if edge == nil || !graph.IsUnresolvedTarget(edge.To) {

@@ -92,10 +92,87 @@ func TestResolveIncomingForNamesAmbiguousWildcardStaysUnresolved(t *testing.T) {
 	}
 }
 
+// incomingNamesCountingStore records every GetInEdgesByNodeIDs batch so a
+// test can assert how often the pending frontier is materialized.
+type incomingNamesCountingStore struct {
+	graph.Store
+	inEdgeBatches [][]string
+}
+
+func (s *incomingNamesCountingStore) GetInEdgesByNodeIDs(ids []string) map[string][]*graph.Edge {
+	s.inEdgeBatches = append(s.inEdgeBatches, append([]string(nil), ids...))
+	return s.Store.GetInEdgesByNodeIDs(ids)
+}
+
+// The successful path must not pay for the pending frontier twice: the
+// probe's materialized read is the same batch the resolution helper needs,
+// so the stub-key batch may hit the store exactly once. On SQLite the
+// duplicate read doubled both time and allocations at scale.
+func TestResolveIncomingForNamesHitPathReadsPendingEdgesOnce(t *testing.T) {
+	bare := &graph.Edge{From: "repo/c.go::CallerA", To: graph.UnresolvedMarker + "Target", Kind: graph.EdgeCalls, FilePath: "repo/c.go", Line: 3}
+	g := graph.New()
+	g.AddBatch([]*graph.Node{
+		{ID: "repo/c.go::CallerA", Kind: graph.KindFunction, Name: "CallerA", FilePath: "repo/c.go", RepoPrefix: "repo", Language: "go"},
+		{ID: "repo/b.go::Target", Kind: graph.KindFunction, Name: "Target", FilePath: "repo/b.go", RepoPrefix: "repo", Language: "go"},
+	}, []*graph.Edge{bare})
+
+	store := &incomingNamesCountingStore{Store: g}
+	r := New(store)
+	r.ResolveIncomingForNames([]string{"Target"}, []string{"repo"})
+
+	if bare.To != "repo/b.go::Target" {
+		t.Fatalf("hit-path edge target = %q, want repo/b.go::Target", bare.To)
+	}
+	stubBatches := 0
+	for _, batch := range store.inEdgeBatches {
+		for _, id := range batch {
+			if id == graph.UnresolvedMarker+"Target" {
+				stubBatches++
+				break
+			}
+		}
+	}
+	if stubBatches != 1 {
+		t.Fatalf("stub-key frontier materialized %d times, want exactly 1", stubBatches)
+	}
+}
+
 // The receipt consumers call the names pass on every apply, usually with no
 // pending edge parked under any requested name. That call must cost a probe,
 // not a graph-wide index build - this benchmark is the regression guard for
 // the probe-first fast path.
+// BenchmarkResolveIncomingForNamesPending guards the hit path: pending
+// edges parked under the requested name must be materialized from the store
+// exactly once per call. The two candidates keep every edge legitimately
+// ambiguous, so each iteration repeats the same full read-and-refuse work
+// instead of draining the frontier on the first pass.
+func BenchmarkResolveIncomingForNamesPending(b *testing.B) {
+	g := graph.New()
+	nodes := []*graph.Node{
+		{ID: "repo/x/a.go::X.Target", Kind: graph.KindMethod, Name: "Target", QualName: "X.Target", FilePath: "repo/x/a.go", RepoPrefix: "repo", Language: "go"},
+		{ID: "repo/y/b.go::Y.Target", Kind: graph.KindMethod, Name: "Target", QualName: "Y.Target", FilePath: "repo/y/b.go", RepoPrefix: "repo", Language: "go"},
+	}
+	edges := make([]*graph.Edge, 0, 2000)
+	for i := 0; i < 2000; i++ {
+		caller := fmt.Sprintf("repo/c%d.go::Caller%d", i, i)
+		nodes = append(nodes, &graph.Node{
+			ID: caller, Kind: graph.KindFunction, Name: fmt.Sprintf("Caller%d", i),
+			FilePath: fmt.Sprintf("repo/c%d.go", i), RepoPrefix: "repo", Language: "go",
+		})
+		edges = append(edges, &graph.Edge{
+			From: caller, To: graph.UnresolvedMarker + "*.Target", Kind: graph.EdgeCalls,
+			FilePath: fmt.Sprintf("repo/c%d.go", i), Line: 3,
+		})
+	}
+	g.AddBatch(nodes, edges)
+	r := New(g)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		r.ResolveIncomingForNames([]string{"Target"}, []string{"repo"})
+	}
+}
+
 func BenchmarkResolveIncomingForNamesNoPending(b *testing.B) {
 	g := graph.New()
 	nodes := make([]*graph.Node, 0, 2000)
