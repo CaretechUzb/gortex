@@ -1594,10 +1594,11 @@ func (e *CSharpExtractor) emitProperty(m parser.QueryResult, filePath, fileID st
 // as Meta["scoped_usings"] ("scope|name", empty scope = compilation
 // unit). Additive: the flat keys keep their exact legacy shape.
 func stampCSharpUsings(root *sitter.Node, src []byte, fileNode *graph.Node) {
-	var usings, globals, statics, scoped, globalStatics []string
+	var usings, globals, statics, scoped, globalStatics, globalAliases []string
 	seen := map[string]bool{}
 	seenStatic := map[string]bool{}
 	seenScoped := map[string]bool{}
+	seenGlobalAlias := map[string]bool{}
 	walkNodes(root, func(n *sitter.Node) {
 		if n.Type() != "using_directive" {
 			return
@@ -1612,6 +1613,17 @@ func stampCSharpUsings(root *sitter.Node, src []byte, fileNode *graph.Node) {
 			case "static":
 				isStatic = true
 			case "name_equals", "=":
+				// An alias grants no bare-name namespace visibility, but a
+				// GLOBAL alias makes its identifier project-scoped and
+				// opaque to string-compared type-argument stamps in every
+				// OTHER file — record the name so the dispatch gate can
+				// refuse stamps that spell it.
+				if isGlobal {
+					if a := csharpUsingAliasName(n, src); a != "" && !seenGlobalAlias[a] {
+						seenGlobalAlias[a] = true
+						globalAliases = append(globalAliases, a)
+					}
+				}
 				return
 			case "identifier", "qualified_name":
 				name = strings.TrimSpace(c.Content(src))
@@ -1647,11 +1659,14 @@ func stampCSharpUsings(root *sitter.Node, src []byte, fileNode *graph.Node) {
 			scoped = append(scoped, key)
 		}
 	})
-	if len(usings) == 0 && len(statics) == 0 {
+	if len(usings) == 0 && len(statics) == 0 && len(globalAliases) == 0 {
 		return
 	}
 	if fileNode.Meta == nil {
 		fileNode.Meta = map[string]any{}
+	}
+	if len(globalAliases) > 0 {
+		fileNode.Meta["global_using_aliases"] = globalAliases
 	}
 	if len(usings) > 0 {
 		fileNode.Meta["usings"] = usings

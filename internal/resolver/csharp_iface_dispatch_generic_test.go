@@ -682,6 +682,87 @@ func TestResolveCSharpInterfaceDispatch_EscapedOpenParamStaysInFanout(t *testing
 	assert.Contains(t, targets, "Relay.cs::CrateBox.Get")
 }
 
+// Review RED (revision 5a): a PROJECT-WIDE alias (`global using Entity =
+// App.Crate;` in another file) makes the spelling "Entity" opaque in every
+// file - the receiver's IBox<Entity> and the implementor's IBox<Crate> are
+// the same constructed interface, but the ancestor-only alias scan cannot
+// see the cross-file directive and the stamps compare unequal. Any stamp
+// naming a project-global alias must be refused (never filter).
+func TestResolveCSharpInterfaceDispatch_GlobalUsingAliasReceiverNeverFilters(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Global.cs": `global using Entity = App.Crate;
+`,
+		"Stores.cs": `namespace App {
+    public class Crate { }
+    public class Widget { }
+    public interface IBox<T> {
+        int Get(int id);
+    }
+    public class CrateBox : IBox<Crate> {
+        public int Get(int id) { return 1; }
+    }
+    public class WidgetBox : IBox<Widget> {
+        public int Get(int id) { return 2; }
+    }
+}`,
+		"Flow.cs": `namespace App {
+    public class Flow {
+        private readonly IBox<Entity> _crates;
+        public Flow(IBox<Entity> c) { _crates = c; }
+        public int Pull() { return _crates.Get(1); }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	callerID := "Flow.cs::Flow.Pull"
+	bindFieldReceiverCall(t, g, callerID, "_crates", "Stores.cs::IBox.Get")
+
+	ResolveCSharpInterfaceDispatch(g)
+
+	targets := dispatchTargets(g, callerID)
+	assert.Contains(t, targets, "Stores.cs::CrateBox.Get",
+		"Entity IS Crate through the project-global alias - the impl must stay in")
+	assert.Contains(t, targets, "Stores.cs::WidgetBox.Get",
+		"an alias-named receiver stamp is opaque and filters nothing")
+}
+
+// Review RED (revision 5b): the implementor-side twin - a base list spelled
+// through the project-global alias (`CrateBox : IBox<Entity>`) must not
+// stamp a closed argument the gate would compare against literal spellings.
+func TestResolveCSharpInterfaceDispatch_GlobalUsingAliasImplementorStaysInFanout(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Global.cs": `global using Entity = App.Crate;
+`,
+		"Stores.cs": `namespace App {
+    public class Crate { }
+    public interface IBox<T> {
+        int Get(int id);
+    }
+    public class CrateBox : IBox<Entity> {
+        public int Get(int id) { return 1; }
+    }
+}`,
+		"Flow.cs": `namespace App {
+    public class Flow {
+        private readonly IBox<Crate> _crates;
+        public Flow(IBox<Crate> c) { _crates = c; }
+        public int Pull() { return _crates.Get(1); }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	callerID := "Flow.cs::Flow.Pull"
+	bindFieldReceiverCall(t, g, callerID, "_crates", "Stores.cs::IBox.Get")
+
+	ResolveCSharpInterfaceDispatch(g)
+
+	targets := dispatchTargets(g, callerID)
+	assert.Contains(t, targets, "Stores.cs::CrateBox.Get",
+		"the alias-spelled base list stamps nothing - the impl stays in the fan-out")
+}
+
 // Codex review RED: `IBoxStore<System.Int32>` and `IBoxStore<int>` are the
 // SAME constructed interface in different spellings — the gate must fold
 // both to one canonical form and RETAIN the edge, never suppress it on a

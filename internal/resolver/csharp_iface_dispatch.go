@@ -173,6 +173,27 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 		return 0
 	}
 
+	// Project-global using aliases (`global using Entity = App.Crate;`)
+	// make their identifier opaque to the string-compared stamps in EVERY
+	// file of the project — the extractor's ancestor scan only sees the
+	// declaring file, so a receiver spelled IBox<Entity> and an implementor
+	// spelled IBox<Crate> stamp unequal spellings of one constructed
+	// interface. Any stamp naming such an alias is refused (never filter).
+	// Collected once per pass from the file nodes' extractor stamps, and
+	// only when stamps exist to gate with; the union across repos is
+	// deliberate — over-refusing can only PRESERVE edges.
+	globalAliasNames := map[string]bool{}
+	if len(implArgs) > 0 {
+		for n := range graph.NodesByKindsSeq(g, graph.KindFile) {
+			if n == nil || n.Meta == nil {
+				continue
+			}
+			for _, a := range csharpMetaStrings(n.Meta["global_using_aliases"]) {
+				globalAliasNames[a] = true
+			}
+		}
+	}
+
 	// implementation/interface type node id → member name → method nodes.
 	// Every overload matters: C# overloads mint one node each (Convert,
 	// Convert_L39, ...) sharing the same Name, and real call sites bind to any
@@ -316,6 +337,9 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 			subArgs := ""
 			if !variant {
 				subArgs = implArgs[sub][ag.ifaceID]
+				if csharpArgsNameGlobalAlias(subArgs, globalAliasNames) {
+					subArgs = ""
+				}
 			}
 			for _, m := range byName[ag.name] {
 				if m == nil || anchorSet[m.ID] {
@@ -429,6 +453,9 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 			srcArgs := f.implArgs[e.To]
 			if srcArgs == "" && len(f.implArgs) > 0 {
 				srcArgs = csharpReceiverDeclaredArgs(g, e, f.ifaceID, f.ifaceName, receiverFieldTypes)
+				if csharpArgsNameGlobalAlias(srcArgs, globalAliasNames) {
+					srcArgs = ""
+				}
 			}
 			for _, member := range f.members {
 				// Skip the member the call already reaches — and the CALLER
@@ -638,6 +665,21 @@ func csharpMemberMethodsAllByTypeFromEdges(edges []*graph.Edge, nodes map[string
 		set[method.Name] = append(set[method.Name], method)
 	}
 	return out
+}
+
+// csharpArgsNameGlobalAlias reports whether any comma-separated argument in
+// a type-argument stamp names a project-global using alias — a spelling the
+// string comparison cannot resolve, so the stamp must be refused.
+func csharpArgsNameGlobalAlias(args string, aliases map[string]bool) bool {
+	if args == "" || len(aliases) == 0 {
+		return false
+	}
+	for _, a := range strings.Split(args, ",") {
+		if aliases[a] {
+			return true
+		}
+	}
+	return false
 }
 
 // containsInt reports whether xs contains v. Family lists are tiny (a method
