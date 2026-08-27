@@ -321,6 +321,56 @@ func TestResolveCSharpInterfaceDispatch_MultiArgClosureGatesFanout(t *testing.T)
 		"an IPair<int,Crate> receiver never dispatches to the IPair<int,Widget> impl")
 }
 
+// Review RED (revision 1): two DIFFERENT member calls on one line, each on
+// its own field of the same generic interface closed with different
+// arguments — `_crates.Fetch(1) + _widgets.Save(2)`. The receiver lookup is
+// cached per call site, and a cache key without the member identity lets the
+// first receiver's arguments poison the second call's gate: WidgetBoxStore.Save
+// silently loses its usage. Each member call must gate on ITS OWN receiver.
+func TestResolveCSharpInterfaceDispatch_SameLineDistinctMembersKeepOwnReceivers(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Stores.cs": `namespace App {
+    public class Widget { }
+    public class Crate { }
+    public interface IBoxStore<T> {
+        int Fetch(int id);
+        int Save(int id);
+    }
+    public class WidgetBoxStore : IBoxStore<Widget> {
+        public int Fetch(int id) { return 1; }
+        public int Save(int id) { return 1; }
+    }
+    public class CrateBoxStore : IBoxStore<Crate> {
+        public int Fetch(int id) { return 2; }
+        public int Save(int id) { return 2; }
+    }
+    public class Flow {
+        private readonly IBoxStore<Crate> _crates;
+        private readonly IBoxStore<Widget> _widgets;
+        public Flow(IBoxStore<Crate> c, IBoxStore<Widget> w) { _crates = c; _widgets = w; }
+        public int Pull() { return _crates.Fetch(1) + _widgets.Save(2); }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	callerID := "Stores.cs::Flow.Pull"
+	bindFieldReceiverCall(t, g, callerID, "_crates", "Stores.cs::IBoxStore.Fetch")
+	bindFieldReceiverCall(t, g, callerID, "_widgets", "Stores.cs::IBoxStore.Save")
+
+	ResolveCSharpInterfaceDispatch(g)
+
+	targets := dispatchTargets(g, callerID)
+	assert.Contains(t, targets, "Stores.cs::CrateBoxStore.Fetch",
+		"the Fetch call gates on _crates and keeps the Crate impl")
+	assert.NotContains(t, targets, "Stores.cs::WidgetBoxStore.Fetch",
+		"the Fetch call's receiver is IBoxStore<Crate>")
+	assert.Contains(t, targets, "Stores.cs::WidgetBoxStore.Save",
+		"the Save call gates on _widgets - the Fetch lookup must not poison it")
+	assert.NotContains(t, targets, "Stores.cs::CrateBoxStore.Save",
+		"the Save call's receiver is IBoxStore<Widget>")
+}
+
 // Codex review RED: `IBoxStore<System.Int32>` and `IBoxStore<int>` are the
 // SAME constructed interface in different spellings — the gate must fold
 // both to one canonical form and RETAIN the edge, never suppress it on a

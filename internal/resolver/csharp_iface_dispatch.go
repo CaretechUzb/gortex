@@ -400,7 +400,7 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 			// it never pays the receiver lookup either.
 			srcArgs := f.implArgs[e.To]
 			if srcArgs == "" && len(f.implArgs) > 0 {
-				srcArgs = csharpReceiverDeclaredArgs(g, e, f.ifaceName, receiverFieldTypes)
+				srcArgs = csharpReceiverDeclaredArgs(g, e, f.ifaceID, f.ifaceName, receiverFieldTypes)
 			}
 			for _, member := range f.members {
 				// Skip the member the call already reaches — and the CALLER
@@ -661,11 +661,16 @@ func csharpShortTypeName(id string) string {
 // Typed LOCALS are a named remainder: the tenv strips generics before
 // receiver_type is stamped, so local-receiver sites keep the full
 // fan-out until the extractor carries local type arguments too.
-func csharpReceiverDeclaredArgs(g graph.Store, e *graph.Edge, ifaceName string, cache map[string]string) string {
+func csharpReceiverDeclaredArgs(g graph.Store, e *graph.Edge, ifaceID, ifaceName string, cache map[string]string) string {
 	if e == nil || e.From == "" {
 		return ""
 	}
-	cacheKey := e.From + "\x00" + e.FilePath + "\x00" + strconv.Itoa(e.Line) + "\x00" + ifaceName
+	// The member (e.To) selects WHICH companion edge lends its receiver, so
+	// two different member calls sharing a line resolve different fields —
+	// a key without it lets the first call's arguments poison the second.
+	// The full interface ID keeps short-name twins from distinct families
+	// apart for the same reason.
+	cacheKey := e.From + "\x00" + e.To + "\x00" + e.FilePath + "\x00" + strconv.Itoa(e.Line) + "\x00" + ifaceID
 	if v, ok := cache[cacheKey]; ok {
 		return v
 	}
