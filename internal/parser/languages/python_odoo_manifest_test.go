@@ -1,6 +1,7 @@
 package languages
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -152,4 +153,39 @@ func odooEdgeTargets(res *parser.ExtractionResult) []string {
 		}
 	}
 	return out
+}
+
+// A globbed asset entry mints no edge — it names a set, not a file — but
+// the pattern itself has to survive somewhere, or the bundle's real shape
+// is silently smaller than the manifest declares.
+func TestOdooManifest_GlobAssetsAreRecordedNotDropped(t *testing.T) {
+	res := odooManifest(t, "addons/sale/__manifest__.py", saleManifest)
+
+	var moduleNode *graph.Node
+	for _, n := range res.Nodes {
+		if n != nil && n.Kind == graph.KindModule {
+			moduleNode = n
+			break
+		}
+	}
+	if moduleNode == nil {
+		t.Fatal("no module node")
+	}
+	globs, ok := moduleNode.Meta["odoo_asset_globs"].([]string)
+	if !ok {
+		t.Fatalf("odoo_asset_globs missing, meta=%v", moduleNode.Meta)
+	}
+	if len(globs) != 1 || globs[0] != "web.assets_backend:sale/static/src/**/*.scss" {
+		t.Errorf("odoo_asset_globs = %v, want the bundle-qualified scss pattern", globs)
+	}
+
+	// The concrete sibling still binds, and the glob still mints no edge.
+	if e := odooEdge(res, graph.EdgeReferences, "addons/sale/static/src/js/sale.js"); e == nil {
+		t.Error("concrete asset path lost")
+	}
+	for _, e := range res.Edges {
+		if e != nil && strings.ContainsAny(e.To, "*?") {
+			t.Errorf("glob minted an edge to a path that cannot exist: %s", e.To)
+		}
+	}
 }

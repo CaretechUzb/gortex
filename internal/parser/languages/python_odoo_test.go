@@ -260,3 +260,71 @@ class Bare(Model):
 		t.Errorf("an unqualified base must not be detected, got %v", got)
 	}
 }
+
+// A class may override the derived table name with an explicit `_table`,
+// and core Odoo models do: ir.actions.act_window lives in `ir_act_window`,
+// not the `ir_actions_act_window` the dots-to-underscores rule predicts.
+// Deriving regardless mints a table node that does not exist.
+func TestOdooModel_ExplicitTableOverridesConvention(t *testing.T) {
+	res := odooExtract(t, `
+from odoo import models, fields
+
+class ActWindow(models.Model):
+    _name = "ir.actions.act_window"
+    _table = "ir_act_window"
+
+    name = fields.Char()
+`)
+	if e := odooEdge(res, graph.EdgeModelsTable, ormTableNodeID("ir_actions_act_window")); e != nil {
+		t.Error("derived the table name despite an explicit _table")
+	}
+	e := odooEdge(res, graph.EdgeModelsTable, ormTableNodeID("ir_act_window"))
+	if e == nil {
+		t.Fatal("no EdgeModelsTable to the explicit ir_act_window")
+	}
+	if got := e.Meta["derivation"]; got != "explicit" {
+		t.Errorf("derivation = %v, want explicit", got)
+	}
+	if got := e.Meta["table_name"]; got != "ir_act_window" {
+		t.Errorf("table_name = %v, want ir_act_window", got)
+	}
+	if got := odooClassNode(t, res, "ActWindow").Meta["odoo_table"]; got != "ir_act_window" {
+		t.Errorf("odoo_table = %v, want ir_act_window", got)
+	}
+}
+
+// Without an explicit _table the convention still applies, and says so.
+func TestOdooModel_DerivedTableStillReportsConvention(t *testing.T) {
+	res := odooExtract(t, odooSaleOrder)
+	e := odooEdge(res, graph.EdgeModelsTable, ormTableNodeID("sale_order"))
+	if e == nil {
+		t.Fatal("no EdgeModelsTable to sale_order")
+	}
+	if got := e.Meta["derivation"]; got != "convention" {
+		t.Errorf("derivation = %v, want convention", got)
+	}
+	if _, ok := odooClassNode(t, res, "SaleOrder").Meta["odoo_table"]; ok {
+		t.Error("odoo_table set on a model that declares no _table")
+	}
+}
+
+// _order and _rec_name were read and then dropped on the floor.
+func TestOdooModel_RecordsOrderAndRecName(t *testing.T) {
+	res := odooExtract(t, `
+from odoo import models, fields
+
+class Partner(models.Model):
+    _name = "res.partner"
+    _order = "display_name asc"
+    _rec_name = "display_name"
+
+    display_name = fields.Char()
+`)
+	n := odooClassNode(t, res, "Partner")
+	if got := n.Meta["odoo_order"]; got != "display_name asc" {
+		t.Errorf("odoo_order = %v", got)
+	}
+	if got := n.Meta["odoo_rec_name"]; got != "display_name" {
+		t.Errorf("odoo_rec_name = %v", got)
+	}
+}

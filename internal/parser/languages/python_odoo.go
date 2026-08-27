@@ -108,6 +108,14 @@ func detectOdooModel(classNode *sitter.Node, src []byte, classID, className, fil
 	if d := attrs["_description"]; d != "" {
 		classNodeRef.Meta["odoo_description"] = d
 	}
+	// odooClassAttrs already reads these; they qualify the identity the
+	// class declares, and `_table` in particular is what the table edge
+	// below binds against.
+	for _, attr := range []string{"_table", "_order", "_rec_name"} {
+		if v := attrs[attr]; v != "" {
+			classNodeRef.Meta["odoo"+attr] = v
+		}
+	}
 
 	inherits := odooInheritNames(body, src)
 	if len(inherits) > 0 {
@@ -120,7 +128,7 @@ func detectOdooModel(classNode *sitter.Node, src []byte, classID, className, fil
 
 	// An abstract model is a mixin: it has no table of its own.
 	if modelKind != "abstract" {
-		odooEmitTableEdge(result, classID, name, filePath, startLine)
+		odooEmitTableEdge(result, classID, name, attrs["_table"], filePath, startLine)
 	}
 
 	// `_inherit` is specialisation, whether it extends the model in
@@ -147,12 +155,22 @@ func detectOdooModel(classNode *sitter.Node, src []byte, classID, className, fil
 	odooEmitFields(result, classID, filePath, fields)
 }
 
-// odooEmitTableEdge binds the model to its physical table. Odoo derives
-// the table name from `_name` by replacing dots with underscores, so this
-// is a fact, not a guess — and it makes every Odoo model visible to the
-// existing analyze kind=models / unreferenced_tables queries for free.
-func odooEmitTableEdge(result *parser.ExtractionResult, classID, modelName, filePath string, line int) {
-	tableName := strings.ReplaceAll(modelName, ".", "_")
+// odooEmitTableEdge binds the model to its physical table, which makes
+// every Odoo model visible to the existing analyze kind=models /
+// unreferenced_tables queries for free.
+//
+// Odoo derives the table name from `_name` by replacing dots with
+// underscores, but a class may override that with an explicit `_table`
+// and a fair number of core models do — `ir.actions.act_window` lives in
+// `ir_act_window`, not the `ir_actions_act_window` the convention would
+// predict. The override is the authority whenever it is present, so
+// `derivation` now records which of the two rules produced the name
+// rather than always claiming convention.
+func odooEmitTableEdge(result *parser.ExtractionResult, classID, modelName, tableAttr, filePath string, line int) {
+	tableName, derivation := strings.ReplaceAll(modelName, ".", "_"), "convention"
+	if tableAttr != "" {
+		tableName, derivation = tableAttr, "explicit"
+	}
 	tableID := ormTableNodeID(tableName)
 	if !ormTableNodeAlreadyEmitted(result, tableID) {
 		result.Nodes = append(result.Nodes, &graph.Node{
@@ -176,7 +194,7 @@ func odooEmitTableEdge(result *parser.ExtractionResult, classID, modelName, file
 			"binding":    "subclass",
 			"table_name": tableName,
 			"model_name": modelName,
-			"derivation": "convention",
+			"derivation": derivation,
 		},
 	})
 }

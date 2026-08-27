@@ -213,3 +213,101 @@ func TestOdooModuleFromPath(t *testing.T) {
 		}
 	}
 }
+
+// odooEdgeFrom finds an edge by its source, which is the whole point of
+// the scope stack: WHICH node a reference hangs off.
+func odooEdgeFrom(res *parser.ExtractionResult, from string, kind graph.EdgeKind, to string) *graph.Edge {
+	for _, e := range res.Edges {
+		if e != nil && e.From == from && e.Kind == kind && e.To == to {
+			return e
+		}
+	}
+	return nil
+}
+
+// A <t t-name> nested inside a <template> opened a scope that was never
+// closed, so every later reference in the enclosing template — and in the
+// rest of the file — was attributed to the inner QWeb node instead.
+func TestOdooXML_NestedTemplateScopeIsRestored(t *testing.T) {
+	res := odooXML(t, "addons/sale/views/sale_views.xml", `<odoo>
+  <template id="layout">
+    <t t-name="sale.Inner"><div/></t>
+    <field name="inherit_id" ref="base.parent"/>
+  </template>
+</odoo>`)
+
+	outer := "odoo::template::sale.layout"
+	inner := "odoo::template::sale.Inner"
+	if odooNode(res, inner) == nil {
+		t.Fatal("inner QWeb template node not minted")
+	}
+	want := odooXMLIDPlaceholder + "base.parent"
+	if odooEdgeFrom(res, outer, graph.EdgeExtends, want) == nil {
+		t.Errorf("inherit_id after a nested <t> did not attribute to %s", outer)
+	}
+	if odooEdgeFrom(res, inner, graph.EdgeExtends, want) != nil {
+		t.Errorf("inherit_id leaked onto the inner QWeb node %s", inner)
+	}
+}
+
+// A closed <record> must not keep owning what follows it.
+func TestOdooXML_ClosedRecordDoesNotOwnLaterElements(t *testing.T) {
+	res := odooXML(t, "addons/sale/data/sale_data.xml", `<odoo>
+  <data>
+    <record id="first" model="ir.ui.view"/>
+    <function model="sale.order" name="_cron"/>
+  </data>
+</odoo>`)
+
+	stale := odooEdgeFrom(res, "odoo::record::sale.first",
+		graph.EdgeCalls, odooMethodPlaceholder+"sale.order._cron")
+	if stale != nil {
+		t.Error("<function> after a closed sibling record was attributed to that record")
+	}
+}
+
+// Sibling records must each own only their own children.
+func TestOdooXML_SiblingRecordsDoNotCrossAttribute(t *testing.T) {
+	res := odooXML(t, "addons/sale/views/sale_views.xml", `<odoo>
+  <record id="first" model="ir.ui.view">
+    <field name="inherit_id" ref="base.view_a"/>
+  </record>
+  <record id="second" model="ir.ui.view">
+    <field name="inherit_id" ref="base.view_b"/>
+  </record>
+</odoo>`)
+
+	for _, tc := range []struct{ rec, ref string }{
+		{"odoo::record::sale.first", "base.view_a"},
+		{"odoo::record::sale.second", "base.view_b"},
+	} {
+		if odooEdgeFrom(res, tc.rec, graph.EdgeExtends, odooXMLIDPlaceholder+tc.ref) == nil {
+			t.Errorf("%s lost its own inherit_id %s", tc.rec, tc.ref)
+		}
+	}
+	if odooEdgeFrom(res, "odoo::record::sale.first",
+		graph.EdgeExtends, odooXMLIDPlaceholder+"base.view_b") != nil {
+		t.Error("the second record's inherit_id was attributed to the first")
+	}
+}
+
+// A repository tracked AT the addons root — the layout docs/multi-repo.md
+// documents — puts the module name in the FIRST path segment. A fallback
+// scan that stops at parts[1] returned "" for every such file, unqualifying
+// every external ID the file minted.
+func TestOdooModuleFromPath_AddonsRootLayout(t *testing.T) {
+	cases := map[string]string{
+		"sale/views/sale_views.xml":         "sale",
+		"my_addon/data/x.xml":               "my_addon",
+		"my_addon/static/src/xml/t.xml":     "my_addon",
+		"project/my_addon/views/v.xml":      "my_addon",
+		"addons/website_sale/views/tpl.xml": "website_sale",
+		"views/orphan.xml":                  "",
+		"standalone.xml":                    "",
+	}
+	for in, want := range cases {
+		if got := odooModuleFromPath(in); got != want {
+			t.Errorf("odooModuleFromPath(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

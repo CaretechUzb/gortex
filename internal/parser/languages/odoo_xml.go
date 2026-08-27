@@ -51,6 +51,14 @@ const (
 // attributes, where a plain ref= attribute will not do.
 var odooRefEvalRE = regexp.MustCompile(`ref\(\s*["']([\w.]+)["']\s*\)`)
 
+// odooScope is one open record/template/menu element and the nesting
+// depth it was opened at, so it can be popped by its own end tag rather
+// than by whichever element happens to close next.
+type odooScope struct {
+	depth int
+	node  string
+}
+
 // IsOdooXML reports whether src is an Odoo XML document.
 //
 // Two shapes qualify. The common one is the `<odoo>` root (or the pre-v10
@@ -105,10 +113,24 @@ func (e *OdooXMLExtractor) Extract(filePath string, src []byte) (*parser.Extract
 	dec := xml.NewDecoder(bytes.NewReader(src))
 	dec.Strict = false
 
-	// current is the record/template node an attribute-level reference
-	// attributes to; without it a `ref=` deep inside a record would have
-	// nothing to hang off.
-	current := ""
+	// scopes is the stack of record/template/menu nodes an attribute-level
+	// reference attributes to; without it a `ref=` deep inside a record
+	// would have nothing to hang off.
+	//
+	// It has to be a STACK rather than one current node. Odoo nests these
+	// freely — a `<template>` wrapping a `<t t-name>`, a `<record>` next to
+	// a sibling `<record>` — and a scalar that is only ever overwritten
+	// never returns to the enclosing node when the inner one closes, so
+	// every later reference in the file is attributed to whichever node was
+	// opened last rather than to the one that actually contains it.
+	var scopes []odooScope
+	depth := 0
+	current := func() string {
+		if len(scopes) == 0 {
+			return ""
+		}
+		return scopes[len(scopes)-1].node
+	}
 	seen := map[string]bool{}
 	// pendingModelField tracks an open `<field name="model">`, whose value
 	// is element TEXT rather than an attribute. This is the canonical way
@@ -123,12 +145,12 @@ func (e *OdooXMLExtractor) Extract(filePath string, src []byte) (*parser.Extract
 		}
 		switch t := tok.(type) {
 		case xml.CharData:
-			if pendingModelField == "" || current == "" {
+			if pendingModelField == "" || current() == "" {
 				continue
 			}
 			if model := strings.TrimSpace(string(t)); model != "" {
 				result.Edges = append(result.Edges, odooModelRef(
-					current, model, graph.EdgeReferences, filePath, pendingLine,
+					current(), model, graph.EdgeReferences, filePath, pendingLine,
 					"field_"+pendingModelField))
 			}
 			pendingModelField = ""
@@ -137,12 +159,20 @@ func (e *OdooXMLExtractor) Extract(filePath string, src []byte) (*parser.Extract
 			if strings.EqualFold(t.Name.Local, "field") {
 				pendingModelField = ""
 			}
+			// Pop the scope this element opened, if it opened one. A
+			// self-closing tag yields both a start and an end token, so
+			// the depth counter stays balanced either way.
+			if len(scopes) > 0 && scopes[len(scopes)-1].depth == depth {
+				scopes = scopes[:len(scopes)-1]
+			}
+			depth--
 			continue
 		}
 		se, ok := tok.(xml.StartElement)
 		if !ok {
 			continue
 		}
+		depth++
 		local := strings.ToLower(se.Name.Local)
 		line := lineForOffset(lineStarts, int(clampOffset(dec.InputOffset(), len(src))))
 		if local == "field" {
@@ -154,27 +184,35 @@ func (e *OdooXMLExtractor) Extract(filePath string, src []byte) (*parser.Extract
 			}
 		}
 
+		// A node-minting element opens a scope that stays current until its
+		// own end tag. An element that mints nothing (an empty `id=`, a
+		// `<t>` with no t-name) is deliberately still pushed where it owns
+		// the scope, so the enclosing node is restored on close rather than
+		// leaking into the rest of the document.
+		push := func(node string) {
+			scopes = append(scopes, odooScope{depth: depth, node: node})
+		}
 		switch local {
 		case "record":
-			current = e.emitRecord(result, fileNode, seen, filePath, module, se, line)
+			push(e.emitRecord(result, fileNode, seen, filePath, module, se, line))
 		case "template":
-			current = e.emitTemplate(result, fileNode, seen, filePath, module, se, line, "template")
+			push(e.emitTemplate(result, fileNode, seen, filePath, module, se, line, "template"))
 		case "t":
 			// A QWeb template inside <templates>, keyed by t-name.
 			if name := odooAttr(se, "t-name"); name != "" {
-				current = e.emitQWeb(result, fileNode, seen, filePath, module, name, line)
+				push(e.emitQWeb(result, fileNode, seen, filePath, module, name, line))
 			}
 		case "menuitem":
-			current = e.emitMenu(result, fileNode, seen, filePath, module, se, line)
+			push(e.emitMenu(result, fileNode, seen, filePath, module, se, line))
 		case "field":
-			e.emitFieldRefs(result, current, filePath, module, se, line)
+			e.emitFieldRefs(result, current(), filePath, module, se, line)
 		case "function":
-			e.emitFunctionCall(result, current, filePath, se, line)
+			e.emitFunctionCall(result, current(), filePath, se, line)
 		}
 
 		// ref= and eval="ref(...)" appear on many element kinds; handle
 		// them uniformly rather than per element.
-		e.emitGenericRefs(result, current, filePath, module, se, line, local)
+		e.emitGenericRefs(result, current(), filePath, module, se, line, local)
 	}
 	return result, nil
 }
@@ -420,7 +458,16 @@ func odooModuleFromPath(filePath string) string {
 	}
 	// Fall back to the directory above views/data/security/static, the
 	// conventional places Odoo XML lives inside an addon.
-	for i := len(parts) - 2; i >= 1; i-- {
+	//
+	// The scan must reach parts[0]: a repository tracked AT the addons
+	// root — the layout docs/multi-repo.md documents, where paths read
+	// `sale/views/sale_views.xml` — puts the module name in the first
+	// segment. Stopping at parts[1] returned "" for every such file, so
+	// records were minted with bare unqualified external IDs while the
+	// manifest still named the module, and odooXMLIDIndex's bare-form
+	// fallback then collapsed same-named views across addons onto one
+	// node.
+	for i := len(parts) - 2; i >= 0; i-- {
 		switch parts[i] {
 		case "views", "data", "security", "report", "wizard", "demo", "static", "src", "xml":
 			continue

@@ -125,17 +125,29 @@ func captureOdooManifest(result *parser.ExtractionResult, root *sitter.Node, fil
 		}
 	}
 
-	odooManifestAssets(result, entries["assets"], src, moduleID, filePath, dir, line)
+	// A globbed asset entry names a set rather than one file, so it mints
+	// no edge. Recording the patterns on the module node keeps the
+	// bundle's real shape visible instead of dropping it silently.
+	if globs := odooManifestAssets(result, entries["assets"], src, moduleID, filePath, dir, line); len(globs) > 0 {
+		meta["odoo_asset_globs"] = globs
+	}
 }
 
 // odooManifestAssets walks the `assets` dict — bundle name → list of
-// paths. Glob entries and operator tuples (('remove', …), ('replace', …))
-// are recorded in Meta but produce no edge, since they name no single
-// resolvable file.
-func odooManifestAssets(result *parser.ExtractionResult, assets *sitter.Node, src []byte, moduleID, filePath, dir string, line int) {
+// paths — minting one edge per concrete path and RETURNING the glob
+// entries it deliberately did not bind, each as "<bundle>:<pattern>".
+//
+// A glob names a set, not a file, so it mints no edge; operator tuples
+// (('remove', …), ('replace', …)) are dropped earlier by
+// odooManifestStringList. Returning the patterns rather than writing them
+// to a map that goes out of scope is the difference between the bundle's
+// shape staying visible and being discarded — the caller is the only side
+// that holds a node to record them on.
+func odooManifestAssets(result *parser.ExtractionResult, assets *sitter.Node, src []byte, moduleID, filePath, dir string, line int) []string {
 	if assets == nil || assets.Type() != "dictionary" {
-		return
+		return nil
 	}
+	var globs []string
 	for i, nc := 0, int(assets.NamedChildCount()); i < nc; i++ {
 		pair := assets.NamedChild(i)
 		if pair == nil || pair.Type() != "pair" {
@@ -146,21 +158,18 @@ func odooManifestAssets(result *parser.ExtractionResult, assets *sitter.Node, sr
 			continue
 		}
 		for _, rel := range odooManifestStringList(pair.ChildByFieldName("value"), src) {
-			meta := map[string]any{"odoo_link": "asset", "odoo_bundle": bundle}
 			if strings.ContainsAny(rel, "*?") {
-				// A glob names a set, not a file; record it so the
-				// bundle's shape stays visible without minting an edge
-				// to a path that does not exist.
-				meta["odoo_asset_glob"] = rel
+				globs = append(globs, bundle+":"+rel)
 				continue
 			}
 			result.Edges = append(result.Edges, &graph.Edge{
 				From: moduleID, To: odooAssetPath(dir, rel), Kind: graph.EdgeReferences,
 				FilePath: filePath, Line: line, Origin: graph.OriginASTResolved,
-				Meta: meta,
+				Meta: map[string]any{"odoo_link": "asset", "odoo_bundle": bundle},
 			})
 		}
 	}
+	return globs
 }
 
 // odooAssetPath resolves an asset entry. Asset paths are written
