@@ -240,6 +240,128 @@ func TestResolveCSharpInterfaceDispatch_ReceiverLookupReadsCallerAdjacencyOnce(t
 		"the gate still filters on the cached evidence")
 }
 
+// Sweep pin: a PROPERTY receiver rides the same evidence path as a field -
+// properties mint KindField nodes, the field-identifier emitter covers
+// their bare-identifier reads, and the declared-type stamp carries the
+// closed arguments - so the gate must filter for property receivers
+// exactly as it does for fields.
+func TestResolveCSharpInterfaceDispatch_PropertyReceiverGatesFanout(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Props.cs": `namespace App {
+    public class Crate { }
+    public class Widget { }
+    public interface IBox<T> {
+        int Get(int id);
+    }
+    public class CrateBox : IBox<Crate> {
+        public int Get(int id) { return 1; }
+    }
+    public class WidgetBox : IBox<Widget> {
+        public int Get(int id) { return 2; }
+    }
+    public class Flow {
+        private IBox<Crate> Store { get; set; }
+        public int Pull() { return Store.Get(1); }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	callerID := "Props.cs::Flow.Pull"
+	bindFieldReceiverCall(t, g, callerID, "Store", "Props.cs::IBox.Get")
+
+	ResolveCSharpInterfaceDispatch(g)
+
+	targets := dispatchTargets(g, callerID)
+	assert.Contains(t, targets, "Props.cs::CrateBox.Get",
+		"a property receiver's declared arguments gate exactly like a field's")
+	assert.NotContains(t, targets, "Props.cs::WidgetBox.Get",
+		"an IBox<Crate> property receiver never dispatches to the Widget impl")
+}
+
+// Sweep pin: an implementor reached TRANSITIVELY (class D : IDerived where
+// IDerived : IBox<Crate>) carries no stamp against the root interface - its
+// base-list evidence names IDerived, not IBox - so it must stay in every
+// fan-out, even one whose receiver closes over different arguments. The
+// documented conservative rule, pinned so stamp inheritance can never
+// silently flip it into filtering.
+func TestResolveCSharpInterfaceDispatch_TransitiveImplementorStaysInFanout(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Derived.cs": `namespace App {
+    public class Crate { }
+    public class Widget { }
+    public interface IBox<T> {
+        int Get(int id);
+    }
+    public interface IDerived : IBox<Crate> {
+    }
+    public class DerivedBox : IDerived {
+        public int Get(int id) { return 1; }
+    }
+    public class WidgetBox : IBox<Widget> {
+        public int Get(int id) { return 2; }
+    }
+    public class Flow {
+        private readonly IBox<Widget> _widgets;
+        public Flow(IBox<Widget> w) { _widgets = w; }
+        public int Pull() { return _widgets.Get(1); }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	callerID := "Derived.cs::Flow.Pull"
+	bindFieldReceiverCall(t, g, callerID, "_widgets", "Derived.cs::IBox.Get")
+
+	ResolveCSharpInterfaceDispatch(g)
+
+	targets := dispatchTargets(g, callerID)
+	assert.Contains(t, targets, "Derived.cs::WidgetBox.Get",
+		"the receiver's own closure keeps its matching impl")
+	assert.Contains(t, targets, "Derived.cs::DerivedBox.Get",
+		"a transitive implementor is unstamped and never filtered")
+}
+
+// Sweep pin: a nullable-annotated receiver (`IBox<Crate?>`) is a non-simple
+// spelling and stamps nothing - the site keeps the full fan-out. Pinned
+// against a future fold treating Crate? as Crate: right for reference
+// types, wrong for value types (int? is Nullable<int>), so the refusal is
+// the correct conservative rule.
+func TestResolveCSharpInterfaceDispatch_NullableReceiverSpellingNeverFilters(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Nullable.cs": `namespace App {
+    public class Crate { }
+    public class Widget { }
+    public interface IBox<T> {
+        int Get(int id);
+    }
+    public class CrateBox : IBox<Crate> {
+        public int Get(int id) { return 1; }
+    }
+    public class WidgetBox : IBox<Widget> {
+        public int Get(int id) { return 2; }
+    }
+    public class Flow {
+        private readonly IBox<Crate?> _maybe;
+        public Flow(IBox<Crate?> m) { _maybe = m; }
+        public int Pull() { return _maybe.Get(1); }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	callerID := "Nullable.cs::Flow.Pull"
+	bindFieldReceiverCall(t, g, callerID, "_maybe", "Nullable.cs::IBox.Get")
+
+	ResolveCSharpInterfaceDispatch(g)
+
+	targets := dispatchTargets(g, callerID)
+	assert.Contains(t, targets, "Nullable.cs::CrateBox.Get",
+		"a non-simple spelling stamps nothing and filters nothing")
+	assert.Contains(t, targets, "Nullable.cs::WidgetBox.Get",
+		"a non-simple spelling stamps nothing and filters nothing")
+}
+
 // dispatchTargets returns the fan-out targets minted from callerID.
 func dispatchTargets(g graph.Store, callerID string) []string {
 	var targets []string
