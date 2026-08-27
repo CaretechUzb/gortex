@@ -851,6 +851,11 @@ func (e *CSharpExtractor) emitContainer(m parser.QueryResult, kind string, nodeK
 		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
 	})
 	emitCSharpAnnotationEdges(csharpCollectAttributes(def.Node, src), id, filePath, result, annotationSeen)
+	// EF Core model attribution: [Table] → EdgeModelsTable. Classes and
+	// records only — EF entities are reference types.
+	if kind == "class" || kind == "record" {
+		emitCSharpORMEdges(def.Node, src, id, filePath, result)
+	}
 	emitCSharpGenericParamNodes(id, def.Node, src, filePath, def.StartLine+1, result)
 	// Classes, structs, records, and interfaces carry a base list;
 	// emitCSharpBaseList derives each entry's edge kind from the
