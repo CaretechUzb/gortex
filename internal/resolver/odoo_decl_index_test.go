@@ -153,3 +153,55 @@ func TestBuildOdooDecls_SkipsJoinWalksWithNoDeclarations(t *testing.T) {
 	assert.Zero(t, c.opens[graph.KindMethod],
 		"no declaring class and no JS class means nothing for a method to join against")
 }
+
+// odooBatchCounter records how the fan-out reaches the store: one mutation
+// per sibling, or one batch for all of them.
+type odooBatchCounter struct {
+	graph.Store
+	addEdgeCalls int
+	batchCalls   int
+	batchedEdges int
+}
+
+func (s *odooBatchCounter) AddEdge(e *graph.Edge) {
+	s.addEdgeCalls++
+	s.Store.AddEdge(e)
+}
+
+func (s *odooBatchCounter) AddBatch(nodes []*graph.Node, edges []*graph.Edge) {
+	s.batchCalls++
+	s.batchedEdges += len(edges)
+	s.Store.AddBatch(nodes, edges)
+}
+
+// The fan-out is the widest write the Odoo pass makes — one sibling edge per
+// extra class declaring a shared `_name`, across every checkout that is not a
+// sibling of the asking one. Writing it an edge at a time cost ~2.9ms each on
+// a disk backend.
+func TestOdooReconcileFanout_WritesOneBatchNotOneEdgeEach(t *testing.T) {
+	c := &odooBatchCounter{Store: graph.New()}
+	want := []*graph.Edge{
+		{From: "a/x.py::A", To: "odoo/m.py::M", Kind: graph.EdgeExtends},
+		{From: "a/y.py::B", To: "odoo/m.py::M", Kind: graph.EdgeExtends},
+		{From: "a/z.py::C", To: "odoo/m.py::M", Kind: graph.EdgeExtends},
+	}
+	keep := map[odooEdgeIdentity]bool{}
+
+	odooReconcileFanout(c, nil, want, keep, func(*graph.Edge) bool { return false })
+
+	assert.Zero(t, c.addEdgeCalls, "the fan-out must not write one edge at a time")
+	assert.Equal(t, 1, c.batchCalls, "every sibling belongs to one batch")
+	assert.Equal(t, len(want), c.batchedEdges)
+	assert.Len(t, keep, len(want), "every offered sibling must still be marked kept")
+}
+
+// An empty fan-out must not open a transaction at all.
+func TestOdooReconcileFanout_EmptyFanoutWritesNothing(t *testing.T) {
+	c := &odooBatchCounter{Store: graph.New()}
+
+	odooReconcileFanout(c, nil, nil, map[odooEdgeIdentity]bool{},
+		func(*graph.Edge) bool { return false })
+
+	assert.Zero(t, c.batchCalls)
+	assert.Zero(t, c.addEdgeCalls)
+}

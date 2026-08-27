@@ -328,14 +328,23 @@ func odooEdgeIdentityOf(e *graph.Edge) odooEdgeIdentity {
 // `keep` (pre-seeded with every identity this pass bound) closes the
 // residual case where a stale sibling collides with a live primary.
 func odooReconcileFanout(g graph.Store, observed map[odooEdgeIdentity]*graph.Edge, want []*graph.Edge, keep map[odooEdgeIdentity]bool, stale func(*graph.Edge) bool) {
+	// One transaction, not one per sibling. AddBatch is the batched
+	// sibling of AddEdge and keeps its single-row UPSERT semantics, so
+	// re-running the pass still re-offers the same siblings without
+	// duplicating them — but a disk backend stops paying a mutation per
+	// edge. The fan-out is the widest write in the pass: on a workspace
+	// holding three checkouts of one repository it lands tens of
+	// thousands of siblings, and the per-edge loop was ~2.9ms each.
+	batch := make([]*graph.Edge, 0, len(want))
 	for _, e := range want {
 		if e == nil {
 			continue
 		}
 		keep[odooEdgeIdentityOf(e)] = true
-		// AddEdge is idempotent on (From, To, Kind), so re-running the
-		// pass re-offers the same siblings without duplicating them.
-		g.AddEdge(e)
+		batch = append(batch, e)
+	}
+	if len(batch) > 0 {
+		g.AddBatch(nil, batch)
 	}
 	var retire []*graph.Edge
 	for id, e := range observed {
