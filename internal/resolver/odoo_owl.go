@@ -35,7 +35,7 @@ func bindOdooJS(g graph.Store, scope map[string]bool) int {
 		if spec := odooMetaString(e, "odoo_js_import"); spec != "" {
 			plans = append(plans, odooBindPlan{
 				edge:        e,
-				target:      odooResolveJSModule(byModule, spec),
+				target:      odooResolveJSModule(g, byModule, e.From, spec),
 				placeholder: odooJSModuleStubPrefix + spec,
 			})
 			return
@@ -43,7 +43,7 @@ func bindOdooJS(g graph.Store, scope map[string]bool) int {
 		if tmpl := odooMetaString(e, "odoo_template"); tmpl != "" {
 			plans = append(plans, odooBindPlan{
 				edge:        e,
-				target:      odooLookupXMLID(byTemplate, tmpl),
+				target:      odooLookupXMLID(g, byTemplate, e.From, tmpl),
 				placeholder: odooTemplateStubPrefix + tmpl,
 			})
 			return
@@ -55,7 +55,9 @@ func bindOdooJS(g graph.Store, scope map[string]bool) int {
 			}
 			key := target + "." + method
 			plans = append(plans, odooBindPlan{
-				edge: e, target: byJSMethod[key], placeholder: odooJSMethodStubPrefix + key,
+				edge:        e,
+				target:      byJSMethod.lookup(g, e.From, key),
+				placeholder: odooJSMethodStubPrefix + key,
 			})
 		}
 	})
@@ -75,11 +77,11 @@ func bindOdooJS(g graph.Store, scope map[string]bool) int {
 // cannot be computed from the specifier alone. That half of the index is
 // keyed on the (addon, module-relative path) pair every Odoo JS file node
 // already carries, which makes the join exact rather than a guess.
-func odooResolveJSModule(byModule map[string]string, spec string) string {
+func odooResolveJSModule(g graph.Store, byModule odooIndex, fromID, spec string) string {
 	if spec == "" {
 		return ""
 	}
-	if id := byModule[spec]; id != "" {
+	if id := byModule.lookup(g, fromID, spec); id != "" {
 		return id
 	}
 	spec = strings.TrimPrefix(spec, "@")
@@ -95,7 +97,7 @@ func odooResolveJSModule(byModule map[string]string, spec string) string {
 	if !ok || addon == "" || rest == "" {
 		return ""
 	}
-	if id := byModule[addon+"/"+rest]; id != "" {
+	if id := byModule.lookup(g, fromID, addon+"/"+rest); id != "" {
 		return id
 	}
 	// `@web/../tests/helpers/utils` escapes the addon's `static/src` root.
@@ -111,7 +113,7 @@ func odooResolveJSModule(byModule map[string]string, spec string) string {
 	if strings.HasPrefix(cleaned, "..") {
 		return "" // climbed out of the addon entirely
 	}
-	return byModule[addon+"/static/"+cleaned]
+	return byModule.lookup(g, fromID, addon+"/static/"+cleaned)
 }
 
 // odooJSModuleIndex maps a module specifier to the file node providing
@@ -124,16 +126,9 @@ func odooResolveJSModule(byModule map[string]string, spec string) string {
 // which the extractor captured onto the file node — nothing about the
 // path implies it. The two key shapes cannot collide: a legacy name is
 // dotted and a modern key is slashed.
-func odooJSModuleIndex(g graph.Store) map[string]string {
-	out := map[string]string{}
-	put := func(key, id string) {
-		if key == "" {
-			return
-		}
-		if prev, exists := out[key]; !exists || id < prev {
-			out[key] = id
-		}
-	}
+func odooJSModuleIndex(g graph.Store) odooIndex {
+	out := odooIndex{}
+	put := out.put
 	for n := range g.NodesByKind(graph.KindFile) {
 		if n == nil || n.Meta == nil {
 			continue
@@ -200,16 +195,9 @@ func odooJSPathAfter(filePath, marker string) (string, bool) {
 // fully qualified (`static template = "sale.OrderWidget"`). Without the
 // bare fallback the two never meet in a repository that is itself a
 // single addon.
-func odooTemplateIndex(g graph.Store) map[string]string {
-	out := map[string]string{}
-	put := func(key, id string) {
-		if key == "" {
-			return
-		}
-		if prev, ok := out[key]; !ok || id < prev {
-			out[key] = id
-		}
-	}
+func odooTemplateIndex(g graph.Store) odooIndex {
+	out := odooIndex{}
+	put := out.put
 	for n := range g.NodesByKind(graph.KindResource) {
 		if n == nil || n.Meta == nil {
 			continue
@@ -226,7 +214,7 @@ func odooTemplateIndex(g graph.Store) map[string]string {
 
 // odooJSMethodIndex maps "<ClassName>.<method>" to the method node a
 // patch(...) call overrides.
-func odooJSMethodIndex(g graph.Store) map[string]string {
+func odooJSMethodIndex(g graph.Store) odooIndex {
 	classNames := map[string]string{}
 	for n := range g.NodesByKind(graph.KindType) {
 		if n == nil || n.Name == "" {
@@ -242,7 +230,7 @@ func odooJSMethodIndex(g graph.Store) map[string]string {
 	if len(classNames) == 0 {
 		return nil
 	}
-	out := map[string]string{}
+	out := odooIndex{}
 	for n := range g.NodesByKind(graph.KindMethod) {
 		if n == nil || n.Name == "" {
 			continue
@@ -255,10 +243,7 @@ func odooJSMethodIndex(g graph.Store) map[string]string {
 		if className == "" {
 			continue
 		}
-		key := className + "." + n.Name
-		if prev, ok := out[key]; !ok || n.ID < prev {
-			out[key] = n.ID
-		}
+		out.put(className+"."+n.Name, n.ID)
 	}
 	return out
 }

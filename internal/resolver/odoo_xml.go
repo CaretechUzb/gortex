@@ -54,7 +54,9 @@ func bindOdooXMLIDs(g graph.Store, scope map[string]bool) int {
 			}
 			key := model + "." + method
 			plans = append(plans, odooBindPlan{
-				edge: e, target: byMethod[key], placeholder: odooMethodStubPrefix + key,
+				edge:        e,
+				target:      byMethod.lookup(g, e.From, key),
+				placeholder: odooMethodStubPrefix + key,
 			})
 			return
 		}
@@ -62,13 +64,13 @@ func bindOdooXMLIDs(g graph.Store, scope map[string]bool) int {
 		if xmlID == "" {
 			return
 		}
-		target := odooLookupXMLID(byXMLID, xmlID)
+		target := odooLookupXMLID(g, byXMLID, e.From, xmlID)
 		var siblings []string
 		if target == "" && odooIsImplicitXMLID(xmlID) {
 			if implicit == nil {
 				implicit = buildOdooImplicitXMLIDs(g)
 			}
-			if targets := implicit.lookup(xmlID); len(targets) > 0 {
+			if targets := odooDropSiblingCheckouts(g, e.From, implicit.lookup(xmlID)); len(targets) > 0 {
 				if len(targets) > odooFanoutCap {
 					targets = targets[:odooFanoutCap]
 				}
@@ -125,16 +127,9 @@ func bindOdooXMLIDs(g graph.Store, scope map[string]bool) int {
 // the binding layout-independent; odooLookupXMLID still prefers an exact
 // match, so a genuine cross-module reference is never mis-bound to a
 // same-named record in another addon when the exact one exists.
-func odooXMLIDIndex(g graph.Store) map[string]string {
-	out := map[string]string{}
-	put := func(key, id string) {
-		if key == "" {
-			return
-		}
-		if prev, ok := out[key]; !ok || id < prev {
-			out[key] = id
-		}
-	}
+func odooXMLIDIndex(g graph.Store) odooIndex {
+	out := odooIndex{}
+	put := out.put
 	for n := range g.NodesByKind(graph.KindResource) {
 		if n == nil || n.Meta == nil {
 			continue
@@ -159,11 +154,11 @@ func odooBareXMLID(xmlID string) string {
 
 // odooLookupXMLID resolves an external ID, preferring the exact form and
 // falling back to the bare name for the layout reasons above.
-func odooLookupXMLID(idx map[string]string, xmlID string) string {
-	if target := idx[xmlID]; target != "" {
+func odooLookupXMLID(g graph.Store, idx odooIndex, fromID, xmlID string) string {
+	if target := idx.lookup(g, fromID, xmlID); target != "" {
 		return target
 	}
-	return idx[odooBareXMLID(xmlID)]
+	return idx.lookup(g, fromID, odooBareXMLID(xmlID))
 }
 
 // odooModelMethodIndex maps "<model._name>.<method>" to the Python method
@@ -172,7 +167,7 @@ func odooLookupXMLID(idx map[string]string, xmlID string) string {
 //
 // The join runs class → method rather than the reverse because a method
 // node knows only its class, while the `_name` lives on the class.
-func odooModelMethodIndex(g graph.Store) map[string]string {
+func odooModelMethodIndex(g graph.Store) odooIndex {
 	classModel := map[string]string{}
 	for n := range g.NodesByKind(graph.KindType) {
 		if n == nil || n.Meta == nil {
@@ -185,7 +180,7 @@ func odooModelMethodIndex(g graph.Store) map[string]string {
 	if len(classModel) == 0 {
 		return nil
 	}
-	out := map[string]string{}
+	out := odooIndex{}
 	for n := range g.NodesByKind(graph.KindMethod) {
 		if n == nil || n.Name == "" {
 			continue
@@ -199,10 +194,7 @@ func odooModelMethodIndex(g graph.Store) map[string]string {
 		if model == "" {
 			continue
 		}
-		key := model + "." + n.Name
-		if prev, ok := out[key]; !ok || n.ID < prev {
-			out[key] = n.ID
-		}
+		out.put(model+"."+n.Name, n.ID)
 	}
 	return out
 }

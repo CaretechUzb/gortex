@@ -1507,6 +1507,13 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 	if mi.graph == nil {
 		return
 	}
+
+	// Republish the checkout grouping before any pass consults it. A
+	// repository tracked or untracked since the last derivation changes
+	// which prefixes are worktrees of one another, and every pass below
+	// reads that to decide whether an edge between two prefixes can carry
+	// information at all.
+	mi.publishCheckoutGroups()
 	fullCoverage := fullCoverageGlobalPass(scope, censusEligible)
 	reporter := progress.FromContext(ctx)
 	r := resolver.New(mi.graph)

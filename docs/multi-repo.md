@@ -218,6 +218,44 @@ it: `daemon status` reconciles the live indexer registry against
 `not indexed` rather than dropping out of one view while the other keeps
 listing it.
 
+### Worktrees of a tracked repository
+
+A `git worktree` has its own root directory, so tracking one registers an
+independent repository with its own prefix — two prefixes over one body
+of code. Gortex recognises the relationship: repositories that resolve to
+the same main checkout form a **checkout group**, and no pass will bind a
+reference in one member to a definition in another.
+
+That gate matters because the two trees are byte-identical, so every
+name-keyed pass otherwise finds a second, equally good definition of
+every symbol and has no reason to prefer the right one. Lexical order
+usually picks the wrong one: measured on a 117k-node Odoo repository
+tracked alongside a worktree of itself, ~190k edges crossed into the
+worktree — model references, view inheritance, JS imports, even classes
+that "extended" themselves in the other checkout — and 1,909 of them were
+promoted to `cross_repo_*` relationships that reported boundary crossings
+that never happened.
+
+What the grouping changes:
+
+- A reference resolves inside its own checkout. Only when the asking
+  repository declares nothing does the lookup leave it, and it then skips
+  its own worktrees and considers genuinely separate repositories only.
+- `cross_repo_*` edges are never minted between members, and
+  `Edge.CrossRepo` is never set on an edge between them.
+- The cross-repo candidate pass is skipped entirely when every tracked
+  prefix belongs to one checkout group — there is nothing it could find.
+
+Genuine multi-repository setups are unaffected: two directories holding
+identical files are two repositories unless git says they share a
+checkout, and cross-repository resolution between them works as before.
+
+The grouping is recomputed whenever a repository is tracked, untracked,
+or reconciled, and is never persisted — untracking a worktree stops it
+being anyone's sibling immediately. Edges minted **before** a worktree was
+recognised are not retro-actively removed; reindexing (or re-tracking)
+the repository clears them.
+
 ### Empty indexes
 
 A repo that finished indexing with no files at all is reported as

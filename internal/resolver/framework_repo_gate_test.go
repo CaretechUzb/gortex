@@ -96,9 +96,9 @@ func TestNewFrameworkRepoGateStore_UnwrappedWhenNothingExcluded(t *testing.T) {
 	base := &recordingStore{}
 	gate := newFrameworkRepoGate(map[string]frameworkgate.Set{"odoo": odooOnly()})
 
-	assert.Same(t, base, newFrameworkRepoGateStore(base, gate, "odoo"))
-	assert.Same(t, base, newFrameworkRepoGateStore(base, nil, "value-ref"))
-	assert.NotSame(t, base, newFrameworkRepoGateStore(base, gate, "value-ref"))
+	assert.Same(t, base, newFrameworkRepoGateStore(base, gate, "odoo", nil))
+	assert.Same(t, base, newFrameworkRepoGateStore(base, nil, "value-ref", nil))
+	assert.NotSame(t, base, newFrameworkRepoGateStore(base, gate, "value-ref", nil))
 }
 
 func TestFrameworkRepoGateStore_AddEdgeDropsExcludedRepo(t *testing.T) {
@@ -107,7 +107,7 @@ func TestFrameworkRepoGateStore_AddEdgeDropsExcludedRepo(t *testing.T) {
 		"odoo":   odooOnly(),
 		"gortex": {},
 	})
-	store := newFrameworkRepoGateStore(base, gate, "value-ref")
+	store := newFrameworkRepoGateStore(base, gate, "value-ref", nil)
 
 	store.AddEdge(edgeFrom("odoo/a.py::X"))   // excluded
 	store.AddEdge(edgeFrom("gortex/a.go::X")) // allowed
@@ -126,7 +126,7 @@ func TestFrameworkRepoGateStore_AddBatchFiltersEdgesKeepsNodes(t *testing.T) {
 		"odoo":   odooOnly(),
 		"gortex": {},
 	})
-	store := newFrameworkRepoGateStore(base, gate, "react-resolve")
+	store := newFrameworkRepoGateStore(base, gate, "react-resolve", nil)
 
 	node := &graph.Node{ID: "odoo/a.py::X", RepoPrefix: "odoo"}
 	store.AddBatch([]*graph.Node{node}, []*graph.Edge{
@@ -145,7 +145,7 @@ func TestFrameworkRepoGateStore_AddBatchFiltersEdgesKeepsNodes(t *testing.T) {
 func TestFrameworkRepoGateStore_AddBatchLeavesCallerSliceIntact(t *testing.T) {
 	base := &recordingStore{}
 	gate := newFrameworkRepoGate(map[string]frameworkgate.Set{"odoo": odooOnly()})
-	store := newFrameworkRepoGateStore(base, gate, "value-ref")
+	store := newFrameworkRepoGateStore(base, gate, "value-ref", nil)
 
 	edges := []*graph.Edge{edgeFrom("odoo/a.py::X"), edgeFrom("gortex/a.go::X")}
 	store.AddBatch(nil, edges)
@@ -187,7 +187,7 @@ func TestFrameworkRepoGate_BatchFlushHonoursGate(t *testing.T) {
 		"odoo":   odooOnly(),
 		"gortex": {},
 	})
-	gated := newFrameworkRepoGateStore(base, gate, "value-ref")
+	gated := newFrameworkRepoGateStore(base, gate, "value-ref", nil)
 
 	n := runLegacyFrameworkSynthWithCache(gated, nil, func(store graph.Store) int {
 		store.AddEdge(edgeFrom("odoo/a.py::X"))
@@ -210,7 +210,7 @@ func TestFrameworkRepoGate_AllowedPassFlushesUngated(t *testing.T) {
 		"odoo":   odooOnly(),
 		"gortex": {},
 	})
-	gated := newFrameworkRepoGateStore(base, gate, "odoo")
+	gated := newFrameworkRepoGateStore(base, gate, "odoo", nil)
 	require.Same(t, base, gated)
 
 	runLegacyFrameworkSynthWithCache(gated, nil, func(store graph.Store) int {
@@ -257,7 +257,7 @@ func gateFor(base graph.Store, pass string) graph.Store {
 	return newFrameworkRepoGateStore(base, newFrameworkRepoGate(map[string]frameworkgate.Set{
 		"odoo":   odooOnly(),
 		"gortex": {},
-	}), pass)
+	}), pass, nil)
 }
 
 func TestFrameworkRepoGateStore_ReindexEdgeRefusesExcludedRepo(t *testing.T) {
@@ -344,7 +344,7 @@ func TestRunClaimingResolvers_CountsRepoGatedRefusals(t *testing.T) {
 		WithFrameworkAllowByRepo(map[string]frameworkgate.Set{"odoo": odooOnly()}),
 	})
 
-	claimed, gated := runClaimingResolversScopedCounted(g, nil, o)
+	claimed, gated, _ := runClaimingResolversScopedCounted(g, nil, o)
 	assert.NotNil(t, claimed)
 	assert.GreaterOrEqual(t, gated, 0, "the counter must be plumbed, not dropped")
 
@@ -371,6 +371,6 @@ func TestRunClaimingResolvers_UnclaimedEdgesAreNotCountedAsRefusals(t *testing.T
 	o := resolveFrameworkSynthOptions([]FrameworkSynthOption{
 		WithFrameworkAllowByRepo(map[string]frameworkgate.Set{"odoo": frameworkgate.New([]string{"flask"})}),
 	})
-	_, gated := runClaimingResolversScopedCounted(g, nil, o)
+	_, gated, _ := runClaimingResolversScopedCounted(g, nil, o)
 	assert.Zero(t, gated, "an edge no resolver claims is not a refused write")
 }

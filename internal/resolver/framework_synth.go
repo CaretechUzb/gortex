@@ -1080,6 +1080,11 @@ type SynthCount struct {
 	// the pass ran, and it still landed edges in the repositories that
 	// did admit it. Edges is reported net of these.
 	RepoGated int `json:"repo_gated,omitempty"`
+	// SiblingGated counts edges refused for spanning two git worktrees
+	// of one repository (see graph/checkout_groups.go). Reported apart
+	// from RepoGated because it is an invariant about the graph, not a
+	// permission the pass could have been granted.
+	SiblingGated int `json:"sibling_gated,omitempty"`
 }
 
 // FrameworkSynthReport is the aggregate result of one
@@ -1129,6 +1134,9 @@ type FrameworkSynthReport struct {
 	// Zero, and absent from the report, for a workspace where no
 	// repository narrows anything.
 	RepoGated int `json:"repo_gated,omitempty"`
+	// SiblingGated totals the edge writes refused across every pass for
+	// spanning two checkouts of one repository.
+	SiblingGated int `json:"sibling_gated,omitempty"`
 }
 
 // scopedSynthesizer is the optional capability a FrameworkSynthesizer exposes
@@ -1272,7 +1280,7 @@ func runFrameworkSynthesizersScoped(
 		// the batch layer flushes into gated, so a refused edge never
 		// reaches the backend. gated is g itself when nothing excludes
 		// this pass, which is the unconfigured hot path.
-		gated := newFrameworkRepoGateStore(g, repoGate, s.Name())
+		gated := newFrameworkRepoGateStore(g, repoGate, s.Name(), g)
 		var gatedScope graph.Store
 		if !disabled && shouldRunFrameworkSynthesizer(s, executionScope, candidates) {
 			if sf, ok := s.(synthFunc); ok {
@@ -1291,7 +1299,7 @@ func runFrameworkSynthesizersScoped(
 					n = sf.scopedFn(gated, executionScope)
 				default:
 					passScope = genericSeed.newPassStore()
-					gatedScope = newFrameworkRepoGateStore(passScope, repoGate, s.Name())
+					gatedScope = newFrameworkRepoGateStore(passScope, repoGate, s.Name(), g)
 					n = runLegacyFrameworkSynth(gatedScope, sf.fn)
 				}
 			} else if ss, ok := s.(scopedSynthesizer); ok {
@@ -1308,13 +1316,15 @@ func runFrameworkSynthesizersScoped(
 		// drops. Report Edges net of them: the pass counts what it
 		// staged, not what the backend accepted.
 		repoGated := droppedFrameworkRepoEdges(gated) + droppedFrameworkRepoEdges(gatedScope)
-		if n -= repoGated; n < 0 {
+		siblingGated := droppedSiblingCheckoutEdges(gated) + droppedSiblingCheckoutEdges(gatedScope)
+		if n -= repoGated + siblingGated; n < 0 {
 			n = 0
 		}
 		rep.RepoGated += repoGated
+		rep.SiblingGated += siblingGated
 		count := SynthCount{
 			Name: s.Name(), Edges: n, Millis: time.Since(start).Milliseconds(),
-			Disabled: disabled, RepoGated: repoGated,
+			Disabled: disabled, RepoGated: repoGated, SiblingGated: siblingGated,
 		}
 		if passScope != nil {
 			stats := passScope.stats()
@@ -1346,8 +1356,9 @@ func runFrameworkSynthesizersScoped(
 	// external-call synthesis classifies the residual unresolved refs as
 	// external. Reported in registration order for determinism.
 	claimStart := time.Now()
-	claimed, claimRepoGated := runClaimingResolversScopedCounted(g, executionScope, o)
+	claimed, claimRepoGated, claimSiblingGated := runClaimingResolversScopedCounted(g, executionScope, o)
 	rep.RepoGated += claimRepoGated
+	rep.SiblingGated += claimSiblingGated
 	rep.ClaimMillis = time.Since(claimStart).Milliseconds()
 	for _, r := range defaultClaimingResolvers() {
 		n := claimed[r.Name()]
@@ -1653,7 +1664,7 @@ func RunClaimingResolvers(g graph.Store, opts ...FrameworkSynthOption) map[strin
 // references sourced by changed repositories. Resolver precedence is retained:
 // each registered resolver receives only edges not claimed by an earlier one.
 func RunClaimingResolversScoped(g graph.Store, scope map[string]bool, opts ...FrameworkSynthOption) map[string]int {
-	claimed, _ := runClaimingResolversScopedCounted(g, scope, resolveFrameworkSynthOptions(opts))
+	claimed, _, _ := runClaimingResolversScopedCounted(g, scope, resolveFrameworkSynthOptions(opts))
 	return claimed
 }
 
@@ -1670,15 +1681,15 @@ func runClaimingResolversScopedCounted(
 	g graph.Store,
 	scope map[string]bool,
 	o frameworkSynthOptions,
-) (map[string]int, int) {
+) (map[string]int, int, int) {
 	out := map[string]int{}
 	if g == nil {
-		return out, 0
+		return out, 0, 0
 	}
 	repoGated := 0
 	resolvers := defaultClaimingResolvers()
 	if len(resolvers) == 0 {
-		return out, repoGated
+		return out, repoGated, 0
 	}
 	admissible := make([]ClaimingResolver, 0, len(resolvers))
 	for _, r := range resolvers {
@@ -1690,9 +1701,16 @@ func runClaimingResolversScopedCounted(
 		}
 	}
 	if len(admissible) == 0 {
-		return out, repoGated
+		return out, repoGated, 0
 	}
 	pending := scopedClaimingCandidates(g, scope, admissible)
+	// The checkout rule cannot be enforced on candidate admission the way
+	// the allow-list is: which repository a claim will bind INTO is not
+	// known until the resolver has run. So the writes go through the gate
+	// store instead, which refuses a rebind whose two endpoints turn out
+	// to be two checkouts of one repository. Unwrapped when no worktree
+	// is tracked.
+	writes := newFrameworkRepoGateStore(g, nil, "", g)
 	// A claiming resolver rewrites an existing unresolved edge rather
 	// than adding one, so per-repository enforcement belongs here, on
 	// candidate admission — not on a gated store. An edge whose source
@@ -1725,7 +1743,7 @@ func runClaimingResolversScopedCounted(
 			continue
 		}
 		if batcher, ok := r.(batchClaimingResolver); ok {
-			for edge := range batcher.ResolveBatch(g, candidates) {
+			for edge := range batcher.ResolveBatch(writes, candidates) {
 				if edge != nil && !claimed[edge] {
 					claimed[edge] = true
 					out[r.Name()]++
@@ -1734,11 +1752,11 @@ func runClaimingResolversScopedCounted(
 			continue
 		}
 		for _, e := range candidates {
-			if r.Resolve(g, e) {
+			if r.Resolve(writes, e) {
 				claimed[e] = true
 				out[r.Name()]++
 			}
 		}
 	}
-	return out, repoGated
+	return out, repoGated, droppedSiblingCheckoutEdges(writes)
 }

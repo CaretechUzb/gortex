@@ -47,7 +47,7 @@ func bindOdooModels(g graph.Store, scope map[string]bool) int {
 			return
 		}
 		placeholder := odooModelStubPrefix + model
-		targets := byModel[model]
+		targets := odooDropSiblingCheckouts(g, e.From, byModel[model])
 		if len(targets) == 0 {
 			plans = append(plans, odooBindPlan{edge: e, placeholder: placeholder})
 			return

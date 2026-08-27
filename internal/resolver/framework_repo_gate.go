@@ -116,11 +116,47 @@ func (gate *frameworkRepoGate) admits(fromID, pass string) bool {
 // 1,190 react-resolve edges bind inside repositories that had excluded
 // those passes, while the report showed repo_gated:0 for them because
 // nothing was ever offered to the gate.
+//
+// The same wrapper also enforces the repository-checkout invariant: no
+// framework pass may write an edge between two git worktrees of one
+// repository (see graph/checkout_groups.go). That is not a config
+// question — the two prefixes are one body of code, so the edge carries
+// no information whichever repository allowed the pass — but it needs
+// exactly the same coverage of exactly the same write paths, and every
+// registered synthesizer and claiming resolver already funnels through
+// here. The two refusals are counted apart so the run report never
+// attributes a checkout drop to an allow-list.
 type frameworkRepoGateStore struct {
 	graph.Store
-	gate    *frameworkRepoGate
-	pass    string
-	dropped int
+	gate *frameworkRepoGate
+	pass string
+	// siblingSrc is the store the checkout grouping is published on. It is
+	// NOT always the embedded Store: a scoped pass writes through a
+	// pass-local seed store that knows nothing about repository topology.
+	siblingSrc      any
+	dropped         int
+	droppedSiblings int
+}
+
+// refuses reports whether this pass may not write the edge, recording
+// which of the two rules refused it.
+//
+// The checkout rule is checked first and separately: it is an invariant
+// about the graph, not a permission the pass could have been granted, so
+// counting it as an allow-list drop would misreport both numbers.
+func (v *frameworkRepoGateStore) refuses(e *graph.Edge, oldFrom string) bool {
+	if e == nil {
+		return false
+	}
+	if graph.SiblingCheckoutIDs(v.siblingSrc, e.From, e.To) {
+		v.droppedSiblings++
+		return true
+	}
+	if v.refusesEdge(e, oldFrom) {
+		v.dropped++
+		return true
+	}
+	return false
 }
 
 // refusesEdge reports whether this pass may not write the given edge.
@@ -140,11 +176,16 @@ func (v *frameworkRepoGateStore) refusesEdge(e *graph.Edge, oldFrom string) bool
 // newFrameworkRepoGateStore wraps store for one pass, or returns store
 // unchanged when nothing can be dropped. Returning the bare store keeps
 // the unconfigured hot path free of an extra interface hop per edge.
-func newFrameworkRepoGateStore(store graph.Store, gate *frameworkRepoGate, pass string) graph.Store {
-	if store == nil || !gate.excludesPass(pass) {
+// siblingSrc is where the checkout grouping lives — the workspace graph,
+// which for a scoped pass is not the store being written through.
+func newFrameworkRepoGateStore(store graph.Store, gate *frameworkRepoGate, pass string, siblingSrc any) graph.Store {
+	if store == nil {
 		return store
 	}
-	return &frameworkRepoGateStore{Store: store, gate: gate, pass: pass}
+	if !gate.excludesPass(pass) && !graph.HasSiblingCheckouts(siblingSrc) {
+		return store
+	}
+	return &frameworkRepoGateStore{Store: store, gate: gate, pass: pass, siblingSrc: siblingSrc}
 }
 
 // droppedFrameworkRepoEdges reports how many edges the gate refused, for
@@ -156,9 +197,18 @@ func droppedFrameworkRepoEdges(store graph.Store) int {
 	return 0
 }
 
+// droppedSiblingCheckoutEdges reports how many edges were refused for
+// spanning two checkouts of one repository. Reported apart from the
+// allow-list drops so neither number explains the other away.
+func droppedSiblingCheckoutEdges(store graph.Store) int {
+	if gated, ok := store.(*frameworkRepoGateStore); ok {
+		return gated.droppedSiblings
+	}
+	return 0
+}
+
 func (v *frameworkRepoGateStore) AddEdge(e *graph.Edge) {
-	if e != nil && !v.gate.admits(e.From, v.pass) {
-		v.dropped++
+	if v.refuses(e, "") {
 		return
 	}
 	v.Store.AddEdge(e)
@@ -170,8 +220,7 @@ func (v *frameworkRepoGateStore) AddEdge(e *graph.Edge) {
 func (v *frameworkRepoGateStore) AddBatch(nodes []*graph.Node, edges []*graph.Edge) {
 	kept := edges[:0:0]
 	for _, e := range edges {
-		if e != nil && !v.gate.admits(e.From, v.pass) {
-			v.dropped++
+		if v.refuses(e, "") {
 			continue
 		}
 		kept = append(kept, e)
@@ -184,8 +233,7 @@ func (v *frameworkRepoGateStore) AddBatch(nodes []*graph.Node, edges []*graph.Ed
 // persist leaves the stored row unresolved, which is exactly what a
 // repository that excluded the pass asked for.
 func (v *frameworkRepoGateStore) ReindexEdge(e *graph.Edge, oldTo string) {
-	if v.refusesEdge(e, "") {
-		v.dropped++
+	if v.refuses(e, "") {
 		return
 	}
 	v.Store.ReindexEdge(e, oldTo)
@@ -194,8 +242,7 @@ func (v *frameworkRepoGateStore) ReindexEdge(e *graph.Edge, oldTo string) {
 func (v *frameworkRepoGateStore) ReindexEdges(batch []graph.EdgeReindex) {
 	kept := batch[:0:0]
 	for _, r := range batch {
-		if v.refusesEdge(r.Edge, r.OldFrom) {
-			v.dropped++
+		if v.refuses(r.Edge, r.OldFrom) {
 			continue
 		}
 		kept = append(kept, r)
@@ -204,8 +251,7 @@ func (v *frameworkRepoGateStore) ReindexEdges(batch []graph.EdgeReindex) {
 }
 
 func (v *frameworkRepoGateStore) SetEdgeProvenance(e *graph.Edge, newOrigin string) bool {
-	if v.refusesEdge(e, "") {
-		v.dropped++
+	if v.refuses(e, "") {
 		return false
 	}
 	return v.Store.SetEdgeProvenance(e, newOrigin)
@@ -214,8 +260,7 @@ func (v *frameworkRepoGateStore) SetEdgeProvenance(e *graph.Edge, newOrigin stri
 func (v *frameworkRepoGateStore) SetEdgeProvenanceBatch(batch []graph.EdgeProvenanceUpdate) int {
 	kept := batch[:0:0]
 	for _, u := range batch {
-		if v.refusesEdge(u.Edge, "") {
-			v.dropped++
+		if v.refuses(u.Edge, "") {
 			continue
 		}
 		kept = append(kept, u)

@@ -261,13 +261,19 @@ func (cr *CrossRepoResolver) crossWorkspaceEligible(sourceWS, targetWS, importPa
 // modules live in different workspaces — the worktree-instance case,
 // where the importer's workspace has its own copy of the imported module
 // but the canonical copy (in another workspace) sorted first.
-func (cr *CrossRepoResolver) pickImportCandidate(callerWS, importPath string, candidates []graph.FileNodeIdentity) (graph.FileNodeIdentity, bool) {
+func (cr *CrossRepoResolver) pickImportCandidate(callerRepo, callerWS, importPath string, candidates []graph.FileNodeIdentity) (graph.FileNodeIdentity, bool) {
 	for _, candidate := range candidates {
+		if cr.siblingCheckout(callerRepo, graph.RepoPrefixOfID(candidate.ID)) {
+			continue
+		}
 		if fileCandidateWorkspaceID(candidate) == callerWS {
 			return candidate, true
 		}
 	}
 	for _, candidate := range candidates {
+		if cr.siblingCheckout(callerRepo, graph.RepoPrefixOfID(candidate.ID)) {
+			continue
+		}
 		if cr.crossWorkspaceEligible(callerWS, fileCandidateWorkspaceID(candidate), importPath) {
 			return candidate, true
 		}
@@ -279,6 +285,7 @@ func (cr *CrossRepoResolver) pickImportCandidate(callerWS, importPath string, ca
 // qualified-name candidate set. The boolean reports an ambiguous eligible
 // foreign set, which must stay unresolved rather than bind by row order.
 func (cr *CrossRepoResolver) pickQualNameCandidate(callerRepo, callerWS, qualName string, candidates []*graph.Node) (*graph.Node, bool) {
+	candidates = cr.withoutSiblingCheckouts(callerRepo, candidates)
 	if candidate := lowestIDQualNameCandidate(candidates, func(n *graph.Node) bool {
 		return n.RepoPrefix == callerRepo && candidateWorkspaceID(n) == callerWS
 	}); candidate != nil {
@@ -306,6 +313,28 @@ func (cr *CrossRepoResolver) pickQualNameCandidate(callerRepo, callerWS, qualNam
 		eligible = candidate
 	}
 	return eligible, false
+}
+
+// withoutSiblingCheckouts removes candidates that live in a different git
+// checkout of the caller's own repository. They are duplicates of a
+// same-repo candidate by construction, and leaving them in lets the
+// foreign-eligible tier below report an ambiguity — two "different" repos
+// offering one symbol — that does not exist.
+//
+// The input slice is returned untouched when no worktree is tracked, so
+// the common workspace allocates nothing.
+func (cr *CrossRepoResolver) withoutSiblingCheckouts(callerRepo string, candidates []*graph.Node) []*graph.Node {
+	if callerRepo == "" || !graph.HasSiblingCheckouts(cr.graph) {
+		return candidates
+	}
+	kept := make([]*graph.Node, 0, len(candidates))
+	for _, candidate := range candidates {
+		if candidate != nil && cr.siblingCheckout(callerRepo, candidate.RepoPrefix) {
+			continue
+		}
+		kept = append(kept, candidate)
+	}
+	return kept
 }
 
 // ResolveAll resolves all unresolved edges in the graph, trying same-repo
@@ -786,9 +815,20 @@ func (cr *CrossRepoResolver) clearReachableReposIndex() {
 func (cr *CrossRepoResolver) reachabilityChecker(e *graph.Edge) func(targetRepo string) bool {
 	callerRepo := cr.callerRepoPrefix(e)
 	reachableRepos := cr.reachableReposByFile[cr.callerFileID(e)]
+	// Hoisted out of the closure: this runs once per CANDIDATE, and on a
+	// workspace with no worktree tracked the answer is a constant false.
+	checkSiblings := graph.HasSiblingCheckouts(cr.graph)
 	return func(targetRepo string) bool {
 		if targetRepo == "" || targetRepo == callerRepo {
 			return true
+		}
+		// A separate checkout of the caller's OWN repository is never a
+		// legitimate target, even when the caller's file genuinely imports
+		// it: the symbol it would bind to is the same symbol the caller's
+		// own checkout defines, so the hop states nothing and hides the
+		// real, same-repo binding behind a foreign node ID.
+		if checkSiblings && cr.siblingCheckout(callerRepo, targetRepo) {
+			return false
 		}
 		if reachableRepos == nil {
 			return false
@@ -796,6 +836,14 @@ func (cr *CrossRepoResolver) reachabilityChecker(e *graph.Edge) func(targetRepo 
 		_, ok := reachableRepos[targetRepo]
 		return ok
 	}
+}
+
+// siblingCheckout reports whether targetRepo is a different git checkout
+// of the same repository as callerRepo — see graph/checkout_groups.go.
+// False whenever no worktree is tracked, which is the common case and
+// costs one map-length read.
+func (cr *CrossRepoResolver) siblingCheckout(callerRepo, targetRepo string) bool {
+	return graph.SiblingCheckouts(cr.graph, callerRepo, targetRepo)
 }
 
 // callerFileID returns the graph ID of the file that owns the edge's
@@ -1410,7 +1458,7 @@ func (cr *CrossRepoResolver) resolveImport(e *graph.Edge, importPath string, sta
 	// on the first ineligible candidate — a same-workspace instance (a
 	// worktree of the imported module tracked under its own prefix) may
 	// appear later in the list.
-	if picked, ok := cr.pickImportCandidate(callerWS, importPath, crossRepoAll); ok {
+	if picked, ok := cr.pickImportCandidate(callerRepo, callerWS, importPath, crossRepoAll); ok {
 		e.To = picked.ID
 		stats.Resolved++
 		if isCrossRepoHop(callerRepo, picked.RepoPrefix) {
