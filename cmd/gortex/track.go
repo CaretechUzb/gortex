@@ -101,6 +101,13 @@ func runTrack(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("path is not a directory: %s", absPath)
 	}
 
+	// Validate before anything else writes or prints: an unusable --name
+	// would otherwise reach ResolvePrefix verbatim on the already-tracked
+	// branch below, which never calls AddRepo.
+	if err := config.ValidateRepoName(trackName); err != nil {
+		return err
+	}
+
 	emitTrackBanner(w, absPath, daemon.IsRunning())
 
 	// 1. Config write FIRST. Registering a repo is a config operation

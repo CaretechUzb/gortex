@@ -317,6 +317,21 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// multi-repo mode, desyncing the unprefixed graph (#270).
 	healDuplicateRepos(state.configManager.Global(), logger)
 
+	// Drop any entry whose `name:` cannot be a repo prefix before the warmup
+	// loop registers it. AddRepo refuses such a name, so one is here only via
+	// a hand-edit — but ResolvePrefix hands Name back verbatim, and it would
+	// become the ambiguous first segment of every node ID that repository
+	// contributes. Rejecting the single entry keeps the blast radius at one
+	// repository: the daemon still starts, everything else stays queryable,
+	// and the operator gets the offending path plus the reason.
+	for _, bad := range state.configManager.Global().RejectInvalidRepoNames() {
+		logger.Warn("daemon: skipping repo with an unusable name — fix `name:` in the global config and restart",
+			zap.String("path", bad.Path),
+			zap.String("name", bad.Name),
+			zap.String("project", bad.Project),
+			zap.String("reason", bad.Reason))
+	}
+
 	repos := state.configManager.Global().Repos
 
 	// Purge orphaned repo prefixes BEFORE the warmup loop re-registers the
