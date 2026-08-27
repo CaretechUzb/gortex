@@ -336,3 +336,192 @@ func TestOdooIsRegisteredAsASingleFramework(t *testing.T) {
 		}
 	}
 }
+
+// The fan-out siblings are the one family odooRebind cannot recompute —
+// they carry no placeholder of their own. That left them outside the
+// pass's full-recompute contract: deleting one of several classes
+// declaring a model left its sibling edge pointing at a node that is gone,
+// and file-scoped cleanup could not reach it either, because a sibling's
+// FilePath is the SOURCE file rather than the vanished target's.
+func TestResolveOdooRefs_FanOutRetiredWhenDeclaringClassIsDeleted(t *testing.T) {
+	g := graph.New()
+	odooModelClass(g, "a/order.py::SaleOrder", "sale.order")
+	odooModelClass(g, "b/order.py::SaleOrderB", "sale.order")
+	odooModelClass(g, "c/w.py::Wizard", "sale.wizard")
+	odooModelStub(g, "c/w.py::Wizard", "sale.order", graph.EdgeExtends)
+
+	ResolveOdooRefs(g)
+	require.NotNil(t, odooFindEdge(g, graph.EdgeExtends, "c/w.py::Wizard", "b/order.py::SaleOrderB"),
+		"precondition: the sibling edge must exist before the class is deleted")
+
+	// The addon is deleted; the class node goes with its file.
+	g.EvictFile("b/order.py::SaleOrderB")
+	ResolveOdooRefs(g)
+
+	assert.Nil(t, odooFindEdge(g, graph.EdgeExtends, "c/w.py::Wizard", "b/order.py::SaleOrderB"),
+		"the sibling edge must be retired with its target")
+	assert.NotNil(t, odooFindEdge(g, graph.EdgeExtends, "c/w.py::Wizard", "a/order.py::SaleOrder"),
+		"the surviving declaration must stay bound")
+}
+
+// The quieter half of the same gap: the target node is still in the graph,
+// it just no longer declares the model.
+func TestResolveOdooRefs_FanOutRetiredWhenClassStopsDeclaringModel(t *testing.T) {
+	g := graph.New()
+	odooModelClass(g, "a/order.py::SaleOrder", "sale.order")
+	odooModelClass(g, "b/order.py::SaleOrderB", "sale.order")
+	odooModelClass(g, "c/w.py::Wizard", "sale.wizard")
+	odooModelStub(g, "c/w.py::Wizard", "sale.order", graph.EdgeExtends)
+
+	ResolveOdooRefs(g)
+	require.NotNil(t, odooFindEdge(g, graph.EdgeExtends, "c/w.py::Wizard", "b/order.py::SaleOrderB"))
+
+	// The class is edited to extend a different model.
+	odooModelClass(g, "b/order.py::SaleOrderB", "sale.other")
+	ResolveOdooRefs(g)
+
+	assert.Nil(t, odooFindEdge(g, graph.EdgeExtends, "c/w.py::Wizard", "b/order.py::SaleOrderB"),
+		"a class that no longer declares the model must not keep its sibling edge")
+}
+
+// Retirement must not fire on a steady state: re-running the pass with
+// nothing changed keeps every sibling.
+func TestResolveOdooRefs_FanOutSurvivesRerun(t *testing.T) {
+	g := graph.New()
+	odooModelClass(g, "a/order.py::SaleOrder", "sale.order")
+	odooModelClass(g, "b/order.py::SaleOrderB", "sale.order")
+	odooModelClass(g, "c/w.py::Wizard", "sale.wizard")
+	odooModelStub(g, "c/w.py::Wizard", "sale.order", graph.EdgeExtends)
+
+	ResolveOdooRefs(g)
+	ResolveOdooRefs(g)
+	ResolveOdooRefs(g)
+
+	for _, want := range []string{"a/order.py::SaleOrder", "b/order.py::SaleOrderB"} {
+		assert.NotNil(t, odooFindEdge(g, graph.EdgeExtends, "c/w.py::Wizard", want),
+			"a steady-state rerun must keep the fan-out (%s)", want)
+	}
+}
+
+// A test module addresses its helpers by climbing out of the addon's
+// `static/src` root — `@web/../tests/helpers/utils` is
+// `web/static/tests/helpers/utils.js`. Odoo's asset loader resolves the
+// specifier as a path relative to that root, so the `..` is meaningful
+// rather than decorative; matched literally it can never hit a file,
+// because no real path carries the segment.
+func TestResolveOdooRefs_ImportEscapingStaticSrcBindsToFile(t *testing.T) {
+	g := graph.New()
+	g.AddNode(&graph.Node{
+		ID: "addons/web/static/tests/helpers/utils.js", Kind: graph.KindFile,
+		Name: "utils.js", FilePath: "addons/web/static/tests/helpers/utils.js",
+		Language: "javascript",
+		Meta:     map[string]any{"odoo_js_module": true, "odoo_js_addon": "web"},
+	})
+	g.AddNode(&graph.Node{
+		ID: "addons/sale/static/tests/t.js", Kind: graph.KindFile, Name: "t.js",
+		FilePath: "addons/sale/static/tests/t.js", Language: "javascript",
+		Meta: map[string]any{"odoo_js_module": true, "odoo_js_addon": "sale"},
+	})
+	odooStub(g, "addons/sale/static/tests/t.js",
+		odooJSModuleStubPrefix+"@web/../tests/helpers/utils", graph.EdgeImports, odooJSVia,
+		map[string]any{"odoo_js_import": "@web/../tests/helpers/utils"})
+
+	ResolveOdooRefs(g)
+
+	assert.NotNil(t,
+		odooFindEdge(g, graph.EdgeImports, "addons/sale/static/tests/t.js",
+			"addons/web/static/tests/helpers/utils.js"),
+		"an import escaping static/src must bind to the file it names")
+}
+
+// The escape is resolved, not merely stripped: climbing past the addon
+// root names nothing, and inventing a binding there would be worse than
+// leaving the import unresolved.
+func TestResolveOdooRefs_ImportEscapingPastTheAddonStaysUnbound(t *testing.T) {
+	g := graph.New()
+	g.AddNode(&graph.Node{
+		ID: "addons/web/static/tests/helpers/utils.js", Kind: graph.KindFile,
+		Name: "utils.js", FilePath: "addons/web/static/tests/helpers/utils.js",
+		Language: "javascript",
+		Meta:     map[string]any{"odoo_js_module": true, "odoo_js_addon": "web"},
+	})
+	e := odooStub(g, "addons/sale/static/tests/t.js",
+		odooJSModuleStubPrefix+"@web/../../../etc/passwd", graph.EdgeImports, odooJSVia,
+		map[string]any{"odoo_js_import": "@web/../../../etc/passwd"})
+
+	ResolveOdooRefs(g)
+
+	assert.Equal(t, odooJSModuleStubPrefix+"@web/../../../etc/passwd", e.To,
+		"a specifier climbing out of the addon must stay a placeholder")
+}
+
+// Retirement must not strand a model whose primary edge the STORE
+// removed.
+//
+// When the class holding targets[0] is evicted, graph-level dangling-edge
+// cleanup drops the primary with it, so the next pass collects only the
+// surviving sibling — which carries no placeholder and is therefore never
+// recomputed. Retirement driven by "the pass did not recompute it" then
+// deletes that sibling too, and the reference to the model disappears
+// outright even though a class still declares it. Fan-outs are widest
+// exactly where Odoo is densest, so on a real corpus this takes most of
+// the graph with it; keying retirement to the edge's own model instead
+// cannot rotate and cannot strand.
+func TestResolveOdooRefs_FanOutSurvivesEvictionOfThePrimaryTarget(t *testing.T) {
+	g := graph.New()
+	odooModelClass(g, "a/order.py::SaleOrder", "sale.order")
+	odooModelClass(g, "b/order.py::SaleOrderB", "sale.order")
+	odooModelClass(g, "c/w.py::Wizard", "sale.wizard")
+	e := odooModelStub(g, "c/w.py::Wizard", "sale.order", graph.EdgeExtends)
+
+	ResolveOdooRefs(g)
+	require.Equal(t, "a/order.py::SaleOrder", e.To,
+		"precondition: the lowest-sorting declaration is the primary")
+	require.NotNil(t, odooFindEdge(g, graph.EdgeExtends, "c/w.py::Wizard", "b/order.py::SaleOrderB"),
+		"precondition: the second declaration is a sibling")
+
+	g.EvictFile("a/order.py::SaleOrder")
+	ResolveOdooRefs(g)
+	ResolveOdooRefs(g)
+
+	assert.NotNil(t, odooFindEdge(g, graph.EdgeExtends, "c/w.py::Wizard", "b/order.py::SaleOrderB"),
+		"the surviving declaration must stay linked after the primary's target is evicted")
+}
+
+// A partial run must bind against the WHOLE graph, not just the changed
+// repository.
+//
+// Every Odoo family is a full recompute: an edge whose target is missing
+// from the index is reset to its placeholder, which is how a reference to
+// a deleted record un-binds itself. If the pass builds its indexes from
+// the changed repository alone, it applies that verdict to every Odoo edge
+// in the workspace — so indexing a second addon after the first silently
+// resets the first's edges to placeholders while the records they name are
+// still sitting in the graph.
+func TestResolveOdooRefsScoped_DoesNotUnbindOutOfScopeRepos(t *testing.T) {
+	g := graph.New()
+	g.AddNode(&graph.Node{
+		ID: "odoo/sale/views/v.xml", Kind: graph.KindFile,
+		FilePath: "odoo/sale/views/v.xml", Language: "odoo_xml",
+	})
+	g.AddNode(&graph.Node{
+		ID: "odoo/odoo::record::sale.view_order", Kind: graph.KindResource,
+		Name: "view_order", QualName: "sale.view_order",
+		FilePath: "odoo/sale/views/v.xml", Language: "odoo_xml",
+		Meta: map[string]any{"odoo_xml_id": "sale.view_order"},
+	})
+	e := odooStub(g, "odoo/sale/views/v.xml",
+		odooXMLIDStubPrefix+"sale.view_order", graph.EdgeReferences, odooXMLVia,
+		map[string]any{"odoo_xml_id": "sale.view_order"})
+
+	ResolveOdooRefs(g)
+	require.Equal(t, "odoo/odoo::record::sale.view_order", e.To,
+		"precondition: a full run binds the reference")
+
+	// A second repository is indexed. Its scoped pass must leave the
+	// first repository's already-bound edge exactly as it found it.
+	ResolveOdooRefsScoped(g, map[string]bool{"addons": true})
+
+	assert.Equal(t, "odoo/odoo::record::sale.view_order", e.To,
+		"a scoped run must not reset an out-of-scope edge to its placeholder")
+}

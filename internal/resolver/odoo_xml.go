@@ -23,23 +23,26 @@ var odooXMLEdgeKinds = []graph.EdgeKind{
 // for its own registry rows (`model_sale_order`, `field_x__y`,
 // `module_sale`); those bind through the implicit index as a fallback, so
 // a declared record always wins over the synthesized reading of a name.
-func bindOdooXMLIDs(g graph.Store) int {
+func bindOdooXMLIDs(g graph.Store, scope map[string]bool) int {
+	// No early return on empty indexes: a full recompute must still run
+	// so edges whose target has left the graph are reset to their
+	// placeholders and their siblings retired.
 	byXMLID := odooXMLIDIndex(g)
 	byMethod := odooModelMethodIndex(g)
-	if len(byXMLID) == 0 && len(byMethod) == 0 {
-		return 0
-	}
 
 	var plans []odooBindPlan
 	var extra []*graph.Edge
+	observed := map[odooEdgeIdentity]*graph.Edge{}
 	// Built on first use: the implicit index costs three node scans and
 	// most corpora reference no implicit external ID at all.
 	var implicit *odooImplicitXMLIDs
 
-	odooCollect(g, odooXMLVia, odooXMLEdgeKinds, func(e *graph.Edge) {
+	odooCollect(g, scope, odooXMLVia, odooXMLEdgeKinds, func(e *graph.Edge) {
 		// A materialised fan-out sibling has no placeholder of its own;
-		// recomputing it would collapse the fan-out onto its first target.
+		// recomputing it would collapse the fan-out onto its first
+		// target, so it is reconciled as a set instead.
 		if odooIsFanout(e) {
+			observed[odooEdgeIdentityOf(e)] = e
 			return
 		}
 		// A <function model= name=> edge carries both keys, so the
@@ -88,11 +91,25 @@ func bindOdooXMLIDs(g graph.Store) int {
 	})
 
 	resolved := odooRebind(g, plans, ConfidenceTyped)
-	// AddEdge is idempotent on (From, To, Kind), so re-running the pass
-	// re-offers the same sibling edges without duplicating them.
-	for _, e := range extra {
-		g.AddEdge(e)
+	// Only the implicit index ever fans out here — a declared external ID
+	// is unique — so a sibling is stale once the implicit reading of its
+	// own external ID stops naming its target.
+	stale := func(e *graph.Edge) bool {
+		xmlID := odooMetaString(e, "odoo_xml_id")
+		if xmlID == "" || !odooIsImplicitXMLID(xmlID) {
+			return false
+		}
+		if implicit == nil {
+			implicit = buildOdooImplicitXMLIDs(g)
+		}
+		for _, t := range implicit.lookup(xmlID) {
+			if t == e.To {
+				return false
+			}
+		}
+		return true
 	}
+	odooReconcileFanout(g, observed, extra, odooBoundIdentities(plans), stale)
 	return resolved
 }
 

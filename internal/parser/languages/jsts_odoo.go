@@ -3,6 +3,7 @@ package languages
 import (
 	"bytes"
 	"path"
+	"regexp"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -44,6 +45,16 @@ const (
 	odooJSOverridePlaceholder = "unresolved::odoo::jsmethod::"
 )
 
+// odooJSAliasRE matches the legacy-module alias an Odoo 16 ES module
+// declares in its header comment: `/** @odoo-module alias=web.env */`.
+//
+// v16 migrated the legacy `odoo.define("web.env", …)` wrapper to a real ES
+// module and left this annotation behind as the only remaining declaration
+// of the old dotted name. Files still written against the legacy vocabulary
+// go on importing that name, so without reading the annotation the two
+// halves of the migration never meet.
+var odooJSAliasRE = regexp.MustCompile(`@odoo-module[^*\n]*?\balias\s*=\s*([\w.]+)`)
+
 // odooRegistryNodeID is the shared identity for one registry slot, so a
 // provider (`.add("orm", …)`) and a consumer (`useService("orm")`) meet on
 // the same node with no resolution pass involved.
@@ -79,6 +90,12 @@ func captureOdooModule(result *parser.ExtractionResult, root *sitter.Node, fileP
 	}
 	if legacy {
 		fileNode.Meta["odoo_js_legacy"] = true
+	}
+	// Set before the walk so an explicit odoo.define() in the same file
+	// still wins; the two never disagree, but the call is the stronger
+	// declaration of the pair.
+	if m := odooJSAliasRE.FindSubmatch(src); m != nil {
+		fileNode.Meta["odoo_js_legacy_name"] = string(m[1])
 	}
 
 	funcRanges := buildFuncRanges(result)

@@ -201,3 +201,54 @@ func TestOdooJSAddonFromPath(t *testing.T) {
 		}
 	}
 }
+
+// Odoo 16 migrated `odoo.define("web.env", …)` to a real ES module and
+// left the dotted name behind only as an `alias=` in the header comment.
+// Files still written against the legacy vocabulary go on importing that
+// name, so without reading the annotation the two halves of the migration
+// never meet and every such import stays unresolved.
+func TestOdooJS_ModuleAliasDeclaresTheLegacyName(t *testing.T) {
+	cases := map[string]string{
+		`/** @odoo-module alias=web.public.widget */`:                  "web.public.widget",
+		`/** @odoo-module alias=web.env default=false **/`:             "web.env",
+		`/** @odoo-module alias = sale_expense.sale_order_many2one */`: "sale_expense.sale_order_many2one",
+	}
+	for header, want := range cases {
+		res := odooJS(t, odooJSPath, header+"\nexport const x = 1;\n")
+		n := odooNode(res, odooJSPath)
+		if n == nil {
+			t.Fatalf("no file node for %q", header)
+		}
+		if got := n.Meta["odoo_js_legacy_name"]; got != want {
+			t.Errorf("%q: odoo_js_legacy_name = %v, want %v", header, got, want)
+		}
+	}
+}
+
+// A plain module declares no legacy name, and reading one out of an
+// unrelated `alias` mention would collapse distinct modules onto one node.
+func TestOdooJS_NoAliasLeavesNoLegacyName(t *testing.T) {
+	res := odooJS(t, odooJSPath, "/** @odoo-module **/\nconst alias = someOther.alias;\n")
+	n := odooNode(res, odooJSPath)
+	if n == nil {
+		t.Fatal("no file node")
+	}
+	if got, ok := n.Meta["odoo_js_legacy_name"]; ok {
+		t.Errorf("odoo_js_legacy_name = %v, want unset", got)
+	}
+}
+
+// An explicit odoo.define() is the stronger declaration of the pair and
+// must win over an alias annotation in the same file.
+func TestOdooJS_DefineWinsOverAlias(t *testing.T) {
+	res := odooJS(t, odooJSPath, `/** @odoo-module alias=web.Stale */
+odoo.define("web.Real", function (require) { return 1; });
+`)
+	n := odooNode(res, odooJSPath)
+	if n == nil {
+		t.Fatal("no file node")
+	}
+	if got := n.Meta["odoo_js_legacy_name"]; got != "web.Real" {
+		t.Errorf("odoo_js_legacy_name = %v, want web.Real", got)
+	}
+}

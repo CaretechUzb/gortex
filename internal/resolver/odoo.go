@@ -53,12 +53,30 @@ const odooFanoutCap = 200
 // single registered synthesizer for the odoo framework; see the package
 // comment above for why the three families run in this fixed order.
 func ResolveOdooRefs(g graph.Store) int {
+	return ResolveOdooRefsScoped(g, nil)
+}
+
+// ResolveOdooRefsScoped limits the recompute to edges declared in a
+// changed repository, while every index it binds against is still built
+// from the WHOLE store. A nil scope preserves the full/cold behaviour.
+//
+// The split is not an optimization — it is what makes the pass safe to
+// run partially at all. Each family is a full recompute: an edge whose
+// target is absent from the index is RESET to its placeholder, which is
+// how a reference to a deleted record un-binds itself. Handed a scoped
+// store, the pass would build its indexes from the changed repository
+// alone and then apply that verdict to every Odoo edge in the workspace,
+// so indexing addons after odoo reset all of odoo's edges to placeholders
+// — 181,077 of them, with the records they name still sitting in the
+// graph. Scoping the collection instead of the indexes keeps "absent from
+// the index" meaning what it says.
+func ResolveOdooRefsScoped(g graph.Store, scope map[string]bool) int {
 	if g == nil {
 		return 0
 	}
-	n := bindOdooModels(g)
-	n += bindOdooXMLIDs(g)
-	n += bindOdooJS(g)
+	n := bindOdooModels(g, scope)
+	n += bindOdooXMLIDs(g, scope)
+	n += bindOdooJS(g, scope)
 	return n
 }
 
@@ -84,6 +102,7 @@ type odooBindPlan struct {
 func odooRebind(g graph.Store, plans []odooBindPlan, confidence float64) int {
 	var batch []graph.EdgeReindex
 	resolved := 0
+	stillLive := odooLiveRebindTargets(g, plans)
 	for _, p := range plans {
 		e := p.edge
 		if e == nil {
@@ -91,6 +110,18 @@ func odooRebind(g graph.Store, plans []odooBindPlan, confidence float64) int {
 		}
 		want, bound := p.target, p.target != ""
 		if !bound {
+			// About to un-bind. A recompute may only do that because the
+			// target is genuinely gone — never because the index it was
+			// built from could not see it. Those two look identical from
+			// here, so the target is asked directly, and an edge whose
+			// target still answers to the edge's own key keeps its
+			// binding. Without this, one pass over a partial view resets
+			// a whole repository's edges to placeholders while the
+			// records they name are still in the graph, and nothing ever
+			// puts them back.
+			if stillLive[odooEdgeIdentityOf(e)] {
+				continue
+			}
 			want = p.placeholder
 		}
 		if want == "" {
@@ -151,6 +182,140 @@ func odooIsFanout(e *graph.Edge) bool {
 	return v
 }
 
+// odooLiveRebindTargets reports which of the plans that would UN-BIND an
+// edge have a target still satisfying that edge's own key.
+//
+// Only currently-bound edges are asked about — a plan that leaves a
+// placeholder as a placeholder changes nothing — so the batch read costs
+// one query on the rare pass that would drop bindings, and nothing at all
+// on a steady-state run.
+func odooLiveRebindTargets(g graph.Store, plans []odooBindPlan) map[odooEdgeIdentity]bool {
+	var ids []string
+	for _, p := range plans {
+		if p.edge == nil || p.target != "" || graph.IsUnresolvedTarget(p.edge.To) {
+			continue
+		}
+		ids = append(ids, p.edge.To)
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	nodes := g.GetNodesByIDs(ids)
+	out := map[odooEdgeIdentity]bool{}
+	for _, p := range plans {
+		if p.edge == nil || p.target != "" || graph.IsUnresolvedTarget(p.edge.To) {
+			continue
+		}
+		if odooTargetSatisfies(nodes[p.edge.To], p.edge) {
+			out[odooEdgeIdentityOf(p.edge)] = true
+		}
+	}
+	return out
+}
+
+// odooTargetSatisfies reports whether n is still a valid target for e,
+// judged by the same key the binder would have used.
+//
+// A key the binder cannot re-check here — a JS module specifier names a
+// path rather than anything stored on the file node — reports false, which
+// leaves the existing un-bind behaviour untouched for that family.
+func odooTargetSatisfies(n *graph.Node, e *graph.Edge) bool {
+	if n == nil || n.Meta == nil {
+		return false
+	}
+	if k := odooMetaString(e, "odoo_xml_id"); k != "" {
+		v, _ := n.Meta["odoo_xml_id"].(string)
+		if v == k || (v != "" && odooBareXMLID(v) == odooBareXMLID(k)) {
+			return true
+		}
+		// The implicit index binds `model_<name>` to the class itself,
+		// which carries no external ID of its own.
+		if m, _ := n.Meta["odoo_model"].(string); m != "" && odooIsImplicitXMLID(k) {
+			return true
+		}
+		return false
+	}
+	if k := odooMetaString(e, "odoo_model"); k != "" {
+		v, _ := n.Meta["odoo_model"].(string)
+		return v == k
+	}
+	if k := odooMetaString(e, "odoo_template"); k != "" {
+		v, _ := n.Meta["odoo_template"].(string)
+		return v == k || (v != "" && odooBareXMLID(v) == odooBareXMLID(k))
+	}
+	return false
+}
+
+// odooEdgeIdentity is an edge's (From, To, Kind) triple — the same key
+// AddEdge is idempotent on, and the one RemoveEdge deletes by.
+type odooEdgeIdentity struct {
+	from, to string
+	kind     graph.EdgeKind
+}
+
+func odooEdgeIdentityOf(e *graph.Edge) odooEdgeIdentity {
+	return odooEdgeIdentity{from: e.From, to: e.To, kind: e.Kind}
+}
+
+// odooReconcileFanout writes the fan-out siblings a pass just computed
+// and retires the observed ones that are no longer justified.
+//
+// A sibling carries no placeholder of its own, so odooRebind cannot
+// recompute it — which is why every odooCollect callback skips it. That
+// skip left these edges outside the pass's full-recompute contract: when
+// one of several classes declaring the same `_name` was deleted, its
+// sibling survived pointing at a node that no longer exists, and
+// file-scoped edge cleanup could not reach it either, because a
+// sibling's FilePath is the SOURCE file rather than the vanished
+// target's.
+//
+// Retirement is driven by `stale`, which asks whether an edge's target is
+// still a valid target FOR THAT EDGE'S OWN KEY, and never by "the pass
+// did not recompute it". The difference is not cosmetic.
+// graph.RemoveEdgesExact deletes by (From, To, Kind, FilePath, Line), and
+// odooSiblingEdge clones its primary, so a sibling and the primary it came
+// from are indistinguishable at the store level whenever they share a
+// target. Meanwhile `want` only ever holds targets[1:], and which target
+// sorts into targets[0] is not stable across passes. Diffing against the
+// recomputed set therefore condemns an identity the pass had just bound as
+// a primary, and the delete takes the primary with it — silently, and in
+// proportion to fan-out width. A key-relative predicate cannot rotate, and
+// `keep` (pre-seeded with every identity this pass bound) closes the
+// residual case where a stale sibling collides with a live primary.
+func odooReconcileFanout(g graph.Store, observed map[odooEdgeIdentity]*graph.Edge, want []*graph.Edge, keep map[odooEdgeIdentity]bool, stale func(*graph.Edge) bool) {
+	for _, e := range want {
+		if e == nil {
+			continue
+		}
+		keep[odooEdgeIdentityOf(e)] = true
+		// AddEdge is idempotent on (From, To, Kind), so re-running the
+		// pass re-offers the same siblings without duplicating them.
+		g.AddEdge(e)
+	}
+	var retire []*graph.Edge
+	for id, e := range observed {
+		if keep[id] || !stale(e) {
+			continue
+		}
+		retire = append(retire, e)
+	}
+	if len(retire) > 0 {
+		graph.RemoveEdgesExact(g, retire)
+	}
+}
+
+// odooBoundIdentities collects the identities a pass bound as primaries,
+// so reconciliation can never retire one of them by tuple collision.
+func odooBoundIdentities(plans []odooBindPlan) map[odooEdgeIdentity]bool {
+	keep := make(map[odooEdgeIdentity]bool, len(plans))
+	for _, p := range plans {
+		if p.edge != nil {
+			keep[odooEdgeIdentityOf(p.edge)] = true
+		}
+	}
+	return keep
+}
+
 // odooEdgeVia reports the edge's Odoo via tag.
 func odooEdgeVia(e *graph.Edge) string {
 	if e == nil || e.Meta == nil {
@@ -165,14 +330,27 @@ func odooEdgeVia(e *graph.Edge) string {
 // EdgeCalls alone — they use extends / composes / references / imports /
 // renders_child / overrides — which is also why the framework registry
 // gates this pass on a node marker rather than on the call-edge census.
-func odooCollect(g graph.Store, via string, kinds []graph.EdgeKind, fn func(*graph.Edge)) {
-	for _, kind := range kinds {
-		for e := range g.EdgesByKind(kind) {
-			if e == nil || odooEdgeVia(e) != via {
-				continue
+func odooCollect(g graph.Store, scope map[string]bool, via string, kinds []graph.EdgeKind, fn func(*graph.Edge)) {
+	if scope == nil {
+		// Stream on the cold path. The Odoo families run to a million
+		// edges on a full workspace, and frameworkRepoEdges would
+		// materialise all of them into a slice only to have most
+		// filtered out by `via` a line later.
+		for _, kind := range kinds {
+			for e := range g.EdgesByKind(kind) {
+				if e == nil || odooEdgeVia(e) != via {
+					continue
+				}
+				fn(e)
 			}
-			fn(e)
 		}
+		return
+	}
+	for _, e := range frameworkRepoEdges(g, scope, kinds...) {
+		if e == nil || odooEdgeVia(e) != via {
+			continue
+		}
+		fn(e)
 	}
 }
 

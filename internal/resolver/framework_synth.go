@@ -920,7 +920,7 @@ func defaultFrameworkSynthesizers() []FrameworkSynthesizer {
 		// Odoo runs as one pass; its three binding families are ordered
 		// sub-steps inside ResolveOdooRefs rather than registry entries,
 		// so their order cannot drift with registry edits.
-		synthFunc{name: SynthOdoo, fn: ResolveOdooRefs},
+		synthFunc{name: SynthOdoo, fn: ResolveOdooRefs, scopedFn: ResolveOdooRefsScoped},
 		synthFunc{name: SynthSQLCallsite, fn: ResolveSQLCallsites},
 		// Store-factory (Zustand/Redux/Pinia/MobX) indirect action calls —
 		// binds getState()-chain and destructured calls to the action node.

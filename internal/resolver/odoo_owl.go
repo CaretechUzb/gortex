@@ -1,6 +1,7 @@
 package resolver
 
 import (
+	"path"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -24,13 +25,13 @@ var odooJSEdgeKinds = []graph.EdgeKind{
 // bindOdooJS binds the three Odoo front-end placeholder families:
 // addon-aliased module imports, OWL component → QWeb template links, and
 // patched method overrides.
-func bindOdooJS(g graph.Store) int {
+func bindOdooJS(g graph.Store, scope map[string]bool) int {
 	byModule := odooJSModuleIndex(g)
 	byTemplate := odooTemplateIndex(g)
 	byJSMethod := odooJSMethodIndex(g)
 
 	var plans []odooBindPlan
-	odooCollect(g, odooJSVia, odooJSEdgeKinds, func(e *graph.Edge) {
+	odooCollect(g, scope, odooJSVia, odooJSEdgeKinds, func(e *graph.Edge) {
 		if spec := odooMetaString(e, "odoo_js_import"); spec != "" {
 			plans = append(plans, odooBindPlan{
 				edge:        e,
@@ -94,7 +95,23 @@ func odooResolveJSModule(byModule map[string]string, spec string) string {
 	if !ok || addon == "" || rest == "" {
 		return ""
 	}
-	return byModule[addon+"/"+rest]
+	if id := byModule[addon+"/"+rest]; id != "" {
+		return id
+	}
+	// `@web/../tests/helpers/utils` escapes the addon's `static/src` root.
+	// Odoo's asset loader treats the specifier as a path relative to that
+	// root, so a `..` segment climbs to `static/` — which is how every test
+	// module addresses the helpers living beside `src/` rather than in it.
+	// Resolving the escape against the addon-relative key alone cannot
+	// work: the `..` never matches a file whose path has no such segment.
+	if !strings.Contains(rest, "../") {
+		return ""
+	}
+	cleaned := path.Clean("src/" + rest)
+	if strings.HasPrefix(cleaned, "..") {
+		return "" // climbed out of the addon entirely
+	}
+	return byModule[addon+"/static/"+cleaned]
 }
 
 // odooJSModuleIndex maps a module specifier to the file node providing
@@ -127,11 +144,16 @@ func odooJSModuleIndex(g graph.Store) map[string]string {
 		if addon == "" {
 			continue
 		}
-		rest, ok := odooJSModuleRelPath(n.FilePath, addon)
-		if !ok {
-			continue
+		if rest, ok := odooJSModuleRelPath(n.FilePath, addon); ok {
+			put(addon+"/"+rest, n.ID)
 		}
-		put(addon+"/"+rest, n.ID)
+		// The escape-form key, for specifiers that climb out of
+		// `static/src` (see odooResolveJSModule). Kept distinct by its
+		// literal `static/` segment, which a module-relative key never
+		// has.
+		if rest, ok := odooJSStaticRelPath(n.FilePath, addon); ok {
+			put(addon+"/static/"+rest, n.ID)
+		}
 	}
 	return out
 }
@@ -139,7 +161,20 @@ func odooJSModuleIndex(g graph.Store) map[string]string {
 // odooJSModuleRelPath extracts the part of a path after
 // `<addon>/static/src/`, without its extension.
 func odooJSModuleRelPath(filePath, addon string) (string, bool) {
-	marker := "/" + addon + "/static/src/"
+	return odooJSPathAfter(filePath, "/"+addon+"/static/src/")
+}
+
+// odooJSStaticRelPath extracts the part of a path after `<addon>/static/`,
+// without its extension — the reach of a specifier that climbs out of
+// `static/src`, which is where Odoo keeps its JS test helpers.
+func odooJSStaticRelPath(filePath, addon string) (string, bool) {
+	return odooJSPathAfter(filePath, "/"+addon+"/static/")
+}
+
+// odooJSPathAfter returns the extension-less remainder of filePath after
+// marker, which is anchored on a leading slash so an addon name never
+// matches mid-segment.
+func odooJSPathAfter(filePath, marker string) (string, bool) {
 	idx := strings.Index("/"+filePath, marker)
 	if idx < 0 {
 		return "", false

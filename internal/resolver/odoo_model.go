@@ -24,17 +24,22 @@ var odooModelEdgeKinds = []graph.EdgeKind{
 // them would silently hide the others, so every declaring class is bound.
 // The first target keeps the original edge; the rest are materialised as
 // sibling edges.
-func bindOdooModels(g graph.Store) int {
+func bindOdooModels(g graph.Store, scope map[string]bool) int {
+	// No early return on an empty index: a full recompute must still run
+	// so edges whose declaring class has left the graph are reset to
+	// their placeholders and their siblings retired, rather than left
+	// pointing at a node that is gone.
 	byModel := odooModelIndex(g)
-	if len(byModel) == 0 {
-		return 0
-	}
 
 	var plans []odooBindPlan
 	var extra []*graph.Edge
+	observed := map[odooEdgeIdentity]*graph.Edge{}
 
-	odooCollect(g, odooModelVia, odooModelEdgeKinds, func(e *graph.Edge) {
+	odooCollect(g, scope, odooModelVia, odooModelEdgeKinds, func(e *graph.Edge) {
 		if odooIsFanout(e) {
+			// Recomputing a sibling would collapse the fan-out onto its
+			// first target; it is reconciled as a set instead.
+			observed[odooEdgeIdentityOf(e)] = e
 			return
 		}
 		model := odooMetaString(e, "odoo_model")
@@ -62,11 +67,22 @@ func bindOdooModels(g graph.Store) int {
 	})
 
 	resolved := odooRebind(g, plans, ConfidenceTyped)
-	// AddEdge is idempotent on (From, To, Kind), so re-running the pass
-	// re-offers the same sibling edges without duplicating them.
-	for _, e := range extra {
-		g.AddEdge(e)
+	// A sibling is stale once its target stops being one of the classes
+	// declaring its model — which covers the deleted class too, since
+	// odooModelIndex is built from live nodes only.
+	stale := func(e *graph.Edge) bool {
+		model := odooMetaString(e, "odoo_model")
+		if model == "" {
+			return false
+		}
+		for _, t := range byModel[model] {
+			if t == e.To {
+				return false
+			}
+		}
+		return true
 	}
+	odooReconcileFanout(g, observed, extra, odooBoundIdentities(plans), stale)
 	return resolved
 }
 
