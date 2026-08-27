@@ -349,3 +349,29 @@ func TestMarkTestSymbolsAndEmitEdges_PersistsMetadataAcrossSQLiteReload(t *testi
 		t.Fatalf("persisted EdgeTests = %d, want 2", persistedEdges)
 	}
 }
+
+func TestMarkTestSymbolsAndEmitEdges_SkipsUnresolvedCallTargets(t *testing.T) {
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "pkg/foo.go", Kind: graph.KindFile, Name: "pkg/foo.go", FilePath: "pkg/foo.go", Language: "go"})
+	g.AddNode(&graph.Node{ID: "pkg/foo_test.go", Kind: graph.KindFile, Name: "pkg/foo_test.go", FilePath: "pkg/foo_test.go", Language: "go"})
+	g.AddNode(&graph.Node{ID: "pkg/foo.go::Foo", Kind: graph.KindFunction, Name: "Foo", FilePath: "pkg/foo.go", Language: "go"})
+	g.AddNode(&graph.Node{ID: "pkg/foo_test.go::TestFoo", Kind: graph.KindFunction, Name: "TestFoo", FilePath: "pkg/foo_test.go", Language: "go"})
+
+	// One resolved subject call, one still-unresolved call (an assertion
+	// framework member the repo can never bind). Cloning the unresolved
+	// call would mint a tests edge with NONE of the original's receiver
+	// evidence - a later resolve pass then re-binds the naked clone
+	// without the guards that protect the calls edge.
+	g.AddEdge(&graph.Edge{From: "pkg/foo_test.go::TestFoo", To: "pkg/foo.go::Foo", Kind: graph.EdgeCalls, FilePath: "pkg/foo_test.go", Line: 10})
+	g.AddEdge(&graph.Edge{From: "pkg/foo_test.go::TestFoo", To: "unresolved::*.Equal", Kind: graph.EdgeCalls, FilePath: "pkg/foo_test.go", Line: 11})
+
+	_, emitted := markTestSymbolsAndEmitEdges(g)
+	if emitted != 1 {
+		t.Fatalf("expected 1 EdgeTests (the resolved subject only), got %d", emitted)
+	}
+	for _, e := range g.AllEdges() {
+		if e.Kind == graph.EdgeTests && graph.IsUnresolvedTarget(e.To) {
+			t.Fatalf("tests edge cloned an unresolved call: %+v", e)
+		}
+	}
+}
