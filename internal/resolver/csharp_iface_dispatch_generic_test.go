@@ -175,6 +175,71 @@ func TestResolveCSharpInterfaceDispatch_OpenGenericImplStaysInFanout(t *testing.
 	assert.Contains(t, targets, "Stores.cs::CrateBoxStore.Fetch")
 }
 
+// outEdgeCountingStore counts GetOutEdges reads per node ID. Plain
+// interface embedding deliberately hides the optional projection
+// capabilities the same way csharpProjectionlessStore does.
+type outEdgeCountingStore struct {
+	graph.Store
+	outEdgeReads map[string]int
+}
+
+func (s *outEdgeCountingStore) GetOutEdges(id string) []*graph.Edge {
+	s.outEdgeReads[id]++
+	return s.Store.GetOutEdges(id)
+}
+
+// Review RED (revision P2): every receiver lookup re-read the caller's full
+// out-edge adjacency - one scan per call site per evidence pass, so a method
+// with N through-interface sites paid ~2N GetOutEdges reads. The lookup must
+// read a caller's adjacency once per pass and serve every site from it.
+func TestResolveCSharpInterfaceDispatch_ReceiverLookupReadsCallerAdjacencyOnce(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Multi.cs": `namespace App {
+    public class Crate { }
+    public class Widget { }
+    public interface IBox<T> {
+        int Get(int id);
+    }
+    public class CrateBox : IBox<Crate> {
+        public int Get(int id) { return 1; }
+    }
+    public class WidgetBox : IBox<Widget> {
+        public int Get(int id) { return 2; }
+    }
+    public class Flow {
+        private readonly IBox<Crate> _a;
+        private readonly IBox<Crate> _b;
+        private readonly IBox<Crate> _c;
+        public Flow(IBox<Crate> a, IBox<Crate> b, IBox<Crate> c) { _a = a; _b = b; _c = c; }
+        public int Pull() {
+            int x = _a.Get(1);
+            int y = _b.Get(2);
+            int z = _c.Get(3);
+            return x + y + z;
+        }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	callerID := "Multi.cs::Flow.Pull"
+	bindFieldReceiverCall(t, g, callerID, "_a", "Multi.cs::IBox.Get")
+	bindFieldReceiverCall(t, g, callerID, "_b", "Multi.cs::IBox.Get")
+	bindFieldReceiverCall(t, g, callerID, "_c", "Multi.cs::IBox.Get")
+
+	counting := &outEdgeCountingStore{Store: g, outEdgeReads: map[string]int{}}
+	ResolveCSharpInterfaceDispatch(counting)
+
+	if n := counting.outEdgeReads[callerID]; n > 1 {
+		t.Fatalf("receiver lookups read the caller's out edges %d times, want at most 1", n)
+	}
+	targets := dispatchTargets(g, callerID)
+	assert.Contains(t, targets, "Multi.cs::CrateBox.Get",
+		"the cached adjacency still yields the receiver evidence")
+	assert.NotContains(t, targets, "Multi.cs::WidgetBox.Get",
+		"the gate still filters on the cached evidence")
+}
+
 // dispatchTargets returns the fan-out targets minted from callerID.
 func dispatchTargets(g graph.Store, callerID string) []string {
 	var targets []string

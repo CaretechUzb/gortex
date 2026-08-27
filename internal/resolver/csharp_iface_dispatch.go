@@ -406,7 +406,7 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 
 	var batch []*graph.Edge
 	seen := map[string]bool{}
-	receiverFieldTypes := map[string]string{} // per (caller,file,line) cache of the receiver field's declared type text
+	receiverLookups := newCSharpReceiverLookupCtx()
 	for _, e := range callEdges {
 		if e == nil || e.IsSpeculative() || graph.IsUnresolvedTarget(e.To) {
 			continue
@@ -452,7 +452,7 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 			// it never pays the receiver lookup either.
 			srcArgs := f.implArgs[e.To]
 			if srcArgs == "" && len(f.implArgs) > 0 {
-				srcArgs = csharpReceiverDeclaredArgs(g, e, f.ifaceID, f.ifaceName, receiverFieldTypes)
+				srcArgs = csharpReceiverDeclaredArgs(g, e, f.ifaceID, f.ifaceName, receiverLookups)
 				if csharpArgsNameGlobalAlias(srcArgs, globalAliasNames) {
 					srcArgs = ""
 				}
@@ -731,7 +731,47 @@ func csharpShortTypeName(id string) string {
 // Typed LOCALS are a named remainder: the tenv strips generics before
 // receiver_type is stamped, so local-receiver sites keep the full
 // fan-out until the extractor carries local type arguments too.
-func csharpReceiverDeclaredArgs(g graph.Store, e *graph.Edge, ifaceID, ifaceName string, cache map[string]string) string {
+// csharpReceiverLookupCtx carries the per-pass receiver-evidence caches:
+// declared args per (caller, member, site, interface), each caller's
+// out-edge adjacency read ONCE and served to every site (the companion
+// scan and the field-read evidence scan both consume it), and resolved
+// field nodes by ID.
+type csharpReceiverLookupCtx struct {
+	args      map[string]string
+	outEdges  map[string][]*graph.Edge
+	fields    map[string]*graph.Node
+	fieldSeen map[string]bool
+}
+
+func newCSharpReceiverLookupCtx() *csharpReceiverLookupCtx {
+	return &csharpReceiverLookupCtx{
+		args:      map[string]string{},
+		outEdges:  map[string][]*graph.Edge{},
+		fields:    map[string]*graph.Node{},
+		fieldSeen: map[string]bool{},
+	}
+}
+
+func (c *csharpReceiverLookupCtx) callerOutEdges(g graph.Store, caller string) []*graph.Edge {
+	if es, ok := c.outEdges[caller]; ok {
+		return es
+	}
+	es := g.GetOutEdges(caller)
+	c.outEdges[caller] = es
+	return es
+}
+
+func (c *csharpReceiverLookupCtx) fieldNode(g graph.Store, id string) *graph.Node {
+	if c.fieldSeen[id] {
+		return c.fields[id]
+	}
+	c.fieldSeen[id] = true
+	n := g.GetNodesByIDs([]string{id})[id]
+	c.fields[id] = n
+	return n
+}
+
+func csharpReceiverDeclaredArgs(g graph.Store, e *graph.Edge, ifaceID, ifaceName string, lookups *csharpReceiverLookupCtx) string {
 	if e == nil || e.From == "" {
 		return ""
 	}
@@ -741,11 +781,11 @@ func csharpReceiverDeclaredArgs(g graph.Store, e *graph.Edge, ifaceID, ifaceName
 	// The full interface ID keeps short-name twins from distinct families
 	// apart for the same reason.
 	cacheKey := e.From + "\x00" + e.To + "\x00" + e.FilePath + "\x00" + strconv.Itoa(e.Line) + "\x00" + ifaceID
-	if v, ok := cache[cacheKey]; ok {
+	if v, ok := lookups.args[cacheKey]; ok {
 		return v
 	}
 	args := ""
-	if field := csharpReceiverField(g, e); field != nil {
+	if field := csharpReceiverField(g, e, lookups); field != nil {
 		ft, _ := field.Meta["field_type"].(string)
 		prefix := strings.TrimSpace(ft)
 		if lt := strings.Index(prefix, "<"); lt > 0 {
@@ -758,14 +798,14 @@ func csharpReceiverDeclaredArgs(g graph.Store, e *graph.Edge, ifaceID, ifaceName
 			args, _ = field.Meta["field_type_args"].(string)
 		}
 	}
-	cache[cacheKey] = args
+	lookups.args[cacheKey] = args
 	return args
 }
 
 // csharpReceiverField resolves the call site's receiver to a field (or
 // constant) node of the caller's own type, or nil when the receiver is
 // not an unambiguous bare same-type field.
-func csharpReceiverField(g graph.Store, e *graph.Edge) *graph.Node {
+func csharpReceiverField(g graph.Store, e *graph.Edge, lookups *csharpReceiverLookupCtx) *graph.Node {
 	name := ""
 	if e.Meta != nil {
 		if amb, _ := e.Meta["receiver_ambiguous"].(bool); amb {
@@ -780,7 +820,7 @@ func csharpReceiverField(g graph.Store, e *graph.Edge) *graph.Node {
 		// different call sharing the line can never lend its receiver.
 		memberName := csharpShortTypeName(e.To)
 		companionTo := "unresolved::*." + memberName
-		for _, out := range g.GetOutEdges(e.From) {
+		for _, out := range lookups.callerOutEdges(g, e.From) {
 			if out == nil || out.Kind != graph.EdgeCalls || out.To != companionTo {
 				continue
 			}
@@ -812,7 +852,7 @@ func csharpReceiverField(g graph.Store, e *graph.Edge) *graph.Node {
 	// the field it shadows and gate on the wrong declared arguments —
 	// without the read edge the receiver stays unknown (never filter).
 	fieldRead := false
-	for _, out := range g.GetOutEdges(e.From) {
+	for _, out := range lookups.callerOutEdges(g, e.From) {
 		if out == nil || out.Kind != graph.EdgeReads {
 			continue
 		}
@@ -827,7 +867,7 @@ func csharpReceiverField(g graph.Store, e *graph.Edge) *graph.Node {
 	if !fieldRead {
 		return nil
 	}
-	field := g.GetNodesByIDs([]string{fieldID})[fieldID]
+	field := lookups.fieldNode(g, fieldID)
 	if field == nil || field.Meta == nil ||
 		(field.Kind != graph.KindField && field.Kind != graph.KindConstant) {
 		return nil
