@@ -44,21 +44,40 @@ import (
 //   - a qualified base whose generic segment is not the FINAL one
 //     (Outer<int>.IInner) never stamps the outer segment's arguments.
 
+// csharpFileAliasNames collects every using-alias identifier the FILE
+// declares, in one walk, regardless of scope. An alias may spell any type,
+// including one whose canonical form differs from the alias identifier, so
+// it is opaque to a string comparison — and treating every alias as
+// in-scope everywhere in the file over-refuses at worst, which only ever
+// PRESERVES fan-out edges. Computed once per extraction and threaded to
+// each stamp site: the previous per-declaration ancestor scan re-walked
+// the enclosing namespace's whole declaration list, quadratic in sibling
+// count (the review's 2,000-sibling fixture).
+func csharpFileAliasNames(root *sitter.Node, src []byte) map[string]bool {
+	var out map[string]bool
+	walkNodes(root, func(n *sitter.Node) {
+		if name := csharpUsingAliasName(n, src); name != "" {
+			if out == nil {
+				out = map[string]bool{}
+			}
+			out[name] = true
+		}
+	})
+	return out
+}
+
 // csharpUnstampableArgNames collects every identifier that must NOT be
-// read as a closed concrete type argument at node's position, walking the
-// ancestor chain once:
+// read as a closed concrete type argument at node's position:
 //
 //   - type parameters of every enclosing type declaration, the node's own
 //     included — a nested type legitimately closes over its outer types'
-//     parameters, and every one of them is open;
-//   - using-alias names in scope (`using MyCrate = App.Crate;`, at file
-//     level or inside an enclosing namespace) — an alias may spell any
-//     type, including one whose canonical form differs from the alias
-//     identifier, so it is opaque to a string comparison.
+//     parameters, and every one of them is open (per-declaration ancestor
+//     walk, cheap);
+//   - the file's using-alias names, precollected by csharpFileAliasNames.
 //
 // Both categories mean the same thing to the caller: this spelling does
 // not denote a type the dispatch gate may compare by name.
-func csharpUnstampableArgNames(node *sitter.Node, src []byte) map[string]bool {
+func csharpUnstampableArgNames(node *sitter.Node, src []byte, fileAliases map[string]bool) map[string]bool {
 	var out map[string]bool
 	add := func(name string) {
 		if name == "" {
@@ -75,24 +94,10 @@ func csharpUnstampableArgNames(node *sitter.Node, src []byte) map[string]bool {
 			for name := range csharpMethodTypeParamNames(n, src) {
 				add(name)
 			}
-		case "compilation_unit", "namespace_declaration", "file_scoped_namespace_declaration":
-			// Using directives are DIRECT children of the compilation
-			// unit or of a namespace declaration (a block namespace
-			// keeps its members one level down, in declaration_list) —
-			// all of which sit on the ancestor chain of any type, so
-			// this shallow scan sees every alias actually in scope,
-			// scoped usings included, without a whole-tree walk.
-			for i, _nc := 0, int(n.NamedChildCount()); i < _nc; i++ {
-				c := n.NamedChild(i)
-				if c != nil && c.Type() == "declaration_list" {
-					for j, _jc := 0, int(c.NamedChildCount()); j < _jc; j++ {
-						add(csharpUsingAliasName(c.NamedChild(j), src))
-					}
-					continue
-				}
-				add(csharpUsingAliasName(c, src))
-			}
 		}
+	}
+	for name := range fileAliases {
+		add(name)
 	}
 	return out
 }

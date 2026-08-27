@@ -294,3 +294,25 @@ func TestCSharpExtractor_SameLineSameNameCallsMarkReceiverAmbiguous(t *testing.T
 		}
 	}
 }
+
+// The 2,000-sibling shape from the review: one namespace whose declaration
+// list holds thousands of types, each with a generic base entry and a
+// generic field. A per-declaration alias scan that re-walks the namespace's
+// children makes stamping quadratic in sibling count; the per-file alias
+// set must be collected once.
+func BenchmarkCSharpExtractSiblingHeavyTypeArgStamps(b *testing.B) {
+	var sb []byte
+	sb = append(sb, []byte("using MyCrate = App.Crate;\nnamespace App {\n    public interface IBoxStore<T> { }\n    public class Crate { }\n")...)
+	for i := 0; i < 2000; i++ {
+		n := []byte("    public class Store" + itoa(i) + " : IBoxStore<Crate> {\n        private readonly IBoxStore<Crate> _store;\n    }\n")
+		sb = append(sb, n...)
+	}
+	sb = append(sb, []byte("}\n")...)
+	e := NewCSharpExtractor()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := e.Extract("Siblings.cs", sb); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

@@ -316,6 +316,11 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 	// shape so a locally-known interface always wins.
 	localInterfaces := collectCSharpInterfaceNames(root, src)
 
+	// Using-alias names, collected once per file: the type-argument stamp
+	// sites consult them per declaration, and a per-declaration rescan of
+	// the enclosing namespace was quadratic in sibling count.
+	fileAliases := csharpFileAliasNames(root, src)
+
 	var calls []csharpDeferredCall
 	var locals []csharpDeferredLocal
 	var typeUses []csharpTypeUse
@@ -329,19 +334,19 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 			e.emitNamespace(m, filePath, fileID, result, seen)
 
 		case m.Captures["class.def"] != nil:
-			e.emitContainer(m, "class", graph.KindType, filePath, fileID, src, result, seen, annotationSeen, localInterfaces)
+			e.emitContainer(m, "class", graph.KindType, filePath, fileID, src, result, seen, annotationSeen, localInterfaces, fileAliases)
 
 		case m.Captures["iface.def"] != nil:
-			e.emitContainer(m, "iface", graph.KindInterface, filePath, fileID, src, result, seen, annotationSeen, localInterfaces)
+			e.emitContainer(m, "iface", graph.KindInterface, filePath, fileID, src, result, seen, annotationSeen, localInterfaces, fileAliases)
 
 		case m.Captures["struct.def"] != nil:
-			e.emitContainer(m, "struct", graph.KindType, filePath, fileID, src, result, seen, annotationSeen, localInterfaces)
+			e.emitContainer(m, "struct", graph.KindType, filePath, fileID, src, result, seen, annotationSeen, localInterfaces, fileAliases)
 
 		case m.Captures["record.def"] != nil:
-			e.emitContainer(m, "record", graph.KindType, filePath, fileID, src, result, seen, annotationSeen, localInterfaces)
+			e.emitContainer(m, "record", graph.KindType, filePath, fileID, src, result, seen, annotationSeen, localInterfaces, fileAliases)
 
 		case m.Captures["enum.def"] != nil:
-			e.emitContainer(m, "enum", graph.KindType, filePath, fileID, src, result, seen, annotationSeen, localInterfaces)
+			e.emitContainer(m, "enum", graph.KindType, filePath, fileID, src, result, seen, annotationSeen, localInterfaces, fileAliases)
 
 		case m.Captures["anon.def"] != nil:
 			e.emitAnonymousType(m, filePath, fileID, result, seen)
@@ -353,10 +358,10 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 			e.emitConstructor(m, filePath, fileID, src, result, seen)
 
 		case m.Captures["field.def"] != nil:
-			e.emitField(m, filePath, fileID, src, result, seen)
+			e.emitField(m, filePath, fileID, src, result, seen, fileAliases)
 
 		case m.Captures["prop.def"] != nil:
-			e.emitProperty(m, filePath, fileID, src, result, seen)
+			e.emitProperty(m, filePath, fileID, src, result, seen, fileAliases)
 
 		case m.Captures["using.def"] != nil:
 			e.emitUsing(m, filePath, fileID, result)
@@ -839,7 +844,7 @@ func (e *CSharpExtractor) emitNamespace(m parser.QueryResult, filePath, fileID s
 // emitContainer collapses the per-kind class/interface/struct/enum
 // node emission. The capture-name prefix selects which capture set to
 // read from (the legacy code repeated this body four times).
-func (e *CSharpExtractor) emitContainer(m parser.QueryResult, kind string, nodeKind graph.NodeKind, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen, annotationSeen map[string]bool, localInterfaces map[string]bool) {
+func (e *CSharpExtractor) emitContainer(m parser.QueryResult, kind string, nodeKind graph.NodeKind, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen, annotationSeen map[string]bool, localInterfaces, fileAliases map[string]bool) {
 	name := m.Captures[kind+".name"].Text
 	def := m.Captures[kind+".def"]
 	id := filePath + "::" + name
@@ -894,7 +899,7 @@ func (e *CSharpExtractor) emitContainer(m parser.QueryResult, kind string, nodeK
 	// for structs and records, inheritance for interfaces).
 	switch kind {
 	case "class", "struct", "record", "iface":
-		emitCSharpBaseList(id, def.Node, src, filePath, localInterfaces, result)
+		emitCSharpBaseList(id, def.Node, src, filePath, localInterfaces, fileAliases, result)
 	case "enum":
 		e.emitCSharpEnumMembers(def.Node, src, filePath, id, name, result, seen)
 	}
@@ -1450,7 +1455,7 @@ func (e *CSharpExtractor) emitConstructor(m parser.QueryResult, filePath, fileID
 	emitCSharpFunctionShape(id, def.Node, src, filePath, startLine1, result)
 }
 
-func (e *CSharpExtractor) emitField(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool) {
+func (e *CSharpExtractor) emitField(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool, fileAliases map[string]bool) {
 	def := m.Captures["field.def"]
 	owner := csharpDirectMemberOwner(def.Node, src, "class_declaration", "struct_declaration", "interface_declaration", "record_declaration")
 	if owner.kind == "" {
@@ -1483,7 +1488,7 @@ func (e *CSharpExtractor) emitField(m parser.QueryResult, filePath, fileID strin
 		meta["field_type"] = fieldTypeRaw
 		// Closed generic arguments of the declared type — the dispatch
 		// gate's receiver evidence (see csharp_base_type_args.go).
-		if args := csharpSimpleTypeArgsFromText(fieldTypeRaw, csharpUnstampableArgNames(def.Node, src)); args != "" {
+		if args := csharpSimpleTypeArgsFromText(fieldTypeRaw, csharpUnstampableArgNames(def.Node, src, fileAliases)); args != "" {
 			meta["field_type_args"] = args
 		}
 	}
@@ -1522,7 +1527,7 @@ func (e *CSharpExtractor) emitField(m parser.QueryResult, filePath, fileID strin
 	emitCSharpTypeUseEdges(id, fieldTypeRaw, filePath, def.StartLine+1, result)
 }
 
-func (e *CSharpExtractor) emitProperty(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool) {
+func (e *CSharpExtractor) emitProperty(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool, fileAliases map[string]bool) {
 	def := m.Captures["prop.def"]
 	owner := csharpDirectMemberOwner(def.Node, src, "class_declaration", "struct_declaration", "interface_declaration", "record_declaration")
 	if owner.kind == "" {
@@ -1554,7 +1559,7 @@ func (e *CSharpExtractor) emitProperty(m parser.QueryResult, filePath, fileID st
 		meta["field_type"] = propTypeRaw
 		// Same closed-generic-arguments stamp fields carry (dispatch
 		// gate receiver evidence — csharp_base_type_args.go).
-		if args := csharpSimpleTypeArgsFromText(propTypeRaw, csharpUnstampableArgNames(def.Node, src)); args != "" {
+		if args := csharpSimpleTypeArgsFromText(propTypeRaw, csharpUnstampableArgNames(def.Node, src, fileAliases)); args != "" {
 			meta["field_type_args"] = args
 		}
 	}
@@ -1831,7 +1836,7 @@ func collectCSharpInterfaceNames(root *sitter.Node, src []byte) map[string]bool 
 // the resolver binds them like every other C# reference. A base that
 // resolves to a same-file class still flows through unchanged — it is
 // neither a known interface nor I-prefixed, so it lands as EdgeExtends.
-func emitCSharpBaseList(typeID string, decl *sitter.Node, src []byte, filePath string, localInterfaces map[string]bool, result *parser.ExtractionResult) {
+func emitCSharpBaseList(typeID string, decl *sitter.Node, src []byte, filePath string, localInterfaces, fileAliases map[string]bool, result *parser.ExtractionResult) {
 	if decl == nil {
 		return
 	}
@@ -1862,7 +1867,7 @@ func emitCSharpBaseList(typeID string, decl *sitter.Node, src []byte, filePath s
 	// the declaring type AND every enclosing type (Relay<T> : IBoxStore<T>,
 	// or a type nested inside a generic outer), plus in-scope using
 	// aliases (opaque spellings).
-	declTypeParams := csharpUnstampableArgNames(decl, src)
+	declTypeParams := csharpUnstampableArgNames(decl, src, fileAliases)
 	// A base list closing the SAME erased target twice
 	// (Both : IBoxStore<Crate>, IBoxStore<Widget>) collapses to one stored
 	// edge — identical (from, to, kind, file, line) — so a stamp would
