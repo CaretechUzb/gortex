@@ -536,6 +536,152 @@ func TestResolveCSharpInterfaceDispatch_ContravariantInterfaceNeverFilters(t *te
 	assert.Contains(t, targets, "Sinks.cs::DogSink.Put")
 }
 
+// Review RED (revision 4a): `IBox<dynamic>` and `IBox<object>` construct
+// over the same underlying type (dynamic erases to object) - the gate must
+// fold them together and retain the edge.
+func TestResolveCSharpInterfaceDispatch_DynamicObjectSpellingsRetainTheEdge(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Dyn.cs": `namespace App {
+    public class Crate { }
+    public interface IBox<T> {
+        int Get(int id);
+    }
+    public class DynBox : IBox<dynamic> {
+        public int Get(int id) { return 1; }
+    }
+    public class CrateBox : IBox<Crate> {
+        public int Get(int id) { return 2; }
+    }
+    public class Flow {
+        private readonly IBox<object> _objects;
+        public Flow(IBox<object> o) { _objects = o; }
+        public int Pull() { return _objects.Get(1); }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	callerID := "Dyn.cs::Flow.Pull"
+	bindFieldReceiverCall(t, g, callerID, "_objects", "Dyn.cs::IBox.Get")
+
+	ResolveCSharpInterfaceDispatch(g)
+
+	targets := dispatchTargets(g, callerID)
+	assert.Contains(t, targets, "Dyn.cs::DynBox.Get",
+		"dynamic and object spell the same constructed interface - the edge stays")
+	assert.NotContains(t, targets, "Dyn.cs::CrateBox.Get",
+		"the genuinely different closure still filters")
+}
+
+// Review RED (revision 4b): `nint` IS System.IntPtr (and nuint UIntPtr) -
+// the native-int keyword and the struct name spell one type.
+func TestResolveCSharpInterfaceDispatch_NativeIntSpellingsRetainTheEdge(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Native.cs": `namespace App {
+    public class Crate { }
+    public interface IBox<T> {
+        int Get(int id);
+    }
+    public class PtrBox : IBox<System.IntPtr> {
+        public int Get(int id) { return 1; }
+    }
+    public class CrateBox : IBox<Crate> {
+        public int Get(int id) { return 2; }
+    }
+    public class Flow {
+        private readonly IBox<nint> _ptrs;
+        public Flow(IBox<nint> p) { _ptrs = p; }
+        public int Pull() { return _ptrs.Get(1); }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	callerID := "Native.cs::Flow.Pull"
+	bindFieldReceiverCall(t, g, callerID, "_ptrs", "Native.cs::IBox.Get")
+
+	ResolveCSharpInterfaceDispatch(g)
+
+	targets := dispatchTargets(g, callerID)
+	assert.Contains(t, targets, "Native.cs::PtrBox.Get",
+		"nint and System.IntPtr spell the same constructed interface - the edge stays")
+	assert.NotContains(t, targets, "Native.cs::CrateBox.Get")
+}
+
+// Review RED (revision 4c): a verbatim identifier (`@Crate`) and a
+// global-qualified spelling (`global::App.Crate`) both name plain Crate.
+func TestResolveCSharpInterfaceDispatch_VerbatimAndGlobalSpellingsRetainTheEdge(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Spell.cs": `namespace App {
+    public class Crate { }
+    public class Widget { }
+    public interface IBox<T> {
+        int Get(int id);
+    }
+    public class VerbatimBox : IBox<@Crate> {
+        public int Get(int id) { return 1; }
+    }
+    public class WidgetBox : IBox<Widget> {
+        public int Get(int id) { return 2; }
+    }
+    public class Flow {
+        private readonly IBox<global::App.Crate> _crates;
+        public Flow(IBox<global::App.Crate> c) { _crates = c; }
+        public int Pull() { return _crates.Get(1); }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	callerID := "Spell.cs::Flow.Pull"
+	bindFieldReceiverCall(t, g, callerID, "_crates", "Spell.cs::IBox.Get")
+
+	ResolveCSharpInterfaceDispatch(g)
+
+	targets := dispatchTargets(g, callerID)
+	assert.Contains(t, targets, "Spell.cs::VerbatimBox.Get",
+		"@Crate and global::App.Crate both name Crate - the edge stays")
+	assert.NotContains(t, targets, "Spell.cs::WidgetBox.Get",
+		"the genuinely different closure still filters")
+}
+
+// Review RED (revision 4d): `class Relay<T> : IBox<@T>` closes NOTHING -
+// the escaped spelling still names the open parameter T, and reading it as
+// a closed type called "@T" would filter the open implementor out of every
+// differently-closed receiver's fan-out.
+func TestResolveCSharpInterfaceDispatch_EscapedOpenParamStaysInFanout(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Relay.cs": `namespace App {
+    public class Crate { }
+    public interface IBox<T> {
+        int Get(int id);
+    }
+    public class Relay<T> : IBox<@T> {
+        public int Get(int id) { return 1; }
+    }
+    public class CrateBox : IBox<Crate> {
+        public int Get(int id) { return 2; }
+    }
+    public class Flow {
+        private readonly IBox<Crate> _crates;
+        public Flow(IBox<Crate> c) { _crates = c; }
+        public int Pull() { return _crates.Get(1); }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	callerID := "Relay.cs::Flow.Pull"
+	bindFieldReceiverCall(t, g, callerID, "_crates", "Relay.cs::IBox.Get")
+
+	ResolveCSharpInterfaceDispatch(g)
+
+	targets := dispatchTargets(g, callerID)
+	assert.Contains(t, targets, "Relay.cs::Relay.Get",
+		"an open-generic implementor spelled with a verbatim parameter stays in the fan-out")
+	assert.Contains(t, targets, "Relay.cs::CrateBox.Get")
+}
+
 // Codex review RED: `IBoxStore<System.Int32>` and `IBoxStore<int>` are the
 // SAME constructed interface in different spellings — the gate must fold
 // both to one canonical form and RETAIN the edge, never suppress it on a

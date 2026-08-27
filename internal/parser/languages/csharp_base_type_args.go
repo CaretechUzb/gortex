@@ -207,6 +207,14 @@ func csharpCanonicalTypeArg(t string) string {
 		return "ulong"
 	case "Object":
 		return "object"
+	case "dynamic":
+		// dynamic erases to object — the two spellings construct over the
+		// same underlying type, and folding can only CREATE matches.
+		return "object"
+	case "IntPtr":
+		return "nint"
+	case "UIntPtr":
+		return "nuint"
 	}
 	return t
 }
@@ -248,9 +256,20 @@ func csharpNormalizeSimpleArg(text string, openParams map[string]bool) string {
 		// beyond one identifier chain — not comparable by string.
 		return ""
 	}
+	// Qualifiers reduce to the final segment — `global::App.Crate`, an
+	// extern-alias qualifier, and a dotted namespace all name the same
+	// last-segment type the resolver-side convention compares by.
+	if i := strings.LastIndex(text, "::"); i >= 0 {
+		text = text[i+2:]
+	}
 	if dot := strings.LastIndex(text, "."); dot >= 0 {
 		text = text[dot+1:]
 	}
+	// A verbatim identifier (`@Crate`, `@T`) names the same symbol as its
+	// bare spelling. Strip BEFORE the open-parameter/alias check so
+	// `IBox<@T>` reads as the open parameter T — never as a closed type
+	// spelled "@T" that would gate the open implementor out.
+	text = strings.TrimPrefix(text, "@")
 	if text == "" || openParams[text] {
 		return ""
 	}
