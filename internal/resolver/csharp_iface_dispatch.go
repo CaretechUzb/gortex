@@ -733,7 +733,31 @@ func csharpReceiverField(g graph.Store, e *graph.Edge) *graph.Node {
 	if ownerID == "" {
 		return nil
 	}
-	field := g.GetNodesByIDs([]string{ownerID + "." + name})[ownerID+"."+name]
+	fieldID := ownerID + "." + name
+	// Binding evidence: the field-identifier emitter refuses shadowed
+	// identifiers (a parameter or local with the field's name owns the
+	// identifier inside that method), so an EdgeReads at this exact site
+	// naming the field is proof the bare receiver really is the enclosing
+	// type's field. A name-only lookup would bind a shadowed identifier to
+	// the field it shadows and gate on the wrong declared arguments —
+	// without the read edge the receiver stays unknown (never filter).
+	fieldRead := false
+	for _, out := range g.GetOutEdges(e.From) {
+		if out == nil || out.Kind != graph.EdgeReads {
+			continue
+		}
+		if out.FilePath != e.FilePath || out.Line != e.Line {
+			continue
+		}
+		if out.To == "unresolved::*."+name || out.To == fieldID {
+			fieldRead = true
+			break
+		}
+	}
+	if !fieldRead {
+		return nil
+	}
+	field := g.GetNodesByIDs([]string{fieldID})[fieldID]
 	if field == nil || field.Meta == nil ||
 		(field.Kind != graph.KindField && field.Kind != graph.KindConstant) {
 		return nil

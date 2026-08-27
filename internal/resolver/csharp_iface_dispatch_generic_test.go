@@ -371,6 +371,90 @@ func TestResolveCSharpInterfaceDispatch_SameLineDistinctMembersKeepOwnReceivers(
 		"the Save call's receiver is IBoxStore<Widget>")
 }
 
+// Review RED (revision 2a): a method parameter shadows the receiver field —
+// `IBox<Crate> _box` field, `IBox<Widget> _box` parameter. The receiver
+// identifier binds to the PARAMETER, but a bare text lookup finds the field
+// and its Crate arguments suppress WidgetBox.Get. Without binding evidence
+// the receiver is unknown and the site must keep the full fan-out.
+func TestResolveCSharpInterfaceDispatch_ParameterShadowedReceiverNeverFilters(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Boxes.cs": `namespace App {
+    public class Widget { }
+    public class Crate { }
+    public interface IBox<T> {
+        int Get(int id);
+    }
+    public class WidgetBox : IBox<Widget> {
+        public int Get(int id) { return 1; }
+    }
+    public class CrateBox : IBox<Crate> {
+        public int Get(int id) { return 2; }
+    }
+    public class Flow {
+        private readonly IBox<Crate> _box;
+        public Flow(IBox<Crate> b) { _box = b; }
+        public int Pull(IBox<Widget> _box) {
+            return _box.Get(7);
+        }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	callerID := "Boxes.cs::Flow.Pull"
+	bindFieldReceiverCall(t, g, callerID, "_box", "Boxes.cs::IBox.Get")
+
+	ResolveCSharpInterfaceDispatch(g)
+
+	targets := dispatchTargets(g, callerID)
+	assert.Contains(t, targets, "Boxes.cs::WidgetBox.Get",
+		"the receiver is the shadowing IBox<Widget> parameter - its impl must stay in")
+	assert.Contains(t, targets, "Boxes.cs::CrateBox.Get",
+		"an unknown receiver filters nothing")
+}
+
+// Review RED (revision 2b): a `var` local shadows the receiver field the
+// same way - the identifier binds to the local, not the field the text
+// lookup finds. (An interface-TYPED local never reaches the receiver
+// lookup: the tenv binds its call directly and leaves no companion.)
+func TestResolveCSharpInterfaceDispatch_LocalShadowedReceiverNeverFilters(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Boxes.cs": `namespace App {
+    public class Widget { }
+    public class Crate { }
+    public interface IBox<T> {
+        int Get(int id);
+    }
+    public class WidgetBox : IBox<Widget> {
+        public int Get(int id) { return 1; }
+    }
+    public class CrateBox : IBox<Crate> {
+        public int Get(int id) { return 2; }
+    }
+    public class Flow {
+        private readonly IBox<Crate> _box;
+        public Flow(IBox<Crate> b) { _box = b; }
+        public int Pull(IBox<Widget> source) {
+            var _box = source;
+            return _box.Get(7);
+        }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	callerID := "Boxes.cs::Flow.Pull"
+	bindFieldReceiverCall(t, g, callerID, "_box", "Boxes.cs::IBox.Get")
+
+	ResolveCSharpInterfaceDispatch(g)
+
+	targets := dispatchTargets(g, callerID)
+	assert.Contains(t, targets, "Boxes.cs::WidgetBox.Get",
+		"the receiver is the shadowing IBox<Widget> local - its impl must stay in")
+	assert.Contains(t, targets, "Boxes.cs::CrateBox.Get",
+		"an unknown receiver filters nothing")
+}
+
 // Codex review RED: `IBoxStore<System.Int32>` and `IBoxStore<int>` are the
 // SAME constructed interface in different spellings — the gate must fold
 // both to one canonical form and RETAIN the edge, never suppress it on a
