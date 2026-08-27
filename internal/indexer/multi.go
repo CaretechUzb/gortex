@@ -1456,6 +1456,9 @@ func (mi *MultiIndexer) EndBatch() {
 	// Keep the transition write side through the complete global pass: a
 	// watcher admitted before or during EndBatch runs wholly before or after it.
 	mi.runGlobalGraphPasses(context.Background(), state.scope, state.censusEligible)
+	// This pass IS the derivation any repository tracked during the batch
+	// was waiting for. Scheduling another would double every cold index.
+	mi.ClearDeferredWorkspaceRederive()
 }
 
 // ResetBatch clears deferred-batch mode WITHOUT running the graph-wide
@@ -2816,6 +2819,10 @@ func (mi *MultiIndexer) TrackRepoCtx(ctx context.Context, entry config.RepoEntry
 	// derivation passes take the batch-transition gate themselves and
 	// must not be started from inside a topology mutation.
 	rederive := false
+	// The batched counterpart: the pass cannot run now, so the prefix is
+	// only recorded, and whoever ends the batch decides whether it still
+	// needs one.
+	deferRederive := false
 	err = mi.coordinateRepositoryTopologyMutation(ctx, idx, func() error {
 		// Construction can precede a queued batch transition. Once the stable
 		// lane and transition generation are held, reapply the authoritative mode.
@@ -2884,6 +2891,15 @@ func (mi *MultiIndexer) TrackRepoCtx(ctx context.Context, entry config.RepoEntry
 		// warmup over 100+ repos is O(R · E). The batch caller runs it once
 		// after the loop (RunGlobalResolve does this for daemon warmup).
 		if !batchMode.deferGlobalPasses {
+			// Reconciled inline, not left to the scheduled pass below.
+			// The pass opens with RunGlobalResolve, which reconciles
+			// again, so this generation is thrown away seconds later —
+			// measured at ~37s of a track on a five-repo workspace. It
+			// stays anyway: a track that returns is expected to have
+			// left contract edges queryable, and deferring it to a
+			// background pass turns that into a race. Ten tests in this
+			// package assert the synchronous form, and the saving is 4%
+			// of a post-track derivation.
 			mi.ReconcileContractEdges()
 			// A batch runs the global passes once at EndBatch for every
 			// repo it indexed. Outside one, nothing else will: without
@@ -2892,6 +2908,16 @@ func (mi *MultiIndexer) TrackRepoCtx(ctx context.Context, entry config.RepoEntry
 			// of the workspace owns into it stays missing until some
 			// unrelated full reindex happens to run.
 			rederive = true
+		} else {
+			// Inside a batch the passes are suppressed, and the batch
+			// transition is supposed to run them once for everything it
+			// indexed. Two of the warm-restart transitions do not: with
+			// no repo delta, and with an exact file-level delta, the
+			// daemon takes ResetBatch and derives nothing workspace-wide.
+			// A repository tracked in that window would otherwise stay
+			// underived forever, so it is recorded here and handed back
+			// at the transition.
+			deferRederive = true
 		}
 		return nil
 	})
@@ -2903,6 +2929,9 @@ func (mi *MultiIndexer) TrackRepoCtx(ctx context.Context, entry config.RepoEntry
 	}
 	if rederive {
 		mi.scheduleWorkspaceRederive(prefix)
+	}
+	if deferRederive {
+		mi.deferWorkspaceRederive(prefix)
 	}
 	return result, nil
 }

@@ -971,6 +971,15 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	default:
 		state.multiIndexer.EndBatch()
 	}
+	// The two fast paths above run no workspace-wide pass, so a repository
+	// tracked while this warmup was in flight — `gortex track` racing a
+	// daemon restart — joined the graph with only its own extraction
+	// edges and nothing scheduled to finish it. EndBatch clears the set
+	// itself, so this is a no-op on the path that did derive.
+	if deferred := state.multiIndexer.FlushDeferredWorkspaceRederive(); len(deferred) > 0 {
+		logger.Info("daemon: deriving repositories tracked during warmup",
+			zap.Strings("repos", deferred))
+	}
 	postBatchNodes, postBatchContracts, postBatchResolutionAffected := state.multiIndexer.BackfillWorkspaceSlugsWithImpact()
 	if postBatchNodes+postBatchContracts > 0 {
 		logger.Info("daemon: backfilled workspace/project slugs after derived passes",

@@ -347,13 +347,13 @@ func TestRunWorkspaceRederive_ReportsPreemption(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	mi.runWorkspaceRederive(ctx, "repo-a")
+	mi.runWorkspaceRederive(ctx, map[string]struct{}{"repo-a": {}})
 	assert.Zero(t, logs.FilterMessage(rederiveStartLog).Len(),
 		"an already-cancelled pass must not even start")
 
 	ctx2, cancel2 := context.WithCancel(context.Background())
 	defer cancel2()
-	mi.runWorkspaceRederive(ctx2, "repo-a")
+	mi.runWorkspaceRederive(ctx2, map[string]struct{}{"repo-a": {}})
 	done := logs.FilterMessage(rederiveDoneLog).All()
 	require.Len(t, done, 1)
 	assert.Equal(t, false, done[0].ContextMap()["preempted"])
