@@ -1,6 +1,10 @@
 package resolver
 
-import "github.com/zzet/gortex/internal/graph"
+import (
+	"time"
+
+	"github.com/zzet/gortex/internal/graph"
+)
 
 // Odoo binding.
 //
@@ -91,7 +95,17 @@ func ResolveOdooRefsScoped(g graph.Store, scope map[string]bool) int {
 	models := &odooFamily{via: odooModelVia, kinds: odooModelEdgeKinds}
 	xmlIDs := &odooFamily{via: odooXMLVia, kinds: odooXMLEdgeKinds}
 	js := &odooFamily{via: odooJSVia, kinds: odooJSEdgeKinds}
-	odooCollectFamilies(g, scope, models, xmlIDs, js)
+	// Phase timings, published to the pass report. The two halves of this
+	// pass have unrelated costs and unrelated fixes — edge collection
+	// narrows with the scope, the declaration indexes never can — and one
+	// aggregate number cannot tell them apart.
+	phases := map[string]int64{}
+	phase := func(name string, fn func()) {
+		start := time.Now()
+		fn()
+		phases[name] = time.Since(start).Milliseconds()
+	}
+	phase("collect_edges", func() { odooCollectFamilies(g, scope, models, xmlIDs, js) })
 
 	// The declaration indexes every binder looks through, likewise built
 	// once for the whole pass rather than once per binder. They are
@@ -99,11 +113,15 @@ func ResolveOdooRefsScoped(g graph.Store, scope map[string]bool) int {
 	// to a declaration in another — so a scoped pass pays for them in
 	// full and the only thing that helps is not paying eleven times over.
 	// See odoo_decl_index.go.
-	decls := buildOdooDecls(g)
+	var decls *odooDecls
+	phase("build_decls", func() { decls = buildOdooDecls(g) })
 
-	n := bindOdooModels(g, models.edges, sc, decls)
-	n += bindOdooXMLIDs(g, xmlIDs.edges, sc, decls)
-	n += bindOdooJS(g, js.edges, sc, decls)
+	n := 0
+	phase("bind_models", func() { n += bindOdooModels(g, models.edges, sc, decls) })
+	phase("bind_xmlids", func() { n += bindOdooXMLIDs(g, xmlIDs.edges, sc, decls) })
+	phase("bind_js", func() { n += bindOdooJS(g, js.edges, sc, decls) })
+	phases["edges_collected"] = int64(len(models.edges) + len(xmlIDs.edges) + len(js.edges))
+	publishSynthPhases(phases)
 	return n
 }
 

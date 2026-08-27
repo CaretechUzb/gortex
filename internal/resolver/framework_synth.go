@@ -1085,6 +1085,31 @@ type SynthCount struct {
 	// from RepoGated because it is an invariant about the graph, not a
 	// permission the pass could have been granted.
 	SiblingGated int `json:"sibling_gated,omitempty"`
+	// PhaseMillis breaks a pass's own time into whatever phases it
+	// chooses to publish. Absent for every pass that publishes nothing.
+	// It exists because a pass reported as one number is a pass that
+	// cannot be optimised: `odoo` read 340s with no way to separate its
+	// whole-store declaration indexes from its scoped edge walk, and the
+	// two have completely different fixes.
+	PhaseMillis map[string]int64 `json:"phase_ms,omitempty"`
+}
+
+// frameworkSynthPhaseSink carries a pass's self-reported phase timings to
+// the loop that builds its SynthCount. One slot is enough and no lock is
+// needed: the synthesizer loop is serial by construction (registration
+// order is load-bearing and every write funnels through one edge batch).
+var frameworkSynthPhaseSink map[string]int64
+
+// publishSynthPhases is called by a pass, from inside its own execution,
+// to attach a breakdown of its time to the report.
+func publishSynthPhases(phases map[string]int64) { frameworkSynthPhaseSink = phases }
+
+// takeSynthPhases collects and clears the slot, so a pass that publishes
+// nothing inherits nothing from the pass before it.
+func takeSynthPhases() map[string]int64 {
+	phases := frameworkSynthPhaseSink
+	frameworkSynthPhaseSink = nil
+	return phases
 }
 
 // FrameworkSynthReport is the aggregate result of one
@@ -1325,6 +1350,7 @@ func runFrameworkSynthesizersScoped(
 		count := SynthCount{
 			Name: s.Name(), Edges: n, Millis: time.Since(start).Milliseconds(),
 			Disabled: disabled, RepoGated: repoGated, SiblingGated: siblingGated,
+			PhaseMillis: takeSynthPhases(),
 		}
 		if passScope != nil {
 			stats := passScope.stats()

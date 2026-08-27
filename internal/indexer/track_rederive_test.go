@@ -314,7 +314,7 @@ func TestRunGlobalGraphPasses_ReturnsAtFirstBoundaryWhenCancelled(t *testing.T) 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	before := logs.FilterMessage(globalPassesDoneLog).Len()
-	mi.runGlobalGraphPasses(ctx, nil, false)
+	mi.runGlobalGraphPasses(ctx, nil, false, false)
 
 	aborts := logs.FilterMessage(globalPassesAbortedLog).All()
 	require.Len(t, aborts, 1, "a cancelled run must log exactly one preemption")
@@ -335,7 +335,7 @@ func TestRunGlobalGraphPasses_UncancelledRunStillCompletes(t *testing.T) {
 	mi.WaitWorkspaceRederive()
 
 	before := logs.FilterMessage(globalPassesDoneLog).Len()
-	mi.runGlobalGraphPasses(context.Background(), nil, false)
+	mi.runGlobalGraphPasses(context.Background(), nil, false, false)
 	assert.Equal(t, before+1, logs.FilterMessage(globalPassesDoneLog).Len())
 	assert.Zero(t, logs.FilterMessage(globalPassesAbortedLog).Len())
 }

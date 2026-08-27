@@ -297,7 +297,7 @@ func serialColdReference(t *testing.T, repos []config.RepoEntry) *MultiIndexer {
 		mi.indexers[prefix].RunDeferredPasses(t.Context())
 	}
 	mi.runCrossRepoResolve(true)
-	mi.runGlobalGraphPasses(t.Context(), nil, false)
+	mi.runGlobalGraphPasses(t.Context(), nil, false, false)
 	return mi
 }
 
