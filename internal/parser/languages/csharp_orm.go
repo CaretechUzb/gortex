@@ -161,51 +161,144 @@ func csharpEFConfigTableCall(decl *sitter.Node, src []byte) (table, schema, rela
 		if table != "" {
 			return false
 		}
-		if n.Type() != "invocation_expression" {
+		t, s, r, ok := csharpEFTableViewArgs(n, src)
+		if !ok {
 			return true
 		}
-		fn := n.ChildByFieldName("function")
-		if fn == nil || fn.Type() != "member_access_expression" {
-			return true
-		}
-		name := ""
-		if nm := fn.ChildByFieldName("name"); nm != nil {
-			name = nm.Content(src)
-		}
-		if name != "ToTable" && name != "ToView" {
-			return true
-		}
-		args := n.ChildByFieldName("arguments")
-		if args == nil {
-			return true
-		}
-		var lits []string
-		for i, _nc := 0, int(args.NamedChildCount()); i < _nc; i++ {
-			a := args.NamedChild(i)
-			if a == nil {
-				continue
-			}
-			lit := csharpAttrPositionalString(a.Content(src))
-			if i == 0 && lit == "" {
-				return true
-			}
-			lits = append(lits, lit)
-		}
-		if len(lits) == 0 || lits[0] == "" {
-			return true
-		}
-		table = lits[0]
-		if len(lits) > 1 {
-			schema = lits[1]
-		}
-		if name == "ToView" {
-			relation = "view"
-		} else {
-			relation = "table"
-		}
+		table, schema, relation = t, s, r
 		return false
 	})
 	return table, schema, relation
+}
+
+// csharpEFTableViewArgs recognises an invocation node as a
+// ToTable/ToView call with a literal name and returns its arguments.
+// The first argument must itself be a string literal — the
+// lambda-only overloads configure without naming, so a non-literal
+// first argument is not a table fact.
+func csharpEFTableViewArgs(n *sitter.Node, src []byte) (table, schema, relation string, ok bool) {
+	if n.Type() != "invocation_expression" {
+		return "", "", "", false
+	}
+	fn := n.ChildByFieldName("function")
+	if fn == nil || fn.Type() != "member_access_expression" {
+		return "", "", "", false
+	}
+	name := ""
+	if nm := fn.ChildByFieldName("name"); nm != nil {
+		name = nm.Content(src)
+	}
+	if name != "ToTable" && name != "ToView" {
+		return "", "", "", false
+	}
+	args := n.ChildByFieldName("arguments")
+	if args == nil {
+		return "", "", "", false
+	}
+	var lits []string
+	for i, _nc := 0, int(args.NamedChildCount()); i < _nc; i++ {
+		a := args.NamedChild(i)
+		if a == nil {
+			continue
+		}
+		lit := csharpAttrPositionalString(a.Content(src))
+		if i == 0 && lit == "" {
+			return "", "", "", false
+		}
+		lits = append(lits, lit)
+	}
+	if len(lits) == 0 || lits[0] == "" {
+		return "", "", "", false
+	}
+	table = lits[0]
+	if len(lits) > 1 {
+		schema = lits[1]
+	}
+	relation = "table"
+	if name == "ToView" {
+		relation = "view"
+	}
+	return table, schema, relation, true
+}
+
+// csharpEFEntityGenericArg matches the Entity<T> generic-name link of
+// a modelBuilder fluent chain.
+var csharpEFEntityGenericArg = regexp.MustCompile(`^Entity\s*<\s*([^<>,]+?)\s*>$`)
+
+// csharpEFEntityFromChain walks a ToTable/ToView call's receiver
+// chain (`modelBuilder.Entity<T>().HasKey(...).ToTable(...)`) down to
+// the Entity<T> link and returns T's final name segment, or "" when
+// the chain never names an entity.
+func csharpEFEntityFromChain(fn *sitter.Node, src []byte) string {
+	expr := fn.ChildByFieldName("expression")
+	for expr != nil {
+		switch expr.Type() {
+		case "invocation_expression":
+			expr = expr.ChildByFieldName("function")
+		case "member_access_expression":
+			if nm := expr.ChildByFieldName("name"); nm != nil && nm.Type() == "generic_name" {
+				if m := csharpEFEntityGenericArg.FindStringSubmatch(nm.Content(src)); len(m) >= 2 {
+					entity := strings.TrimSpace(m[1])
+					if i := strings.LastIndexByte(entity, '.'); i >= 0 {
+						entity = entity[i+1:]
+					}
+					return strings.TrimPrefix(entity, "@")
+				}
+			}
+			expr = expr.ChildByFieldName("expression")
+		default:
+			return ""
+		}
+	}
+	return ""
+}
+
+// stampCSharpEFFluent records the OnModelCreating inline fluent
+// mapping facts on the file node as Meta["ef_fluent"], one
+// "entity|table|schema|relation" entry per Entity<T> chain that ends
+// in a literal ToTable/ToView. Only OnModelCreating bodies are
+// scanned: that is where EF looks, and a helper method reached from
+// there is a cross-file/cross-method chase the extractor stays out
+// of. The resolver joins entries to entity class nodes by name, same
+// as the config-class stamps.
+func stampCSharpEFFluent(root *sitter.Node, src []byte, fileNode *graph.Node) {
+	var entries []string
+	seen := map[string]bool{}
+	walkNodes(root, func(n *sitter.Node) {
+		if n.Type() != "method_declaration" {
+			return
+		}
+		if nm := n.ChildByFieldName("name"); nm == nil || nm.Content(src) != "OnModelCreating" {
+			return
+		}
+		body := n.ChildByFieldName("body")
+		if body == nil {
+			return
+		}
+		walkAST(body, func(inv *sitter.Node) bool {
+			table, schema, relation, ok := csharpEFTableViewArgs(inv, src)
+			if !ok {
+				return true
+			}
+			entity := csharpEFEntityFromChain(inv.ChildByFieldName("function"), src)
+			if entity == "" {
+				return true
+			}
+			entry := entity + "|" + table + "|" + schema + "|" + relation
+			if !seen[entry] {
+				seen[entry] = true
+				entries = append(entries, entry)
+			}
+			return true
+		})
+	})
+	if len(entries) == 0 {
+		return
+	}
+	if fileNode.Meta == nil {
+		fileNode.Meta = map[string]any{}
+	}
+	fileNode.Meta["ef_fluent"] = entries
 }
 
 // emitCSharpORMEdges materialises the KindTable node + EdgeModelsTable

@@ -138,6 +138,52 @@ public class GadgetConfig : IEntityTypeConfiguration<Gadget>
 	assert.False(t, hasTable, "no ToTable/ToView call, no table stamp")
 }
 
+func TestCSharpORM_OnModelCreatingFluentFileStamp(t *testing.T) {
+	src := `using Microsoft.EntityFrameworkCore;
+
+namespace Probe.Data;
+
+public class ProbeContext : DbContext
+{
+    public DbSet<Widget> Widgets { get; set; }
+
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<Widget>().ToTable("widget_master", "core");
+        modelBuilder.Entity<Domain.Gadget>().HasKey(g => g.Id);
+        modelBuilder.Entity<Domain.Gadget>().ToView("gadget_view");
+        modelBuilder.Entity<Sprocket>().HasIndex(s => s.Serial);
+    }
+}
+`
+	fix := runCSharpExtractFixtureORM(t, "Data/ProbeContext.cs", src)
+	fileNode := fix.nodesByID["Data/ProbeContext.cs"]
+	require.NotNil(t, fileNode)
+	assert.Equal(t, []string{
+		"Widget|widget_master|core|table",
+		"Gadget|gadget_view||view",
+	}, fileNode.Meta["ef_fluent"],
+		"one entry per Entity<T> chain ending in a literal ToTable/ToView; chains without one stamp nothing")
+}
+
+func TestCSharpORM_FluentOutsideOnModelCreatingNotStamped(t *testing.T) {
+	src := `namespace Probe.Data;
+
+public class MapHelper
+{
+    public void Wire(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<Widget>().ToTable("widgets_elsewhere");
+    }
+}
+`
+	fix := runCSharpExtractFixtureORM(t, "Data/MapHelper.cs", src)
+	fileNode := fix.nodesByID["Data/MapHelper.cs"]
+	require.NotNil(t, fileNode)
+	_, has := fileNode.Meta["ef_fluent"]
+	assert.False(t, has, "only OnModelCreating bodies are scanned in v1")
+}
+
 func TestCSharpORM_PlainClassIgnored(t *testing.T) {
 	src := `namespace Probe.Core;
 

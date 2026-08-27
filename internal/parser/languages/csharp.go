@@ -304,6 +304,7 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 	fileID := fileNode.ID
 	result.Nodes = append(result.Nodes, fileNode)
 	stampCSharpUsings(root, src, fileNode)
+	stampCSharpEFFluent(root, src, fileNode)
 
 	seen := make(map[string]bool)
 	annotationSeen := make(map[string]bool)
