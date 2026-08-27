@@ -241,6 +241,30 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 		return 0
 	}
 
+	// A variance-declaring interface (ISource<out T> / ISink<in T>) makes
+	// differently-closed constructions assignable across the family, so the
+	// closed-and-unequal equality gate — which models invariant parameters
+	// only — must never arm for it: its families carry no stamped args at
+	// all, and every site keeps the full fan-out.
+	ifaceIDs := make([]string, 0, len(anchorGroups))
+	seenIfaceIDs := map[string]bool{}
+	for _, key := range anchorOrder {
+		id := anchorGroups[key].ifaceID
+		if !seenIfaceIDs[id] {
+			seenIfaceIDs[id] = true
+			ifaceIDs = append(ifaceIDs, id)
+		}
+	}
+	variantIface := map[string]bool{}
+	for id, n := range g.GetNodesByIDs(ifaceIDs) {
+		if n == nil || n.Meta == nil {
+			continue
+		}
+		if v, _ := n.Meta["variant_type_params"].(bool); v {
+			variantIface[id] = true
+		}
+	}
+
 	// Descendant closure per interface, computed once and shared across that
 	// interface's anchors (one per member name).
 	descCache := map[string][]string{}
@@ -283,12 +307,16 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 		}
 		memberArgs := map[string]string{}
 		implCount := 0
+		variant := variantIface[ag.ifaceID]
 		for _, sub := range descendants(ag.ifaceID) {
 			byName := membersByType[sub]
 			if byName == nil {
 				continue
 			}
-			subArgs := implArgs[sub][ag.ifaceID]
+			subArgs := ""
+			if !variant {
+				subArgs = implArgs[sub][ag.ifaceID]
+			}
 			for _, m := range byName[ag.name] {
 				if m == nil || anchorSet[m.ID] {
 					continue

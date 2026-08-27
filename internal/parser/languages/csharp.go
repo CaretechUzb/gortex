@@ -857,6 +857,9 @@ func (e *CSharpExtractor) emitContainer(m parser.QueryResult, kind string, nodeK
 	switch kind {
 	case "iface":
 		meta["type_flavor"] = "interface"
+		if csharpHasVariantTypeParams(def.Node) {
+			meta["variant_type_params"] = true
+		}
 	case "struct":
 		meta["type_flavor"] = "struct"
 	case "enum":

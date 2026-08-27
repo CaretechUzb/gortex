@@ -97,6 +97,45 @@ func csharpUnstampableArgNames(node *sitter.Node, src []byte) map[string]bool {
 	return out
 }
 
+// csharpHasVariantTypeParams reports whether decl's type-parameter list
+// declares any `in`/`out` variance modifier. A variance-declaring
+// interface makes differently-closed constructions assignable across the
+// implements family (ISource<Dog> satisfies an ISource<out T> receiver
+// closed over Animal), so the dispatch gate — which models invariant
+// parameters only — must never arm for it.
+func csharpHasVariantTypeParams(decl *sitter.Node) bool {
+	if decl == nil {
+		return false
+	}
+	tparams := decl.ChildByFieldName("type_parameters")
+	if tparams == nil {
+		for i, _nc := 0, int(decl.NamedChildCount()); i < _nc; i++ {
+			c := decl.NamedChild(i)
+			if c != nil && c.Type() == "type_parameter_list" {
+				tparams = c
+				break
+			}
+		}
+	}
+	if tparams == nil {
+		return false
+	}
+	for i, _nc := 0, int(tparams.NamedChildCount()); i < _nc; i++ {
+		tp := tparams.NamedChild(i)
+		if tp == nil || tp.Type() != "type_parameter" {
+			continue
+		}
+		// The variance keyword is an anonymous token child of the
+		// type_parameter, before its identifier.
+		for j, _jc := 0, int(tp.ChildCount()); j < _jc; j++ {
+			if c := tp.Child(j); c != nil && (c.Type() == "in" || c.Type() == "out") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // csharpUsingAliasName returns the alias identifier a using directive
 // introduces (`using MyCrate = App.Crate;` → "MyCrate"), or "" when the
 // node is not an alias directive. Grammar revisions differ — some wrap

@@ -455,6 +455,87 @@ func TestResolveCSharpInterfaceDispatch_LocalShadowedReceiverNeverFilters(t *tes
 		"an unknown receiver filters nothing")
 }
 
+// Review RED (revision 3a): a covariant interface (`ISource<out T>`) makes
+// ISource<Dog> assignable to an ISource<Animal> receiver, so DogSource.Get
+// is a real dispatch target at the site - the closed-and-unequal equality
+// gate only models INVARIANT parameters and must stand down entirely when
+// the interface declares any variance.
+func TestResolveCSharpInterfaceDispatch_CovariantInterfaceNeverFilters(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Sources.cs": `namespace App {
+    public class Animal { }
+    public class Dog : Animal { }
+    public class Cat : Animal { }
+    public interface ISource<out T> {
+        T Get();
+    }
+    public class DogSource : ISource<Dog> {
+        public Dog Get() { return new Dog(); }
+    }
+    public class CatSource : ISource<Cat> {
+        public Cat Get() { return new Cat(); }
+    }
+    public class Flow {
+        private readonly ISource<Animal> _source;
+        public Flow(ISource<Animal> s) { _source = s; }
+        public Animal Pull() {
+            return _source.Get();
+        }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	callerID := "Sources.cs::Flow.Pull"
+	bindFieldReceiverCall(t, g, callerID, "_source", "Sources.cs::ISource.Get")
+
+	ResolveCSharpInterfaceDispatch(g)
+
+	targets := dispatchTargets(g, callerID)
+	assert.Contains(t, targets, "Sources.cs::DogSource.Get",
+		"out T: ISource<Dog> satisfies an ISource<Animal> receiver - the impl must stay in")
+	assert.Contains(t, targets, "Sources.cs::CatSource.Get",
+		"out T: ISource<Cat> satisfies an ISource<Animal> receiver - the impl must stay in")
+}
+
+// Review RED (revision 3b): the contravariant twin (`ISink<in T>`) -
+// ISink<Animal> is assignable to an ISink<Dog> receiver.
+func TestResolveCSharpInterfaceDispatch_ContravariantInterfaceNeverFilters(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Sinks.cs": `namespace App {
+    public class Animal { }
+    public class Dog : Animal { }
+    public interface ISink<in T> {
+        int Put(int item);
+    }
+    public class AnimalSink : ISink<Animal> {
+        public int Put(int item) { return 1; }
+    }
+    public class DogSink : ISink<Dog> {
+        public int Put(int item) { return 2; }
+    }
+    public class Flow {
+        private readonly ISink<Dog> _sink;
+        public Flow(ISink<Dog> s) { _sink = s; }
+        public int Push() {
+            return _sink.Put(3);
+        }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	callerID := "Sinks.cs::Flow.Push"
+	bindFieldReceiverCall(t, g, callerID, "_sink", "Sinks.cs::ISink.Put")
+
+	ResolveCSharpInterfaceDispatch(g)
+
+	targets := dispatchTargets(g, callerID)
+	assert.Contains(t, targets, "Sinks.cs::AnimalSink.Put",
+		"in T: ISink<Animal> satisfies an ISink<Dog> receiver - the impl must stay in")
+	assert.Contains(t, targets, "Sinks.cs::DogSink.Put")
+}
+
 // Codex review RED: `IBoxStore<System.Int32>` and `IBoxStore<int>` are the
 // SAME constructed interface in different spellings — the gate must fold
 // both to one canonical form and RETAIN the edge, never suppress it on a
