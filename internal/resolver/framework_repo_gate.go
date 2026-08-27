@@ -138,6 +138,35 @@ type frameworkRepoGateStore struct {
 	droppedSiblings int
 }
 
+// CheckoutGroup and HasCheckoutGroups republish the checkout grouping that
+// siblingSrc carries.
+//
+// Without them the wrapper is opaque to it. graph.CheckoutGrouped is not
+// part of graph.Store, so embedding the interface promotes nothing, and
+// every pass that asks its own store "does this workspace hold sibling
+// checkouts?" was told no — including the Odoo model binder, whose
+// odooSiblingCache then short-circuited to the identity and filtered
+// nothing. Measured on a workspace with three checkouts of one repository:
+// the binder staged 229,249 cross-checkout candidates and this wrapper
+// refused every one of them, one edge at a time, inside a pass that took
+// 183s. The graph was correct — refuses() reads siblingSrc directly, so
+// the invariant held — but the work was done twice and thrown away once.
+//
+// Forwarding moves the decision back to where the candidate is built. The
+// gate below stays as the backstop for passes that do not ask.
+func (v *frameworkRepoGateStore) CheckoutGroup(repoPrefix string) string {
+	grouped, ok := v.siblingSrc.(graph.CheckoutGrouped)
+	if !ok {
+		return ""
+	}
+	return grouped.CheckoutGroup(repoPrefix)
+}
+
+func (v *frameworkRepoGateStore) HasCheckoutGroups() bool {
+	grouped, ok := v.siblingSrc.(graph.CheckoutGrouped)
+	return ok && grouped.HasCheckoutGroups()
+}
+
 // refuses reports whether this pass may not write the edge, recording
 // which of the two rules refused it.
 //
