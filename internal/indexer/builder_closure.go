@@ -168,18 +168,18 @@ func (b *SparseGenerationBuilder) affectedClosureContext(
 		return nil, err
 	}
 
-	seedNodeIDs, err := builderSeedNodeIDsContext(ctx, req.Base, seeds)
+	frontier := make(map[string]struct{})
+	targetEvidence := walk.collectIntroduced(present, frontier)
+	seedNodeIDs, err := builderSemanticSeedNodeIDs(ctx, req, seeds, deleted, targetEvidence)
 	if err != nil {
 		return nil, err
 	}
-	frontier := make(map[string]struct{})
-	if err := b.collectDependents(ctx, req, seedNodeIDs, frontier); err != nil {
+	if err := b.collectDependents(ctx, req, seedNodeIDs.reverse, frontier); err != nil {
 		return nil, err
 	}
-	if err := b.collectDependencies(ctx, req, seeds, seedNodeIDs, frontier); err != nil {
+	if err := b.collectDependencies(ctx, req, seeds, seedNodeIDs.all, frontier); err != nil {
 		return nil, err
 	}
-	walk.collectIntroduced(present, frontier)
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -327,9 +327,13 @@ func (w *closureWalk) collectManifests(out map[string]struct{}) {
 // no base nodes, and a modified file's base edges describe the references it
 // USED to make, so a reference the change introduces — and a definition it
 // introduces — is a link nothing in the base layer draws to the change.
-func (w *closureWalk) collectIntroduced(present map[string]struct{}, out map[string]struct{}) {
+func (w *closureWalk) collectIntroduced(
+	present map[string]struct{},
+	out map[string]struct{},
+) builderSemanticTarget {
+	semantic := newBuilderSemanticTarget(present)
 	if len(present) == 0 {
-		return
+		return semantic
 	}
 	rels := make([]string, 0, len(present))
 	graphPaths := make([]string, 0, len(present))
@@ -343,9 +347,10 @@ func (w *closureWalk) collectIntroduced(present map[string]struct{}, out map[str
 	accounted := w.baseAccountedNames(graphPaths)
 
 	refs := closureRefs{
-		names:   map[string]struct{}{},
-		imports: map[string]struct{}{},
-		defines: map[string]struct{}{},
+		names:    map[string]struct{}{},
+		imports:  map[string]struct{}{},
+		defines:  map[string]struct{}{},
+		semantic: &semantic,
 	}
 	for _, rel := range rels {
 		w.extractInto(rel, &refs)
@@ -382,6 +387,7 @@ func (w *closureWalk) collectIntroduced(present map[string]struct{}, out map[str
 			out[graphPath] = struct{}{}
 		}
 	}
+	return semantic
 }
 
 // collectPlaceholderReferrers offers the base files whose references park on a
@@ -635,6 +641,7 @@ func (w *closureWalk) extractInto(rel string, refs *closureRefs) {
 		return
 	}
 	refs.collect(result)
+	refs.semantic.record(rel, result)
 }
 
 // closureRefs is the vocabulary one file's extraction hands the closure: the
@@ -643,9 +650,10 @@ func (w *closureWalk) extractInto(rel string, refs *closureRefs) {
 // binds from and the third is what it binds to, so a file placed by any of them
 // is a file the pass would have had to see.
 type closureRefs struct {
-	names   map[string]struct{}
-	imports map[string]struct{}
-	defines map[string]struct{}
+	names    map[string]struct{}
+	imports  map[string]struct{}
+	defines  map[string]struct{}
+	semantic *builderSemanticTarget
 }
 
 // collect reads one extraction's unresolved references and its definitions.

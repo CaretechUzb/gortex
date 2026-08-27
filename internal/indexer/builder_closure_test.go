@@ -15,6 +15,8 @@ import (
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/indexer/source"
+	"github.com/zzet/gortex/internal/parser"
+	"github.com/zzet/gortex/internal/parser/languages"
 )
 
 // The closure's reference-driven cases.
@@ -49,6 +51,19 @@ type closureCase struct {
 // over it, and builds the commit layer spanning the two.
 func buildClosureCase(t *testing.T, treeA, treeB map[string]string) closureCase {
 	t.Helper()
+	return buildClosureCaseWithEvidenceFailure(t, treeA, treeB, "")
+}
+
+// buildClosureCaseWithEvidenceFailure forces the target-side semantic probe for
+// failEvidencePath to miss once. The generation pass reads the same source
+// successfully afterwards, producing the legacy full-reverse closure for an
+// apples-to-apples parity comparison with the optimized closure.
+func buildClosureCaseWithEvidenceFailure(
+	t *testing.T,
+	treeA, treeB map[string]string,
+	failEvidencePath string,
+) closureCase {
+	t.Helper()
 	builderIsolateGit(t)
 	dir := builderTempDir(t, "repo")
 	builderGit(t, dir, "init", "--initial-branch=main")
@@ -66,23 +81,59 @@ func buildClosureCase(t *testing.T, treeA, treeB map[string]string) closureCase 
 	targetTree := builderGit(t, dir, "rev-parse", "HEAD^{tree}")
 	commitOID := builderGit(t, dir, "rev-parse", "HEAD")
 
-	generationID, report, err := builderNewBuilder(store).BuildCommitLayer(context.Background(), CommitLayerRequest{
-		Identity: GenerationIdentity{
-			OwnerKind:           "dedicated_graph",
-			GraphID:             "graph-closure",
-			LayerID:             "layer-" + targetTree,
-			CheckoutID:          "checkout-closure",
-			ProvenanceCommitOID: commitOID,
-		},
-		Base:          store,
-		RepoDir:       dir,
-		BaseTreeOID:   baseTree,
-		TargetTreeOID: targetTree,
-		RootPath:      dir,
-		RepoPrefix:    builderRepoPrefix,
-		WorkspaceID:   builderRepoPrefix,
-		ProjectID:     builderRepoPrefix,
-	})
+	builder := builderNewBuilder(store)
+	var (
+		generationID int64
+		report       BuildReport
+		err          error
+	)
+	if failEvidencePath == "" {
+		generationID, report, err = builder.BuildCommitLayer(context.Background(), CommitLayerRequest{
+			Identity: GenerationIdentity{
+				OwnerKind:           "dedicated_graph",
+				GraphID:             "graph-closure",
+				LayerID:             "layer-" + targetTree,
+				CheckoutID:          "checkout-closure",
+				ProvenanceCommitOID: commitOID,
+			},
+			Base:          store,
+			RepoDir:       dir,
+			BaseTreeOID:   baseTree,
+			TargetTreeOID: targetTree,
+			RootPath:      dir,
+			RepoPrefix:    builderRepoPrefix,
+			WorkspaceID:   builderRepoPrefix,
+			ProjectID:     builderRepoPrefix,
+		})
+	} else {
+		changes, diffErr := diffTreeChanges(context.Background(), dir, baseTree, targetTree)
+		if diffErr != nil {
+			t.Fatalf("diffTreeChanges: %v", diffErr)
+		}
+		target, sourceErr := source.NewGitTreeSource(context.Background(), dir, targetTree)
+		if sourceErr != nil {
+			t.Fatalf("NewGitTreeSource: %v", sourceErr)
+		}
+		defer target.Close() //nolint:errcheck // read-only test source
+		generationID, report, err = builder.Build(context.Background(), BuildRequest{
+			Identity: GenerationIdentity{
+				OwnerKind:           "dedicated_graph",
+				GraphID:             "graph-closure",
+				LayerID:             "layer-" + targetTree,
+				CheckoutID:          "checkout-closure",
+				GenerationKind:      CommitLayerGenerationKind,
+				TreeOID:             targetTree,
+				ProvenanceCommitOID: commitOID,
+			},
+			Base:        store,
+			Target:      &failFirstOpenSource{ContentSource: target, path: failEvidencePath},
+			Changes:     changes,
+			RootPath:    dir,
+			RepoPrefix:  builderRepoPrefix,
+			WorkspaceID: builderRepoPrefix,
+			ProjectID:   builderRepoPrefix,
+		})
+	}
 	if err != nil {
 		t.Fatalf("BuildCommitLayer: %v", err)
 	}
@@ -98,6 +149,20 @@ func buildClosureCase(t *testing.T, treeA, treeB map[string]string) closureCase 
 		composed: builderComposed(t, store, generationID),
 		flat:     flat,
 	}
+}
+
+type failFirstOpenSource struct {
+	source.ContentSource
+	path   string
+	failed bool
+}
+
+func (s *failFirstOpenSource) Open(path string) (io.ReadCloser, source.FileMeta, error) {
+	if path == s.path && !s.failed {
+		s.failed = true
+		return nil, source.FileMeta{}, errors.New("synthetic target-evidence read failure")
+	}
+	return s.ContentSource.Open(path)
 }
 
 // assertClosureCarries requires every named path to be in the closure — the
@@ -507,6 +572,9 @@ type closurePlanningBase struct {
 	outEdgeCalls   int
 	nodeCalls      int
 	afterFileNodes func()
+	afterInEdges   func()
+	afterOutEdges  func()
+	afterNodes     func()
 }
 
 func (b *closurePlanningBase) GetFileNodesByPaths(paths []string) map[string][]*graph.Node {
@@ -520,17 +588,29 @@ func (b *closurePlanningBase) GetFileNodesByPaths(paths []string) map[string][]*
 
 func (b *closurePlanningBase) GetInEdgesByNodeIDs(ids []string) map[string][]*graph.Edge {
 	b.inEdgeCalls++
-	return b.LayerBase.GetInEdgesByNodeIDs(ids)
+	edges := b.LayerBase.GetInEdgesByNodeIDs(ids)
+	if b.afterInEdges != nil {
+		b.afterInEdges()
+	}
+	return edges
 }
 
 func (b *closurePlanningBase) GetOutEdgesByNodeIDs(ids []string) map[string][]*graph.Edge {
 	b.outEdgeCalls++
-	return b.LayerBase.GetOutEdgesByNodeIDs(ids)
+	edges := b.LayerBase.GetOutEdgesByNodeIDs(ids)
+	if b.afterOutEdges != nil {
+		b.afterOutEdges()
+	}
+	return edges
 }
 
 func (b *closurePlanningBase) GetNodesByIDs(ids []string) map[string]*graph.Node {
 	b.nodeCalls++
-	return b.LayerBase.GetNodesByIDs(ids)
+	nodes := b.LayerBase.GetNodesByIDs(ids)
+	if b.afterNodes != nil {
+		b.afterNodes()
+	}
+	return nodes
 }
 
 func (b *closurePlanningBase) calls() int {
@@ -624,6 +704,71 @@ func TestAffectedClosureStopsAfterCanceledBaseRead(t *testing.T) {
 	}
 }
 
+func TestSemanticShapeAdjacencyStopsAfterEachCanceledBatch(t *testing.T) {
+	tests := []struct {
+		name string
+		hook func(*closurePlanningBase, context.CancelFunc)
+		want [4]int
+	}{
+		{
+			name: "in edges",
+			hook: func(base *closurePlanningBase, cancel context.CancelFunc) {
+				base.afterInEdges = cancel
+			},
+			want: [4]int{1, 1, 0, 0},
+		},
+		{
+			name: "out edges",
+			hook: func(base *closurePlanningBase, cancel context.CancelFunc) {
+				base.afterOutEdges = cancel
+			},
+			want: [4]int{1, 1, 1, 0},
+		},
+		{
+			name: "missing nodes",
+			hook: func(base *closurePlanningBase, cancel context.CancelFunc) {
+				base.afterNodes = cancel
+			},
+			want: [4]int{1, 1, 1, 1},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, base, req := benchmarkSemanticReverseFanoutFixture(1)
+			baseGraph := base.LayerBase.(*graph.Graph)
+			seedNodes := baseGraph.FindNodesByName("Seed")
+			if len(seedNodes) != 1 {
+				t.Fatalf("Seed nodes = %d, want 1", len(seedNodes))
+			}
+			const pathlessParamID = "builtin::int"
+			baseGraph.AddNode(&graph.Node{
+				ID: pathlessParamID, Name: "int", Kind: graph.KindParam,
+				Meta: map[string]any{"position": 0, "type": "int"},
+			})
+			baseGraph.AddEdge(&graph.Edge{
+				From: pathlessParamID, To: seedNodes[0].ID, Kind: graph.EdgeParamOf,
+			})
+
+			ctx, cancel := context.WithCancel(context.Background())
+			tt.hook(base, cancel)
+			_, err := builderSemanticSeedNodeIDs(
+				ctx,
+				req,
+				[]string{builderGraphPath(req.RepoPrefix, "seed.go")},
+				nil,
+				newBuilderSemanticTarget(map[string]struct{}{"seed.go": {}}),
+			)
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("builderSemanticSeedNodeIDs error = %v, want context.Canceled", err)
+			}
+			got := [4]int{base.fileNodeCalls, base.inEdgeCalls, base.outEdgeCalls, base.nodeCalls}
+			if got != tt.want {
+				t.Fatalf("base reads = %v, want %v; a read continued after cancellation", got, tt.want)
+			}
+		})
+	}
+}
+
 func BenchmarkSparsePlanningCanceledClosure(b *testing.B) {
 	const fileCount = 1000
 	builder, base, req := benchmarkClosurePlanningFixture(fileCount)
@@ -645,6 +790,243 @@ func BenchmarkSparsePlanningCanceledClosure(b *testing.B) {
 	}
 	b.StopTimer()
 	b.ReportMetric(float64(base.calls())/float64(b.N), "base_calls/op")
+}
+
+type semanticPlanningSource struct {
+	files  map[string]source.FileMeta
+	bodies map[string]string
+}
+
+func (s semanticPlanningSource) Open(path string) (io.ReadCloser, source.FileMeta, error) {
+	meta, ok := s.files[path]
+	if !ok {
+		return nil, source.FileMeta{}, source.ErrNotInSource
+	}
+	return io.NopCloser(strings.NewReader(s.bodies[path])), meta, nil
+}
+
+func (s semanticPlanningSource) Stat(path string) (source.FileMeta, error) {
+	meta, ok := s.files[path]
+	if !ok {
+		return source.FileMeta{}, source.ErrNotInSource
+	}
+	return meta, nil
+}
+
+func (s semanticPlanningSource) Walk(ctx context.Context, yield func(source.FileMeta) error) error {
+	for _, meta := range s.files {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := yield(meta); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (semanticPlanningSource) Identity() string { return "semantic-planning" }
+func (semanticPlanningSource) Close() error     { return nil }
+
+func benchmarkSemanticReverseFanoutFixture(fileCount int) (*SparseGenerationBuilder, *closurePlanningBase, BuildRequest) {
+	const (
+		repo     = "bench"
+		seedRel  = "seed.go"
+		seedPath = repo + "/" + seedRel
+		body     = "package fixture\n\nfunc Seed() {}\n"
+	)
+	extractor := languages.NewGoExtractor()
+	registry := parser.NewRegistry()
+	registry.Register(extractor)
+	result, err := safeExtractWithOptions(extractor, seedPath, []byte(body), parser.ExtractionOptions{})
+	if err != nil {
+		panic(err)
+	}
+	baseGraph := graph.New()
+	seedID := ""
+	for _, node := range result.Nodes {
+		baseGraph.AddNode(node)
+		if node != nil && node.Name == "Seed" && node.Kind == graph.KindFunction {
+			seedID = node.ID
+		}
+	}
+	for _, edge := range result.Edges {
+		baseGraph.AddEdge(edge)
+	}
+	if result.Tree != nil {
+		result.Tree.Close()
+	}
+	if seedID == "" {
+		panic("Go extraction did not produce Seed")
+	}
+	files := map[string]source.FileMeta{
+		seedRel: {Path: seedRel, Size: int64(len(body))},
+	}
+	for i := 0; i < fileCount; i++ {
+		rel := "dependent_" + strconv.Itoa(i) + ".go"
+		graphPath := repo + "/" + rel
+		id := graphPath + "::Dependent"
+		files[rel] = source.FileMeta{Path: rel, Size: 16}
+		baseGraph.AddNode(&graph.Node{
+			ID: id, Name: "Dependent", Kind: graph.KindFunction,
+			FilePath: graphPath, RepoPrefix: repo,
+		})
+		baseGraph.AddEdge(&graph.Edge{
+			From: id, To: seedID, Kind: graph.EdgeCalls, FilePath: graphPath,
+		})
+	}
+	base := &closurePlanningBase{LayerBase: baseGraph}
+	builder := &SparseGenerationBuilder{Registry: registry, Logger: zap.NewNop()}
+	builder.Config.AffectedByReresolveMax = fileCount + 1
+	return builder, base, BuildRequest{
+		Base: base,
+		Target: semanticPlanningSource{
+			files:  files,
+			bodies: map[string]string{seedRel: body},
+		},
+		RepoPrefix: repo,
+	}
+}
+
+func BenchmarkSparsePlanningUnchangedReverseFanout(b *testing.B) {
+	const fileCount = 900
+	builder, base, req := benchmarkSemanticReverseFanoutFixture(fileCount)
+	present := map[string]struct{}{"seed.go": {}}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		var report BuildReport
+		closure, err := builder.affectedClosureContext(context.Background(), req, present, nil, &report)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(closure) != 0 {
+			b.Fatalf("closure files = %d, want 0", len(closure))
+		}
+	}
+	b.StopTimer()
+	b.ReportMetric(float64(base.calls())/float64(b.N), "base_calls/op")
+}
+
+func TestSemanticReverseFanoutSkipsBodyOnlyChange(t *testing.T) {
+	builder, _, req := benchmarkSemanticReverseFanoutFixture(20)
+	var report BuildReport
+	closure, err := builder.affectedClosureContext(
+		context.Background(), req, map[string]struct{}{"seed.go": {}}, nil, &report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(closure) != 0 {
+		t.Fatalf("body-only closure = %v, want no reverse dependents", closure)
+	}
+}
+
+func TestSemanticReverseFanoutKeepsShapeChange(t *testing.T) {
+	const dependentCount = 20
+	builder, _, req := benchmarkSemanticReverseFanoutFixture(dependentCount)
+	target := req.Target.(semanticPlanningSource)
+	const changed = "package fixture\n\nfunc Seed(value int) {}\n"
+	target.bodies["seed.go"] = changed
+	target.files["seed.go"] = source.FileMeta{Path: "seed.go", Size: int64(len(changed))}
+	req.Target = target
+
+	var report BuildReport
+	closure, err := builder.affectedClosureContext(
+		context.Background(), req, map[string]struct{}{"seed.go": {}}, nil, &report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(closure) != dependentCount {
+		t.Fatalf("shape-change closure files = %d, want %d: %v", len(closure), dependentCount, closure)
+	}
+}
+
+func TestSemanticReverseFanoutFallsBackForDeletedFile(t *testing.T) {
+	const dependentCount = 20
+	builder, _, req := benchmarkSemanticReverseFanoutFixture(dependentCount)
+
+	var report BuildReport
+	closure, err := builder.affectedClosureContext(
+		context.Background(), req, nil, map[string]struct{}{"seed.go": {}}, &report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(closure) != dependentCount {
+		t.Fatalf("deleted-file fallback closure files = %d, want %d: %v", len(closure), dependentCount, closure)
+	}
+}
+
+func TestSemanticReverseFanoutFallsBackForIncompleteTargetExtraction(t *testing.T) {
+	const dependentCount = 20
+	builder, _, req := benchmarkSemanticReverseFanoutFixture(dependentCount)
+	builder.Registry = parser.NewRegistry()
+
+	var report BuildReport
+	closure, err := builder.affectedClosureContext(
+		context.Background(), req, map[string]struct{}{"seed.go": {}}, nil, &report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(closure) != dependentCount {
+		t.Fatalf("incomplete-target fallback closure files = %d, want %d: %v", len(closure), dependentCount, closure)
+	}
+}
+
+func TestSemanticReverseFanoutNamedPathlessBuiltinMatchesLegacy(t *testing.T) {
+	treeA := map[string]string{
+		"seed.go":   "package fixture\n\nfunc Seed(value int) int { return value }\n",
+		"caller.go": "package fixture\n\nfunc Caller() int { return Seed(1) }\n",
+	}
+	treeB := make(map[string]string, len(treeA))
+	for path, body := range treeA {
+		treeB[path] = body
+	}
+	treeB["seed.go"] = "package fixture\n\nfunc Seed(value int) int {\n\tnext := value\n\treturn next\n}\n"
+
+	optimized := buildClosureCase(t, treeA, treeB)
+	legacy := buildClosureCaseWithEvidenceFailure(t, treeA, treeB, "seed.go")
+	if slices.Contains(optimized.report.ClosurePaths, "caller.go") {
+		t.Fatalf("optimized body-only closure unexpectedly carries caller.go: %v", optimized.report.ClosurePaths)
+	}
+	assertClosureCarries(t, legacy.report, "caller.go")
+
+	pathlessInt := false
+	for _, node := range optimized.store.FindNodesByName("int") {
+		if node != nil && node.Name == "int" && node.FilePath == "" {
+			pathlessInt = true
+			break
+		}
+	}
+	if !pathlessInt {
+		t.Fatal("fixture has no named pathless int node; it does not cover resolution-insensitive shape parity")
+	}
+	// Compare the two generation strategies directly. The generic flat helper
+	// intentionally leaves workspace/project identity off pathless builtins,
+	// while sparse generations stamp the request identity; that fixture-only
+	// metadata difference is unrelated to reverse-fanout parity.
+	builderAssertReadersAgree(t, optimized.composed, legacy.composed)
+}
+
+func TestSemanticReverseFanoutBodyOnlyParity(t *testing.T) {
+	treeA := map[string]string{
+		"seed.go":   "package fixture\n\nfunc Seed() {}\n",
+		"caller.go": "package fixture\n\nfunc Caller() { Seed() }\n",
+		"other.go":  "package fixture\n\nfunc Other() { Seed() }\n",
+	}
+	treeB := make(map[string]string, len(treeA))
+	for path, body := range treeA {
+		treeB[path] = body
+	}
+	treeB["seed.go"] = "package fixture\n\nfunc Seed() {\n\t// body-only edit\n}\n"
+
+	c := buildClosureCase(t, treeA, treeB)
+	for _, path := range []string{"caller.go", "other.go"} {
+		if slices.Contains(c.report.ClosurePaths, path) {
+			t.Errorf("body-only closure unexpectedly carries %q: %v", path, c.report.ClosurePaths)
+		}
+	}
+	builderAssertReadersAgree(t, c.composed, c.flat)
 }
 
 func TestClosureTruncationNarrowsProducers(t *testing.T) {
