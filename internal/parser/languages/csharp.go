@@ -2427,20 +2427,12 @@ func normalizeCSharpTypeName(t string) string {
 	return t
 }
 
-// csharpFieldDeclType returns the verbatim declared type of a
-// field_declaration. The type is a field of the nested
-// variable_declaration node, not of the field_declaration itself, so a
-// direct ChildByFieldName("type") on the field_declaration is always nil.
-func csharpFieldDeclType(fieldDecl *sitter.Node, src []byte) string {
-	if t := csharpFieldDeclTypeNode(fieldDecl); t != nil {
-		return strings.TrimSpace(t.Content(src))
-	}
-	return ""
-}
-
-// csharpFieldDeclTypeNode is csharpFieldDeclType returning the type NODE —
-// the type-argument stamp derives its arguments from the parsed tree, not
-// from raw text, so trivia between tokens stays out of the identity.
+// csharpFieldDeclTypeNode returns the declared type NODE of a
+// field_declaration — the type-argument stamp derives its arguments from
+// the parsed tree, not from raw text, so trivia between tokens stays out
+// of the identity. The type is a field of the nested variable_declaration
+// node, not of the field_declaration itself, so a direct
+// ChildByFieldName("type") on the field_declaration is always nil.
 func csharpFieldDeclTypeNode(fieldDecl *sitter.Node) *sitter.Node {
 	if fieldDecl == nil {
 		return nil
