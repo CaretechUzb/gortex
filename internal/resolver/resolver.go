@@ -218,6 +218,18 @@ type Resolver struct {
 	// (filepathlite.Dir/Clean dominate). Read-only after build, so the
 	// workers share it lock-free.
 	dirByFilePath map[string]string
+	// retargetedTestCallFiles accumulates the caller files of EdgeCalls
+	// edges a resolution pass bound where the caller is test-classified
+	// (test file path, or an is_test-stamped source symbol). The test
+	// projection skips unresolved calls, so a call that resolves LATER
+	// needs its caller reconciled — but the definition-side derived plan
+	// never names the caller file. Consumers drain this frontier via
+	// TakeRetargetedTestCallFiles after resolution and re-run the scoped
+	// test projection over it. Guarded by retargetedMu: the parallel
+	// apply loop holds r.mu, but single-file passes and the deferred LSP
+	// apply note entries on their own paths.
+	retargetedMu            sync.Mutex
+	retargetedTestCallFiles map[string]struct{}
 	// importEdgeGen counts imports-kind edge writes noted while a resolve
 	// pass may hold pass-scoped import-adjacency retention. Write-site
 	// verdicts live at noteImportEdgeWrite's callers.
@@ -1057,6 +1069,9 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 				placeholderStart := time.Now()
 				reconcilePlaceholderSources(r.graph, &r.placeholderSrcIdx, reindexBatch)
 				applyPlaceholderElapsed += time.Since(placeholderStart)
+				for _, ri := range reindexBatch {
+					r.noteRetargetedCall(ri.Edge)
+				}
 				reindexTotal += len(reindexBatch)
 				if pageRevisionKnown {
 					// Ignore this pass's own committed mutations. A later delta
@@ -2750,6 +2765,9 @@ func (r *Resolver) applyIncrementalReindexesLocked(
 		// nil index: incremental batches are file-sized, direct probes
 		// stay under the single-save latency budget.
 		reconcilePlaceholderSources(r.graph, nil, reindexBatch)
+		for _, ri := range reindexBatch {
+			r.noteRetargetedCall(ri.Edge)
+		}
 	}
 	// Cross-package name-match guard — same contract as in ResolveAll.
 	if len(jobs) == 0 {

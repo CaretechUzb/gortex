@@ -490,6 +490,9 @@ func (r *Resolver) resolveDeferredLSPWithPassBudget(
 		r.noteImportEdgeReindexes(reindexBatch)
 		r.graph.ReindexEdges(reindexBatch)
 		reconcilePlaceholderSources(r.graph, &r.placeholderSrcIdx, reindexBatch)
+		for _, ri := range reindexBatch {
+			r.noteRetargetedCall(ri.Edge)
+		}
 	}
 	return result
 }
