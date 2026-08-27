@@ -2800,6 +2800,17 @@ func (mi *MultiIndexer) TrackRepoCtx(ctx context.Context, entry config.RepoEntry
 	// one graph, and every consumer that keyed on ownership — per-repo
 	// counters, scope filters, the nodes_by_repo partial index, warm-restart
 	// mtime lookups — had to carry a branch for the unprefixed shape.
+	// A worktree of a repository already tracked at this same commit is the
+	// same code under a different prefix. Duplicating that repository's
+	// subgraph installs it without parsing a file or deriving an edge; the
+	// copy declines (returning false) whenever anything about the situation
+	// is not exactly that, and indexing continues below.
+	if copied, ok, copyErr := mi.trackWorktreeByCopy(ctx, entry, absPath, prefix); copyErr != nil {
+		return nil, copyErr
+	} else if ok {
+		return copied, nil
+	}
+
 	idx := mi.newPerRepoIndexerForMutation(ctx, cfg.Index)
 	idx.SetRepoPrefix(prefix)
 	// Workspace / project slugs stamped on every node. Resolution
