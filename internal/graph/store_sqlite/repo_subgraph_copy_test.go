@@ -201,3 +201,39 @@ func TestCopyRepoSubgraph_RefusesAnOccupiedDestination(t *testing.T) {
 		t.Fatal("expected a copy into an existing repository to be refused")
 	}
 }
+
+// A copied repository that is complete in the graph but invisible to
+// `search_symbols` is not usable. The FTS corpus carries the source's node
+// ids, so it has to be rewritten and its docid map rebuilt.
+func TestCopyRepoSubgraph_CopiesTheSearchCorpus(t *testing.T) {
+	store := copyFixture(t)
+	tx, err := store.beginWrite()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO symbol_fts (node_id, repo_prefix, tokens) VALUES ('local/models/order.py::Order','local','Order order')`); err != nil {
+		_ = tx.Rollback()
+		t.Skipf("symbol_fts not present at this schema: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := store.CopyRepoSubgraph("local", "wt2"); err != nil {
+		t.Fatal(err)
+	}
+
+	got := copyIDs(t, store, `SELECT node_id FROM symbol_fts WHERE repo_prefix = 'wt2'`)
+	if len(got) != 1 || got[0] != "wt2/models/order.py::Order" {
+		t.Fatalf("search corpus not carried with rewritten ids: %v", got)
+	}
+	// The docid map must name the ids SQLite actually assigned, not the
+	// source's — a stale map makes every hit resolve to the wrong node.
+	mapped := copyIDs(t, store,
+		`SELECT r.node_id FROM symbol_fts_rowid r JOIN symbol_fts f ON f.rowid = r.fts_rowid
+		  WHERE r.repo_prefix = 'wt2' AND f.node_id = r.node_id`)
+	if len(mapped) != 1 {
+		t.Fatalf("symbol_fts_rowid does not agree with the copied corpus: %v", mapped)
+	}
+}

@@ -12,7 +12,8 @@ import (
 // independent of node ids, so a copy carries them verbatim under the new
 // prefix. They are exactly rekeyMoveTables, for the same reason recorded
 // there: every one is keyed by (repo_prefix, file_path) or (repo_prefix,
-// provider), never by node_id.
+// provider), never by node_id. The FTS corpora are handled separately by
+// copyFTSCorpora, which has to rewrite ids and re-map docids.
 //
 // The id-keyed sidecars and the FTS vtables are deliberately NOT copied.
 // Their rows carry the source's node ids, and an FTS5 corpus cannot be
@@ -164,11 +165,85 @@ func (s *Store) CopyRepoSubgraph(srcPrefix, dstPrefix string) (graph.RepoSubgrap
 		out.Sidecars += rowsAffected(res)
 	}
 
+	// The search corpora. These are the reason a copied repository would
+	// otherwise be complete in the graph and invisible to search: symbol_fts
+	// carries the source's node ids, so without a rewrite `search_symbols`
+	// returns nothing for the new prefix.
+	fts, err := copyFTSCorpora(tx, srcPrefix, dstPrefix, idExpr)
+	if err != nil {
+		return out, err
+	}
+	out.Sidecars += fts
+
 	if err := tx.Commit(); err != nil {
 		return out, err
 	}
 	s.markMutationReceiptsIncompleteLocked()
 	return out, nil
+}
+
+// copyFTSCorpora duplicates the FTS5 search corpora under the new prefix.
+//
+// Both are plain (not external-content) FTS5 tables, so rows can be inserted
+// directly and SQLite assigns fresh docids. The docid is exactly what cannot
+// be carried across — which is why a re-key drops these tables rather than
+// relabelling them — so each corpus is inserted first and its id-mapping
+// table is then rebuilt by reading back the docids SQLite chose.
+func copyFTSCorpora(tx txExecer, srcPrefix, dstPrefix string, idExpr func(string) (string, []any)) (int, error) {
+	copied := 0
+
+	symExpr, symArgs := idExpr("node_id")
+	args := append(append([]any{}, symArgs...), dstPrefix, srcPrefix)
+	res, err := tx.Exec(
+		`INSERT INTO symbol_fts (node_id, repo_prefix, tokens) `+
+			`SELECT `+symExpr+`, ?, tokens FROM symbol_fts WHERE repo_prefix = ?`, args...)
+	if err != nil {
+		return copied, fmt.Errorf("store_sqlite: CopyRepoSubgraph symbol_fts: %w", err)
+	}
+	copied += rowsAffected(res)
+
+	// Rebuild the node_id -> docid map from the docids just assigned.
+	res, err = tx.Exec(
+		`INSERT OR IGNORE INTO symbol_fts_rowid (node_id, repo_prefix, fts_rowid) `+
+			`SELECT node_id, repo_prefix, rowid FROM symbol_fts WHERE repo_prefix = ?`, dstPrefix)
+	if err != nil {
+		return copied, fmt.Errorf("store_sqlite: CopyRepoSubgraph symbol_fts_rowid: %w", err)
+	}
+	copied += rowsAffected(res)
+
+	// Without the normalization marker the destination reads as un-normalised
+	// and the corpus is rebuilt from scratch on the next pass.
+	if _, err := tx.Exec(
+		`INSERT OR IGNORE INTO symbol_fts_state (repo_prefix, normalization) `+
+			`SELECT ?, normalization FROM symbol_fts_state WHERE repo_prefix = ?`,
+		dstPrefix, srcPrefix); err != nil {
+		return copied, fmt.Errorf("store_sqlite: CopyRepoSubgraph symbol_fts_state: %w", err)
+	}
+
+	bodyExpr, bodyArgs := idExpr("node_id")
+	args = append(append([]any{}, bodyArgs...), dstPrefix, srcPrefix)
+	res, err = tx.Exec(
+		`INSERT INTO content_fts (node_id, repo_prefix, file_path, ordinal, body) `+
+			`SELECT `+bodyExpr+`, ?, file_path, ordinal, body FROM content_fts WHERE repo_prefix = ?`, args...)
+	if err != nil {
+		return copied, fmt.Errorf("store_sqlite: CopyRepoSubgraph content_fts: %w", err)
+	}
+	copied += rowsAffected(res)
+
+	res, err = tx.Exec(
+		`INSERT OR IGNORE INTO content_fts_rowid (fts_rowid, repo_prefix, file_path) `+
+			`SELECT rowid, repo_prefix, file_path FROM content_fts WHERE repo_prefix = ?`, dstPrefix)
+	if err != nil {
+		return copied, fmt.Errorf("store_sqlite: CopyRepoSubgraph content_fts_rowid: %w", err)
+	}
+	copied += rowsAffected(res)
+
+	return copied, nil
+}
+
+// txExecer is the slice of *sql.Tx copyFTSCorpora needs.
+type txExecer interface {
+	Exec(query string, args ...any) (sql.Result, error)
 }
 
 func rowsAffected(res sql.Result) int {
