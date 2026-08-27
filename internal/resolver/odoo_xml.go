@@ -23,7 +23,7 @@ var odooXMLEdgeKinds = []graph.EdgeKind{
 // for its own registry rows (`model_sale_order`, `field_x__y`,
 // `module_sale`); those bind through the implicit index as a fallback, so
 // a declared record always wins over the synthesized reading of a name.
-func bindOdooXMLIDs(g graph.Store, scope map[string]bool) int {
+func bindOdooXMLIDs(g graph.Store, edges []*graph.Edge, sc *odooSiblingCache) int {
 	// No early return on empty indexes: a full recompute must still run
 	// so edges whose target has left the graph are reset to their
 	// placeholders and their siblings retired.
@@ -37,40 +37,40 @@ func bindOdooXMLIDs(g graph.Store, scope map[string]bool) int {
 	// most corpora reference no implicit external ID at all.
 	var implicit *odooImplicitXMLIDs
 
-	odooCollect(g, scope, odooXMLVia, odooXMLEdgeKinds, func(e *graph.Edge) {
+	for _, e := range edges {
 		// A materialised fan-out sibling has no placeholder of its own;
 		// recomputing it would collapse the fan-out onto its first
 		// target, so it is reconciled as a set instead.
 		if odooIsFanout(e) {
 			observed[odooEdgeIdentityOf(e)] = e
-			return
+			continue
 		}
 		// A <function model= name=> edge carries both keys, so the
 		// method form is checked first.
 		if method := odooMetaString(e, "odoo_method"); method != "" {
 			model := odooMetaString(e, "odoo_model")
 			if model == "" {
-				return
+				continue
 			}
 			key := model + "." + method
 			plans = append(plans, odooBindPlan{
 				edge:        e,
-				target:      byMethod.lookup(g, e.From, key),
+				target:      byMethod.lookup(sc, e.From, key),
 				placeholder: odooMethodStubPrefix + key,
 			})
-			return
+			continue
 		}
 		xmlID := odooMetaString(e, "odoo_xml_id")
 		if xmlID == "" {
-			return
+			continue
 		}
-		target := odooLookupXMLID(g, byXMLID, e.From, xmlID)
+		target := odooLookupXMLID(sc, byXMLID, e.From, xmlID)
 		var siblings []string
 		if target == "" && odooIsImplicitXMLID(xmlID) {
 			if implicit == nil {
 				implicit = buildOdooImplicitXMLIDs(g)
 			}
-			if targets := odooDropSiblingCheckouts(g, e.From, implicit.lookup(xmlID)); len(targets) > 0 {
+			if targets := sc.keep(e.From, xmlID, implicit.lookup(xmlID)); len(targets) > 0 {
 				if len(targets) > odooFanoutCap {
 					targets = targets[:odooFanoutCap]
 				}
@@ -90,7 +90,7 @@ func bindOdooXMLIDs(g graph.Store, scope map[string]bool) int {
 			}
 			extra = append(extra, odooSiblingEdge(e, t))
 		}
-	})
+	}
 
 	resolved := odooRebind(g, plans, ConfidenceTyped)
 	// Only the implicit index ever fans out here — a declared external ID
@@ -104,12 +104,7 @@ func bindOdooXMLIDs(g graph.Store, scope map[string]bool) int {
 		if implicit == nil {
 			implicit = buildOdooImplicitXMLIDs(g)
 		}
-		for _, t := range implicit.lookup(xmlID) {
-			if t == e.To {
-				return false
-			}
-		}
-		return true
+		return !sc.declares(e.From, xmlID, implicit.lookup(xmlID), e.To)
 	}
 	odooReconcileFanout(g, observed, extra, odooBoundIdentities(plans), stale)
 	return resolved
@@ -154,11 +149,11 @@ func odooBareXMLID(xmlID string) string {
 
 // odooLookupXMLID resolves an external ID, preferring the exact form and
 // falling back to the bare name for the layout reasons above.
-func odooLookupXMLID(g graph.Store, idx odooIndex, fromID, xmlID string) string {
-	if target := idx.lookup(g, fromID, xmlID); target != "" {
+func odooLookupXMLID(sc *odooSiblingCache, idx odooIndex, fromID, xmlID string) string {
+	if target := idx.lookup(sc, fromID, xmlID); target != "" {
 		return target
 	}
-	return idx.lookup(g, fromID, odooBareXMLID(xmlID))
+	return idx.lookup(sc, fromID, odooBareXMLID(xmlID))
 }
 
 // odooModelMethodIndex maps "<model._name>.<method>" to the Python method

@@ -25,42 +25,42 @@ var odooJSEdgeKinds = []graph.EdgeKind{
 // bindOdooJS binds the three Odoo front-end placeholder families:
 // addon-aliased module imports, OWL component → QWeb template links, and
 // patched method overrides.
-func bindOdooJS(g graph.Store, scope map[string]bool) int {
+func bindOdooJS(g graph.Store, edges []*graph.Edge, sc *odooSiblingCache) int {
 	byModule := odooJSModuleIndex(g)
 	byTemplate := odooTemplateIndex(g)
 	byJSMethod := odooJSMethodIndex(g)
 
 	var plans []odooBindPlan
-	odooCollect(g, scope, odooJSVia, odooJSEdgeKinds, func(e *graph.Edge) {
+	for _, e := range edges {
 		if spec := odooMetaString(e, "odoo_js_import"); spec != "" {
 			plans = append(plans, odooBindPlan{
 				edge:        e,
-				target:      odooResolveJSModule(g, byModule, e.From, spec),
+				target:      odooResolveJSModule(sc, byModule, e.From, spec),
 				placeholder: odooJSModuleStubPrefix + spec,
 			})
-			return
+			continue
 		}
 		if tmpl := odooMetaString(e, "odoo_template"); tmpl != "" {
 			plans = append(plans, odooBindPlan{
 				edge:        e,
-				target:      odooLookupXMLID(g, byTemplate, e.From, tmpl),
+				target:      odooLookupXMLID(sc, byTemplate, e.From, tmpl),
 				placeholder: odooTemplateStubPrefix + tmpl,
 			})
-			return
+			continue
 		}
 		if method := odooMetaString(e, "odoo_patch_method"); method != "" {
 			target := odooMetaString(e, "odoo_patch_target")
 			if target == "" {
-				return
+				continue
 			}
 			key := target + "." + method
 			plans = append(plans, odooBindPlan{
 				edge:        e,
-				target:      byJSMethod.lookup(g, e.From, key),
+				target:      byJSMethod.lookup(sc, e.From, key),
 				placeholder: odooJSMethodStubPrefix + key,
 			})
 		}
-	})
+	}
 	return odooRebind(g, plans, ConfidenceTyped)
 }
 
@@ -77,11 +77,11 @@ func bindOdooJS(g graph.Store, scope map[string]bool) int {
 // cannot be computed from the specifier alone. That half of the index is
 // keyed on the (addon, module-relative path) pair every Odoo JS file node
 // already carries, which makes the join exact rather than a guess.
-func odooResolveJSModule(g graph.Store, byModule odooIndex, fromID, spec string) string {
+func odooResolveJSModule(sc *odooSiblingCache, byModule odooIndex, fromID, spec string) string {
 	if spec == "" {
 		return ""
 	}
-	if id := byModule.lookup(g, fromID, spec); id != "" {
+	if id := byModule.lookup(sc, fromID, spec); id != "" {
 		return id
 	}
 	spec = strings.TrimPrefix(spec, "@")
@@ -97,7 +97,7 @@ func odooResolveJSModule(g graph.Store, byModule odooIndex, fromID, spec string)
 	if !ok || addon == "" || rest == "" {
 		return ""
 	}
-	if id := byModule.lookup(g, fromID, addon+"/"+rest); id != "" {
+	if id := byModule.lookup(sc, fromID, addon+"/"+rest); id != "" {
 		return id
 	}
 	// `@web/../tests/helpers/utils` escapes the addon's `static/src` root.
@@ -113,7 +113,7 @@ func odooResolveJSModule(g graph.Store, byModule odooIndex, fromID, spec string)
 	if strings.HasPrefix(cleaned, "..") {
 		return "" // climbed out of the addon entirely
 	}
-	return byModule.lookup(g, fromID, addon+"/static/"+cleaned)
+	return byModule.lookup(sc, fromID, addon+"/static/"+cleaned)
 }
 
 // odooJSModuleIndex maps a module specifier to the file node providing

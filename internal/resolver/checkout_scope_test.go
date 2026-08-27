@@ -105,18 +105,21 @@ func TestOdooXMLIDBinding_PrefersOwnCheckout(t *testing.T) {
 // so its ordering rule is worth pinning directly.
 func TestOdooIndexLookup_Ordering(t *testing.T) {
 	g := siblingGraph(t)
+	// The binders share one cache per pass; the ordering rule it serves
+	// must be identical to asking the store directly.
+	sc := newOdooSiblingCache(g)
 	ix := odooIndex{}
 	ix.put("k", "local-bench/a.py::X")
 	ix.put("k", "local/b.py::X")
 	ix.put("k", "core/c.py::X")
 
-	assert.Equal(t, "local/b.py::X", ix.lookup(g, "local/caller.py::C", "k"),
+	assert.Equal(t, "local/b.py::X", ix.lookup(sc, "local/caller.py::C", "k"),
 		"the asking repository wins outright")
-	assert.Equal(t, "local-bench/a.py::X", ix.lookup(g, "local-bench/caller.py::C", "k"),
+	assert.Equal(t, "local-bench/a.py::X", ix.lookup(sc, "local-bench/caller.py::C", "k"),
 		"the rule is symmetric — each checkout resolves inside itself")
-	assert.Equal(t, "core/c.py::X", ix.lookup(g, "addons/caller.py::C", "k"),
+	assert.Equal(t, "core/c.py::X", ix.lookup(sc, "addons/caller.py::C", "k"),
 		"an unrelated repository falls back to the lowest ID")
-	assert.Equal(t, "", ix.lookup(g, "local/caller.py::C", "missing"))
+	assert.Equal(t, "", ix.lookup(sc, "local/caller.py::C", "missing"))
 
 	// The case the sibling rule exists for: the asking checkout declares
 	// nothing, so the fallback runs — and must step over the duplicate in
@@ -124,7 +127,7 @@ func TestOdooIndexLookup_Ordering(t *testing.T) {
 	sib := odooIndex{}
 	sib.put("k", "local/a.py::X")
 	sib.put("k", "core/z.py::X")
-	assert.Equal(t, "core/z.py::X", sib.lookup(g, "local-bench/caller.py::C", "k"),
+	assert.Equal(t, "core/z.py::X", sib.lookup(sc, "local-bench/caller.py::C", "k"),
 		"a sibling checkout is never the fallback target")
 }
 

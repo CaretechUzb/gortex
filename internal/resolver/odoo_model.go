@@ -24,7 +24,7 @@ var odooModelEdgeKinds = []graph.EdgeKind{
 // them would silently hide the others, so every declaring class is bound.
 // The first target keeps the original edge; the rest are materialised as
 // sibling edges.
-func bindOdooModels(g graph.Store, scope map[string]bool) int {
+func bindOdooModels(g graph.Store, edges []*graph.Edge, sc *odooSiblingCache) int {
 	// No early return on an empty index: a full recompute must still run
 	// so edges whose declaring class has left the graph are reset to
 	// their placeholders and their siblings retired, rather than left
@@ -35,22 +35,22 @@ func bindOdooModels(g graph.Store, scope map[string]bool) int {
 	var extra []*graph.Edge
 	observed := map[odooEdgeIdentity]*graph.Edge{}
 
-	odooCollect(g, scope, odooModelVia, odooModelEdgeKinds, func(e *graph.Edge) {
+	for _, e := range edges {
 		if odooIsFanout(e) {
 			// Recomputing a sibling would collapse the fan-out onto its
 			// first target; it is reconciled as a set instead.
 			observed[odooEdgeIdentityOf(e)] = e
-			return
+			continue
 		}
 		model := odooMetaString(e, "odoo_model")
 		if model == "" {
-			return
+			continue
 		}
 		placeholder := odooModelStubPrefix + model
-		targets := odooDropSiblingCheckouts(g, e.From, byModel[model])
+		targets := sc.keep(e.From, model, byModel[model])
 		if len(targets) == 0 {
 			plans = append(plans, odooBindPlan{edge: e, placeholder: placeholder})
-			return
+			continue
 		}
 		if len(targets) > odooFanoutCap {
 			targets = targets[:odooFanoutCap]
@@ -64,7 +64,7 @@ func bindOdooModels(g graph.Store, scope map[string]bool) int {
 			}
 			extra = append(extra, odooSiblingEdge(e, t))
 		}
-	})
+	}
 
 	resolved := odooRebind(g, plans, ConfidenceTyped)
 	// A sibling is stale once its target stops being one of the classes
@@ -75,12 +75,7 @@ func bindOdooModels(g graph.Store, scope map[string]bool) int {
 		if model == "" {
 			return false
 		}
-		for _, t := range byModel[model] {
-			if t == e.To {
-				return false
-			}
-		}
-		return true
+		return !sc.declares(e.From, model, byModel[model], e.To)
 	}
 	odooReconcileFanout(g, observed, extra, odooBoundIdentities(plans), stale)
 	return resolved
