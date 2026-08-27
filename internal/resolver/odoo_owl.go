@@ -25,10 +25,10 @@ var odooJSEdgeKinds = []graph.EdgeKind{
 // bindOdooJS binds the three Odoo front-end placeholder families:
 // addon-aliased module imports, OWL component → QWeb template links, and
 // patched method overrides.
-func bindOdooJS(g graph.Store, edges []*graph.Edge, sc *odooSiblingCache) int {
-	byModule := odooJSModuleIndex(g)
-	byTemplate := odooTemplateIndex(g)
-	byJSMethod := odooJSMethodIndex(g)
+func bindOdooJS(g graph.Store, edges []*graph.Edge, sc *odooSiblingCache, d *odooDecls) int {
+	byModule := d.jsModules
+	byTemplate := d.templates
+	byJSMethod := d.jsMethods
 
 	var plans []odooBindPlan
 	for _, e := range edges {
@@ -116,43 +116,6 @@ func odooResolveJSModule(sc *odooSiblingCache, byModule odooIndex, fromID, spec 
 	return byModule.lookup(sc, fromID, addon+"/static/"+cleaned)
 }
 
-// odooJSModuleIndex maps a module specifier to the file node providing
-// it, under both vocabularies odooResolveJSModule accepts.
-//
-// Modern modules are keyed "<addon>/<module-relative path>": Odoo client
-// assets always live at `<addon>/static/src/<rest>`, so the key is
-// recovered by stripping that prefix and the file extension. Legacy
-// modules are keyed on the name the file passed to `odoo.define(...)`,
-// which the extractor captured onto the file node — nothing about the
-// path implies it. The two key shapes cannot collide: a legacy name is
-// dotted and a modern key is slashed.
-func odooJSModuleIndex(g graph.Store) odooIndex {
-	out := odooIndex{}
-	put := out.put
-	for n := range g.NodesByKind(graph.KindFile) {
-		if n == nil || n.Meta == nil {
-			continue
-		}
-		legacy, _ := n.Meta["odoo_js_legacy_name"].(string)
-		put(legacy, n.ID)
-		addon, _ := n.Meta["odoo_js_addon"].(string)
-		if addon == "" {
-			continue
-		}
-		if rest, ok := odooJSModuleRelPath(n.FilePath, addon); ok {
-			put(addon+"/"+rest, n.ID)
-		}
-		// The escape-form key, for specifiers that climb out of
-		// `static/src` (see odooResolveJSModule). Kept distinct by its
-		// literal `static/` segment, which a module-relative key never
-		// has.
-		if rest, ok := odooJSStaticRelPath(n.FilePath, addon); ok {
-			put(addon+"/static/"+rest, n.ID)
-		}
-	}
-	return out
-}
-
 // odooJSModuleRelPath extracts the part of a path after
 // `<addon>/static/src/`, without its extension.
 func odooJSModuleRelPath(filePath, addon string) (string, bool) {
@@ -184,66 +147,4 @@ func odooJSPathAfter(filePath, marker string) (string, bool) {
 		}
 	}
 	return rest, true
-}
-
-// odooTemplateIndex maps a QWeb template name to the XML node declaring
-// it — the link between an OWL component and its markup.
-//
-// Indexed under both the qualified and bare forms for the same reason as
-// odooXMLIDIndex: a `<template id="OrderWidget">` picks up its module
-// prefix from the file path, while the JS side always names the template
-// fully qualified (`static template = "sale.OrderWidget"`). Without the
-// bare fallback the two never meet in a repository that is itself a
-// single addon.
-func odooTemplateIndex(g graph.Store) odooIndex {
-	out := odooIndex{}
-	put := out.put
-	for n := range g.NodesByKind(graph.KindResource) {
-		if n == nil || n.Meta == nil {
-			continue
-		}
-		tmpl, _ := n.Meta["odoo_template"].(string)
-		if tmpl == "" {
-			continue
-		}
-		put(tmpl, n.ID)
-		put(odooBareXMLID(tmpl), n.ID)
-	}
-	return out
-}
-
-// odooJSMethodIndex maps "<ClassName>.<method>" to the method node a
-// patch(...) call overrides.
-func odooJSMethodIndex(g graph.Store) odooIndex {
-	classNames := map[string]string{}
-	for n := range g.NodesByKind(graph.KindType) {
-		if n == nil || n.Name == "" {
-			continue
-		}
-		if n.Language != "javascript" && n.Language != "typescript" {
-			continue
-		}
-		if prev, ok := classNames[n.ID]; !ok || n.Name < prev {
-			classNames[n.ID] = n.Name
-		}
-	}
-	if len(classNames) == 0 {
-		return nil
-	}
-	out := odooIndex{}
-	for n := range g.NodesByKind(graph.KindMethod) {
-		if n == nil || n.Name == "" {
-			continue
-		}
-		idx := strings.LastIndex(n.ID, ".")
-		if idx <= 0 {
-			continue
-		}
-		className := classNames[n.ID[:idx]]
-		if className == "" {
-			continue
-		}
-		out.put(className+"."+n.Name, n.ID)
-	}
-	return out
 }

@@ -85,17 +85,25 @@ func ResolveOdooRefsScoped(g graph.Store, scope map[string]bool) int {
 	// makes the single walk safe: no family is streaming the edge
 	// buckets while another rewrites targets underneath it.
 	//
-	// Only the EDGE collection moves. Each binder still builds its own
-	// node indexes at its own point in the sequence, so the ordering
-	// contract above is untouched.
+	// Only the EDGE collection moves here; the ordering contract above is
+	// untouched, because binding order is what enforces it and that is
+	// unchanged.
 	models := &odooFamily{via: odooModelVia, kinds: odooModelEdgeKinds}
 	xmlIDs := &odooFamily{via: odooXMLVia, kinds: odooXMLEdgeKinds}
 	js := &odooFamily{via: odooJSVia, kinds: odooJSEdgeKinds}
 	odooCollectFamilies(g, scope, models, xmlIDs, js)
 
-	n := bindOdooModels(g, models.edges, sc)
-	n += bindOdooXMLIDs(g, xmlIDs.edges, sc)
-	n += bindOdooJS(g, js.edges, sc)
+	// The declaration indexes every binder looks through, likewise built
+	// once for the whole pass rather than once per binder. They are
+	// whole-store by construction — a reference in one repository binds
+	// to a declaration in another — so a scoped pass pays for them in
+	// full and the only thing that helps is not paying eleven times over.
+	// See odoo_decl_index.go.
+	decls := buildOdooDecls(g)
+
+	n := bindOdooModels(g, models.edges, sc, decls)
+	n += bindOdooXMLIDs(g, xmlIDs.edges, sc, decls)
+	n += bindOdooJS(g, js.edges, sc, decls)
 	return n
 }
 

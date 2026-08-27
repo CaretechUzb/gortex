@@ -154,7 +154,7 @@ func TestOdooImplicitXMLIDs_IgnoresForeignModuleNodes(t *testing.T) {
 	g.AddNode(&graph.Node{
 		ID: "module::npm:sale@1.0.0", Kind: graph.KindModule, Name: "sale",
 	})
-	assert.Empty(t, buildOdooImplicitXMLIDs(g).lookup("base.module_sale"))
+	assert.Empty(t, buildOdooDecls(g).implicit.lookup("base.module_sale"))
 }
 
 // A declared record wins: the implicit index is only ever a fallback.

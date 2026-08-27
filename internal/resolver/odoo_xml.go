@@ -23,19 +23,20 @@ var odooXMLEdgeKinds = []graph.EdgeKind{
 // for its own registry rows (`model_sale_order`, `field_x__y`,
 // `module_sale`); those bind through the implicit index as a fallback, so
 // a declared record always wins over the synthesized reading of a name.
-func bindOdooXMLIDs(g graph.Store, edges []*graph.Edge, sc *odooSiblingCache) int {
+func bindOdooXMLIDs(g graph.Store, edges []*graph.Edge, sc *odooSiblingCache, d *odooDecls) int {
 	// No early return on empty indexes: a full recompute must still run
 	// so edges whose target has left the graph are reset to their
 	// placeholders and their siblings retired.
-	byXMLID := odooXMLIDIndex(g)
-	byMethod := odooModelMethodIndex(g)
+	byXMLID := d.xmlIDs
+	byMethod := d.modelMethods
 
 	var plans []odooBindPlan
 	var extra []*graph.Edge
 	observed := map[odooEdgeIdentity]*graph.Edge{}
-	// Built on first use: the implicit index costs three node scans and
-	// most corpora reference no implicit external ID at all.
-	var implicit *odooImplicitXMLIDs
+	// The implicit index used to be built on first use, because it cost
+	// three more whole-store node scans. It now rides the same two walks
+	// as every other declaration index, so it is simply here.
+	implicit := d.implicit
 
 	for _, e := range edges {
 		// A materialised fan-out sibling has no placeholder of its own;
@@ -67,9 +68,6 @@ func bindOdooXMLIDs(g graph.Store, edges []*graph.Edge, sc *odooSiblingCache) in
 		target := odooLookupXMLID(sc, byXMLID, e.From, xmlID)
 		var siblings []string
 		if target == "" && odooIsImplicitXMLID(xmlID) {
-			if implicit == nil {
-				implicit = buildOdooImplicitXMLIDs(g)
-			}
 			if targets := sc.keep(e.From, xmlID, implicit.lookup(xmlID)); len(targets) > 0 {
 				if len(targets) > odooFanoutCap {
 					targets = targets[:odooFanoutCap]
@@ -101,42 +99,10 @@ func bindOdooXMLIDs(g graph.Store, edges []*graph.Edge, sc *odooSiblingCache) in
 		if xmlID == "" || !odooIsImplicitXMLID(xmlID) {
 			return false
 		}
-		if implicit == nil {
-			implicit = buildOdooImplicitXMLIDs(g)
-		}
 		return !sc.declares(e.From, xmlID, implicit.lookup(xmlID), e.To)
 	}
 	odooReconcileFanout(g, observed, extra, odooBoundIdentities(plans), stale)
 	return resolved
-}
-
-// odooXMLIDIndex maps an external ID to the record / template / menu node
-// declaring it. A duplicate external ID is an Odoo error, so the first
-// (deterministically lowest) ID wins rather than fanning out.
-//
-// Records are indexed under BOTH their qualified and bare forms. The
-// module prefix is derived from the file path, and a repository that IS a
-// single addon has no `<addon>/` segment in its repo-relative paths — so
-// the same view can be declared bare and referenced qualified (or the
-// reverse) purely because of repository layout. Indexing both forms makes
-// the binding layout-independent; odooLookupXMLID still prefers an exact
-// match, so a genuine cross-module reference is never mis-bound to a
-// same-named record in another addon when the exact one exists.
-func odooXMLIDIndex(g graph.Store) odooIndex {
-	out := odooIndex{}
-	put := out.put
-	for n := range g.NodesByKind(graph.KindResource) {
-		if n == nil || n.Meta == nil {
-			continue
-		}
-		xmlID, _ := n.Meta["odoo_xml_id"].(string)
-		if xmlID == "" {
-			continue
-		}
-		put(xmlID, n.ID)
-		put(odooBareXMLID(xmlID), n.ID)
-	}
-	return out
 }
 
 // odooBareXMLID drops a module prefix: `sale.view_order` -> `view_order`.
@@ -154,42 +120,4 @@ func odooLookupXMLID(sc *odooSiblingCache, idx odooIndex, fromID, xmlID string) 
 		return target
 	}
 	return idx.lookup(sc, fromID, odooBareXMLID(xmlID))
-}
-
-// odooModelMethodIndex maps "<model._name>.<method>" to the Python method
-// node implementing it, so `<function model="sale.order" name="_do">`
-// lands on real code.
-//
-// The join runs class → method rather than the reverse because a method
-// node knows only its class, while the `_name` lives on the class.
-func odooModelMethodIndex(g graph.Store) odooIndex {
-	classModel := map[string]string{}
-	for n := range g.NodesByKind(graph.KindType) {
-		if n == nil || n.Meta == nil {
-			continue
-		}
-		if model, _ := n.Meta["odoo_model"].(string); model != "" {
-			classModel[n.ID] = model
-		}
-	}
-	if len(classModel) == 0 {
-		return nil
-	}
-	out := odooIndex{}
-	for n := range g.NodesByKind(graph.KindMethod) {
-		if n == nil || n.Name == "" {
-			continue
-		}
-		// Python method node IDs are shaped "<classID>.<method>".
-		idx := strings.LastIndex(n.ID, ".")
-		if idx <= 0 {
-			continue
-		}
-		model := classModel[n.ID[:idx]]
-		if model == "" {
-			continue
-		}
-		out.put(model+"."+n.Name, n.ID)
-	}
-	return out
 }

@@ -1,10 +1,6 @@
 package resolver
 
-import (
-	"sort"
-
-	"github.com/zzet/gortex/internal/graph"
-)
+import "github.com/zzet/gortex/internal/graph"
 
 // odooModelEdgeKinds are the kinds an `odoo-model` placeholder rides:
 // _inherit is specialisation, _inherits is composition, and a comodel or
@@ -24,12 +20,12 @@ var odooModelEdgeKinds = []graph.EdgeKind{
 // them would silently hide the others, so every declaring class is bound.
 // The first target keeps the original edge; the rest are materialised as
 // sibling edges.
-func bindOdooModels(g graph.Store, edges []*graph.Edge, sc *odooSiblingCache) int {
+func bindOdooModels(g graph.Store, edges []*graph.Edge, sc *odooSiblingCache, d *odooDecls) int {
 	// No early return on an empty index: a full recompute must still run
 	// so edges whose declaring class has left the graph are reset to
 	// their placeholders and their siblings retired, rather than left
 	// pointing at a node that is gone.
-	byModel := odooModelIndex(g)
+	byModel := d.models
 
 	var plans []odooBindPlan
 	var extra []*graph.Edge
@@ -98,24 +94,4 @@ func odooSiblingEdge(src *graph.Edge, target string) *graph.Edge {
 		ConfidenceLabel: graph.ConfidenceLabelFor(src.Kind, ConfidenceTyped),
 		Meta:            meta,
 	}
-}
-
-// odooModelIndex maps an Odoo model `_name` to every class node declaring
-// it. Targets are sorted so a fan-out binds deterministically across runs.
-func odooModelIndex(g graph.Store) map[string][]string {
-	out := map[string][]string{}
-	for n := range g.NodesByKind(graph.KindType) {
-		if n == nil || n.Meta == nil {
-			continue
-		}
-		model, _ := n.Meta["odoo_model"].(string)
-		if model == "" {
-			continue
-		}
-		out[model] = append(out[model], n.ID)
-	}
-	for _, ids := range out {
-		sort.Strings(ids)
-	}
-	return out
 }

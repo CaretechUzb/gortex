@@ -1,10 +1,7 @@
 package resolver
 
 import (
-	"sort"
 	"strings"
-
-	"github.com/zzet/gortex/internal/graph"
 )
 
 // Implicit Odoo external IDs.
@@ -84,68 +81,6 @@ func odooIsImplicitXMLID(xmlID string) bool {
 	return strings.HasPrefix(local, odooImplicitModelPrefix) ||
 		strings.HasPrefix(local, odooImplicitFieldPrefix) ||
 		strings.HasPrefix(local, odooImplicitModulePrefix)
-}
-
-// buildOdooImplicitXMLIDs indexes every model, field and addon the graph
-// knows under the external ID the ORM would mint for it.
-func buildOdooImplicitXMLIDs(g graph.Store) *odooImplicitXMLIDs {
-	idx := &odooImplicitXMLIDs{
-		models:  map[string][]string{},
-		fields:  map[string]string{},
-		modules: map[string]string{},
-	}
-	if g == nil {
-		return idx
-	}
-
-	// classModel is built in the same walk the model index needs, so the
-	// field join below costs one extra scan rather than two.
-	classModel := map[string]string{}
-	for n := range g.NodesByKind(graph.KindType) {
-		if n == nil || n.Meta == nil {
-			continue
-		}
-		model, _ := n.Meta["odoo_model"].(string)
-		if model == "" {
-			continue
-		}
-		classModel[n.ID] = model
-		key := odooImplicitXMLIDKey(model)
-		idx.models[key] = append(idx.models[key], n.ID)
-	}
-	for _, ids := range idx.models {
-		sort.Strings(ids)
-	}
-
-	if len(classModel) > 0 {
-		for n := range g.NodesByKind(graph.KindField) {
-			if n == nil || n.Name == "" {
-				continue
-			}
-			cut := strings.LastIndex(n.ID, odooFieldIDSep)
-			if cut <= 0 {
-				continue
-			}
-			model := classModel[n.ID[:cut]]
-			if model == "" {
-				continue
-			}
-			key := odooImplicitXMLIDKey(model) + "__" + n.Name
-			if prev, ok := idx.fields[key]; !ok || n.ID < prev {
-				idx.fields[key] = n.ID
-			}
-		}
-	}
-
-	for n := range g.NodesByKind(graph.KindModule) {
-		if n == nil || n.Name == "" || !strings.Contains(n.ID, odooModuleIDMarker) {
-			continue
-		}
-		if prev, ok := idx.modules[n.Name]; !ok || n.ID < prev {
-			idx.modules[n.Name] = n.ID
-		}
-	}
-	return idx
 }
 
 // lookup returns every node the implicit external ID denotes. Only the
