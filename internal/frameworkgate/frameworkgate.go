@@ -183,25 +183,65 @@ func Union(a, b Set) Set {
 // Intersect returns the Set allowing only what BOTH inputs allow. It is
 // the strict counterpart to Union, for callers that own a single graph
 // scope and want the narrowest admission rather than the safest.
+//
+// The intersection is taken over what the Sets MATCH, not over how they
+// are spelled. Comparing raw patterns made Intersect disagree with
+// Allows on every wildcard: `*` ∩ `django` is `django`, not nothing, and
+// `godot*` ∩ `godot-autoload` is `godot-autoload`, but a string
+// comparison finds no shared entry in either pair and narrows to
+// AllowNone — the silent-blinding direction this package exists to keep
+// out of the graph.
 func Intersect(a, b Set) Set {
-	if !a.configured {
+	if !a.configured || a.all {
 		return b
 	}
-	if !b.configured {
+	if !b.configured || b.all {
 		return a
 	}
-	inB := make(map[string]bool, len(b.raw))
-	for _, p := range b.raw {
-		inB[strings.ToLower(p)] = true
-	}
 	var keep []string
+	seen := map[string]bool{}
+	add := func(p string) {
+		lowered := strings.ToLower(p)
+		if seen[lowered] {
+			return
+		}
+		seen[lowered] = true
+		keep = append(keep, p)
+	}
+	// An exact name survives if the other side admits it, by whichever
+	// rule — an equal name or a prefix that covers it.
 	for _, p := range a.raw {
-		if inB[strings.ToLower(p)] {
-			keep = append(keep, p)
+		if !isWildcardPattern(p) && b.Allows(p) {
+			add(p)
+		}
+	}
+	for _, p := range b.raw {
+		if !isWildcardPattern(p) && a.Allows(p) {
+			add(p)
+		}
+	}
+	// Two prefixes overlap only when one stem extends the other, and the
+	// longer stem is then exactly their intersection. Disjoint stems
+	// (`godot*` ∩ `django*`) share nothing and contribute nothing.
+	for _, pa := range a.prefix {
+		for _, pb := range b.prefix {
+			switch {
+			case strings.HasPrefix(pa, pb):
+				add(pa + "*")
+			case strings.HasPrefix(pb, pa):
+				add(pb + "*")
+			}
 		}
 	}
 	if len(keep) == 0 {
 		return AllowNone()
 	}
 	return New(keep)
+}
+
+// isWildcardPattern reports whether an entry is written as a prefix match
+// rather than an exact name. Prefix stems intersect by containment, not by
+// membership, so the two forms are combined separately.
+func isWildcardPattern(p string) bool {
+	return strings.HasSuffix(strings.ToLower(strings.TrimSpace(p)), "*")
 }

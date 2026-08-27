@@ -3,6 +3,8 @@ package contracts
 import (
 	"strings"
 	"testing"
+
+	"github.com/zzet/gortex/internal/frameworkgate"
 )
 
 func odooContracts(t *testing.T, src string) []Contract {
@@ -175,6 +177,61 @@ func TestOdooRoutes_BoolKwargs(t *testing.T) {
 	}
 	if meta["odoo_csrf"] != false {
 		t.Errorf("odoo_csrf = %v, want false", meta["odoo_csrf"])
+	}
+}
+
+// `@http.route(...)` is claimed by BOTH the flask-decorator pass (whose
+// regex is `@(\w+)\.route\(`) and the odoo pass. The registry unions its
+// passes with no dedup, so before the flask pass yielded on an `http`
+// receiver the single-string form minted two contracts under the same ID
+// with conflicting frameworks — and whichever landed last won.
+func TestOdooRoutes_SingleStringFormIsNotAlsoClaimedByFlask(t *testing.T) {
+	src := `
+class Main(http.Controller):
+    @http.route('/shop', type='http', auth='public')
+    def shop(self):
+        return None
+`
+	ctx := &RouteExtractCtx{
+		FilePath: "controllers/main.py", Src: []byte(src), Text: src,
+		Lines: strings.Split(src, "\n"), Lang: "python", H: &HTTPExtractor{},
+	}
+	cs := runFrameworkRoutePasses(ctx)
+	seen := map[string]int{}
+	for _, c := range cs {
+		seen[c.ID]++
+		if c.Meta["framework"] == "flask" {
+			t.Errorf("%s attributed to flask, want odoo: %v", c.ID, c.Meta)
+		}
+	}
+	if seen["http::GET::/shop"] != 1 {
+		t.Errorf("http::GET::/shop emitted %d times, want 1: %v", seen["http::GET::/shop"], odooContractIDs(cs))
+	}
+	// Odoo's method-less default must survive the hand-over.
+	if seen["http::POST::/shop"] != 1 {
+		t.Errorf("odoo POST default lost, got %v", odooContractIDs(cs))
+	}
+}
+
+// Excluding `odoo` must hand the route back to flask rather than drop it:
+// the yield above is gated on the odoo pass actually being allowed to run.
+func TestFlaskDecorator_KeepsHTTPReceiverWhenOdooExcluded(t *testing.T) {
+	src := `
+    @http.route('/shop', methods=['GET'])
+    def shop():
+        return None
+`
+	ctx := &RouteExtractCtx{
+		FilePath: "app.py", Src: []byte(src), Text: src,
+		Lines: strings.Split(src, "\n"), Lang: "python",
+		H: &HTTPExtractor{AllowedFrameworks: frameworkgate.New([]string{"flask-decorator"})},
+	}
+	cs := runFrameworkRoutePasses(ctx)
+	if !hasOdooRoute(cs, "http::GET::/shop") {
+		t.Fatalf("route dropped when odoo pass is excluded, got %v", odooContractIDs(cs))
+	}
+	if got := odooRouteMeta(t, cs, "http::GET::/shop")["framework"]; got != "flask" {
+		t.Errorf("framework = %v, want flask", got)
 	}
 }
 

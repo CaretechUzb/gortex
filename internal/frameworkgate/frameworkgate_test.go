@@ -204,3 +204,94 @@ func TestIntersect_DisjointAllowsNothing(t *testing.T) {
 		t.Error("a disjoint intersection is an explicit empty admission, not 'unset'")
 	}
 }
+
+// Intersect must agree with Allows. Comparing raw pattern strings made it
+// disagree on every wildcard — "allow everything" ∩ "django" came back as
+// AllowNone, the silent-blinding direction this package exists to avoid.
+func TestIntersect_RespectsWildcardSemantics(t *testing.T) {
+	cases := []struct {
+		name   string
+		a, b   []string
+		allow  []string
+		refuse []string
+	}{
+		{
+			name:  "explicit star is the identity",
+			a:     []string{"*"},
+			b:     []string{"django"},
+			allow: []string{"django"}, refuse: []string{"flask"},
+		},
+		{
+			name:  "star on the right is the identity too",
+			a:     []string{"django"},
+			b:     []string{"*"},
+			allow: []string{"django"}, refuse: []string{"flask"},
+		},
+		{
+			name:  "prefix covers an exact name",
+			a:     []string{"godot*"},
+			b:     []string{"godot-autoload"},
+			allow: []string{"godot-autoload"}, refuse: []string{"godot-scene", "flask"},
+		},
+		{
+			name:  "nested prefixes narrow to the longer stem",
+			a:     []string{"godot*"},
+			b:     []string{"god*"},
+			allow: []string{"godot-autoload"}, refuse: []string{"godzilla"},
+		},
+		{
+			name:   "disjoint prefixes share nothing",
+			a:      []string{"godot*"},
+			b:      []string{"django*"},
+			refuse: []string{"godot-autoload", "django-urls"},
+		},
+		{
+			name:  "plain exact intersection still works",
+			a:     []string{"flask", "django"},
+			b:     []string{"django", "rails"},
+			allow: []string{"django"}, refuse: []string{"flask", "rails"},
+		},
+		{
+			name:   "AllowNone stays none",
+			a:      []string{"none"},
+			b:      []string{"django"},
+			refuse: []string{"django"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := Intersect(New(tc.a), New(tc.b))
+			for _, name := range tc.allow {
+				if !got.Allows(name) {
+					t.Errorf("Intersect(%v, %v).Allows(%q) = false, want true", tc.a, tc.b, name)
+				}
+			}
+			for _, name := range tc.refuse {
+				if got.Allows(name) {
+					t.Errorf("Intersect(%v, %v).Allows(%q) = true, want false", tc.a, tc.b, name)
+				}
+			}
+		})
+	}
+}
+
+// Intersect must admit exactly what both sides admit, for every name.
+func TestIntersect_MatchesAllowsConjunction(t *testing.T) {
+	sets := [][]string{
+		{"*"}, {"none"}, {"django"}, {"godot*"}, {"god*"},
+		{"flask", "django"}, {"godot*", "flask"},
+	}
+	names := []string{"django", "flask", "rails", "godot-autoload", "godot-scene", "godzilla"}
+	for _, a := range sets {
+		for _, b := range sets {
+			sa, sb := New(a), New(b)
+			got := Intersect(sa, sb)
+			for _, n := range names {
+				want := sa.Allows(n) && sb.Allows(n)
+				if got.Allows(n) != want {
+					t.Errorf("Intersect(%v, %v).Allows(%q) = %v, want %v", a, b, n, got.Allows(n), want)
+				}
+			}
+		}
+	}
+}

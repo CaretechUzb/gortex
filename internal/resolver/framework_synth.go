@@ -1707,13 +1707,19 @@ func runClaimingResolversScopedCounted(
 			if claimed[e] {
 				continue
 			}
+			// Claims first, THEN the repo gate: an edge this resolver
+			// would never have touched is not a refusal, and counting it
+			// as one inflated repoGated by the number of excluded
+			// resolvers — every pending edge in a narrowing repository
+			// scored against every pass it excluded.
+			if !r.Claims(e) {
+				continue
+			}
 			if !repoGate.admits(e.From, r.Name()) {
 				repoGated++
 				continue
 			}
-			if r.Claims(e) {
-				candidates = append(candidates, e)
-			}
+			candidates = append(candidates, e)
 		}
 		if len(candidates) == 0 {
 			continue

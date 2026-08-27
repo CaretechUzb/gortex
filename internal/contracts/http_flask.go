@@ -116,6 +116,22 @@ func (h *HTTPExtractor) extractFlaskDecoratorRoutes(filePath, text string, lines
 		receiver, path, rest := m[1], m[2], m[3]
 		lineNum := i + 1
 
+		// `@http.route(...)` is Odoo's controller decorator, not Flask's.
+		// odooRouteDecoratorRE requires that literal `http.` segment, so
+		// the odoo pass claims this exact line — and both passes are
+		// registered for Python while runFrameworkRoutePasses unions them
+		// with no dedup. Extracting it here too mints a SECOND contract
+		// under the same `http::GET::/path` ID carrying framework:flask
+		// and Odoo's Meta stripped; whichever lands last wins, so the
+		// route is attributed at random.
+		//
+		// Gated on the allow-list rather than unconditional: if a config
+		// excludes `odoo` the odoo pass never runs, and yielding here
+		// would drop the route entirely instead of handing it over.
+		if receiver == "http" && h.AllowedFrameworks.Allows("odoo") {
+			continue
+		}
+
 		methods := flaskMethodsKwarg(rest)
 		if len(methods) == 0 {
 			methods = []string{"GET"}

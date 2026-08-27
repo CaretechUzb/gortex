@@ -351,3 +351,26 @@ func TestRunClaimingResolvers_CountsRepoGatedRefusals(t *testing.T) {
 	// The exported wrapper keeps its original single-value shape.
 	assert.NotNil(t, RunClaimingResolversScoped(g, nil))
 }
+
+// repoGated counts REFUSED WRITES, so an edge the resolver would never
+// have claimed must not score. Counting the repo gate before Claims made
+// every pending edge in a narrowing repository score against every pass
+// that repository excluded.
+func TestRunClaimingResolvers_UnclaimedEdgesAreNotCountedAsRefusals(t *testing.T) {
+	g := graph.New()
+	g.AddNode(&graph.Node{
+		ID: "odoo/a.py::Q", Kind: graph.KindType, Name: "Q", FilePath: "odoo/a.py", Language: "python",
+	})
+	// An unresolved edge in the excluded repository that no claiming
+	// resolver recognises.
+	g.AddEdge(&graph.Edge{
+		From: "odoo/a.py::Q", To: graph.UnresolvedMarker + "not_a_descriptor_name",
+		Kind: graph.EdgeReferences,
+	})
+
+	o := resolveFrameworkSynthOptions([]FrameworkSynthOption{
+		WithFrameworkAllowByRepo(map[string]frameworkgate.Set{"odoo": frameworkgate.New([]string{"flask"})}),
+	})
+	_, gated := runClaimingResolversScopedCounted(g, nil, o)
+	assert.Zero(t, gated, "an edge no resolver claims is not a refused write")
+}
