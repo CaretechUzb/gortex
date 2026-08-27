@@ -2,6 +2,7 @@ package languages
 
 import (
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -81,6 +82,10 @@ func csharpIsTableAttr(name string) bool {
 // csharpAttrPositionalStringArg matches a leading (optionally
 // verbatim) string literal — [Table("name", ...)]'s table name is the
 // attribute's first positional argument, unlike JPA's key=value form.
+// Known limits, accepted for the fixed-cost regex: an escaped quote
+// truncates the name (`"a\"b"` → `a\` — table names with quotes do
+// not survive real databases either), and a C#11 raw string literal
+// ("""...""") matches its empty prefix and is skipped as unnamed.
 var csharpAttrPositionalStringArg = regexp.MustCompile(`^\s*@?"([^"]*)"`)
 
 // csharpAttrPositionalString extracts the first positional string
@@ -126,15 +131,28 @@ func stampCSharpEFConfig(decl *sitter.Node, src []byte, meta map[string]any) {
 	if baseList == nil {
 		return
 	}
-	m := csharpEFConfigIfaceArg.FindStringSubmatch(baseList.Content(src))
-	if len(m) < 2 {
+	// A class may implement IEntityTypeConfiguration<A> AND <B> (legal,
+	// two Configure overloads). A single-entity stamp cannot say whose
+	// ToTable the body scan found, so more than one distinct T refuses.
+	matches := csharpEFConfigIfaceArg.FindAllStringSubmatch(baseList.Content(src), -1)
+	if len(matches) == 0 {
 		return
 	}
-	entity := strings.TrimSpace(m[1])
-	if i := strings.LastIndexByte(entity, '.'); i >= 0 {
-		entity = entity[i+1:]
+	entity := ""
+	for _, m := range matches {
+		cand := strings.TrimSpace(m[1])
+		if i := strings.LastIndexByte(cand, '.'); i >= 0 {
+			cand = cand[i+1:]
+		}
+		cand = strings.TrimPrefix(cand, "@")
+		if cand == "" {
+			continue
+		}
+		if entity != "" && cand != entity {
+			return
+		}
+		entity = cand
 	}
-	entity = strings.TrimPrefix(entity, "@")
 	if entity == "" {
 		return
 	}
@@ -150,24 +168,46 @@ func stampCSharpEFConfig(decl *sitter.Node, src []byte, meta map[string]any) {
 	}
 }
 
-// csharpEFConfigTableCall finds the first builder.ToTable(...) or
-// builder.ToView(...) invocation in the declaration's subtree and
-// returns its literal name/schema arguments. The first argument must
-// itself be a string literal — the lambda-only ToTable overloads
-// configure without naming, so a non-literal first argument returns
-// nothing rather than fishing a string out of a nested lambda.
+// csharpEFConfigTableCall finds the first ToTable(...) / ToView(...)
+// invocation in the declaration's subtree whose receiver is a PLAIN
+// IDENTIFIER outside any lambda, and returns its literal name/schema
+// arguments. Both restrictions are misattribution guards, not
+// conveniences: a ToTable inside a lambda is an owned-type mapping
+// (`builder.OwnsOne(c => c.Slot, s => s.ToTable(...))`) naming the
+// OWNED type's table, and a ToTable chained onto another call
+// (`builder.OwnsOne(...).ToTable(...)`) hangs off a builder for a
+// different entity. Refusing those loses the rare
+// `builder.HasAnnotation(...).ToTable(...)` chain — a miss, never a
+// wrong edge.
 func csharpEFConfigTableCall(decl *sitter.Node, src []byte) (table, schema, relation string) {
-	walkAST(decl, func(n *sitter.Node) bool {
-		if table != "" {
-			return false
-		}
-		t, s, r, ok := csharpEFTableViewArgs(n, src)
-		if !ok {
+	var walk func(n *sitter.Node, inLambda bool) bool
+	walk = func(n *sitter.Node, inLambda bool) bool {
+		if n == nil {
 			return true
 		}
-		table, schema, relation = t, s, r
-		return false
-	})
+		switch n.Type() {
+		case "lambda_expression", "anonymous_method_expression":
+			inLambda = true
+		case "invocation_expression":
+			if !inLambda {
+				if t, s, r, ok := csharpEFTableViewArgs(n, src); ok {
+					if fn := n.ChildByFieldName("function"); fn != nil {
+						if recv := fn.ChildByFieldName("expression"); recv != nil && recv.Type() == "identifier" {
+							table, schema, relation = t, s, r
+							return false
+						}
+					}
+				}
+			}
+		}
+		for i, _nc := 0, int(n.NamedChildCount()); i < _nc; i++ {
+			if !walk(n.NamedChild(i), inLambda) {
+				return false
+			}
+		}
+		return true
+	}
+	walk(decl, false)
 	return table, schema, relation
 }
 
@@ -225,10 +265,23 @@ func csharpEFTableViewArgs(n *sitter.Node, src []byte) (table, schema, relation 
 // a modelBuilder fluent chain.
 var csharpEFEntityGenericArg = regexp.MustCompile(`^Entity\s*<\s*([^<>,]+?)\s*>$`)
 
+// csharpEFSubjectChangers are the fluent links that return a builder
+// for a DIFFERENT entity (owned types, navigations): a ToTable past
+// one of these names that other entity's table, so the chain walk
+// refuses rather than crediting T.
+var csharpEFSubjectChangers = map[string]bool{
+	"OwnsOne": true, "OwnsMany": true,
+	"HasOne": true, "HasMany": true,
+	"WithOne": true, "WithMany": true,
+	"Navigation": true, "ComplexProperty": true,
+}
+
 // csharpEFEntityFromChain walks a ToTable/ToView call's receiver
 // chain (`modelBuilder.Entity<T>().HasKey(...).ToTable(...)`) down to
 // the Entity<T> link and returns T's final name segment, or "" when
-// the chain never names an entity.
+// the chain never names an entity — or passes through a
+// subject-changing link (`Entity<T>().OwnsOne(...).ToTable(...)` is
+// the owned type's table-splitting spelling, not T's table).
 func csharpEFEntityFromChain(fn *sitter.Node, src []byte) string {
 	expr := fn.ChildByFieldName("expression")
 	for expr != nil {
@@ -236,13 +289,24 @@ func csharpEFEntityFromChain(fn *sitter.Node, src []byte) string {
 		case "invocation_expression":
 			expr = expr.ChildByFieldName("function")
 		case "member_access_expression":
-			if nm := expr.ChildByFieldName("name"); nm != nil && nm.Type() == "generic_name" {
-				if m := csharpEFEntityGenericArg.FindStringSubmatch(nm.Content(src)); len(m) >= 2 {
-					entity := strings.TrimSpace(m[1])
-					if i := strings.LastIndexByte(entity, '.'); i >= 0 {
-						entity = entity[i+1:]
+			if nm := expr.ChildByFieldName("name"); nm != nil {
+				txt := nm.Content(src)
+				if nm.Type() == "generic_name" {
+					if m := csharpEFEntityGenericArg.FindStringSubmatch(txt); len(m) >= 2 {
+						entity := strings.TrimSpace(m[1])
+						if i := strings.LastIndexByte(entity, '.'); i >= 0 {
+							entity = entity[i+1:]
+						}
+						return strings.TrimPrefix(entity, "@")
 					}
-					return strings.TrimPrefix(entity, "@")
+					// OwnsOne<Address>(...) spells the subject change as a
+					// generic name — strip the argument list before the check.
+					if i := strings.IndexByte(txt, '<'); i >= 0 {
+						txt = strings.TrimSpace(txt[:i])
+					}
+				}
+				if csharpEFSubjectChangers[txt] {
+					return ""
 				}
 			}
 			expr = expr.ChildByFieldName("expression")
@@ -255,8 +319,10 @@ func csharpEFEntityFromChain(fn *sitter.Node, src []byte) string {
 
 // stampCSharpEFFluent records the OnModelCreating inline fluent
 // mapping facts on the file node as Meta["ef_fluent"], one
-// "entity|table|schema|relation" entry per Entity<T> chain that ends
-// in a literal ToTable/ToView. Only OnModelCreating bodies are
+// "entity|table|schema|relation|line" entry per Entity<T> chain that
+// ends in a literal ToTable/ToView — line is the call's own line, so
+// the resolver's edge evidence points at the mapping statement rather
+// than the file top. Only OnModelCreating bodies are
 // scanned: that is where EF looks, and a helper method reached from
 // there is a cross-file/cross-method chase the extractor stays out
 // of. The resolver joins entries to entity class nodes by name, same
@@ -284,7 +350,8 @@ func stampCSharpEFFluent(root *sitter.Node, src []byte, fileNode *graph.Node) {
 			if entity == "" {
 				return true
 			}
-			entry := entity + "|" + table + "|" + schema + "|" + relation
+			entry := entity + "|" + table + "|" + schema + "|" + relation +
+				"|" + strconv.Itoa(int(inv.StartPoint().Row)+1)
 			if !seen[entry] {
 				seen[entry] = true
 				entries = append(entries, entry)

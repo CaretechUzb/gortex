@@ -943,6 +943,11 @@ func defaultFrameworkSynthesizers() []FrameworkSynthesizer {
 		// find_usages / get_callers result. After the implements-producing
 		// passes so the impl fan-out is complete.
 		synthFunc{name: SynthCSharpIfaceDispatch, fn: ResolveCSharpInterfaceDispatch, scopedFn: ResolveCSharpInterfaceDispatchScoped},
+		// csharp-efcore-models joins the extractor's EF Core facts
+		// (attribute models_table edges, ef_config_*/ef_fluent stamps)
+		// into the models_table layer. Position-independent: it reads
+		// only its own stamps and models_table itself, and no other
+		// pass consumes models_table during synthesis.
 		synthFunc{name: SynthCSharpEFCoreModels, fn: ResolveCSharpEFCoreModels},
 		// Sidekiq job dispatch: Worker.perform_async(...) → the worker's
 		// perform, namespace-aware. Include-gated, typed tier.

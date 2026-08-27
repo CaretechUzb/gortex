@@ -172,6 +172,132 @@ public class ProbeContext : DbContext
 	assert.Equal(t, "view", te.Meta["relation"])
 }
 
+// TestCSharpEFMergeFluentFacts_OrderIndependent: the merge's verdict
+// for an entity must not depend on fact arrival order — facts come off
+// a map-ordered node scan, so every permutation of the same set must
+// produce the same result.
+func TestCSharpEFMergeFluentFacts_OrderIndependent(t *testing.T) {
+	configA := csharpEFFluentFact{entity: "Widget", table: "w1", siteID: "a.cs::AConfig"}
+	configB := csharpEFFluentFact{entity: "Widget", table: "w2", siteID: "b.cs::BConfig"}
+	inline := csharpEFFluentFact{entity: "Widget", table: "w3", inline: true, siteID: "ctx.cs"}
+
+	perms := [][]csharpEFFluentFact{
+		{configA, configB, inline},
+		{configA, inline, configB},
+		{inline, configA, configB},
+		{inline, configB, configA},
+		{configB, inline, configA},
+		{configB, configA, inline},
+	}
+	for i, p := range perms {
+		out := csharpEFMergeFluentFacts(p)
+		require.Len(t, out, 1, "perm %d: inline tier wins outright — config disagreement below it is irrelevant", i)
+		assert.Equal(t, "w3", out[0].table, "perm %d", i)
+		assert.True(t, out[0].inline, "perm %d", i)
+	}
+
+	// No inline tier: the config disagreement drops the entity, both orders.
+	for i, p := range [][]csharpEFFluentFact{{configA, configB}, {configB, configA}} {
+		assert.Empty(t, csharpEFMergeFluentFacts(p), "conflict perm %d", i)
+	}
+
+	// Agreeing same-tier facts: kept, and the retained site is the
+	// deterministic (lowest-siteID) one regardless of order.
+	configA2 := csharpEFFluentFact{entity: "Widget", table: "w1", siteID: "z.cs::ZConfig"}
+	agreeA := csharpEFFluentFact{entity: "Widget", table: "w1", siteID: "a.cs::AConfig"}
+	for i, p := range [][]csharpEFFluentFact{{configA2, agreeA}, {agreeA, configA2}} {
+		out := csharpEFMergeFluentFacts(p)
+		require.Len(t, out, 1, "agree perm %d", i)
+		assert.Equal(t, "a.cs::AConfig", out[0].siteID, "agree perm %d: lowest siteID wins deterministically", i)
+	}
+}
+
+// TestResolveCSharpEFCoreModels_InlineBeatsConfigClass: within the
+// fluent tier, an OnModelCreating inline entry beats a config class —
+// EF applies OnModelCreating statements after ApplyConfiguration.
+func TestResolveCSharpEFCoreModels_InlineBeatsConfigClass(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Domain/Gadget.cs": `namespace App.Domain;
+
+public class Gadget
+{
+    public int Id { get; set; }
+}
+`,
+		"Config/GadgetConfig.cs": `using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+
+namespace App.Config;
+
+public class GadgetConfig : IEntityTypeConfiguration<Gadget>
+{
+    public void Configure(EntityTypeBuilder<Gadget> builder)
+    {
+        builder.ToTable("cfg_gadgets");
+    }
+}
+`,
+		"Data/ProbeContext.cs": `using Microsoft.EntityFrameworkCore;
+
+namespace App.Data;
+
+public class ProbeContext : DbContext
+{
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<Gadget>().ToTable("inline_gadgets");
+    }
+}
+`,
+	})
+	assert.Equal(t, 1, ResolveCSharpEFCoreModels(g))
+	models := efModelsTableEdges(g)
+	require.Len(t, models, 1)
+	assert.Equal(t, "db::orm::inline_gadgets", models[0].To)
+}
+
+// TestResolveCSharpEFCoreModels_EfFluentAnySliceDecodes: meta lists
+// round-trip through persistence as []any — the pass must decode both
+// shapes, not just the in-process []string.
+func TestResolveCSharpEFCoreModels_EfFluentAnySliceDecodes(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Domain/Gadget.cs": `namespace App.Domain;
+
+public class Gadget
+{
+    public int Id { get; set; }
+}
+`,
+		"Data/ProbeContext.cs": `using Microsoft.EntityFrameworkCore;
+
+namespace App.Data;
+
+public class ProbeContext : DbContext
+{
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<Gadget>().ToTable("gadget_rows");
+    }
+}
+`,
+	})
+	fileNode := g.GetNode("Data/ProbeContext.cs")
+	require.NotNil(t, fileNode)
+	entries, ok := fileNode.Meta["ef_fluent"].([]string)
+	require.True(t, ok, "extractor stamps []string in-process")
+	anyEntries := make([]any, len(entries))
+	for i, e := range entries {
+		anyEntries[i] = e
+	}
+	fileNode.Meta["ef_fluent"] = anyEntries
+
+	assert.Equal(t, 1, ResolveCSharpEFCoreModels(g))
+	models := efModelsTableEdges(g)
+	require.Len(t, models, 1)
+	assert.Equal(t, "db::orm::gadget_rows", models[0].To)
+	assert.Greater(t, models[0].Line, 1, "edge evidence carries the mapping statement's line, not the file top")
+}
+
 // TestResolveCSharpEFCoreModels_AmbiguousEntityNameSkips: the join is
 // by unique class name — two classes sharing the entity's name means
 // the pass refuses to guess and emits nothing.

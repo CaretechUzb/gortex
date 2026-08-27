@@ -138,6 +138,108 @@ public class GadgetConfig : IEntityTypeConfiguration<Gadget>
 	assert.False(t, hasTable, "no ToTable/ToView call, no table stamp")
 }
 
+func TestCSharpORM_ConfigOwnedTypeLambdaToTableNotStamped(t *testing.T) {
+	src := `namespace Probe.Data.Config;
+
+public class CrateSlotConfig : IEntityTypeConfiguration<CrateSlot>
+{
+    public void Configure(EntityTypeBuilder<CrateSlot> builder)
+    {
+        builder.OwnsOne(c => c.Slot, s => s.ToTable("slot_rows"));
+    }
+}
+`
+	fix := runCSharpExtractFixtureORM(t, "Config/CrateSlotConfig.cs", src)
+	cfg := fix.nodesByID["Config/CrateSlotConfig.cs::CrateSlotConfig"]
+	require.NotNil(t, cfg)
+	assert.Equal(t, "CrateSlot", cfg.Meta["ef_config_entity"])
+	_, hasTable := cfg.Meta["ef_config_table"]
+	assert.False(t, hasTable,
+		"an owned-type ToTable inside a lambda names the OWNED type's table, not T's — must not stamp")
+}
+
+func TestCSharpORM_ConfigChainedOwnsOneToTableNotStamped(t *testing.T) {
+	src := `namespace Probe.Data.Config;
+
+public class ParcelConfig : IEntityTypeConfiguration<Parcel>
+{
+    public void Configure(EntityTypeBuilder<Parcel> builder)
+    {
+        builder.OwnsOne(p => p.Stub).ToTable("stub_rows");
+    }
+}
+`
+	fix := runCSharpExtractFixtureORM(t, "Config/ParcelConfig.cs", src)
+	cfg := fix.nodesByID["Config/ParcelConfig.cs::ParcelConfig"]
+	require.NotNil(t, cfg)
+	assert.Equal(t, "Parcel", cfg.Meta["ef_config_entity"])
+	_, hasTable := cfg.Meta["ef_config_table"]
+	assert.False(t, hasTable,
+		"ToTable on an OwnsOne return names the owned type's table — the receiver is not the entity builder")
+}
+
+func TestCSharpORM_ConfigDualInterfaceRefusesEntirely(t *testing.T) {
+	src := `namespace Probe.Data.Config;
+
+public class PairConfig : IEntityTypeConfiguration<Drum>, IEntityTypeConfiguration<Spool>
+{
+    public void Configure(EntityTypeBuilder<Drum> builder)
+    {
+        builder.HasKey(d => d.Id);
+    }
+
+    public void Configure(EntityTypeBuilder<Spool> builder)
+    {
+        builder.ToTable("spool_rows");
+    }
+}
+`
+	fix := runCSharpExtractFixtureORM(t, "Config/PairConfig.cs", src)
+	cfg := fix.nodesByID["Config/PairConfig.cs::PairConfig"]
+	require.NotNil(t, cfg)
+	_, hasEntity := cfg.Meta["ef_config_entity"]
+	assert.False(t, hasEntity,
+		"two IEntityTypeConfiguration<T> arguments: a single-entity stamp cannot say whose ToTable it found — refuse")
+}
+
+func TestCSharpORM_ConfigLambdaOnlyToTableNotStamped(t *testing.T) {
+	src := `namespace Probe.Data.Config;
+
+public class VaultConfig : IEntityTypeConfiguration<Vault>
+{
+    public void Configure(EntityTypeBuilder<Vault> builder)
+    {
+        builder.ToTable(tb => tb.HasComment("keyless vault"));
+    }
+}
+`
+	fix := runCSharpExtractFixtureORM(t, "Config/VaultConfig.cs", src)
+	cfg := fix.nodesByID["Config/VaultConfig.cs::VaultConfig"]
+	require.NotNil(t, cfg)
+	assert.Equal(t, "Vault", cfg.Meta["ef_config_entity"])
+	_, hasTable := cfg.Meta["ef_config_table"]
+	assert.False(t, hasTable, "lambda-only ToTable overload names no table — the string inside the lambda is a comment")
+}
+
+func TestCSharpORM_InlineChainedOwnsOneNotStamped(t *testing.T) {
+	src := `namespace Probe.Data;
+
+public class ShipContext : DbContext
+{
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<Parcel>().OwnsOne(p => p.Stub).ToTable("stub_split");
+        modelBuilder.Entity<Parcel>().ToTable("parcels_main");
+    }
+}
+`
+	fix := runCSharpExtractFixtureORM(t, "Data/ShipContext.cs", src)
+	fileNode := fix.nodesByID["Data/ShipContext.cs"]
+	require.NotNil(t, fileNode)
+	assert.Equal(t, []string{"Parcel|parcels_main||table|8"}, fileNode.Meta["ef_fluent"],
+		"the OwnsOne chain's ToTable names the OWNED type's table — the walk must stop at subject-changing links")
+}
+
 func TestCSharpORM_OnModelCreatingFluentFileStamp(t *testing.T) {
 	src := `using Microsoft.EntityFrameworkCore;
 
@@ -160,10 +262,10 @@ public class ProbeContext : DbContext
 	fileNode := fix.nodesByID["Data/ProbeContext.cs"]
 	require.NotNil(t, fileNode)
 	assert.Equal(t, []string{
-		"Widget|widget_master|core|table",
-		"Gadget|gadget_view||view",
+		"Widget|widget_master|core|table|11",
+		"Gadget|gadget_view||view|13",
 	}, fileNode.Meta["ef_fluent"],
-		"one entry per Entity<T> chain ending in a literal ToTable/ToView; chains without one stamp nothing")
+		"one entry per Entity<T> chain ending in a literal ToTable/ToView, line-stamped; chains without one stamp nothing")
 }
 
 func TestCSharpORM_FluentOutsideOnModelCreatingNotStamped(t *testing.T) {
@@ -182,6 +284,39 @@ public class MapHelper
 	require.NotNil(t, fileNode)
 	_, has := fileNode.Meta["ef_fluent"]
 	assert.False(t, has, "only OnModelCreating bodies are scanned in v1")
+}
+
+func TestCSharpORM_NameofTableArgRefused(t *testing.T) {
+	src := `using System.ComponentModel.DataAnnotations.Schema;
+
+namespace Probe.Core.Domain;
+
+[Table(nameof(SlateBin))]
+public class SlateBin
+{
+    public int Id { get; set; }
+}
+`
+	fix := runCSharpExtractFixtureORM(t, "Models/SlateBin.cs", src)
+	assert.Empty(t, fix.edgesByKind[graph.EdgeModelsTable],
+		"a non-literal table name (nameof, constants) stamps nothing — fail-open, no guess")
+}
+
+func TestCSharpORM_VerbatimStringAndAttributeSuffix(t *testing.T) {
+	src := `using System.ComponentModel.DataAnnotations.Schema;
+
+namespace Probe.Core.Domain;
+
+[TableAttribute(@"vault_rows")]
+public class VaultRow
+{
+    public int Id { get; set; }
+}
+`
+	fix := runCSharpExtractFixtureORM(t, "Models/VaultRow.cs", src)
+	models := fix.edgesByKind[graph.EdgeModelsTable]
+	require.Len(t, models, 1, "the explicit Attribute suffix and a verbatim string are both ordinary spellings")
+	assert.Equal(t, "db::orm::vault_rows", models[0].To)
 }
 
 func TestCSharpORM_PlainClassIgnored(t *testing.T) {

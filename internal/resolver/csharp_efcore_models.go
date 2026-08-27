@@ -2,6 +2,8 @@ package resolver
 
 import (
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -26,8 +28,8 @@ import (
 // than adding a second edge, and an entity a fluent fact claimed never
 // falls through to the DbSet convention. Within the fluent tier an
 // inline OnModelCreating entry beats a config class (EF applies
-// OnModelCreating statements after ApplyConfiguration); two
-// same-tier facts that disagree drop the entity entirely.
+// OnModelCreating statements after ApplyConfiguration); two facts in
+// the WINNING tier that disagree drop the entity entirely.
 //
 // Facts join to entity classes by unique class name within the same
 // boundary — an ambiguous name (two classes called Widget) skips
@@ -55,6 +57,9 @@ func ResolveCSharpEFCoreModels(g graph.Store) int {
 		if n == nil {
 			continue
 		}
+		// File nodes skip the language gate deliberately: they carry no
+		// Language, and only the C# extractor mints ef_fluent — key
+		// presence is the filter.
 		if n.Kind == graph.KindFile {
 			fluents = append(fluents, csharpEFInlineFactsFromFile(n)...)
 			continue
@@ -77,6 +82,15 @@ func ResolveCSharpEFCoreModels(g graph.Store) int {
 	if len(dbsets) == 0 && len(fluents) == 0 {
 		return 0
 	}
+	// Node scans are map-ordered; sort every fact list before first-wins
+	// logic so edge content and evidence sites are deterministic across
+	// runs (the mediatr/gin sibling idiom).
+	sort.Slice(dbsets, func(i, j int) bool {
+		if dbsets[i].entity != dbsets[j].entity {
+			return dbsets[i].entity < dbsets[j].entity
+		}
+		return dbsets[i].siteID < dbsets[j].siteID
+	})
 
 	// Entities that already model a table: the attribute binding was
 	// decided at extraction, and a prior run of this pass already
@@ -115,6 +129,13 @@ func ResolveCSharpEFCoreModels(g graph.Store) int {
 			meta["relation"] = f.relation
 		}
 		if es := edgesByFrom[cls.ID]; len(es) > 0 {
+			// Rewire in place. The edge keeps its FilePath/Line (the
+			// entity's own file): the edge's From side is the model, and
+			// anchoring evidence there survives re-extraction of the
+			// fact file. The superseded attribute's table node is
+			// deliberately left behind even if nothing points at it any
+			// more — same call go_orm's override rewire makes; a table
+			// node is cheap and another entity may share it.
 			e := es[0]
 			if e.To == tableID {
 				continue
@@ -200,34 +221,48 @@ type csharpEFFluentFact struct {
 }
 
 // csharpEFMergeFluentFacts reduces the fluent facts to at most one per
-// entity name: inline OnModelCreating entries beat config classes, and
-// two same-tier facts that disagree on the mapping drop the entity —
-// refusing beats guessing.
+// entity name. Two-phase so the verdict never depends on arrival order
+// (facts come off a map-ordered node scan): the inline OnModelCreating
+// tier wins outright when present — a disagreement in the config tier
+// below it is irrelevant — and only the WINNING tier's facts are
+// checked for conflicts; two of those that disagree on the mapping
+// drop the entity, refusing over guessing. Agreeing duplicates keep
+// the lowest-siteID fact, so the retained evidence site is
+// deterministic too.
 func csharpEFMergeFluentFacts(fluents []csharpEFFluentFact) []csharpEFFluentFact {
-	merged := map[string]csharpEFFluentFact{}
-	dropped := map[string]bool{}
+	byEntity := map[string][]csharpEFFluentFact{}
 	var order []string
 	for _, f := range fluents {
-		cur, ok := merged[f.entity]
-		if !ok {
-			merged[f.entity] = f
+		if _, ok := byEntity[f.entity]; !ok {
 			order = append(order, f.entity)
-			continue
 		}
-		if f.inline != cur.inline {
-			if f.inline {
-				merged[f.entity] = f
-			}
-			continue
-		}
-		if f.table != cur.table || f.schema != cur.schema || f.relation != cur.relation {
-			dropped[f.entity] = true
-		}
+		byEntity[f.entity] = append(byEntity[f.entity], f)
 	}
+	sort.Strings(order)
 	var out []csharpEFFluentFact
-	for _, name := range order {
-		if !dropped[name] {
-			out = append(out, merged[name])
+	for _, entity := range order {
+		facts := byEntity[entity]
+		// Winning tier: inline when any inline fact exists.
+		tier := facts[:0:0]
+		for _, f := range facts {
+			if f.inline {
+				tier = append(tier, f)
+			}
+		}
+		if len(tier) == 0 {
+			tier = facts
+		}
+		sort.Slice(tier, func(i, j int) bool { return tier[i].siteID < tier[j].siteID })
+		winner := tier[0]
+		conflict := false
+		for _, f := range tier[1:] {
+			if f.table != winner.table || f.schema != winner.schema || f.relation != winner.relation {
+				conflict = true
+				break
+			}
+		}
+		if !conflict {
+			out = append(out, winner)
 		}
 	}
 	return out
@@ -254,8 +289,9 @@ func csharpEFConfigFactFromNode(n *graph.Node) (csharpEFFluentFact, bool) {
 }
 
 // csharpEFInlineFactsFromFile parses the ef_fluent
-// "entity|table|schema|relation" entries off a file node. Meta lists
-// round-trip through persistence as []any, so both shapes decode.
+// "entity|table|schema|relation|line" entries off a file node. Meta
+// lists round-trip through persistence as []any, so both shapes
+// decode.
 func csharpEFInlineFactsFromFile(n *graph.Node) []csharpEFFluentFact {
 	if n.Meta == nil {
 		return nil
@@ -273,14 +309,18 @@ func csharpEFInlineFactsFromFile(n *graph.Node) []csharpEFFluentFact {
 	}
 	var out []csharpEFFluentFact
 	for _, entry := range entries {
-		parts := strings.SplitN(entry, "|", 4)
-		if len(parts) != 4 || parts[0] == "" || parts[1] == "" {
+		parts := strings.SplitN(entry, "|", 5)
+		if len(parts) != 5 || parts[0] == "" || parts[1] == "" {
 			continue
+		}
+		line, err := strconv.Atoi(parts[4])
+		if err != nil || line < 1 {
+			line = 1
 		}
 		out = append(out, csharpEFFluentFact{
 			entity: parts[0], table: parts[1], schema: parts[2], relation: parts[3],
 			inline: true,
-			siteID: n.ID, filePath: n.FilePath, line: 1,
+			siteID: n.ID, filePath: n.FilePath, line: line,
 		})
 	}
 	return out
