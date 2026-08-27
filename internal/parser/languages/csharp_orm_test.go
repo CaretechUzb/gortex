@@ -73,6 +73,71 @@ public class BinItem
 	assert.Equal(t, "audit", tableNode.Meta["schema"])
 }
 
+func TestCSharpORM_ConfigClassStampsEntityAndTable(t *testing.T) {
+	src := `using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+
+namespace Probe.Data.Config;
+
+public class WidgetConfig : IEntityTypeConfiguration<Widget>
+{
+    public void Configure(EntityTypeBuilder<Widget> builder)
+    {
+        builder.ToTable("widgets_v2", "sales");
+        builder.HasKey(w => w.Id);
+    }
+}
+`
+	fix := runCSharpExtractFixtureORM(t, "Config/WidgetConfig.cs", src)
+	cfg := fix.nodesByID["Config/WidgetConfig.cs::WidgetConfig"]
+	require.NotNil(t, cfg)
+	assert.Equal(t, "Widget", cfg.Meta["ef_config_entity"])
+	assert.Equal(t, "widgets_v2", cfg.Meta["ef_config_table"])
+	assert.Equal(t, "sales", cfg.Meta["ef_config_schema"])
+	assert.Equal(t, "table", cfg.Meta["ef_config_relation"])
+}
+
+func TestCSharpORM_ConfigClassToViewStampsViewRelation(t *testing.T) {
+	src := `namespace Probe.Data.Config;
+
+public class TallyConfig : Microsoft.EntityFrameworkCore.IEntityTypeConfiguration<Domain.CrateTally>
+{
+    public void Configure(EntityTypeBuilder<Domain.CrateTally> builder)
+    {
+        builder.ToView("crate_tallies");
+    }
+}
+`
+	fix := runCSharpExtractFixtureORM(t, "Config/TallyConfig.cs", src)
+	cfg := fix.nodesByID["Config/TallyConfig.cs::TallyConfig"]
+	require.NotNil(t, cfg)
+	assert.Equal(t, "CrateTally", cfg.Meta["ef_config_entity"],
+		"qualified iface and qualified entity arg both reduce to final segments")
+	assert.Equal(t, "crate_tallies", cfg.Meta["ef_config_table"])
+	assert.Equal(t, "view", cfg.Meta["ef_config_relation"])
+	_, hasSchema := cfg.Meta["ef_config_schema"]
+	assert.False(t, hasSchema, "no schema arg, no schema stamp")
+}
+
+func TestCSharpORM_ConfigClassWithoutToTableStampsEntityOnly(t *testing.T) {
+	src := `namespace Probe.Data.Config;
+
+public class GadgetConfig : IEntityTypeConfiguration<Gadget>
+{
+    public void Configure(EntityTypeBuilder<Gadget> builder)
+    {
+        builder.HasIndex(g => g.Serial);
+    }
+}
+`
+	fix := runCSharpExtractFixtureORM(t, "Config/GadgetConfig.cs", src)
+	cfg := fix.nodesByID["Config/GadgetConfig.cs::GadgetConfig"]
+	require.NotNil(t, cfg)
+	assert.Equal(t, "Gadget", cfg.Meta["ef_config_entity"])
+	_, hasTable := cfg.Meta["ef_config_table"]
+	assert.False(t, hasTable, "no ToTable/ToView call, no table stamp")
+}
+
 func TestCSharpORM_PlainClassIgnored(t *testing.T) {
 	src := `namespace Probe.Core;
 

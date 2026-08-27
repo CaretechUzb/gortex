@@ -841,6 +841,12 @@ func (e *CSharpExtractor) emitContainer(m parser.QueryResult, kind string, nodeK
 	if doc := extractCSharpDoc(src, def.StartLine); doc != "" {
 		meta["doc"] = doc
 	}
+	// EF Core fluent mapping: a class implementing
+	// IEntityTypeConfiguration<T> carries facts the resolver joins to
+	// the entity class later — the entity lives in another file.
+	if kind == "class" || kind == "record" {
+		stampCSharpEFConfig(def.Node, src, meta)
+	}
 	result.Nodes = append(result.Nodes, &graph.Node{
 		ID: id, Kind: nodeKind, Name: name,
 		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
