@@ -293,6 +293,48 @@ being anyone's sibling immediately. Edges minted **before** a worktree was
 recognised are not retro-actively removed; reindexing (or re-tracking)
 the repository clears them.
 
+#### Naming a worktree instance
+
+A worktree tracked as its own instance gets a `<base>@<tag>` prefix, where
+the tag is the repo's declared workspace slug when that differs from the
+base, else the checked-out branch, else a short hash of the path
+(`WorktreeInstanceName`). `--name` overrides the whole derivation and is
+stored verbatim, so it is the only path that can produce a prefix the
+sanitizer never saw.
+
+That matters because a prefix is not a label. It is the first segment of
+every node ID the repository contributes (`<prefix>/<path>::<Symbol>`) and
+it is persisted to the global config, so a path separator inside one makes
+the boundary between "which repository" and "which file" ambiguous for
+everything that splits an ID. `gortex track` therefore refuses a `--name`
+outside `[A-Za-z0-9._@-]` — `@` stays legal because it is the instance
+separator itself. A name that reached the config by a hand-edit is dropped
+at daemon start with a warning naming the path and the reason: one
+repository is skipped, the daemon still starts, and every other repository
+stays queryable.
+
+Prefer a short, stable id over the branch name. Branch names are renamed,
+reused across forks, and mostly carry slashes, and the prefix is repeated
+in every symbol id in every result you read — `local@DEV-1284` beats
+`local@feat-DEV-1284-stock-quant-supplier-column`.
+
+#### Work only in worktrees you have tracked
+
+A session's scope comes from its working directory, and `ScopeForCWD`
+picks the **longest tracked root containing** that directory. A worktree
+that is not itself tracked but sits under a tracked repository therefore
+binds the session to the *enclosing* repository, and locate-intent tools
+— which default to the current repo — answer from it without any error.
+Measured on a deployment that tracks `docker-env` and its submodule
+separately: a session opened in an untracked worktree under `docker-env/`
+searched for an Odoo model and got a hit from `docker-env/tasks.py`, out
+of a 63-file graph, while the 120k-node graph it meant to search sat one
+directory away.
+
+A directory outside every tracked root fails closed instead, with the
+structured `repo_not_tracked` error. The nested case is the one to watch,
+because it looks like it worked.
+
 ### Empty indexes
 
 A repo that finished indexing with no files at all is reported as
