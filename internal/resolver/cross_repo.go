@@ -1043,6 +1043,12 @@ func (cr *CrossRepoResolver) cachedFindNodesByQualName(qualName string) []*graph
 
 func (cr *CrossRepoResolver) resolveEdge(e *graph.Edge, stats *CrossRepoStats, batch *[]graph.EdgeReindex) {
 	oldTo := e.To
+	// Shared with the master resolver: a derived tests clone is never
+	// bound independently on any path (see resolutionExempt).
+	if resolutionExempt(e) {
+		stats.Unresolved++
+		return
+	}
 	// UnresolvedName handles BOTH the bare `unresolved::X` and the
 	// multi-repo `<repo>::unresolved::X` forms; a plain TrimPrefix only
 	// strips the bare form, leaving prefixed stubs (which fix-1's widened

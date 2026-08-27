@@ -66,3 +66,87 @@ namespace Probe.Spec.GenArgs {
 		}
 	}
 }
+
+// The refusal must hold on EVERY resolver path, not just the heuristic
+// cascade: the inline LSP hot-path answers by (file, line, name) - exactly
+// the receiver-evidence-free lookup the tests clone must never take.
+func TestResolveFile_LSPNeverBindsATestsEdge(t *testing.T) {
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "src/spec.ts", Kind: graph.KindFile, Name: "spec.ts", FilePath: "src/spec.ts", Language: "typescript"})
+	g.AddNode(&graph.Node{
+		ID: "src/spec.ts::specRun", Kind: graph.KindFunction, Name: "specRun",
+		FilePath: "src/spec.ts", StartLine: 3, EndLine: 5, Language: "typescript",
+	})
+	g.AddNode(&graph.Node{
+		ID: "src/real.ts::doWork", Kind: graph.KindFunction, Name: "doWork",
+		FilePath: "src/real.ts", StartLine: 7, EndLine: 9, Language: "typescript",
+	})
+	testsEdge := &graph.Edge{
+		From: "src/spec.ts::specRun", To: "unresolved::doWork",
+		Kind: graph.EdgeTests, FilePath: "src/spec.ts", Line: 4,
+	}
+	g.AddEdge(testsEdge)
+
+	helper := &fakeLSPHelper{
+		exts: []string{".ts"},
+		defs: map[lspKey]lspAnswer{
+			{path: "src/spec.ts", line: 4, name: "doWork"}: {defPath: "src/real.ts", defLine: 7},
+		},
+	}
+	r := New(g)
+	r.SetLSPHelper(helper)
+	r.ResolveFile("src/spec.ts")
+
+	assert.True(t, graph.IsUnresolvedTarget(testsEdge.To),
+		"the inline LSP path bound a derived tests edge (to %s)", testsEdge.To)
+}
+
+// Bulk-mode ResolveAll defers LSP lookups to a post-loop batch collected
+// BEFORE resolveEdge sees the edge - the batch must refuse tests clones too.
+func TestResolveAll_DeferredLSPNeverBindsATestsEdge(t *testing.T) {
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "src/spec.ts", Kind: graph.KindFile, Name: "spec.ts", FilePath: "src/spec.ts", Language: "typescript"})
+	g.AddNode(&graph.Node{
+		ID: "src/spec.ts::specRun", Kind: graph.KindFunction, Name: "specRun",
+		FilePath: "src/spec.ts", StartLine: 3, EndLine: 5, Language: "typescript",
+	})
+	g.AddNode(&graph.Node{
+		ID: "src/real.ts::doWork", Kind: graph.KindFunction, Name: "doWork",
+		FilePath: "src/real.ts", StartLine: 7, EndLine: 9, Language: "typescript",
+	})
+	testsEdge := &graph.Edge{
+		From: "src/spec.ts::specRun", To: "unresolved::doWork",
+		Kind: graph.EdgeTests, FilePath: "src/spec.ts", Line: 4,
+	}
+	g.AddEdge(testsEdge)
+
+	helper := &fakeLSPHelper{
+		exts: []string{".ts"},
+		defs: map[lspKey]lspAnswer{
+			{path: "src/spec.ts", line: 4, name: "doWork"}: {defPath: "src/real.ts", defLine: 7},
+		},
+	}
+	r := New(g)
+	r.SetLSPHelper(helper)
+	r.ResolveAll()
+
+	assert.True(t, graph.IsUnresolvedTarget(testsEdge.To),
+		"the deferred LSP batch bound a derived tests edge (to %s)", testsEdge.To)
+}
+
+// CrossRepoResolver has its own independent resolveEdge; the same-repo
+// name tier would happily bind the naked clone by bare name.
+func TestCrossRepoResolveAll_NeverBindsATestsEdge(t *testing.T) {
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "repoA/pkg/a_test.go::TestCaller", Kind: graph.KindFunction, Name: "TestCaller", FilePath: "repoA/pkg/a_test.go", Language: "go", RepoPrefix: "repoA"})
+	g.AddNode(&graph.Node{ID: "repoA/pkg/b.go::Helper", Kind: graph.KindFunction, Name: "Helper", FilePath: "repoA/pkg/b.go", Language: "go", RepoPrefix: "repoA"})
+
+	testsEdge := &graph.Edge{From: "repoA/pkg/a_test.go::TestCaller", To: "unresolved::Helper", Kind: graph.EdgeTests, FilePath: "repoA/pkg/a_test.go", Line: 5}
+	g.AddEdge(testsEdge)
+
+	cr := NewCrossRepo(g)
+	cr.ResolveAll()
+
+	assert.True(t, graph.IsUnresolvedTarget(testsEdge.To),
+		"the cross-repository pass bound a derived tests edge (to %s)", testsEdge.To)
+}

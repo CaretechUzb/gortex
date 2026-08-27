@@ -278,6 +278,13 @@ func (r *Resolver) lspDeferTarget(e *graph.Edge) (string, bool) {
 	if r.lspHelper == nil || e == nil || e.FilePath == "" || e.Line <= 0 {
 		return "", false
 	}
+	// A resolution-exempt edge (derived tests clone) must not enter the
+	// batch: the collector runs BEFORE resolveEdge refuses the edge, and
+	// the deferred bind would take the same receiver-evidence-free lookup
+	// the refusal exists to prevent.
+	if resolutionExempt(e) {
+		return "", false
+	}
 	if !graph.IsUnresolvedTarget(e.To) {
 		return "", false
 	}

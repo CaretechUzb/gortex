@@ -3057,8 +3057,24 @@ func releaseResolverClone(clone *graph.Edge) {
 // caller decides whether to call graph.ReindexEdge immediately
 // (single-threaded ResolveFile) or to defer the reindex (parallel
 // ResolveAll). When nothing changed the returned bool is false.
+// resolutionExempt reports whether the resolver must never bind this edge
+// independently, on ANY path — the heuristic cascade, the inline LSP
+// hot-path, the deferred bulk LSP batch, and the cross-repository pass all
+// consult it. A tests edge is DERIVED: the test-linkage pass clones a test
+// caller's calls edges, meta-free. Re-running the bind WITHOUT the
+// original's receiver evidence bypasses every receiver-gated guard (a
+// List<int> site's clone bound a `this List<string>` extension the guarded
+// calls edge itself refuses). The tests layer follows its calls edge; the
+// resolver never binds it.
+func resolutionExempt(e *graph.Edge) bool {
+	return e != nil && e.Kind == graph.EdgeTests
+}
+
 func (r *Resolver) resolveEdge(e *graph.Edge, stats *ResolveStats) (oldTo string, changed bool) {
 	oldTo = e.To
+	if resolutionExempt(e) {
+		return oldTo, false
+	}
 	// graph.UnresolvedName handles both `unresolved::Name` (legacy)
 	// and `<repoPrefix>::unresolved::Name` (multi-repo COPY rewrite).
 	// strings.TrimPrefix only stripped the bare form, leaving every
@@ -3095,16 +3111,6 @@ func (r *Resolver) resolveEdge(e *graph.Edge, stats *ResolveStats) (oldTo string
 	}
 
 	switch {
-	case e.Kind == graph.EdgeTests:
-		// A tests edge is DERIVED: the test-linkage pass clones a test
-		// caller's calls edges, meta-free. Routing such a clone through
-		// the call cascades re-runs the bind WITHOUT the original's
-		// receiver evidence, bypassing every receiver-gated guard (a
-		// List<int> site's clone bound a `this List<string>` extension
-		// the guarded calls edge itself refuses). The tests layer
-		// follows its calls edge; the resolver never binds it
-		// independently. Same shape as the type-position gate below.
-		return oldTo, false
 	case strings.HasPrefix(target, "grpc::"):
 		// gRPC client-stub call placeholder
 		// (`unresolved::grpc::<Service>::<Method>`). Landed on the
