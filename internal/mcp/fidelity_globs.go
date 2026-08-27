@@ -151,19 +151,24 @@ func matchFidelityGlob(pattern, rel string) bool {
 // globPatternSegments splits a pattern into the segments the matcher
 // consumes, with two normalisations.
 //
-// A trailing `*` becomes `**`. That is not a widening: this package has
-// always read `dir/*` as a directory prefix covering the whole subtree
-// (see matchSegmentGlob), which is the same reach as `dir/**`. Spelling
-// it that way is what lets the rule compose with a preceding globstar —
-// `src/**/internal/*` cannot be resolved by the legacy prefix fallback,
-// because that treats `src/**/internal` as a literal.
+// A trailing `*` becomes `**`, but only when some earlier segment is a
+// whole-segment `**`. The rewrite exists for one job: letting the
+// directory-prefix rule survive a globbed prefix, since the legacy
+// fallback treats `src/**/internal` as a literal and cannot resolve it.
+//
+// The condition is what keeps it from being a widening. `dir/*` has
+// always meant the whole subtree here, and the legacy fallback still
+// says so for literal prefixes — but `**` can consume zero segments, so
+// rewriting unconditionally also made `*/*` match `top.go` and
+// `src/*/*` match `src/top.go`, dropping a segment that an ordinary `*`
+// requires. Patterns with no globstar keep their old depth exactly.
 //
 // Adjacent globstars collapse. `a/**/**/b` means exactly `a/**/b`, and
 // leaving the duplicates in multiplies the matcher's state space for no
 // added meaning — which is how a short pattern turned into minutes of CPU.
 func globPatternSegments(pattern string) []string {
 	segs := strings.Split(pattern, "/")
-	if n := len(segs); n > 0 && segs[n-1] == "*" {
+	if n := len(segs); n > 1 && segs[n-1] == "*" && hasGlobstarSegment(segs[:n-1]) {
 		segs[n-1] = "**"
 	}
 	out := make([]string, 0, len(segs))
@@ -174,6 +179,18 @@ func globPatternSegments(pattern string) []string {
 		out = append(out, s)
 	}
 	return out
+}
+
+// hasGlobstarSegment reports whether any segment is a bare `**`. A `**`
+// inside a larger segment (`a**b`) is two ordinary stars to path.Match,
+// not a globstar, so it does not count.
+func hasGlobstarSegment(segs []string) bool {
+	for _, s := range segs {
+		if s == "**" {
+			return true
+		}
+	}
+	return false
 }
 
 // matchGlobstarSegments matches a segment-split pattern against a

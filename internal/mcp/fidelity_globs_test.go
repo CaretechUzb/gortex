@@ -214,13 +214,45 @@ func TestGetEditingContext_FidelityGlobsOmit(t *testing.T) {
 // before applying the result limit, so one request could hold a daemon
 // core indefinitely.
 //
-// The bound is deliberately loose. The memoised matcher answers this in
-// microseconds, so five seconds is roughly six orders of magnitude of
-// headroom — enough that a loaded or throttled runner cannot trip it,
-// while still failing outright if the exponential behavior returns.
+// The globstars are separated by a literal segment on purpose. Adjacent
+// ones collapse in globPatternSegments before the matcher ever sees them,
+// so a run of `**/**/**/…` reduces to a single `**` and exercises none of
+// the memo — an earlier version of this test used exactly that and stayed
+// green with the memo deleted. Alternating `**/x/` survives the collapse
+// and is what forces the repeated subproblems.
+//
+// The size is measured, not guessed. Removing the memo and leaving the
+// collapse in place, on this machine:
+//
+//	globstars  path segments   calls          unmemoised
+//	        8             20     803,860           10 ms
+//	        8             40 246,777,526          7.48 s
+//	       10             30 151,946,378          8.04 s
+//	       10             40 3,189,663,472     1 m 53.8 s
+//
+// The memoised matcher answers every one of those in under a
+// millisecond. Ten and forty gives the deadline a margin of more than
+// twenty times against the exponential path while sitting several orders
+// of magnitude above the memoised one, so a loaded runner cannot trip it
+// and a lost memo cannot pass it. Smaller inputs — including 8 and 20 —
+// prove the memo matters by call count but finish far inside any
+// wall-clock bound, which is how the previous version of this test came
+// to be green against a matcher with no memo at all.
 func TestMatchFidelityGlob_RepeatedGlobstarsStayBounded(t *testing.T) {
-	pattern := "a/" + strings.Repeat("**/", 12) + "z.go"
-	rel := "a/" + strings.Repeat("x/", 25) + "q.go"
+	pattern := "a/" + strings.Repeat("**/x/", 10) + "never"
+	rel := "a/" + strings.Repeat("x/", 40) + "q"
+
+	// Guard the guard: if a future change makes these collapse too, the
+	// timing assertion below stops testing anything.
+	segs := globPatternSegments(pattern)
+	globstars := 0
+	for _, s := range segs {
+		if s == "**" {
+			globstars++
+		}
+	}
+	require.Greaterf(t, globstars, 4,
+		"the adversarial pattern collapsed to %v — it no longer reaches the memo", segs)
 
 	done := make(chan bool, 1)
 	start := time.Now()
@@ -228,7 +260,7 @@ func TestMatchFidelityGlob_RepeatedGlobstarsStayBounded(t *testing.T) {
 
 	select {
 	case got := <-done:
-		assert.False(t, got, "the path does not end in z.go, so this must not match")
+		assert.False(t, got, "the path does not end in `never`, so this must not match")
 		assert.Lessf(t, time.Since(start), 5*time.Second,
 			"matchFidelityGlob(%q, ...) took %s — the globstar walk is enumerating again",
 			pattern, time.Since(start))
@@ -236,6 +268,46 @@ func TestMatchFidelityGlob_RepeatedGlobstarsStayBounded(t *testing.T) {
 		t.Fatalf("matchFidelityGlob(%q, ...) did not finish within 5s — "+
 			"a user-supplied glob can pin a daemon core", pattern)
 	}
+}
+
+// TestMatchFidelityGlob_TerminalStarKeepsItsRequiredSegment pins the
+// depth an ordinary `*` demands. The trailing-star rewrite exists only to
+// let the subtree rule survive a globbed prefix; applied to a pattern
+// with no globstar it silently dropped a required segment, because `**`
+// may consume zero. A `*/*` find_files glob then returned root files, and
+// the same pattern in fidelity_globs applied omit/compress rules to them.
+func TestMatchFidelityGlob_TerminalStarKeepsItsRequiredSegment(t *testing.T) {
+	for _, tc := range []struct {
+		pattern string
+		rel     string
+		want    bool
+	}{
+		{"*/*", "top.go", false},
+		{"src/*/*", "src/top.go", false},
+		// The depth they do accept is unchanged.
+		{"*/*", "a/b.go", true},
+		{"src/*/*", "src/a/b.go", true},
+		// And the rewrite still fires where it is meant to.
+		{"src/**/internal/*", "src/a/internal/sub/deep.go", true},
+	} {
+		assert.Equalf(t, tc.want, matchFidelityGlob(tc.pattern, tc.rel),
+			"matchFidelityGlob(%q, %q)", tc.pattern, tc.rel)
+	}
+}
+
+// TestFidelityGlobTerminalStarDepthAtTheConsumer runs the same depth rule
+// through the path a configured fidelity rule actually takes, so a
+// widening cannot reach users' files while only the matcher test is
+// watched.
+func TestFidelityGlobTerminalStarDepthAtTheConsumer(t *testing.T) {
+	rules := parseFidelityGlobs("*/*:omit")
+
+	assert.Nil(t, fidelityDecideForPath(rules, "top.go"),
+		"a root file must not be caught by `*/*`")
+
+	nested := fidelityDecideForPath(rules, "a/b.go")
+	require.NotNil(t, nested, "`*/*` still has to match one level down")
+	assert.Equal(t, elide.FidelityOmit, nested(elide.Decl{}))
 }
 
 // TestMatchFidelityGlob_GlobstarComposesWithTrailingSubtree pins the two
