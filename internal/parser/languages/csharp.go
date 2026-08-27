@@ -1483,12 +1483,16 @@ func (e *CSharpExtractor) emitField(m parser.QueryResult, filePath, fileID strin
 	// A field_declaration's type lives on its nested variable_declaration
 	// (`field_declaration → variable_declaration[type] → variable_declarator`),
 	// not as a direct `type` field of the field_declaration itself.
-	fieldTypeRaw := csharpFieldDeclType(def.Node, src)
+	fieldTypeNode := csharpFieldDeclTypeNode(def.Node)
+	fieldTypeRaw := ""
+	if fieldTypeNode != nil {
+		fieldTypeRaw = strings.TrimSpace(fieldTypeNode.Content(src))
+	}
 	if fieldTypeRaw != "" {
 		meta["field_type"] = fieldTypeRaw
 		// Closed generic arguments of the declared type — the dispatch
 		// gate's receiver evidence (see csharp_base_type_args.go).
-		if args := csharpSimpleTypeArgsFromText(fieldTypeRaw, csharpUnstampableArgNames(def.Node, src, fileAliases)); args != "" {
+		if args := csharpTypeArgsFromTypeNode(fieldTypeNode, src, csharpUnstampableArgNames(def.Node, src, fileAliases)); args != "" {
 			meta["field_type_args"] = args
 		}
 	}
@@ -1559,7 +1563,7 @@ func (e *CSharpExtractor) emitProperty(m parser.QueryResult, filePath, fileID st
 		meta["field_type"] = propTypeRaw
 		// Same closed-generic-arguments stamp fields carry (dispatch
 		// gate receiver evidence — csharp_base_type_args.go).
-		if args := csharpSimpleTypeArgsFromText(propTypeRaw, csharpUnstampableArgNames(def.Node, src, fileAliases)); args != "" {
+		if args := csharpTypeArgsFromTypeNode(t, src, csharpUnstampableArgNames(def.Node, src, fileAliases)); args != "" {
 			meta["field_type_args"] = args
 		}
 	}
@@ -2405,8 +2409,18 @@ func normalizeCSharpTypeName(t string) string {
 // variable_declaration node, not of the field_declaration itself, so a
 // direct ChildByFieldName("type") on the field_declaration is always nil.
 func csharpFieldDeclType(fieldDecl *sitter.Node, src []byte) string {
+	if t := csharpFieldDeclTypeNode(fieldDecl); t != nil {
+		return strings.TrimSpace(t.Content(src))
+	}
+	return ""
+}
+
+// csharpFieldDeclTypeNode is csharpFieldDeclType returning the type NODE —
+// the type-argument stamp derives its arguments from the parsed tree, not
+// from raw text, so trivia between tokens stays out of the identity.
+func csharpFieldDeclTypeNode(fieldDecl *sitter.Node) *sitter.Node {
 	if fieldDecl == nil {
-		return ""
+		return nil
 	}
 	for i, _nc := 0, int(fieldDecl.NamedChildCount()); i < _nc; i++ {
 		c := fieldDecl.NamedChild(i)
@@ -2414,17 +2428,17 @@ func csharpFieldDeclType(fieldDecl *sitter.Node, src []byte) string {
 			continue
 		}
 		if t := c.ChildByFieldName("type"); t != nil {
-			return strings.TrimSpace(t.Content(src))
+			return t
 		}
 		// Fallback: first named child of the variable_declaration is the
 		// type in grammar revisions that don't tag the field.
 		if c.NamedChildCount() > 0 {
 			if first := c.NamedChild(0); first != nil && first.Type() != "variable_declarator" {
-				return strings.TrimSpace(first.Content(src))
+				return first
 			}
 		}
 	}
-	return ""
+	return nil
 }
 
 // inferTypeFromCSharpNew extracts the type name from a C# object_creation_expression.

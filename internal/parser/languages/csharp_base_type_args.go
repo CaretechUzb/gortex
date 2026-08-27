@@ -261,6 +261,12 @@ func csharpNormalizeSimpleArg(text string, openParams map[string]bool) string {
 		// beyond one identifier chain — not comparable by string.
 		return ""
 	}
+	if strings.ContainsAny(text, "/*") {
+		// Comment trivia is legal between the tokens of a qualified
+		// spelling (`App./**/Crate`) and no part of type identity — raw
+		// text carrying it must never be compared as a spelling.
+		return ""
+	}
 	// Qualifiers reduce to the final segment — `global::App.Crate`, an
 	// extern-alias qualifier, and a dotted namespace all name the same
 	// last-segment type the resolver-side convention compares by.
@@ -286,28 +292,42 @@ func csharpNormalizeSimpleArg(text string, openParams map[string]bool) string {
 	return csharpCanonicalTypeArg(text)
 }
 
-// csharpSimpleTypeArgsFromText is csharpBaseTypeArgs over a declared-type
-// TEXT (a field/property's type spelling): "IBoxStore<Crate>" → "Crate".
-// "" when the text is not generic, the argument section is non-simple,
-// or any argument is an open parameter.
-func csharpSimpleTypeArgsFromText(text string, openParams map[string]bool) string {
-	text = strings.TrimSpace(text)
-	lt := strings.Index(text, "<")
-	if lt <= 0 || !strings.HasSuffix(text, ">") {
+// csharpTypeArgsFromTypeNode is csharpBaseTypeArgs over a declared-type
+// AST node (a field/property/positional-parameter type):
+// "IBoxStore<Crate>" → "Crate". The arguments come from the parsed tree,
+// not from raw source text, so comment trivia between tokens
+// (`IBox</**/Crate>`) never becomes part of the compared spelling — the
+// earlier text-based path stamped "/**/Crate" as an argument and the
+// dispatch gate then filtered the valid implementor. "" when the type is
+// not a plain generic name (wrapped forms — nullable, array — refuse the
+// same way the text path did), or any argument is open or non-simple.
+func csharpTypeArgsFromTypeNode(typeNode *sitter.Node, src []byte, openParams map[string]bool) string {
+	if typeNode == nil {
 		return ""
 	}
-	inner := text[lt+1 : len(text)-1]
-	if inner == "" || strings.ContainsAny(inner, "<[?(") {
+	switch typeNode.Type() {
+	case "generic_name", "qualified_name":
+	default:
 		return ""
 	}
-	rawArgs := strings.Split(inner, ",")
-	args := make([]string, 0, len(rawArgs))
-	for _, a := range rawArgs {
-		norm := csharpNormalizeSimpleArg(a, openParams)
+	argList := csharpEntryTypeArgumentList(typeNode)
+	if argList == nil {
+		return ""
+	}
+	var args []string
+	for i, _nc := 0, int(argList.NamedChildCount()); i < _nc; i++ {
+		arg := argList.NamedChild(i)
+		if arg == nil || arg.Type() == "comment" {
+			continue
+		}
+		norm := csharpNormalizeSimpleArg(arg.Content(src), openParams)
 		if norm == "" {
 			return ""
 		}
 		args = append(args, norm)
+	}
+	if len(args) == 0 {
+		return ""
 	}
 	return strings.Join(args, ",")
 }

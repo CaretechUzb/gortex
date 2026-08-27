@@ -192,6 +192,37 @@ namespace App {
 		"a using-alias argument is opaque - no stamp")
 }
 
+// Re-review RED: comment trivia between the tokens of a declared type is
+// legal C# and no part of type identity - `IBox</**/Crate>` names the
+// SAME constructed interface as `IBox<Crate>`. The raw-text path stamped
+// "/**/Crate" as an argument and the gate then filtered the valid
+// implementor; deriving the arguments from the parsed type AST keeps
+// trivia out of the compared spelling.
+func TestCSharpExtractor_FieldTypeArgTriviaIsNotIdentity(t *testing.T) {
+	src := []byte(`namespace App {
+    public interface IBox<T> { }
+    public class Crate { }
+
+    public class Flow {
+        private readonly IBox</**/Crate> _box;
+        public IBox</* seasonal */ Crate> Prop { get; set; }
+    }
+}
+`)
+	e := NewCSharpExtractor()
+	result, err := e.Extract("Trivia.cs", src)
+	require.NoError(t, err)
+
+	box := fieldMeta(result.Nodes, "Trivia.cs::Flow._box")
+	require.NotNil(t, box)
+	assert.Equal(t, "Crate", box["field_type_args"],
+		"comment trivia inside the argument list is not part of the argument")
+
+	prop := fieldMeta(result.Nodes, "Trivia.cs::Flow.Prop")
+	require.NotNil(t, prop)
+	assert.Equal(t, "Crate", prop["field_type_args"])
+}
+
 // fieldMeta returns the meta of the node with the given ID.
 func fieldMeta(result_nodes []*graph.Node, id string) map[string]any {
 	for _, n := range result_nodes {
