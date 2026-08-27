@@ -674,6 +674,27 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 		}
 	}
 
+	// Shadow indexes, built BEFORE the call emission so receiver_name can
+	// honor its contract ("a receiver no local, param or builtin
+	// explains"): a bare receiver naming a declared parameter or local is
+	// that value — never the enclosing type's same-named field, never a
+	// static class. Locals ride the tenv only when typed; the name sets
+	// cover every declaration. The field-identifier emitter reuses both.
+	paramsByOwner := csharpParamNamesByOwner(result)
+	localNamesByOwner := map[string]map[string]bool{}
+	for _, l := range locals {
+		owner := localOwner(l)
+		if owner == "" {
+			continue
+		}
+		m := localNamesByOwner[owner]
+		if m == nil {
+			m = map[string]bool{}
+			localNamesByOwner[owner] = m
+		}
+		m[l.name] = true
+	}
+
 	for _, c := range calls {
 		callerID := funcRanges.enclosing(c.line)
 		if callerID == "" {
@@ -720,15 +741,20 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 					// filled, and lands on the wrong overload.
 					edge.Meta = map[string]any{"receiver_name": c.receiver}
 				}
-			} else if c.receiver != "" {
-				// A bare receiver nothing above could type. Its spelling
-				// is still evidence: reaching here means no local, param
-				// or builtin in scope carries that name, so a receiver
-				// that names a static class is the STATIC form of an
-				// extension call (`BagExt.Add(bag)`) — where the `this`
-				// slot is filled by the first argument, not the
-				// receiver. The extension binder needs that distinction
-				// before it can compare argument counts.
+			} else if c.receiver != "" &&
+				!paramsByOwner[callerID][c.receiver] &&
+				!localNamesByOwner[callerID][c.receiver] {
+				// A bare receiver nothing above could type, and no
+				// parameter or local declares its name. Its spelling is
+				// still evidence: a receiver that names a static class is
+				// the STATIC form of an extension call (`BagExt.Add(bag)`)
+				// — where the `this` slot is filled by the first argument,
+				// not the receiver — and a same-named field of the
+				// enclosing type is only bindable because nothing shadows
+				// it. A parameter or local DOES shadow (re-review RED: a
+				// shadowing parameter's call bound through the field it
+				// shadows on the strength of an unrelated same-line
+				// `this.`-qualified read); those receivers stay unknown.
 				edge.Meta = map[string]any{"receiver_name": c.receiver}
 			}
 			// Stamped AFTER the receiver-evidence chain — every branch
@@ -789,24 +815,12 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 	emitCSharpMemberAccesses(accesses, src, filePath, funcRanges,
 		tenvByOwner, builtinsByOwner, result)
 
-	// Field-identifier uses need the shadow indexes: every DECLARED
-	// local by name (typed or not — tenv alone holds only the typed
-	// ones), parameters, and builtin-typed locals.
-	localNamesByOwner := map[string]map[string]bool{}
-	for _, l := range locals {
-		owner := localOwner(l)
-		if owner == "" {
-			continue
-		}
-		m := localNamesByOwner[owner]
-		if m == nil {
-			m = map[string]bool{}
-			localNamesByOwner[owner] = m
-		}
-		m[l.name] = true
-	}
+	// Field-identifier uses reuse the same shadow indexes the receiver
+	// stamps consulted: every DECLARED local by name (typed or not — tenv
+	// alone holds only the typed ones), parameters, and builtin-typed
+	// locals.
 	emitCSharpFieldIdentifierUses(calls, accesses, fieldAssigns, src,
-		filePath, funcRanges, localNamesByOwner, builtinsByOwner, result)
+		filePath, funcRanges, paramsByOwner, localNamesByOwner, builtinsByOwner, result)
 
 	// .NET surfaces a symbol walk misses: DI registrations + COM
 	// interop. Stamped onto the file node.

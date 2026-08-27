@@ -589,7 +589,9 @@ func TestResolveCSharpInterfaceDispatch_ParameterShadowedReceiverNeverFilters(t 
 	New(g).ResolveAll()
 
 	callerID := "Boxes.cs::Flow.Pull"
-	bindFieldReceiverCall(t, g, callerID, "_box", "Boxes.cs::IBox.Get")
+	// The extractor now refuses receiver_name for a param-shadowed bare
+	// receiver, so the bind keys on the member companion alone.
+	bindMemberCall(t, g, callerID, "Get", "Boxes.cs::IBox.Get")
 
 	ResolveCSharpInterfaceDispatch(g)
 
@@ -631,7 +633,9 @@ func TestResolveCSharpInterfaceDispatch_LocalShadowedReceiverNeverFilters(t *tes
 	New(g).ResolveAll()
 
 	callerID := "Boxes.cs::Flow.Pull"
-	bindFieldReceiverCall(t, g, callerID, "_box", "Boxes.cs::IBox.Get")
+	// The extractor now refuses receiver_name for a local-shadowed bare
+	// receiver, so the bind keys on the member companion alone.
+	bindMemberCall(t, g, callerID, "Get", "Boxes.cs::IBox.Get")
 
 	ResolveCSharpInterfaceDispatch(g)
 
@@ -989,4 +993,300 @@ func TestResolveCSharpInterfaceDispatch_BCLAliasSpellingsRetainTheEdge(t *testin
 		"System.Int32 and int spell the same constructed interface - the edge stays")
 	assert.NotContains(t, targets, "Ints.cs::CrateBox.Fetch",
 		"the genuinely different closure still filters")
+}
+
+// bindMemberCall binds the unresolved companion for the named member to the
+// interface member regardless of receiver evidence - the enrichment/LSP
+// tiers key on the site, not on extraction's receiver stamps, so a call
+// whose receiver extraction could not certify still arrives bound.
+func bindMemberCall(t *testing.T, g graph.Store, callerID, member, target string) {
+	t.Helper()
+	var companion *graph.Edge
+	for _, e := range g.GetOutEdges(callerID) {
+		if e != nil && e.Kind == graph.EdgeCalls && e.To == "unresolved::*."+member {
+			companion = e
+			break
+		}
+	}
+	require.NotNil(t, companion, "fixture: extraction must leave the member companion edge")
+	g.AddEdge(&graph.Edge{
+		From: callerID, To: target, Kind: graph.EdgeCalls,
+		FilePath: companion.FilePath, Line: companion.Line,
+		Origin: graph.OriginASTResolved, Confidence: 0.95,
+	})
+}
+
+// Re-review RED: comment trivia in the receiver's declared type is legal
+// C# and no part of type identity - `IBox</**/Crate>` must dispatch
+// exactly like `IBox<Crate>`, not carry "/**/Crate" into the compare and
+// lose the valid implementor.
+func TestResolveCSharpInterfaceDispatch_CommentTriviaInReceiverTypeRetainsTheEdge(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Trivia.cs": `namespace App {
+    public class Crate { }
+    public class Widget { }
+    public interface IBox<T> {
+        int Get(int id);
+    }
+    public class CrateBox : IBox<Crate> {
+        public int Get(int id) { return 1; }
+    }
+    public class WidgetBox : IBox<Widget> {
+        public int Get(int id) { return 2; }
+    }
+    public class Flow {
+        private readonly IBox</**/Crate> _box;
+        public Flow(IBox<Crate> b) { _box = b; }
+        public int Pull() { return _box.Get(1); }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	callerID := "Trivia.cs::Flow.Pull"
+	bindFieldReceiverCall(t, g, callerID, "_box", "Trivia.cs::IBox.Get")
+
+	ResolveCSharpInterfaceDispatch(g)
+
+	targets := dispatchTargets(g, callerID)
+	assert.Contains(t, targets, "Trivia.cs::CrateBox.Get",
+		"trivia-bearing and plain spellings name one constructed interface - the edge stays")
+	assert.NotContains(t, targets, "Trivia.cs::WidgetBox.Get",
+		"the argument still reads as Crate - the different closure still filters")
+}
+
+// Re-review RED: a DECLARATION-side escaped type parameter (`class
+// Outer<@T>`) is the same open parameter T every use-side spelling names.
+// Storing raw "@T" in the open-parameter set while the use side
+// normalizes to "T" stamps the open receiver as CLOSED over a type
+// called "T" - and exact-head dispatch then returns no targets at all.
+func TestResolveCSharpInterfaceDispatch_EscapedDeclarationParamKeepsFanout(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Outer.cs": `namespace App {
+    public class Crate { }
+    public class Widget { }
+    public interface IBox<T> {
+        int Get(int id);
+    }
+    public class CrateBox : IBox<Crate> {
+        public int Get(int id) { return 1; }
+    }
+    public class WidgetBox : IBox<Widget> {
+        public int Get(int id) { return 2; }
+    }
+    public class Outer<@T> {
+        private readonly IBox<@T> _box;
+        public Outer(IBox<@T> b) { _box = b; }
+        public int Pull() { return _box.Get(1); }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	callerID := "Outer.cs::Outer.Pull"
+	bindFieldReceiverCall(t, g, callerID, "_box", "Outer.cs::IBox.Get")
+
+	ResolveCSharpInterfaceDispatch(g)
+
+	targets := dispatchTargets(g, callerID)
+	assert.Contains(t, targets, "Outer.cs::CrateBox.Get",
+		"an open receiver keeps the conservative full fan-out")
+	assert.Contains(t, targets, "Outer.cs::WidgetBox.Get",
+		"an open receiver keeps the conservative full fan-out")
+}
+
+// Re-review RED (unicode twin): `class Outer<\u0054>` declares the same
+// parameter T - the escape is a legal identifier spelling the decoder
+// must fold before the open-parameter set is consulted.
+func TestResolveCSharpInterfaceDispatch_UnicodeEscapedDeclarationParamKeepsFanout(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Uni.cs": `namespace App {
+    public class Crate { }
+    public interface IBox<T> {
+        int Get(int id);
+    }
+    public class CrateBox : IBox<Crate> {
+        public int Get(int id) { return 1; }
+    }
+    public class Outer<\u0054> {
+        private readonly IBox<T> _box;
+        public Outer(IBox<T> b) { _box = b; }
+        public int Pull() { return _box.Get(1); }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	callerID := "Uni.cs::Outer.Pull"
+	bindFieldReceiverCall(t, g, callerID, "_box", "Uni.cs::IBox.Get")
+
+	ResolveCSharpInterfaceDispatch(g)
+
+	targets := dispatchTargets(g, callerID)
+	assert.Contains(t, targets, "Uni.cs::CrateBox.Get",
+		"the escaped declaration parameter is open - the fan-out survives")
+}
+
+// Re-review RED: alias keys and arguments must live in ONE normalization
+// domain. `using @Entity = App.Crate;` stores "@Entity" in the alias set
+// while the argument normalizer strips the verbatim prefix to "Entity" -
+// the alias guard misses and the valid implementor is filtered.
+func TestResolveCSharpInterfaceDispatch_VerbatimAliasReceiverNeverFilters(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Alias.cs": `using @Entity = App.Crate;
+
+namespace App {
+    public class Crate { }
+    public class Widget { }
+    public interface IBox<T> {
+        int Get(int id);
+    }
+    public class CrateBox : IBox<Crate> {
+        public int Get(int id) { return 1; }
+    }
+    public class WidgetBox : IBox<Widget> {
+        public int Get(int id) { return 2; }
+    }
+    public class Flow {
+        private readonly IBox<@Entity> _box;
+        public Flow(IBox<@Entity> b) { _box = b; }
+        public int Pull() { return _box.Get(1); }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	callerID := "Alias.cs::Flow.Pull"
+	bindFieldReceiverCall(t, g, callerID, "_box", "Alias.cs::IBox.Get")
+
+	ResolveCSharpInterfaceDispatch(g)
+
+	targets := dispatchTargets(g, callerID)
+	assert.Contains(t, targets, "Alias.cs::CrateBox.Get",
+		"@Entity denotes the alias - the stamp must refuse and the fan-out survive")
+	assert.Contains(t, targets, "Alias.cs::WidgetBox.Get",
+		"an alias-opaque receiver keeps the conservative full fan-out")
+}
+
+// Re-review RED: a project-global alias whose identifier the argument
+// normalizer FOLDS (`global using Int32 = App.Crate;`) escapes the alias
+// guard - the receiver argument is canonicalized to "int" while the
+// global-alias metadata says "Int32", and the guard compares the two in
+// different domains. The alias-comparable forms must meet the stamp in
+// the stamp's own domain.
+func TestResolveCSharpInterfaceDispatch_FoldableGlobalAliasNeverFilters(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Global.cs": `global using Int32 = App.Crate;
+`,
+		"Stores.cs": `namespace App {
+    public class Crate { }
+    public class Widget { }
+    public interface IBox<T> {
+        int Get(int id);
+    }
+    public class CrateBox : IBox<Crate> {
+        public int Get(int id) { return 1; }
+    }
+    public class WidgetBox : IBox<Widget> {
+        public int Get(int id) { return 2; }
+    }
+}`,
+		"Flow.cs": `namespace App {
+    public class Flow {
+        private readonly IBox<Int32> _box;
+        public Flow(IBox<Int32> b) { _box = b; }
+        public int Pull() { return _box.Get(1); }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	callerID := "Flow.cs::Flow.Pull"
+	bindFieldReceiverCall(t, g, callerID, "_box", "Stores.cs::IBox.Get")
+
+	ResolveCSharpInterfaceDispatch(g)
+
+	targets := dispatchTargets(g, callerID)
+	assert.Contains(t, targets, "Stores.cs::CrateBox.Get",
+		"Int32 legally denotes the project-global alias App.Crate - the stamp must refuse")
+}
+
+// Re-review RED: same-line field-read evidence must not certify a
+// DIFFERENT expression's receiver. `this._box.Save()` emits the field
+// read for _box; the shadowing parameter's `_box.Get()` shares the
+// physical line, and binding the parameter's call through Flow._box
+// filtered the valid WidgetBox.Get out of the store.
+func TestResolveCSharpInterfaceDispatch_SameLineFieldReadDoesNotBindShadowingParam(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Boxes.cs": `namespace App {
+    public sealed class Crate { }
+    public sealed class Widget { }
+
+    public interface IBox<T> {
+        int Get();
+        int Save();
+    }
+
+    public sealed class CrateBox : IBox<Crate> {
+        public int Get() { return 1; }
+        public int Save() { return 1; }
+    }
+
+    public sealed class WidgetBox : IBox<Widget> {
+        public int Get() { return 1; }
+        public int Save() { return 1; }
+    }
+
+    public class Flow {
+        private readonly IBox<Crate> _box;
+        public Flow(IBox<Crate> b) { _box = b; }
+        public int Pull(IBox<Widget> _box) { return this._box.Save() + _box.Get(); }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	callerID := "Boxes.cs::Flow.Pull"
+	bindMemberCall(t, g, callerID, "Get", "Boxes.cs::IBox.Get")
+
+	ResolveCSharpInterfaceDispatch(g)
+
+	targets := dispatchTargets(g, callerID)
+	assert.Contains(t, targets, "Boxes.cs::WidgetBox.Get",
+		"the parameter shadows the field - its receiver is IBox<Widget> and the Widget impl must stay in")
+}
+
+// Re-review RED (P2): a positional record property is a first-class
+// receiver - `record Flow(IBox<Crate> Store)` must narrow Store.Get()
+// exactly like an ordinary property of the same declared type.
+func TestResolveCSharpInterfaceDispatch_PositionalRecordPropertyNarrows(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Rec.cs": `namespace App {
+    public class Crate { }
+    public class Widget { }
+    public interface IBox<T> {
+        int Get(int id);
+    }
+    public class CrateBox : IBox<Crate> {
+        public int Get(int id) { return 1; }
+    }
+    public class WidgetBox : IBox<Widget> {
+        public int Get(int id) { return 2; }
+    }
+    public record Flow(IBox<Crate> Store) {
+        public int Pull() { return Store.Get(1); }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	callerID := "Rec.cs::Flow.Pull"
+	bindFieldReceiverCall(t, g, callerID, "Store", "Rec.cs::IBox.Get")
+
+	ResolveCSharpInterfaceDispatch(g)
+
+	targets := dispatchTargets(g, callerID)
+	assert.Contains(t, targets, "Rec.cs::CrateBox.Get")
+	assert.NotContains(t, targets, "Rec.cs::WidgetBox.Get",
+		"the positional property's declared closure is IBox<Crate> - the Widget impl filters")
 }
