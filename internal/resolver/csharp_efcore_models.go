@@ -115,7 +115,7 @@ func ResolveCSharpEFCoreModels(g graph.Store) int {
 			continue
 		}
 		cls := cands[0]
-		tableID := csharpEFTableNodeID(f.table, f.schema)
+		tableID := csharpEFTableNodeID(cls.RepoPrefix, f.table, f.schema)
 		meta := map[string]any{
 			"orm":        "efcore",
 			"binding":    "fluent",
@@ -140,7 +140,7 @@ func ResolveCSharpEFCoreModels(g graph.Store) int {
 			if e.To == tableID {
 				continue
 			}
-			csharpEFEnsureTableNode(g, tableID, f.table, f.schema, f.filePath)
+			csharpEFEnsureTableNode(g, tableID, f.table, f.schema, f.filePath, cls.RepoPrefix)
 			oldTo := e.To
 			e.To = tableID
 			e.Origin = graph.OriginASTInferred
@@ -156,7 +156,7 @@ func ResolveCSharpEFCoreModels(g graph.Store) int {
 			continue
 		}
 		mapped[cls.ID] = true
-		csharpEFEnsureTableNode(g, tableID, f.table, f.schema, f.filePath)
+		csharpEFEnsureTableNode(g, tableID, f.table, f.schema, f.filePath, cls.RepoPrefix)
 		e := &graph.Edge{
 			From: cls.ID, To: tableID, Kind: graph.EdgeModelsTable,
 			FilePath:        f.filePath,
@@ -184,8 +184,8 @@ func ResolveCSharpEFCoreModels(g graph.Store) int {
 			continue
 		}
 		mapped[cls.ID] = true
-		tableID := csharpEFTableNodeID(f.table, "")
-		csharpEFEnsureTableNode(g, tableID, f.table, "", f.filePath)
+		tableID := csharpEFTableNodeID(cls.RepoPrefix, f.table, "")
+		csharpEFEnsureTableNode(g, tableID, f.table, "", f.filePath, cls.RepoPrefix)
 		e := &graph.Edge{
 			From: cls.ID, To: tableID, Kind: graph.EdgeModelsTable,
 			FilePath:        f.filePath,
@@ -327,26 +327,36 @@ func csharpEFInlineFactsFromFile(n *graph.Node) []csharpEFFluentFact {
 }
 
 // csharpEFTableNodeID mirrors the db::<dialect>::<schema>.<table>
-// convention the other ORM passes share.
-func csharpEFTableNodeID(table, schema string) string {
+// convention the other ORM passes share. In a workspace store, ingest
+// prefixes every extraction ID with the repo — the extractor-minted
+// db::orm:: nodes included — so resolver-minted IDs carry the joined
+// entity's RepoPrefix to keep one logical table one identity
+// regardless of which binding path named it. RepoPrefix is empty in a
+// single-repo store and the ID stays bare, same as extraction.
+func csharpEFTableNodeID(repoPrefix, table, schema string) string {
+	id := "db::orm::" + table
 	if schema != "" {
-		return "db::orm::" + schema + "." + table
+		id = "db::orm::" + schema + "." + table
 	}
-	return "db::orm::" + table
+	if repoPrefix != "" {
+		id = repoPrefix + "/" + id
+	}
+	return id
 }
 
 // csharpEFEnsureTableNode mints the KindTable node when the store does
 // not already hold it.
-func csharpEFEnsureTableNode(g graph.Store, tableID, table, schema, filePath string) {
+func csharpEFEnsureTableNode(g graph.Store, tableID, table, schema, filePath, repoPrefix string) {
 	if g.GetNode(tableID) != nil {
 		return
 	}
 	g.AddNode(&graph.Node{
-		ID:       tableID,
-		Kind:     graph.KindTable,
-		Name:     table,
-		FilePath: filePath,
-		Language: "csharp",
+		ID:         tableID,
+		Kind:       graph.KindTable,
+		Name:       table,
+		FilePath:   filePath,
+		Language:   "csharp",
+		RepoPrefix: repoPrefix,
 		Meta: map[string]any{
 			"dialect": "orm",
 			"schema":  schema,

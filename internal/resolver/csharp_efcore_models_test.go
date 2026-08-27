@@ -298,6 +298,38 @@ public class ProbeContext : DbContext
 	assert.Greater(t, models[0].Line, 1, "edge evidence carries the mapping statement's line, not the file top")
 }
 
+// TestResolveCSharpEFCoreModels_RepoPrefixedStoreSpelling: in a
+// workspace store, ingest prefixes every extraction ID with the repo —
+// including the extractor-minted db::orm:: table nodes. Edges the
+// RESOLVER mints must use the same spelling, or one logical table
+// splits into a bare and a prefixed identity depending on which
+// binding path named it.
+func TestResolveCSharpEFCoreModels_RepoPrefixedStoreSpelling(t *testing.T) {
+	g := graph.New()
+	g.AddNode(&graph.Node{
+		ID: "probe/Domain\\Widget.cs::Widget", Kind: graph.KindType, Name: "Widget",
+		FilePath: "probe/Domain\\Widget.cs", Language: "csharp", RepoPrefix: "probe",
+	})
+	g.AddNode(&graph.Node{
+		ID: "probe/Data\\Ctx.cs::ProbeContext", Kind: graph.KindType, Name: "ProbeContext",
+		FilePath: "probe/Data\\Ctx.cs", Language: "csharp", RepoPrefix: "probe",
+	})
+	g.AddNode(&graph.Node{
+		ID: "probe/Data\\Ctx.cs::ProbeContext.StockWidgets", Kind: graph.KindField, Name: "StockWidgets",
+		FilePath: "probe/Data\\Ctx.cs", Language: "csharp", RepoPrefix: "probe", StartLine: 7,
+		Meta: map[string]any{"kind": "property", "field_type": "DbSet<Widget>", "receiver": "ProbeContext"},
+	})
+
+	assert.Equal(t, 1, ResolveCSharpEFCoreModels(g))
+	models := efModelsTableEdges(g)
+	require.Len(t, models, 1)
+	assert.Equal(t, "probe/db::orm::StockWidgets", models[0].To,
+		"resolver-minted table IDs carry the entity's repo prefix, matching the ingest spelling")
+	tableNode := g.GetNode("probe/db::orm::StockWidgets")
+	require.NotNil(t, tableNode)
+	assert.Equal(t, "probe", tableNode.RepoPrefix)
+}
+
 // TestResolveCSharpEFCoreModels_AmbiguousEntityNameSkips: the join is
 // by unique class name — two classes sharing the entity's name means
 // the pass refuses to guess and emits nothing.
