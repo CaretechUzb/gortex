@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -399,6 +400,169 @@ func BenchmarkScheduleFileMutationRetryCycle(b *testing.B) {
 	}
 	runCycle()
 	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		runCycle()
+	}
+}
+
+func installBlockedMutationAdmission(w *Watcher) chan struct{} {
+	slots := make(chan struct{}, 1)
+	w.mutationSlotsOnce.Do(func() {
+		w.mutationSlotsCh = slots
+	})
+	slots <- struct{}{}
+	return slots
+}
+
+func TestMutationAdmissionTimeoutRetriesAndKeepsTicketPending(t *testing.T) {
+	w := newMutationRetryTestWatcher(t)
+	slots := installBlockedMutationAdmission(w)
+	deferred := make(chan struct{})
+	var deferredOnce sync.Once
+	var patches atomic.Int32
+	w.mutationAdmissionWaitFn = func() time.Duration { return time.Millisecond }
+	w.mutationRetryDelayFn = func(int) time.Duration {
+		deferredOnce.Do(func() { close(deferred) })
+		return 25 * time.Millisecond
+	}
+	w.pointMutationPatch = func(string, ChangeKind, uint64) error {
+		patches.Add(1)
+		return nil
+	}
+
+	ticket := w.scheduleFileMutation("admission-retry.go", ChangeModified)
+	<-deferred
+	select {
+	case result := <-ticket.Done:
+		t.Fatalf("admission timeout completed ticket early: %+v", result)
+	default:
+	}
+	<-slots
+	result := awaitMutationRetryResult(t, ticket)
+	if !result.Reindexed || result.Err != nil || result.AppliedGeneration != ticket.Generation {
+		t.Fatalf("retry result = %+v", result)
+	}
+	if patches.Load() != 1 {
+		t.Fatalf("patches = %d, want 1", patches.Load())
+	}
+}
+
+func TestMutationAdmissionTimeoutCoalescesIntoNewerGeneration(t *testing.T) {
+	w := newMutationRetryTestWatcher(t)
+	slots := installBlockedMutationAdmission(w)
+	deferred := make(chan struct{})
+	var deferredOnce sync.Once
+	var patches atomic.Int32
+	w.mutationAdmissionWaitFn = func() time.Duration { return time.Millisecond }
+	w.mutationRetryDelayFn = func(int) time.Duration {
+		deferredOnce.Do(func() { close(deferred) })
+		return time.Hour
+	}
+	w.pointMutationPatch = func(string, ChangeKind, uint64) error {
+		patches.Add(1)
+		return nil
+	}
+
+	first := w.scheduleFileMutation("admission-successor.go", ChangeModified)
+	<-deferred
+	select {
+	case result := <-first.Done:
+		t.Fatalf("deferred generation completed early: %+v", result)
+	default:
+	}
+	second := w.scheduleFileMutation("admission-successor.go", ChangeDeleted)
+	<-slots
+	for name, ticket := range map[string]*MutationTicket{"first": first, "second": second} {
+		result := awaitMutationRetryResult(t, ticket)
+		if !result.Reindexed || result.Err != nil || result.AppliedGeneration != second.Generation {
+			t.Fatalf("%s result = %+v, successor generation = %d", name, result, second.Generation)
+		}
+	}
+	if patches.Load() != 1 {
+		t.Fatalf("patches = %d, want 1", patches.Load())
+	}
+}
+
+func TestMutationAdmissionTimeoutThenStopCompletesWatcherStopped(t *testing.T) {
+	w := newMutationRetryTestWatcher(t)
+	installBlockedMutationAdmission(w)
+	deferred := make(chan struct{})
+	var deferredOnce sync.Once
+	w.mutationAdmissionWaitFn = func() time.Duration { return time.Millisecond }
+	w.mutationRetryDelayFn = func(int) time.Duration {
+		deferredOnce.Do(func() { close(deferred) })
+		return time.Hour
+	}
+
+	ticket := w.scheduleFileMutation("admission-stop.go", ChangeModified)
+	<-deferred
+	if err := w.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	result := awaitMutationRetryResult(t, ticket)
+	if !errors.Is(result.Err, errWatcherStopped) {
+		t.Fatalf("stop result = %+v", result)
+	}
+}
+
+func TestMutationAdmissionTimeoutDoesNotRetryPermanentPatchError(t *testing.T) {
+	w := newMutationRetryTestWatcher(t)
+	slots := installBlockedMutationAdmission(w)
+	deferred := make(chan struct{})
+	var deferredOnce sync.Once
+	var attempts atomic.Int32
+	permanent := errors.New("parse failed")
+	w.mutationAdmissionWaitFn = func() time.Duration { return time.Millisecond }
+	w.mutationRetryDelayFn = func(int) time.Duration {
+		deferredOnce.Do(func() { close(deferred) })
+		return 25 * time.Millisecond
+	}
+	w.pointMutationPatch = func(string, ChangeKind, uint64) error {
+		attempts.Add(1)
+		return permanent
+	}
+
+	ticket := w.scheduleFileMutation("admission-permanent.go", ChangeModified)
+	<-deferred
+	<-slots
+	result := awaitMutationRetryResult(t, ticket)
+	if result.Reindexed || !errors.Is(result.Err, permanent) {
+		t.Fatalf("permanent result = %+v", result)
+	}
+	if attempts.Load() != 1 {
+		t.Fatalf("attempts = %d, want 1", attempts.Load())
+	}
+}
+
+func BenchmarkMutationAdmissionDeferredRetryCycle(b *testing.B) {
+	w := newMutationRetryTestWatcher(b)
+	w.config.DebounceMs = 0
+	slots := make(chan struct{}, 1)
+	w.mutationSlotsOnce.Do(func() {
+		w.mutationSlotsCh = slots
+	})
+	w.mutationAdmissionWaitFn = func() time.Duration { return 0 }
+	w.mutationRetryDelayFn = func(int) time.Duration {
+		select {
+		case <-slots:
+		default:
+		}
+		return 0
+	}
+	w.pointMutationPatch = func(string, ChangeKind, uint64) error { return nil }
+
+	runCycle := func() {
+		slots <- struct{}{}
+		result := <-w.scheduleFileMutation("admission-bench.go", ChangeModified).Done
+		if !result.Reindexed || result.Err != nil {
+			b.Fatalf("admission retry result = %+v", result)
+		}
+	}
+	runCycle()
+	b.ReportAllocs()
+	b.ReportMetric(1, "tickets/op")
+	b.ReportMetric(0, "terminal_failures/op")
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		runCycle()

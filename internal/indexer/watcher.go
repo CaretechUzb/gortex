@@ -1777,13 +1777,30 @@ func (w *Watcher) runPointMutation(path string, kind ChangeKind, generation uint
 	patchErr := errMutationPatchAborted
 	// Admit through the cohort semaphore before doing any work. A fired cohort
 	// otherwise puts every path into the patch path at once, contending for the
-	// repository mutation lane.
-	release, admitted := w.admitMutationWork(path)
-	if !admitted {
-		if w.mutationAdmissionStopped() {
-			patchErr = errWatcherStopped
+	// repository mutation lane. Admission pressure retains this generation and
+	// its waiters instead of turning a bounded wait into a terminal receipt.
+	release, admissionErr := w.admitMutationWork(path)
+	if admissionErr != nil {
+		if errors.Is(admissionErr, errWatcherStopped) {
+			w.completeMutationWaitersIfCurrent(path, generation, errWatcherStopped)
+			return
 		}
-		w.completeMutationWaitersIfCurrent(path, generation, patchErr)
+		if errors.Is(admissionErr, errMutationAdmissionDeferred) {
+			if w.mutationGenerationSuperseded(path, generation) {
+				return
+			}
+			if w.schedulePointMutationRetry(path, kind, generation, retryAttempt+1) {
+				return
+			}
+			if w.mutationAdmissionStopped() {
+				w.completeMutationWaitersIfCurrent(path, generation, errWatcherStopped)
+				return
+			}
+			if w.mutationGenerationSuperseded(path, generation) {
+				return
+			}
+		}
+		w.completeMutationWaitersIfCurrent(path, generation, admissionErr)
 		return
 	}
 	defer release()
