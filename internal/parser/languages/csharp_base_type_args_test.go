@@ -223,6 +223,89 @@ func TestCSharpExtractor_FieldTypeArgTriviaIsNotIdentity(t *testing.T) {
 	assert.Equal(t, "Crate", prop["field_type_args"])
 }
 
+// Re-review RED: declaration-side identifier ESCAPES must land in the
+// same normalization domain the use side compares in. `class Outer<@T>`
+// declares the open parameter T, but the raw spelling "@T" in the
+// open-parameter set never meets the use side's normalized "T" - the
+// field stamps a closed type called "T" and dispatch filters everything.
+// The Unicode escape spelling of the same declaration fails identically.
+func TestCSharpExtractor_EscapedDeclarationTypeParamsStayOpen(t *testing.T) {
+	src := []byte(`namespace App {
+    public interface IBox<T> { }
+
+    public class Outer<@T> {
+        private readonly IBox<@T> _verbatim;
+        private readonly IBox<T> _bare;
+    }
+
+    public class Uni<\u0054> {
+        private readonly IBox<T> _viaEscape;
+    }
+}
+`)
+	e := NewCSharpExtractor()
+	result, err := e.Extract("Esc.cs", src)
+	require.NoError(t, err)
+
+	for _, id := range []string{"Esc.cs::Outer._verbatim", "Esc.cs::Outer._bare", "Esc.cs::Uni._viaEscape"} {
+		m := fieldMeta(result.Nodes, id)
+		require.NotNil(t, m, id)
+		assert.NotContains(t, m, "field_type_args",
+			"%s: every spelling of the open declaration parameter closes nothing", id)
+	}
+}
+
+// Re-review RED: alias keys and use-side arguments compared in different
+// normalization domains. The alias collector stored "@Entity" while the
+// argument normalizer strips the verbatim prefix to "Entity" - the guard
+// missed and the alias-opaque argument stamped as a closed type.
+func TestCSharpExtractor_VerbatimAliasSpellingsAreOpaque(t *testing.T) {
+	src := []byte(`using @Entity = App.Crate;
+
+namespace App {
+    public interface IBox<T> { }
+    public class Crate { }
+
+    public class Flow {
+        private readonly IBox<@Entity> _verbatimUse;
+        private readonly IBox<Entity> _bareUse;
+    }
+}
+`)
+	e := NewCSharpExtractor()
+	result, err := e.Extract("VAlias.cs", src)
+	require.NoError(t, err)
+
+	for _, id := range []string{"VAlias.cs::Flow._verbatimUse", "VAlias.cs::Flow._bareUse"} {
+		m := fieldMeta(result.Nodes, id)
+		require.NotNil(t, m, id)
+		assert.NotContains(t, m, "field_type_args",
+			"%s: every spelling denoting the alias is opaque - no stamp", id)
+	}
+}
+
+// Re-review RED (metadata half): the project-global alias stamp must
+// carry the CANONICAL identifier, or the resolver-side guard compares
+// "@Entity" against normalized stamps and never refuses.
+func TestCSharpExtractor_GlobalAliasMetaIsCanonical(t *testing.T) {
+	src := []byte(`global using @Entity = App.Crate;
+`)
+	e := NewCSharpExtractor()
+	result, err := e.Extract("GAlias.cs", src)
+	require.NoError(t, err)
+
+	var fileMeta map[string]any
+	for _, n := range result.Nodes {
+		if n != nil && n.Kind == graph.KindFile {
+			fileMeta = n.Meta
+			break
+		}
+	}
+	require.NotNil(t, fileMeta)
+	assert.Equal(t, []string{"Entity"}, fileMeta["global_using_aliases"],
+		"the alias identifier is stored canonically - verbatim prefix stripped")
+}
+
 // fieldMeta returns the meta of the node with the given ID.
 func fieldMeta(result_nodes []*graph.Node, id string) map[string]any {
 	for _, n := range result_nodes {

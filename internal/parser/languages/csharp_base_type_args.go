@@ -1,6 +1,7 @@
 package languages
 
 import (
+	"strconv"
 	"strings"
 
 	sitter "github.com/zzet/gortex/internal/parser/tsitter"
@@ -80,6 +81,14 @@ func csharpFileAliasNames(root *sitter.Node, src []byte) map[string]bool {
 func csharpUnstampableArgNames(node *sitter.Node, src []byte, fileAliases map[string]bool) map[string]bool {
 	var out map[string]bool
 	add := func(name string) {
+		// The set must live in the same normalization domain the use side
+		// compares in: a declaration spelled `class Outer<@T>` (or with a
+		// Unicode escape) declares the same open parameter T that every
+		// use-side spelling normalizes to. A malformed escape keeps the
+		// raw spelling — the use side refuses those outright.
+		if c := csharpCanonicalIdentifier(name); c != "" {
+			name = c
+		}
 		if name == "" {
 			return
 		}
@@ -100,6 +109,50 @@ func csharpUnstampableArgNames(node *sitter.Node, src []byte, fileAliases map[st
 		add(name)
 	}
 	return out
+}
+
+// csharpCanonicalIdentifier reduces one identifier SPELLING to the
+// identifier it denotes: the verbatim prefix (`@T` → T) is dropped and
+// C# Unicode escapes (`\u0054` → T, the 8-digit `\U` form too) are
+// decoded — all legal respellings of one identifier, and the ONLY
+// domain the open-parameter/alias sets and the use-side normalizer may
+// meet in. "" when an escape is malformed (the compiler would refuse
+// the source; refusing to canonicalize keeps every caller conservative).
+func csharpCanonicalIdentifier(s string) string {
+	s = strings.TrimPrefix(strings.TrimSpace(s), "@")
+	if !strings.Contains(s, `\`) {
+		return s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		if s[i] != '\\' {
+			b.WriteByte(s[i])
+			i++
+			continue
+		}
+		if i+1 >= len(s) {
+			return ""
+		}
+		hexLen := 0
+		switch s[i+1] {
+		case 'u':
+			hexLen = 4
+		case 'U':
+			hexLen = 8
+		default:
+			return ""
+		}
+		if i+2+hexLen > len(s) {
+			return ""
+		}
+		v, err := strconv.ParseUint(s[i+2:i+2+hexLen], 16, 32)
+		if err != nil {
+			return ""
+		}
+		b.WriteRune(rune(v))
+		i += 2 + hexLen
+	}
+	return b.String()
 }
 
 // csharpHasVariantTypeParams reports whether decl's type-parameter list
@@ -146,10 +199,20 @@ func csharpHasVariantTypeParams(decl *sitter.Node) bool {
 // node is not an alias directive. Grammar revisions differ — some wrap
 // the alias in a name_equals node, others lay it out flat (identifier,
 // bare `=` token, target); stampCSharpUsings' skip branch matches the
-// same pair.
+// same pair. The returned name is CANONICAL (verbatim prefix stripped,
+// escapes decoded) so the alias sets and the use-side normalizer meet in
+// one domain — `using @Entity = ...` must catch both `IBox<@Entity>` and
+// `IBox<Entity>`. A malformed escape keeps the raw spelling; the use
+// side refuses those outright.
 func csharpUsingAliasName(n *sitter.Node, src []byte) string {
 	if n == nil || n.Type() != "using_directive" {
 		return ""
+	}
+	canonical := func(s string) string {
+		if c := csharpCanonicalIdentifier(s); c != "" {
+			return c
+		}
+		return s
 	}
 	firstIdent := ""
 	for i, _nc := 0, int(n.ChildCount()); i < _nc; i++ {
@@ -161,11 +224,11 @@ func csharpUsingAliasName(n *sitter.Node, src []byte) string {
 		case "name_equals":
 			for j, _jc := 0, int(c.NamedChildCount()); j < _jc; j++ {
 				if id := c.NamedChild(j); id != nil && id.Type() == "identifier" {
-					return strings.TrimSpace(id.Content(src))
+					return canonical(strings.TrimSpace(id.Content(src)))
 				}
 			}
 		case "=":
-			return firstIdent
+			return canonical(firstIdent)
 		case "identifier":
 			if firstIdent == "" {
 				firstIdent = strings.TrimSpace(c.Content(src))
@@ -276,12 +339,15 @@ func csharpNormalizeSimpleArg(text string, openParams map[string]bool) string {
 	if dot := strings.LastIndex(text, "."); dot >= 0 {
 		text = text[dot+1:]
 	}
-	// A verbatim identifier (`@Crate`, `@T`) names the same symbol as its
-	// bare spelling. Strip BEFORE the open-parameter/alias check so
-	// `IBox<@T>` reads as the open parameter T — never as a closed type
-	// spelled "@T" that would gate the open implementor out.
-	text = strings.TrimPrefix(text, "@")
-	if text == "" || openParams[text] {
+	// A verbatim identifier (`@Crate`, `@T`) or a Unicode-escaped one
+	// names the same symbol as its bare spelling. Canonicalize BEFORE the
+	// open-parameter/alias check so every spelling meets the set in one
+	// domain — `IBox<@T>` reads as the open parameter T, never as a
+	// closed type spelled "@T" that would gate the open implementor out.
+	// A malformed escape (or one decoding to a non-identifier character)
+	// refuses: the compiler would too, and refusal never filters.
+	text = csharpCanonicalIdentifier(text)
+	if text == "" || strings.ContainsAny(text, "<[?(,. :@/\\*") || openParams[text] {
 		return ""
 	}
 	// Fold AFTER the open-name check: a type parameter or alias named
