@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -358,4 +359,118 @@ func TestFidelityGlobDecideForPath_SubtreeComposition(t *testing.T) {
 	require.NotNil(t, other)
 	assert.Equal(t, elide.FidelityOmit, other(elide.Decl{}),
 		"a path outside the subtree must fall through to the catch-all")
+}
+
+// BenchmarkMatchFidelityGlob_LongTerminalStarWithoutGlobstar keeps the
+// non-globstar amplification from coming back.
+//
+// A pattern ending in `/*` used to enter the globstar walk on the theory
+// that normalisation might rewrite the terminal star — but that rewrite is
+// gated on an existing `**`, so a pattern without one could never gain a
+// match there and only paid for the split and the working row. find_files
+// runs the matcher against every candidate ahead of `limit`, which made the
+// cost of an oversized pattern a multiplier on the whole scan: this input
+// is ~8 KB with no `**` in it and measured 99,009 B/op before the gate.
+func BenchmarkMatchFidelityGlob_LongTerminalStarWithoutGlobstar(b *testing.B) {
+	pattern := strings.Repeat("segment/", 999) + "*"
+	rel := strings.Repeat("segment/", 39) + "leaf.go"
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if matchFidelityGlob(pattern, rel) {
+			b.Fatal("the deliberately shallower path must not match")
+		}
+	}
+}
+
+// BenchmarkMatchFidelityGlob_GlobstarWalkWorkingSet measures the shape that
+// does reach the walk, so the O(len(rel)) working row stays visible next to
+// the case above rather than being asserted only in a comment.
+func BenchmarkMatchFidelityGlob_GlobstarWalkWorkingSet(b *testing.B) {
+	pattern := "a/" + strings.Repeat("**/x/", 8) + "never"
+	rel := "a/" + strings.Repeat("x/", 20) + "q"
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if matchFidelityGlob(pattern, rel) {
+			b.Fatal("the path does not end in `never`")
+		}
+	}
+}
+
+// TestMatchFidelityGlob_GlobstarGateIgnoresNonSegmentStars pins what counts
+// as a globstar for the entry gate. `a**b` is two ordinary stars to
+// path.Match, not a whole-segment `**`, so it must not pull a pattern into
+// the walk — the gate has to agree with globPatternSegments about that or
+// the two disagree on which patterns the rewrite applies to.
+func TestMatchFidelityGlob_GlobstarGateIgnoresNonSegmentStars(t *testing.T) {
+	for _, pattern := range []string{"**", "**/x.go", "a/**", "a/**/b"} {
+		assert.Truef(t, patternHasGlobstarSegment(pattern),
+			"%q carries a whole-segment globstar", pattern)
+		assert.Truef(t, hasGlobstarSegment(strings.Split(pattern, "/")),
+			"%q: the gate and the split must agree", pattern)
+	}
+	for _, pattern := range []string{"a**b", "a**b/c", "*", "a/*", "a/*.go", "a**"} {
+		assert.Falsef(t, patternHasGlobstarSegment(pattern),
+			"%q has no whole-segment globstar", pattern)
+		assert.Falsef(t, hasGlobstarSegment(strings.Split(pattern, "/")),
+			"%q: the gate and the split must agree", pattern)
+	}
+
+	// `a**b` still behaves as an ordinary segment glob.
+	assert.True(t, matchFidelityGlob("a**b", "axxb"))
+	assert.False(t, matchFidelityGlob("a**b", "a/x/b"))
+}
+
+// TestParseFidelityGlobs_DropsOversizedClause holds the fidelity parser to
+// the same bound as find_files. It is fail-soft by contract, so the clause
+// is dropped rather than reported — but it must not reach the matcher,
+// because fidelity rules run once per file.
+func TestParseFidelityGlobs_DropsOversizedClause(t *testing.T) {
+	huge := strings.Repeat("segment/", maxGlobSegments+10) + "**"
+	rules := parseFidelityGlobs("internal/**:full," + huge + ":omit")
+	require.Len(t, rules, 1, "only the well-formed clause survives")
+	assert.Equal(t, "internal/**", rules[0].glob)
+}
+
+// TestMatchFidelityGlob_NonGlobstarPatternDoesNotEnterTheWalk binds what
+// the benchmark above only reports. A benchmark is not run by CI and
+// nothing fails when its numbers regress, so the allocation ceiling that
+// actually matters is asserted here.
+//
+// Measured on this input (~8 KB pattern, no `**`, 40-segment path):
+//
+//	before the entry gate   99,009 B/op   6 allocs
+//	after                   16,384 B/op   2 allocs
+//
+// The remaining bytes are the `pattern + "/"` concatenations in the legacy
+// prefix fallback, which the handler's size bound now caps. The threshold
+// sits between the two with roughly 2.4x of headroom either way — wide
+// enough that allocator noise cannot trip it, tight enough that putting
+// the dense walk back cannot pass.
+func TestMatchFidelityGlob_NonGlobstarPatternDoesNotEnterTheWalk(t *testing.T) {
+	pattern := strings.Repeat("segment/", 999) + "*"
+	rel := strings.Repeat("segment/", 39) + "leaf.go"
+
+	require.False(t, patternHasGlobstarSegment(pattern),
+		"the fixture must have no whole-segment globstar, or it proves nothing")
+	require.False(t, matchFidelityGlob(pattern, rel),
+		"the deliberately shallower path must not match")
+
+	const runs = 200
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	for i := 0; i < runs; i++ {
+		_ = matchFidelityGlob(pattern, rel)
+	}
+	runtime.ReadMemStats(&after)
+
+	perOp := (after.TotalAlloc - before.TotalAlloc) / runs
+	assert.Lessf(t, perOp, uint64(40_000),
+		"matchFidelityGlob allocated %d B/op for a pattern with no globstar; "+
+			"find_files runs this per candidate file ahead of `limit`, so this "+
+			"is user-controlled memory pressure", perOp)
 }

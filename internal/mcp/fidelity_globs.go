@@ -45,7 +45,9 @@ func parseFidelityGlobs(spec string) []fidelityRule {
 		}
 		glob := strings.TrimSpace(clause[:idx])
 		fid, ok := parseFidelity(clause[idx+1:])
-		if glob == "" || !ok {
+		// Same bound as find_files, dropped rather than reported: this
+		// parser is fail-soft by contract, and the rules run per file.
+		if glob == "" || !ok || globTooComplex(glob) {
 			continue
 		}
 		rules = append(rules, fidelityRule{glob: glob, fidelity: fid})
@@ -109,13 +111,17 @@ func matchFidelityGlob(pattern, rel string) bool {
 	// left exactly as it was, so the directory-prefix rules and the
 	// basename fallback keep deciding everything they decided before.
 	//
-	// The gate keeps the common single-segment patterns (`*_test.go`) on
-	// the cheap path; the shapes that reach the matcher are the ones whose
-	// meaning it owns.
-	if strings.Contains(pattern, "**") || strings.HasSuffix(pattern, "/*") || pattern == "*" {
-		if matchGlobstarSegments(globPatternSegments(pattern), strings.Split(rel, "/")) {
-			return true
-		}
+	// Only a real globstar reaches the walk. A trailing `/*` used to enter
+	// too, on the theory that globPatternSegments might rewrite it — but
+	// that rewrite is itself gated on an existing `**`, so for a pattern
+	// without one the walk could never add a match and only paid for the
+	// split and the working row. find_files runs this against every
+	// candidate before applying the limit, so that overhead was
+	// user-controlled: a 999-segment `segment/.../*` measured 99 kB per
+	// call with no `**` in it at all.
+	if patternHasGlobstarSegment(pattern) &&
+		matchGlobstarSegments(globPatternSegments(pattern), strings.Split(rel, "/")) {
+		return true
 	}
 
 	// Trailing `/**` (or bare `**`): match the directory and the whole
@@ -193,6 +199,35 @@ func hasGlobstarSegment(segs []string) bool {
 	return false
 }
 
+// patternHasGlobstarSegment is hasGlobstarSegment without the split, so the
+// hot path can decide whether the globstar walk is needed at all without
+// allocating. The four shapes are exhaustive: a bare `**` segment is either
+// the whole pattern, its first segment, its last, or bounded by slashes on
+// both sides.
+func patternHasGlobstarSegment(pattern string) bool {
+	return pattern == "**" ||
+		strings.HasPrefix(pattern, "**/") ||
+		strings.HasSuffix(pattern, "/**") ||
+		strings.Contains(pattern, "/**/")
+}
+
+// Bounds on a user-supplied glob, applied before anything scans files. The
+// walk is linear in pattern segments times path segments, so an unbounded
+// pattern is unbounded work per candidate. A repo-relative path glob does
+// not legitimately reach these; they exist to stop one request from turning
+// a file scan into a CPU sink.
+const (
+	maxGlobBytes    = 1024
+	maxGlobSegments = 64
+)
+
+// globTooComplex reports whether a glob exceeds the bounds above. It counts
+// separators rather than splitting, so it allocates nothing.
+func globTooComplex(pattern string) bool {
+	return len(pattern) > maxGlobBytes ||
+		strings.Count(pattern, "/")+1 > maxGlobSegments
+}
+
 // matchGlobstarSegments matches a segment-split pattern against a
 // segment-split path, giving `**` its usual meaning: zero or more whole
 // segments, wherever it appears. Every other segment is matched with
@@ -202,52 +237,47 @@ func hasGlobstarSegment(segs []string) bool {
 // `internal/foo_test.go` as well as `internal/a/b/c_test.go`, or the
 // pattern means something different at each depth.
 //
-// The walk is memoised on (pattern index, path index). Plain recursion
-// re-derives the same suffix pair once per way of reaching it, so each
+// Recursion is not an option here. A plain walk re-derives the same
+// (pattern suffix, path suffix) pair once per way of reaching it, so each
 // extra `**` multiplies the work: a 42-byte pattern with twelve of them
 // against a 27-segment non-match ran for over a hundred seconds. The glob
 // is user input and find_files runs this against every candidate file
-// before applying the result limit, so that was a way to pin a daemon
-// core from a single request. With the memo the work is bounded by the
-// state count, O(len(pattern) * len(rel)^2) in the worst case, and the
-// same input returns in microseconds.
+// before applying the result limit, so that was a way to pin a daemon core
+// from a single request.
+//
+// This is the same dynamic program run bottom-up over one row instead of a
+// dense (pattern x path) memo. row[j] answers "does the pattern suffix
+// under consideration match rel[j:]", and each pattern segment rewrites it
+// once, so the working memory is O(len(rel)) rather than
+// O(len(pattern) * len(rel)) — the matrix was itself a per-candidate
+// allocation an oversized pattern could inflate.
 func matchGlobstarSegments(pattern, rel []string) bool {
-	m, n := len(pattern), len(rel)
+	n := len(rel)
 
-	const (
-		unknown uint8 = iota
-		yes
-		no
-	)
-	memo := make([]uint8, (m+1)*(n+1))
+	// Past the end of the pattern only an exhausted path matches.
+	row := make([]bool, n+1)
+	row[n] = true
 
-	var match func(i, j int) bool
-	match = func(i, j int) bool {
-		if i == m {
-			return j == n
-		}
-		slot := i*(n+1) + j
-		if v := memo[slot]; v != unknown {
-			return v == yes
-		}
-		res := false
+	for i := len(pattern) - 1; i >= 0; i-- {
 		if pattern[i] == "**" {
-			for t := j; t <= n && !res; t++ {
-				res = match(i+1, t)
+			// Zero or more whole segments: rel[j:] matches when rel[t:]
+			// does for any t >= j. A suffix OR, in place, from the back.
+			for j := n - 1; j >= 0; j-- {
+				row[j] = row[j] || row[j+1]
 			}
-		} else if j < n {
-			if ok, _ := path.Match(pattern[i], rel[j]); ok {
-				res = match(i+1, j+1)
-			}
+			continue
 		}
-		if res {
-			memo[slot] = yes
-		} else {
-			memo[slot] = no
+		// One segment consumed. Forward is safe: writing row[j] reads
+		// row[j+1], which this pass has not touched yet.
+		for j := 0; j < n; j++ {
+			ok, _ := path.Match(pattern[i], rel[j])
+			row[j] = ok && row[j+1]
 		}
-		return res
+		// The pattern still has this segment to place, so an exhausted
+		// path can no longer match.
+		row[n] = false
 	}
-	return match(0, 0)
+	return row[0]
 }
 
 // matchSegmentGlob applies the single-segment glob semantics shared

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	mcplib "github.com/mark3labs/mcp-go/mcp"
@@ -237,4 +238,36 @@ func TestFindFiles_GlobstarComposesWithTrailingSubtree(t *testing.T) {
 	require.Falsef(t, got["src/a/other/deep.go"],
 		"a sibling directory that is not `internal` must not match")
 	require.Equal(t, 2, resp.Count, "exactly the two files under src/a/internal")
+}
+
+// TestFindFiles_GlobOversizedIsRejectedBeforeScanning is the consumer-side
+// half of the resource bound. The matcher runs once per candidate file,
+// ahead of `limit`, so the size of a user-supplied glob multiplies across
+// the whole scan rather than costing one call. The handler therefore has to
+// refuse an oversized pattern before it walks anything — a bound that only
+// existed inside the matcher would still have paid for the walk.
+func TestFindFiles_GlobOversizedIsRejectedBeforeScanning(t *testing.T) {
+	srv := setupFindFilesServer(t)
+
+	tooManySegments := strings.Repeat("segment/", maxGlobSegments+10) + "*"
+	tooManyBytes := strings.Repeat("a", maxGlobBytes+1)
+
+	for name, glob := range map[string]string{
+		"segments": tooManySegments,
+		"bytes":    tooManyBytes,
+	} {
+		t.Run(name, func(t *testing.T) {
+			res := callTool(t, srv, "find_files", map[string]any{"glob": glob})
+			require.True(t, res.IsError, "an oversized glob must be refused")
+			text := res.Content[0].(mcplib.TextContent).Text
+			require.Contains(t, text, "too large")
+		})
+	}
+
+	// A glob at the limit still works, so the bound is not merely "reject
+	// anything long".
+	atLimit := strings.Repeat("x/", maxGlobSegments-2) + "**"
+	require.False(t, globTooComplex(atLimit))
+	res := callTool(t, srv, "find_files", map[string]any{"glob": atLimit})
+	require.False(t, res.IsError, "a glob inside the bound must still be served")
 }

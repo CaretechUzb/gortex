@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"fmt"
 	"path"
 	"sort"
 	"strings"
@@ -61,6 +62,14 @@ func (s *Server) handleFindFiles(ctx context.Context, req mcp.CallToolRequest) (
 	glob := strings.TrimSpace(req.GetString("glob", ""))
 	if query == "" && glob == "" {
 		return mcp.NewToolResultError("find_files: pass `query` (a filename/path substring) and/or `glob` (a path glob)"), nil
+	}
+	// Bound the glob before anything walks the file set: the matcher runs
+	// per candidate, ahead of `limit`, so pattern size is a multiplier on
+	// the whole scan rather than on one call.
+	if globTooComplex(glob) {
+		return mcp.NewToolResultError(fmt.Sprintf(
+			"find_files: `glob` is too large (%d bytes, %d segments); the limits are %d bytes and %d segments",
+			len(glob), strings.Count(glob, "/")+1, maxGlobBytes, maxGlobSegments)), nil
 	}
 	fuzzy := req.GetBool("fuzzy", false)
 	resolved, errResult := s.resolveScope(ctx, req, IntentLocate)
