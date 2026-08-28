@@ -45,6 +45,7 @@ var extractorVersions = map[string]int{
 	"go":     3,                                      // generic instantiations are marked so indexing a func value cannot bind (was: generic calls emit call edges)
 	"cpp":    2,                                      // templated and namespace-qualified calls emit call edges
 	"swift":  2,                                      // generic calls and ordinary member calls emit call edges
+	"julia":  2,                                      // bespoke tree-sitter extractor replaces the regex extractor (fields, exports, qualified methods, broadcast/macro calls)
 }
 
 // extractorSaltExtLang maps a lower-case file extension to the language
@@ -95,6 +96,7 @@ var extractorSaltExtLang = map[string]string{
 	".exs":    "elixir",
 	".sh":     "bash",
 	".bash":   "bash",
+	".jl":     "julia",
 }
 
 // ExtractorLangForFile returns the extractor-staleness language key for a
@@ -154,10 +156,22 @@ func ExtractorVersionStaleLangs(storedJSON string) []string {
 }
 
 // staleLangsBetween returns the languages whose stored version is behind the
-// current version. Per-language entries are compared only when present in both
-// maps. The reserved post-extraction policy epoch is global: when current tracks
-// it and stored is missing or behind, every real current language is stale.
+// current version. Iteration is over CURRENT, not stored: a language the
+// stored snapshot never recorded is compared against the implicit baseline
+// version 1 that every untracked language carries, and flagged only when the
+// running binary has raised it above that baseline.
+//
+// The reserved post-extraction policy epoch is global: when current tracks it
+// and stored is missing or behind, every real current language is stale. A
+// language present in stored but absent from current is dropped because its
+// extension is no longer version-tracked.
 func staleLangsBetween(stored, current map[string]int) []string {
+	// No baseline at all is "we do not know what produced this graph",
+	// not "everything is behind".
+	if len(stored) == 0 {
+		return nil
+	}
+
 	staleSet := make(map[string]struct{})
 	if currentPolicy, tracked := current[postExtractionPolicySnapshotKey]; tracked {
 		storedPolicy, found := stored[postExtractionPolicySnapshotKey]
@@ -169,15 +183,26 @@ func staleLangsBetween(stored, current map[string]int) []string {
 			}
 		}
 	}
-	for lang, storedV := range stored {
+
+	for lang, cur := range current {
 		if lang == postExtractionPolicySnapshotKey {
 			continue
 		}
-		if cur, ok := current[lang]; ok && storedV < cur {
+		storedV, recorded := stored[lang]
+		if !recorded {
+			// Never recorded means the snapshot's binary tracked no
+			// version for this language: the implicit baseline is 1.
+			if cur > 1 {
+				staleSet[lang] = struct{}{}
+			}
+			continue
+		}
+		if storedV < cur {
 			staleSet[lang] = struct{}{}
 		}
 	}
-	stale := make([]string, 0, len(staleSet))
+
+	var stale []string
 	for lang := range staleSet {
 		stale = append(stale, lang)
 	}

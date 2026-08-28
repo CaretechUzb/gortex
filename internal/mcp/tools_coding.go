@@ -347,6 +347,17 @@ func (s *Server) handleGetEditingContext(ctx context.Context, req mcp.CallToolRe
 	if err != nil {
 		return mcp.NewToolResultError("path is required"), nil
 	}
+	// Admission before any work: a fidelity_globs value that breaks a size
+	// bound refuses the request. Dropping the offending rule would rewrite
+	// a first-match policy silently — an over-budget `omit` disappearing
+	// lets a later `full` win, and the content the caller asked to hide
+	// comes back in a response that looks like a normal success. Parsed
+	// here rather than at the point of use so a malformed request cannot
+	// be served by a path that happens not to reach the compressor.
+	fidelityRules, fidelityErr := parseFidelityGlobs(req.GetString("fidelity_globs", ""))
+	if fidelityErr != nil {
+		return mcp.NewToolResultError("get_editing_context: " + fidelityErr.Error()), nil
+	}
 	// Normalise to the graph's stored path form so a repo-relative path
 	// (internal/x.go) doesn't miss the repo-prefixed nodes in multi-repo
 	// mode — the cause of spurious "no symbols found for file" misses.
@@ -562,7 +573,7 @@ func (s *Server) handleGetEditingContext(ctx context.Context, req mcp.CallToolRe
 				keepNodes := s.editingContextSymbolNodes(fp, out.Defines)
 				keepPred, resolved := resolveKeepPredicate(req.GetString("keep", ""), keepNodes)
 				keptSymbols = resolved
-				decide := fidelityDecideForPath(parseFidelityGlobs(req.GetString("fidelity_globs", "")), fp)
+				decide := fidelityDecideForPath(fidelityRules, fp)
 				if compressed, cerr := elide.CompressWith(fileBytes, language, elide.Options{Keep: keepPred, Decide: decide}); cerr == nil {
 					sourceCompressed = string(compressed)
 				}

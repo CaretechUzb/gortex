@@ -238,3 +238,51 @@ func persistedORMFacts(nodes []*graph.Node, edges []*graph.Edge) (hasTable, hasM
 	}
 	return hasTable, hasModelEdge
 }
+
+// TestIncrementalReindex_NonMerkleNewlyTrackedLanguageRestages is the Julia
+// shape: `.jl` entered extractorSaltExtLang in the same change that set
+// julia@2, so a repository indexed by the PREVIOUS release carries a snapshot
+// with no julia key at all. Comparing only the keys that snapshot happens to
+// hold leaves every such repository serving the regex-era Julia graph forever
+// — no content change re-triggers extraction. Merkle mode catches this through
+// the changed leaf salt; this is the default non-Merkle path.
+func TestIncrementalReindex_NonMerkleNewlyTrackedLanguageRestages(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "geom.jl"), "module Geom\nradius(c) = c.r\nend\n")
+
+	store := &indexStateStore{Store: graph.New()}
+	reg := parser.NewRegistry()
+	reg.Register(languages.NewJuliaExtractor())
+	idx := New(store, reg, config.IndexConfig{Workers: 1}, zap.NewNop())
+	idx.search = search.NewNull()
+	idx.SetRootPath(dir)
+	_, err := idx.IndexCtx(testCtx(), dir)
+	require.NoError(t, err)
+
+	// The previous release's snapshot: every language it tracked, at the
+	// versions it shipped — but no julia key, because it had no .jl mapping.
+	previous := extractorVersionsSnapshot()
+	delete(previous, "julia")
+	encoded, err := json.Marshal(previous)
+	require.NoError(t, err)
+	store.st = graph.RepoIndexState{ExtractorVersions: string(encoded)}
+	store.found = true
+
+	res, err := idx.incrementalReindexPathsMode(dir, nil, incrementalPathMode{detectDeletions: true})
+	require.NoError(t, err)
+	// Exactly one: the repository holds a single .jl file and nothing
+	// else, so a count above one would mean the restage stopped being
+	// per-language — the whole point of the design.
+	assert.Equal(t, 1, res.StaleFileCount,
+		"a language whose first tracked version postdates the stored snapshot must restage")
+
+	var restamped map[string]int
+	require.NoError(t, json.Unmarshal([]byte(store.st.ExtractorVersions), &restamped))
+	assert.Equal(t, extractorVersionForLang("julia"), restamped["julia"],
+		"the clean restage must record julia so it does not repeat forever")
+
+	res, err = idx.incrementalReindexPathsMode(dir, nil, incrementalPathMode{detectDeletions: true})
+	require.NoError(t, err)
+	assert.Zero(t, res.StaleFileCount,
+		"after the re-stamp an unchanged tree must be a no-op again")
+}
