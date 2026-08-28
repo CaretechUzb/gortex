@@ -2548,9 +2548,13 @@ func collectIncrementalFileFrontierMode(
 			if node.Name == "" || !graph.IsReferenceableSymbol(node.Kind) {
 				continue
 			}
-			appendStubKey(graph.UnresolvedMarker + node.Name)
-			if node.RepoPrefix != "" {
-				appendStubKey(node.RepoPrefix + "::" + graph.UnresolvedMarker + node.Name)
+			// The four name-owned forms are one contract. This builder is
+			// the batched incremental path's incoming leg, and it was the
+			// last one still hand-building the bare pair: a member
+			// reference parked under a wildcard form stayed pending until
+			// the next whole-graph resolve.
+			for _, key := range graph.UnresolvedNameCandidateIDs(node) {
+				appendStubKey(key)
 			}
 		}
 	}

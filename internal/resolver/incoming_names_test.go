@@ -194,3 +194,51 @@ func BenchmarkResolveIncomingForNamesNoPending(b *testing.B) {
 		r.ResolveIncomingForNames([]string{"NoSuchName"}, []string{"repo"})
 	}
 }
+
+// The batched file frontier is the third stub-key builder, and it owns the
+// incoming leg of every incremental resolve. A definition a frontier file
+// declares must have its pending references reached under all four name-owned
+// forms, exactly as the names pass does: the wildcard member forms are how a
+// member reference with an unknown receiver parks, and a file pass that
+// enumerates only the bare forms strands them until the next whole-graph
+// resolve. This is what lets the names pass narrow to evicted names.
+func TestResolveFilesAndIncomingRebindsWildcardMemberStubs(t *testing.T) {
+	bare := &graph.Edge{From: "repo/c.go::CallerA", To: graph.UnresolvedMarker + "*.Target", Kind: graph.EdgeCalls, FilePath: "repo/c.go", Line: 3}
+	prefixed := &graph.Edge{From: "repo/d.go::CallerB", To: "repo::" + graph.UnresolvedMarker + "*.Target", Kind: graph.EdgeCalls, FilePath: "repo/d.go", Line: 4}
+	g := graph.New()
+	g.AddBatch([]*graph.Node{
+		{ID: "repo/c.go::CallerA", Kind: graph.KindFunction, Name: "CallerA", FilePath: "repo/c.go", RepoPrefix: "repo", Language: "go"},
+		{ID: "repo/d.go::CallerB", Kind: graph.KindFunction, Name: "CallerB", FilePath: "repo/d.go", RepoPrefix: "repo", Language: "go"},
+		{ID: "repo/b.go", Kind: graph.KindFile, Name: "b.go", FilePath: "repo/b.go", RepoPrefix: "repo", Language: "go"},
+		{ID: "repo/b.go::T.Target", Kind: graph.KindMethod, Name: "Target", QualName: "T.Target", FilePath: "repo/b.go", RepoPrefix: "repo", Language: "go"},
+	}, []*graph.Edge{bare, prefixed})
+
+	New(g).ResolveFilesAndIncoming([]string{"repo/b.go"})
+
+	if bare.To != "repo/b.go::T.Target" {
+		t.Fatalf("bare wildcard-stub edge target = %q, want repo/b.go::T.Target", bare.To)
+	}
+	if prefixed.To != "repo/b.go::T.Target" {
+		t.Fatalf("prefixed wildcard-stub edge target = %q, want repo/b.go::T.Target", prefixed.To)
+	}
+}
+
+// The laxity control for the widened file frontier, mirroring the names-pass
+// pair: two same-name methods on different receivers keep a wildcard member
+// stub parked. Enumerating the wildcard forms adds reach, not laxity.
+func TestResolveFilesAndIncomingAmbiguousWildcardStaysUnresolved(t *testing.T) {
+	pending := &graph.Edge{From: "repo/c.go::Caller", To: graph.UnresolvedMarker + "*.Target", Kind: graph.EdgeCalls, FilePath: "repo/c.go", Line: 3}
+	g := graph.New()
+	g.AddBatch([]*graph.Node{
+		{ID: "repo/c.go::Caller", Kind: graph.KindFunction, Name: "Caller", FilePath: "repo/c.go", RepoPrefix: "repo", Language: "go"},
+		{ID: "repo/x/a.go", Kind: graph.KindFile, Name: "a.go", FilePath: "repo/x/a.go", RepoPrefix: "repo", Language: "go"},
+		{ID: "repo/x/a.go::X.Target", Kind: graph.KindMethod, Name: "Target", QualName: "X.Target", FilePath: "repo/x/a.go", RepoPrefix: "repo", Language: "go"},
+		{ID: "repo/y/b.go::Y.Target", Kind: graph.KindMethod, Name: "Target", QualName: "Y.Target", FilePath: "repo/y/b.go", RepoPrefix: "repo", Language: "go"},
+	}, []*graph.Edge{pending})
+
+	New(g).ResolveFilesAndIncoming([]string{"repo/x/a.go"})
+
+	if pending.To != graph.UnresolvedMarker+"*.Target" {
+		t.Fatalf("ambiguous wildcard-stub edge target = %q, want it to stay parked", pending.To)
+	}
+}
