@@ -911,6 +911,26 @@ func (e *CSharpExtractor) emitNamespace(m parser.QueryResult, filePath, fileID s
 	})
 }
 
+// csharpMarkVariantTypeParams ORs the variance stamp onto an already
+// emitted type node. Type node IDs carry no arity, so a generic
+// interface can collide with a non-generic twin and be dropped whole -
+// but variance is a REFUSAL signal, and a refusal that only one
+// colliding declaration carries has to survive the collision. Union is
+// therefore the conservative merge: it can only widen a fan-out.
+func csharpMarkVariantTypeParams(result *parser.ExtractionResult, id string) {
+	for i := len(result.Nodes) - 1; i >= 0; i-- {
+		n := result.Nodes[i]
+		if n == nil || n.ID != id {
+			continue
+		}
+		if n.Meta == nil {
+			n.Meta = map[string]any{}
+		}
+		n.Meta["variant_type_params"] = true
+		return
+	}
+}
+
 // emitContainer collapses the per-kind class/interface/struct/enum
 // node emission. The capture-name prefix selects which capture set to
 // read from (the legacy code repeated this body four times).
@@ -919,6 +939,16 @@ func (e *CSharpExtractor) emitContainer(m parser.QueryResult, kind string, nodeK
 	def := m.Captures[kind+".def"]
 	id := filePath + "::" + name
 	if seen[id] {
+		// A second declaration on an ID already taken: the arity pair
+		// (ISource / ISource<out T>, Result / Result<T>), same-file
+		// partial parts, or two namespaces in one file. The node is
+		// dropped, but variance must not be dropped with it - the gate
+		// reads that stamp off whichever node survives, and evaluating
+		// it behind this return meant a bare-named sibling could delete
+		// a covariant family's only protection.
+		if kind == "iface" && csharpHasVariantTypeParams(def.Node) {
+			csharpMarkVariantTypeParams(result, id)
+		}
 		return
 	}
 	seen[id] = true
