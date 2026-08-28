@@ -271,6 +271,21 @@ func (e *JuliaExtractor) walkMacroArgs(n *sitter.Node, src []byte, scope juliaSc
 			case "module_definition":
 				e.handleModule(a, src, scope, st, doc)
 			default:
+				// Walk a macro argument the way the generic walker
+				// would, dispatching the argument's own kind before
+				// its children: walk() visits a node's children but
+				// never the node itself, so a call_expression argument
+				// was never shown to handleCall. `@everywhere
+				// include("f.jl")` under a docstring is the shape that
+				// loses its edge — call edges otherwise need an
+				// enclosing function, which a documented (module- or
+				// file-level) macro call never has.
+				switch a.Type() {
+				case "call_expression", "broadcast_call_expression":
+					e.handleCall(a, src, scope, st)
+				case "macrocall_expression":
+					e.handleMacroCall(a, src, scope, st)
+				}
 				e.walk(a, src, scope, st)
 				continue
 			}

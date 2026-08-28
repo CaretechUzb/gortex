@@ -1009,6 +1009,43 @@ end
 	assert.True(t, sawHelper, "the inner call of a qualified macro keeps its own edge")
 }
 
+// A docstring above a macro call switches walkMacroArgs into its
+// doc-carrying loop, which dispatched definition arguments to their
+// handlers but walked every other argument with walk() — and walk()
+// visits a node's children, never the node itself. A call_expression
+// argument therefore never reached handleCall; since ordinary call
+// edges need an enclosing function, which a documented module-level
+// macro call never has, the one observable loss is the include() that
+// loads a file on every worker.
+func TestJuliaExtractor_DocumentedMacroArgumentsKeepCalls(t *testing.T) {
+	src := []byte(`module M
+"""load helpers on every worker"""
+@everywhere include("helpers.jl")
+end
+`)
+	res, err := NewJuliaExtractor().Extract("everywhere.jl", src)
+	require.NoError(t, err)
+
+	var got bool
+	for _, ed := range res.Edges {
+		if ed.Kind == graph.EdgeImports && ed.To == "unresolved::import::helpers.jl" {
+			got = true
+		}
+	}
+	assert.True(t, got, "an include() in a documented macro argument keeps its import edge")
+
+	// The undocumented form must keep working identically.
+	plain, err := NewJuliaExtractor().Extract("plain.jl", []byte("module M\n@everywhere include(\"more.jl\")\nend\n"))
+	require.NoError(t, err)
+	var plainGot bool
+	for _, ed := range plain.Edges {
+		if ed.Kind == graph.EdgeImports && ed.To == "unresolved::import::more.jl" {
+			plainGot = true
+		}
+	}
+	assert.True(t, plainGot, "the undocumented form is unchanged")
+}
+
 func TestJuliaExtractor_ConstAndDocstrings(t *testing.T) {
 	src := []byte(`"""
 Circle radius helpers.
