@@ -766,18 +766,21 @@ func (e *JuliaExtractor) emitCallable(
 	return inner
 }
 
-// juliaImportModule returns the module a `selected_import` /
-// `import_alias` names, plus the index of the first child after it. A
-// dotted or relative path (`A.B`, `.Local`, `..Up`) is an `import_path`
-// node; a single-segment module is a bare `identifier`. Everything after
-// it is the selected bindings or the alias.
-func juliaImportModule(n *sitter.Node, src []byte) (module string, next int) {
+// juliaImportHead returns what a `selected_import` / `import_alias` names
+// first, plus the index of the child after it. For a statement-level node
+// that is the module: a dotted or relative path (`A.B`, `.Local`, `..Up`)
+// is an `import_path`, a single-segment module a bare `identifier`.
+// Inside a selected list the same position holds the RENAMED BINDING, so
+// operators and macros are accepted there too — `import Base: + as plus`
+// and `import Base: @time as t` both put a non-identifier in it.
+// Everything after is the selection or the alias.
+func juliaImportHead(n *sitter.Node, src []byte) (head string, next int) {
 	first := n.NamedChild(0)
 	if first == nil {
 		return "", 0
 	}
 	switch first.Type() {
-	case "import_path", "identifier":
+	case "import_path", "identifier", "operator", "macro_identifier":
 		return first.Content(src), 1
 	}
 	return "", 0
@@ -787,7 +790,7 @@ func juliaImportModule(n *sitter.Node, src []byte) (module string, next int) {
 // statement level, `bar as baz` inside a selected list — into the
 // upstream name and the local alias.
 func juliaAliasParts(n *sitter.Node, src []byte) (orig, alias string) {
-	orig, next := juliaImportModule(n, src)
+	orig, next := juliaImportHead(n, src)
 	if orig == "" {
 		return "", ""
 	}
@@ -796,7 +799,8 @@ func juliaAliasParts(n *sitter.Node, src []byte) (orig, alias string) {
 		if s == nil {
 			continue
 		}
-		if s.Type() == "identifier" || s.Type() == "operator" {
+		switch s.Type() {
+		case "identifier", "operator", "macro_identifier":
 			alias = s.Content(src)
 		}
 	}
@@ -888,7 +892,7 @@ func (e *JuliaExtractor) handleImport(n *sitter.Node, src []byte, st *juliaWalkS
 			// an import_path whenever the path is dotted or relative.
 			// Scanning for identifiers instead skipped it and promoted
 			// the first selected name to the import target.
-			module, next := juliaImportModule(c, src)
+			module, next := juliaImportHead(c, src)
 			var names []string
 			type binding struct{ orig, alias string }
 			var bindings []binding
@@ -898,9 +902,10 @@ func (e *JuliaExtractor) handleImport(n *sitter.Node, src []byte, st *juliaWalkS
 					continue
 				}
 				switch s.Type() {
-				case "identifier", "operator":
-					// `using Base: +, -` selects operators, which are
-					// `operator` nodes rather than identifiers.
+				case "identifier", "operator", "macro_identifier":
+					// `using Base: +, -` selects operators and
+					// `using Base: @time` a macro; neither is an
+					// identifier node.
 					names = append(names, s.Content(src))
 					bindings = append(bindings, binding{orig: s.Content(src)})
 				case "import_alias":

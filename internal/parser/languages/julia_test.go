@@ -702,6 +702,44 @@ import Foo: bar as baz
 	assert.ElementsMatch(t, []string{"bar"}, byTarget["unresolved::import::Foo"][0].names)
 }
 
+// A selected macro is a `macro_identifier` node and a selected operator an
+// `operator` node, so an identifier-only scan drops both — including from
+// the per-binding edges the module edge's `names` meta exists to back.
+// `using Base: @time` and `import Base: + as plus` are ordinary Julia.
+func TestJuliaExtractor_MacroAndOperatorSelections(t *testing.T) {
+	src := []byte(`using Base: @time, isempty
+import Base.Threads: @spawn
+import Base: + as plus, -
+`)
+	res, err := NewJuliaExtractor().Extract("sel.jl", src)
+	require.NoError(t, err)
+
+	names := map[string][]string{}
+	bindings := map[string]string{}
+	for _, ed := range res.Edges {
+		if ed.Kind != graph.EdgeImports {
+			continue
+		}
+		if v, ok := ed.Meta["names"].([]string); ok {
+			names[ed.To] = append(names[ed.To], v...)
+		}
+		bindings[ed.To] = ed.Alias
+	}
+
+	// Two statements select from Base, so the names accumulate.
+	assert.ElementsMatch(t, []string{"@time", "isempty", "+", "-"},
+		names["unresolved::import::Base"])
+	require.Contains(t, bindings, "unresolved::import::Base::@time",
+		"a selected macro needs its own binding edge")
+	require.Contains(t, bindings, "unresolved::import::Base.Threads::@spawn")
+	assert.ElementsMatch(t, []string{"@spawn"}, names["unresolved::import::Base.Threads"])
+
+	require.Contains(t, bindings, "unresolved::import::Base::+",
+		"a renamed operator selection must not vanish")
+	assert.Equal(t, "plus", bindings["unresolved::import::Base::+"])
+	require.Contains(t, bindings, "unresolved::import::Base::-")
+}
+
 func TestJuliaExtractor_Calls(t *testing.T) {
 	src := []byte(`module Calls
 
