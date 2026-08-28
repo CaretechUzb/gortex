@@ -299,7 +299,9 @@ func (l *CheckoutLifecycle) indexPromotedCorpus(
 			return result, resampled, nil
 		}
 		resampled++
-		l.mi.UntrackRepo(prefix)
+		if _, _, err := l.mi.UntrackRepoChecked(ctx, prefix); err != nil {
+			return nil, resampled, err
+		}
 	}
 	return nil, resampled, fmt.Errorf("%w: %s moved under two full indexes",
 		ErrCheckoutMoved, checkout.RootPath)
@@ -368,17 +370,20 @@ func (l *CheckoutLifecycle) withdrawAutomaticRoute(ctx context.Context, checkout
 // rollbackPromotion undoes what a failed promotion built. The automatic view
 // was never touched, so putting the corpus and the graph row back the way they
 // were is the whole of it.
-func (l *CheckoutLifecycle) rollbackPromotion(ctx context.Context, prefix, graphID string) {
+func (l *CheckoutLifecycle) rollbackPromotion(ctx context.Context, prefix, graphID string) error {
+	if prefix != "" {
+		l.detachWatcher(prefix)
+		if _, _, err := l.mi.purgeRepoChecked(ctx, prefix, nil); err != nil {
+			return fmt.Errorf("indexer: purge rolled-back repository %q: %w", prefix, err)
+		}
+	}
 	if graphID != "" {
 		if err := l.catalog.DeleteDedicatedGraph(ctx, graphID); err != nil &&
 			!errors.Is(err, store_sqlite.ErrCatalogNotFound) {
-			l.logger.Warn("checkout lifecycle: could not drop a rolled-back graph binding",
-				zap.String("graph", graphID), zap.Error(err))
+			return fmt.Errorf("indexer: drop rolled-back graph binding %q: %w", graphID, err)
 		}
 	}
-	if prefix != "" && l.mi.GetMetadata(prefix) != nil {
-		l.evictRepo(prefix)
-	}
+	return nil
 }
 
 // beginModeChange journals a mode change, adopting the entry an interrupted
