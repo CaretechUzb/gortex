@@ -342,7 +342,10 @@ func (g *Graph) recordEvictedNodesForReceipts(nodes []*Node) {
 				acc.noteIncomplete("evicted_import_candidate_kind")
 				continue
 			}
-			if len(names) == 0 {
+			// An empty name set is not always proof of neutrality: a file
+			// node has no stub key yet is an import candidate. See
+			// EvictedNodeNeedsResolutionFrontier.
+			if len(names) == 0 && !EvictedNodeNeedsResolutionFrontier(n.Kind) {
 				continue
 			}
 			acc.resolutionRelevant = true

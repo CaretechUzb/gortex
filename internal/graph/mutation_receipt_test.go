@@ -344,6 +344,35 @@ func TestMutationReceiptEvictAmbiguousImportPackageCandidateRecordsImportStub(t 
 	}
 }
 
+// Evicting a file whose nodes map to no stub names still changes resolution.
+// A file node is an import candidate - relative imports, Lua requires, Godot
+// res:// paths all bind to one - so its removal can collapse an ambiguity for
+// a pending import elsewhere. ReceiptNamesForEvictedSymbol has no stub key to
+// offer for it, but "no name to add" is not "no resolution work": the file
+// still has to reach the definition frontier, and the receipt must not certify
+// itself resolution-irrelevant, which is the one verdict that skips the
+// catch-up pass entirely.
+func TestMutationReceiptEvictNamelessNodeStaysResolutionRelevant(t *testing.T) {
+	g := New()
+	g.AddBatch([]*Node{
+		{ID: "repo/b.go", Kind: KindFile, Name: "b.go", FilePath: "b.go", RepoPrefix: "repo"},
+	}, nil)
+
+	token := g.BeginMutationReceipt()
+	g.EvictFile("b.go")
+	receipt := g.EndMutationReceipt(token)
+
+	if !receipt.Complete {
+		t.Fatalf("receipt = %+v, want complete", receipt)
+	}
+	if !receipt.ResolutionRelevant {
+		t.Fatalf("receipt = %+v, want resolution-relevant: an evicted file node can rebind a pending import", receipt)
+	}
+	if files := receipt.ResolutionFiles(); !slices.Contains(files, "b.go") {
+		t.Fatalf("resolution files = %v, want the evicted file in the frontier", files)
+	}
+}
+
 // EvictedNames is the name frontier's input, and it must carry only names that
 // vanished. An added definition is reached through its own file: that file is
 // in DefinitionFiles, and the file frontier enumerates the stub forms of every

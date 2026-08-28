@@ -218,12 +218,23 @@ func recordSQLiteChangedNodeIdentity(
 	// The old identity's names vanished with it: the file still enters the
 	// definition frontier, but it no longer declares those names, so nothing
 	// in the file pass enumerates their stubs. They belong to the name
-	// frontier for the same reason an evicted definition's names do. The
-	// final identity's names do not — its file declares them.
+	// frontier for the same reason an evicted definition's names do.
+	//
+	// The one name that does NOT need the name pass is a name the final
+	// identity still declares in the form the file frontier enumerates, and
+	// that form is narrow: UnresolvedNameCandidateIDs reads Name only, and
+	// collectIncrementalFileFrontierMode visits referenceable kinds only. So
+	// matching final.QualName is not grounds to skip (that form is never
+	// enumerated), and neither is matching final.Name when the final kind is
+	// no longer referenceable (that node is never visited).
 	for _, name := range []string{old.name, old.qualName} {
-		if name != "" && name != final.Name && name != final.QualName {
-			acc.evictedNames[name] = struct{}{}
+		if name == "" {
+			continue
 		}
+		if finalReferenceable && name == final.Name {
+			continue
+		}
+		acc.evictedNames[name] = struct{}{}
 	}
 	for _, filePath := range []string{old.filePath, final.FilePath} {
 		if filePath != "" {

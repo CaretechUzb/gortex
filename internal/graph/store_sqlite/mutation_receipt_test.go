@@ -966,6 +966,30 @@ func TestSQLiteMutationReceiptEvictAmbiguousImportPackageCandidateRecordsImportS
 	}
 }
 
+// SQLite mirror: evicting a file node contributes no stub name, but a file
+// node is an import candidate, so the receipt must stay resolution-relevant
+// and put the file in the frontier rather than certify the eviction neutral.
+func TestSQLiteMutationReceiptEvictNamelessNodeStaysResolutionRelevant(t *testing.T) {
+	store := openMutationReceiptStore(t)
+	store.AddBatch([]*graph.Node{
+		{ID: "repo/b.go", Kind: graph.KindFile, Name: "b.go", FilePath: "b.go", RepoPrefix: "repo"},
+	}, nil)
+
+	token := store.BeginMutationReceipt()
+	store.EvictFiles([]string{"b.go"})
+	receipt := store.EndMutationReceipt(token)
+
+	if !receipt.Complete {
+		t.Fatalf("receipt = %+v, want complete", receipt)
+	}
+	if !receipt.ResolutionRelevant {
+		t.Fatalf("receipt = %+v, want resolution-relevant: an evicted file node can rebind a pending import", receipt)
+	}
+	if files := receipt.ResolutionFiles(); !slices.Contains(files, "b.go") {
+		t.Fatalf("resolution files = %v, want the evicted file in the frontier", files)
+	}
+}
+
 // The SQLite mirror of the Graph EvictedNames split: the name frontier's input
 // carries the vanished definition and not the added one, which the file
 // frontier already reaches through DefinitionFiles.

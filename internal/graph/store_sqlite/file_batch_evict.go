@@ -186,7 +186,10 @@ func recordSQLiteEvictedNode(acc *sqliteMutationReceiptAccumulator, id, kind, na
 		acc.noteIncomplete("evicted_import_candidate_kind")
 		return
 	}
-	if len(names) == 0 {
+	// An empty name set is not always proof of neutrality: a file node has no
+	// stub key yet is an import candidate. See
+	// graph.EvictedNodeNeedsResolutionFrontier.
+	if len(names) == 0 && !graph.EvictedNodeNeedsResolutionFrontier(graph.NodeKind(kind)) {
 		return
 	}
 	acc.resolutionRelevant = true
