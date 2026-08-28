@@ -9,6 +9,11 @@ import (
 
 // copyFixture builds a repository that exercises every id grammar a real one
 // carries, including the two that a naive prefix rewrite gets wrong.
+//
+// FilePath is written the way the indexer writes it — prefixed by the repo,
+// "local/models/order.py", not the bare relative path. An earlier version of
+// this fixture used the bare form, which is why eight green tests never
+// noticed that the copy left every path pointing at the source checkout.
 func copyFixture(t *testing.T) *Store {
 	t.Helper()
 	store, err := Open(filepath.Join(t.TempDir(), "copy.sqlite"))
@@ -20,7 +25,10 @@ func copyFixture(t *testing.T) *Store {
 	store.AddBatch([]*graph.Node{
 		// File-derived: the `<prefix>/` grammar.
 		{ID: "local/models/order.py::Order", Kind: graph.KindType, Name: "Order",
-			FilePath: "models/order.py", Language: "python", RepoPrefix: "local"},
+			FilePath: "local/models/order.py", Language: "python", RepoPrefix: "local"},
+		// A repository-root file: its generated file_dir is the bare prefix.
+		{ID: "local/README.md::doc:readme", Kind: graph.KindDoc, Name: "readme",
+			FilePath: "local/README.md", Language: "markdown", RepoPrefix: "local"},
 		// Synthetic: the `<prefix>::` grammar. Missed by a `/`-only rewrite.
 		{ID: "local::builtin::py::list/sort", Kind: graph.KindFunction, Name: "sort",
 			Language: "python", RepoPrefix: "local"},
@@ -28,13 +36,14 @@ func copyFixture(t *testing.T) *Store {
 			Name: "ArgumentParser", Language: "python", RepoPrefix: "local"},
 		// A SIBLING CHECKOUT. Starts with "local" but is a different repo.
 		{ID: "local@wt/models/order.py::Order", Kind: graph.KindType, Name: "Order",
-			FilePath: "models/order.py", Language: "python", RepoPrefix: "local@wt"},
+			FilePath: "local@wt/models/order.py", Language: "python", RepoPrefix: "local@wt"},
 		// Another repository, and a globally-keyed node.
 		{ID: "odoo/base/models/res.py::Partner", Kind: graph.KindType, Name: "Partner",
-			FilePath: "base/models/res.py", Language: "python", RepoPrefix: "odoo"},
+			FilePath: "odoo/base/models/res.py", Language: "python", RepoPrefix: "odoo"},
 		{ID: "http::GET::/form", Kind: graph.KindContract, Name: "GET /form", RepoPrefix: "local"},
 	}, []*graph.Edge{
-		{From: "local/models/order.py::Order", To: "local::builtin::py::list/sort", Kind: graph.EdgeCalls},
+		{From: "local/models/order.py::Order", To: "local::builtin::py::list/sort", Kind: graph.EdgeCalls,
+			FilePath: "local/models/order.py"},
 		{From: "local/models/order.py::Order", To: "odoo/base/models/res.py::Partner", Kind: graph.EdgeExtends},
 		{From: "local/models/order.py::Order", To: "http::GET::/form", Kind: graph.EdgeReferences},
 		{From: "local/models/order.py::Order", To: "unresolved::odoo::model::sale.order", Kind: graph.EdgeReferences},
@@ -235,5 +244,82 @@ func TestCopyRepoSubgraph_CopiesTheSearchCorpus(t *testing.T) {
 		  WHERE r.repo_prefix = 'wt2' AND f.node_id = r.node_id`)
 	if len(mapped) != 1 {
 		t.Fatalf("symbol_fts_rowid does not agree with the copied corpus: %v", mapped)
+	}
+}
+
+// The regression this file was missing. Eight tests asserted on ids and all
+// passed while every copied node kept a file_path pointing at the SOURCE
+// checkout — so `get_symbol_source` on the copy resolved to
+// "<dst-root>/<src-prefix>/…", a path that does not exist, and every read
+// failed. Counting rows cannot see this; only reading the path column can.
+func TestCopyRepoSubgraph_RewritesPrefixedPathColumns(t *testing.T) {
+	store := copyFixture(t)
+
+	tx, err := store.beginWrite()
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed := [][2]string{
+		// Prefixed — must be rewritten.
+		{`INSERT OR REPLACE INTO files (repo_prefix, file_path) VALUES ('local','local/models/order.py')`, "files"},
+		{`INSERT INTO content_fts (node_id, repo_prefix, file_path, ordinal, body) ` +
+			`VALUES ('local/README.md::doc:readme','local','local/README.md',0,'hello')`, "content_fts"},
+		// Repo-relative — must NOT be rewritten, or the mtime restat breaks.
+		{`INSERT OR REPLACE INTO file_mtimes (repo_prefix, file_path, mtime_ns) VALUES ('local','models/order.py',123)`, "file_mtimes"},
+	}
+	for _, s := range seed {
+		if _, err := tx.Exec(s[0]); err != nil {
+			_ = tx.Rollback()
+			t.Skipf("%s not present at this schema: %v", s[1], err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := store.CopyRepoSubgraph("local", "wt2"); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		what  string
+		query string
+		want  string
+	}{
+		{"nodes.file_path", `SELECT file_path FROM nodes WHERE id = 'wt2/models/order.py::Order'`, "wt2/models/order.py"},
+		// file_dir is VIRTUAL over file_path; a repository-root file gives it
+		// the bare prefix, the one value an id rewrite would never produce.
+		{"nodes.file_dir", `SELECT file_dir FROM nodes WHERE id = 'wt2/README.md::doc:readme'`, "wt2"},
+		{"edges.file_path", `SELECT file_path FROM edges WHERE from_id = 'wt2/models/order.py::Order' AND file_path <> ''`, "wt2/models/order.py"},
+		{"files.file_path", `SELECT file_path FROM files WHERE repo_prefix = 'wt2'`, "wt2/models/order.py"},
+		{"content_fts.file_path", `SELECT file_path FROM content_fts WHERE repo_prefix = 'wt2'`, "wt2/README.md"},
+		{"content_fts_rowid.file_path", `SELECT file_path FROM content_fts_rowid WHERE repo_prefix = 'wt2'`, "wt2/README.md"},
+		// The convention trap: this one is repo-relative and stays as it is.
+		{"file_mtimes.file_path", `SELECT file_path FROM file_mtimes WHERE repo_prefix = 'wt2'`, "models/order.py"},
+	} {
+		got := copyIDs(t, store, tc.query)
+		if len(got) != 1 || got[0] != tc.want {
+			t.Errorf("%s = %v, want [%s]", tc.what, got, tc.want)
+		}
+	}
+
+	// Nothing under the source prefix may be left behind in the copy, and the
+	// source itself must be untouched.
+	if stale := copyIDs(t, store,
+		`SELECT file_path FROM nodes WHERE repo_prefix = 'wt2' AND substr(file_path,1,6) = 'local/'`); len(stale) != 0 {
+		t.Errorf("copied nodes still point at the source checkout: %v", stale)
+	}
+	if stale := copyIDs(t, store,
+		`SELECT file_path FROM edges WHERE from_repo = 'wt2' AND substr(file_path,1,6) = 'local/'`); len(stale) != 0 {
+		t.Errorf("copied edges still point at the source checkout: %v", stale)
+	}
+	if got := copyIDs(t, store,
+		`SELECT file_path FROM nodes WHERE id = 'local/models/order.py::Order'`); len(got) != 1 || got[0] != "local/models/order.py" {
+		t.Errorf("source node's path was modified: %v", got)
+	}
+	// A sibling checkout starts with the source prefix and must not move.
+	if got := copyIDs(t, store,
+		`SELECT file_path FROM nodes WHERE id = 'local@wt/models/order.py::Order'`); len(got) != 1 || got[0] != "local@wt/models/order.py" {
+		t.Errorf("sibling checkout's path was rewritten: %v", got)
 	}
 }

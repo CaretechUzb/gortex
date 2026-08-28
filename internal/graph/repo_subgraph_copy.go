@@ -34,6 +34,19 @@ type RepoSubgraphCopyResult struct {
 // the `/` grammar is the subtler failure: on one real workspace it left 15,101
 // edges pointing at the SOURCE checkout's synthetic nodes, which is precisely
 // the cross-checkout contamination checkout groups exist to prevent.
+//
+// Implementations MUST also rewrite the prefixed *path* columns — a node's
+// file_path, an edge's file_path, and the same column wherever a sidecar or
+// search corpus carries it. Paths are a separate rewrite from ids: they use
+// only the `<prefix>/` grammar, so an id rewriter's synthetic arm must not be
+// applied to them. Watch for the two conventions that look alike and are not:
+// `files.file_path` is prefixed while `file_mtimes.file_path` is repo-relative
+// and must be left alone, or the mtime restat that registers the copy breaks.
+//
+// Leaving paths behind is invisible to any count-based parity check and breaks
+// every read: absolute_file_path is built by stripping the node's own prefix
+// and joining to the repository root, so a stale `<src>/…` value is appended
+// whole to the destination's root and no file is ever found.
 type RepoSubgraphCopier interface {
 	CopyRepoSubgraph(srcPrefix, dstPrefix string) (RepoSubgraphCopyResult, error)
 }
