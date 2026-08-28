@@ -37,6 +37,10 @@ func copyFixture(t *testing.T) *Store {
 		// A SIBLING CHECKOUT. Starts with "local" but is a different repo.
 		{ID: "local@wt/models/order.py::Order", Kind: graph.KindType, Name: "Order",
 			FilePath: "local@wt/models/order.py", Language: "python", RepoPrefix: "local@wt"},
+		// The sibling's own synthetic node, so the key-range frontier is
+		// pinned at both bounds: '@' must sort clear of both '0' and ';'.
+		{ID: "local@wt::stdlib::argparse::ArgumentParser", Kind: graph.KindFunction,
+			Name: "ArgumentParser", Language: "python", RepoPrefix: "local@wt"},
 		// Another repository, and a globally-keyed node.
 		{ID: "odoo/base/models/res.py::Partner", Kind: graph.KindType, Name: "Partner",
 			FilePath: "odoo/base/models/res.py", Language: "python", RepoPrefix: "odoo"},
@@ -48,6 +52,13 @@ func copyFixture(t *testing.T) *Store {
 		{From: "local/models/order.py::Order", To: "http::GET::/form", Kind: graph.EdgeReferences},
 		{From: "local/models/order.py::Order", To: "unresolved::odoo::model::sale.order", Kind: graph.EdgeReferences},
 		{From: "local@wt/models/order.py::Order", To: "odoo/base/models/res.py::Partner", Kind: graph.EdgeExtends},
+		// Edges SOURCED at a synthetic node. Every other edge here starts at a
+		// `local/…` node, which is exactly why eight tests passed while the
+		// outbound frontier (`from_repo = ?`) could not see this shape at all.
+		{From: "local::stdlib::argparse::ArgumentParser", To: "local::builtin::py::list/sort",
+			Kind: graph.EdgeMemberOf},
+		{From: "local@wt::stdlib::argparse::ArgumentParser", To: "local@wt/models/order.py::Order",
+			Kind: graph.EdgeMemberOf},
 	})
 	return store
 }
@@ -93,9 +104,13 @@ func TestCopyRepoSubgraph_RewritesBothPrefixedGrammars(t *testing.T) {
 		}
 	}
 	// The synthetic grammar is the one a `/`-only rewrite misses, which would
-	// leave the copy's edges pointing back at the source checkout.
+	// leave the copy's edges pointing back at the source checkout. Select the
+	// frontier by id range, not by from_repo: from_repo is blind to exactly the
+	// synthetic ids this is checking, so it would report "no leak" for an edge
+	// it never looked at.
 	leaked := copyIDs(t, store,
-		`SELECT to_id FROM edges WHERE from_repo = 'wt2' AND (substr(to_id,1,6)='local/' OR substr(to_id,1,7)='local::')`)
+		`SELECT to_id FROM edges WHERE ((from_id >= 'wt2/' AND from_id < 'wt20') OR (from_id >= 'wt2::' AND from_id < 'wt2;')) `+
+			`AND (substr(to_id,1,6)='local/' OR substr(to_id,1,7)='local::')`)
 	if len(leaked) != 0 {
 		t.Errorf("copy leaks edges back into the source checkout: %v", leaked)
 	}
@@ -379,6 +394,42 @@ func TestCopyRepoSubgraph_CarriesInboundCrossRepoEdges(t *testing.T) {
 	if orig := copyIDs(t, store,
 		`SELECT from_id FROM edges WHERE to_id = 'local/models/order.py::Order' ORDER BY from_id`); len(orig) != 2 {
 		t.Errorf("source's inbound edges = %v, want both still present", orig)
+	}
+}
+
+// The third gap of the same shape. An edge SOURCED at a synthetic `<prefix>::`
+// node was never copied, because the outbound frontier selected on from_repo —
+// a GENERATED column derived from the first '/' in from_id, which a synthetic
+// id either lacks entirely or carries in the wrong place. On the measured
+// workspace that silently dropped 245 member_of edges binding stdlib symbols to
+// their module, while the derived checkout beside it carried 254.
+//
+// Nothing already in this file could see it: nodes, paths, FTS rows and inbound
+// edges were all at exact parity, and the only count that moved was the edge
+// total — which reads as ordinary drift unless you difference it by kind.
+func TestCopyRepoSubgraph_CarriesEdgesSourcedAtSyntheticNodes(t *testing.T) {
+	store := copyFixture(t)
+
+	if _, err := store.CopyRepoSubgraph("local", "wt2"); err != nil {
+		t.Fatal(err)
+	}
+
+	got := copyIDs(t, store,
+		`SELECT to_id FROM edges WHERE from_id = 'wt2::stdlib::argparse::ArgumentParser'`)
+	if len(got) != 1 || got[0] != "wt2::builtin::py::list/sort" {
+		t.Fatalf("edge sourced at a synthetic node was not copied: %v", got)
+	}
+
+	// The source keeps its own, and the sibling contributes nothing: its
+	// synthetic id starts with "local" too, and '@' is what keeps it outside
+	// both key ranges.
+	if src := copyIDs(t, store,
+		`SELECT to_id FROM edges WHERE from_id = 'local::stdlib::argparse::ArgumentParser'`); len(src) != 1 {
+		t.Errorf("source edge disturbed: %v", src)
+	}
+	if dragged := copyIDs(t, store,
+		`SELECT from_id FROM edges WHERE to_id LIKE 'wt2%' AND from_id LIKE 'local@wt%'`); len(dragged) != 0 {
+		t.Errorf("sibling checkout dragged into the copy: %v", dragged)
 	}
 }
 

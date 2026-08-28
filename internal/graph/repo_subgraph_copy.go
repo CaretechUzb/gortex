@@ -50,6 +50,16 @@ type RepoSubgraphCopyResult struct {
 // `files.file_path` is prefixed while `file_mtimes.file_path` is repo-relative
 // and must be left alone, or the mtime restat that registers the copy breaks.
 //
+// Implementations MUST select the edge frontier by those same two id ranges,
+// NOT by edges.from_repo. from_repo is a generated column derived from the
+// first '/' in from_id, so it sees only the `<prefix>/` grammar: a synthetic id
+// has no slash and generates the empty string, and one carrying a slash deeper
+// in generates a garbage prefix. Selecting on it silently drops every edge
+// SOURCED at a synthetic node — 245 member_of edges on one real workspace,
+// against 254 in the derived checkout beside it. That shows up only as a small
+// shift in the raw edge total, which reads as drift; difference the edge set by
+// kind to see it.
+//
 // Leaving paths behind is invisible to any count-based parity check and breaks
 // every read: absolute_file_path is built by stripping the node's own prefix
 // and joining to the repository root, so a stale `<src>/…` value is appended

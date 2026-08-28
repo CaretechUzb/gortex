@@ -171,9 +171,17 @@ func (s *Store) CopyRepoSubgraph(srcPrefix, dstPrefix string) (graph.RepoSubgrap
 	}
 	out.Nodes = rowsAffected(res)
 
-	// from_repo is generated from from_id, so the edge frontier is selected
-	// by the source's generated value and lands under the destination's
-	// automatically once from_id is rewritten.
+	// The frontier is the two id key ranges, NOT `from_repo = ?`. from_repo is
+	// GENERATED from the first '/' in from_id, so it only understands the
+	// `<prefix>/` grammar: a synthetic `<prefix>::…` id has no slash at all and
+	// generates the empty string, while one that happens to carry a slash
+	// deeper in — `local::builtin::js::array/map/object::entries` — generates a
+	// garbage prefix. Either way `from_repo = 'local'` matches none of them, and
+	// every edge SOURCED at a synthetic node is silently left behind: 245
+	// member_of edges binding stdlib symbols to their module on the measured
+	// workspace, against 254 in the derived checkout beside it. This is the
+	// same frontier copyInboundEdges uses, and it excludes sibling checkouts by
+	// construction rather than by luck.
 	// edges.id is INTEGER PRIMARY KEY AUTOINCREMENT and the table carries no
 	// unique index, so the identity of a copied edge is its new rowid.
 	// Carrying the source's id over collides on the primary key and INSERT OR
@@ -184,10 +192,11 @@ func (s *Store) CopyRepoSubgraph(srcPrefix, dstPrefix string) (graph.RepoSubgrap
 		map[string]bool{"from_id": true, "to_id": true},
 		map[string]bool{"file_path": true},
 		"")
-	edgeArgs = append(edgeArgs, srcPrefix)
+	edgeArgs = append(edgeArgs, prefixKeyRanges(srcPrefix)...)
 	res, err = tx.Exec(
 		`INSERT OR IGNORE INTO edges (`+strings.Join(edgeCols, ",")+`) SELECT `+
-			edgeSel+` FROM edges WHERE from_repo = ?`, edgeArgs...)
+			edgeSel+` FROM edges WHERE (from_id >= ? AND from_id < ?) OR (from_id >= ? AND from_id < ?)`,
+		edgeArgs...)
 	if err != nil {
 		return out, fmt.Errorf("store_sqlite: CopyRepoSubgraph edges: %w", err)
 	}

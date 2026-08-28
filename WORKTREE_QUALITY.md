@@ -207,3 +207,120 @@ introduced by these commits** — the same failures reproduce at `527d3f3e`,
 before either of them. `4b102487` (30 commits back) passed once, which is not
 enough to place the origin; a single green run of a non-deterministic suite
 proves nothing. Left as an open, pre-existing item.
+
+---
+
+## 7. Third defect, same shape: edges sourced at a synthetic node
+
+Found 2026-08-28 by recycling the worktree end-to-end (remove → untrack →
+recreate → track) and differencing the edge set **by kind** instead of by total.
+
+`CopyRepoSubgraph` selected its outbound frontier with `WHERE from_repo = ?`.
+`edges.from_repo` is a GENERATED column — `substr(from_id, 1, instr(from_id,'/')-1)`
+when there is a `/`, else `''` — so it understands only the `<prefix>/` id
+grammar. A synthetic id has no slash (`local::stdlib::re::compile` → `''`) or
+carries one in the wrong place (`local::builtin::js::array/map/object::entries`
+→ `local::builtin::js::array`). `from_repo = 'local'` matches neither, so every
+edge **sourced at** a synthetic node was silently left behind.
+
+| | `local` (derived) | `local@aurora-redesign` (derived) | `test_w` (copied, before) |
+|---|---:|---:|---:|
+| edges sourced at `<prefix>::` nodes | 245 | 254 | **0** |
+
+All 245 were `member_of`, binding a stdlib symbol to its module
+(`local::stdlib::re::compile → local::module::go:re`). The fix uses
+`prefixKeyRanges(srcPrefix)` — the two half-open ranges the *inbound* copy
+already used, which cover both grammars and exclude sibling checkouts because
+`@` (0x40) sorts above both terminators `0` (0x30) and `;` (0x3B).
+
+### Why three rounds of checking missed it
+
+The defect moves **only the raw edge total**, by 245 in ~900,000. Nodes, path
+columns, FTS rows, inbound edges, cross-checkout invariants and every per-repo
+target count were at exact parity. I saw the 245 twice and wrote it off as drift
+between a copy and a source that had since been re-derived. It is visible only
+when the edge set is differenced **by kind**, or when the frontier is split by id
+grammar — both now in the probe.
+
+The unit fixture was blind for the matching reason: every edge in it was sourced
+at a `<prefix>/` node, the one shape `from_repo` can see. Eight tests asserted on
+ids, paths and inbound edges and none could reach this. The fixture now carries
+an edge sourced at a synthetic node — and a sibling's synthetic node too, which
+pins the key-range bound at both ends.
+
+This is the same failure mode as §2 and §3, for the third time: **a check that
+only looks where the bug is not.** §2 counted rows and never read a path; §3
+counted outbound and never asked about inbound; §7 counted a total and never
+split it by kind.
+
+## 8. Full recycle on a physically recreated worktree
+
+The two earlier cycles untracked and re-tracked **without removing the worktree
+directory**, so on-disk mtimes never moved. This cycle removed it with
+`git worktree remove` and recreated it with `git worktree add` — 13,408 files,
+every one freshly written. That exercises the hazard the original plan flagged
+and deferred: *"`file_mtimes` must be re-stamped, since `git worktree add` writes
+fresh mtimes on every file."*
+
+| check | result |
+|---|---|
+| install time | **144 s** (goal 300) |
+| `file_mtimes` provenance | restamped from the new checkout (1787892152–176), **not** carried from source (max 1787810672) |
+| `gortex repos` freshness | `fresh` — no spurious re-index of 9,627 "modified" files fired |
+| nodes | 121,328 = 121,328 |
+| edges owned | **900,021 = 900,021** — exact, first time including the synthetic grammar |
+| → file grammar / synthetic grammar | 899,776 / 245 on both sides |
+| by-kind × by-grammar edge diff | **zero rows** |
+| inbound from `odoo` / `addons` | 110,865 / 74,149 — exactly `local`'s |
+| cross-checkout invariant, 6 probes | 0 |
+| `find_usages` State / DmsFile / IrUiView | 1789·1824·44 / 1582·3154·32 / 8785·8873·4502 — all equal to `local`, file counts included |
+| `get_symbol_source` on cross-repo-linked symbols | 25/25 byte-identical to `local` |
+| odoo-side + addons-side untruncated probes | 30/30 where `test_w` equals `local` exactly |
+| `odoo_health.sh` §2b | `addons` 99.95%/99.96% **PASS** · `odoo` 99.92%/99.95% **PASS** |
+| §2c CSV vocabulary · §4b canaries | 20,025 · implicit 14 / legacy_js 13 — identical to `local` |
+
+An earlier run of this same cycle took 340 s; that run shared the machine with a
+full `-race` suite. Re-run on a quiet machine it is 144 s. The mtime hazard is
+handled, not merely survived.
+
+### Purge is symmetric — measured, not assumed
+
+§3 asserted that "`PurgeRepo` already deletes by both `from_id` and `to_id`".
+That was never actually measured. Untracking before removing the directory made
+it cheap to check, and it holds: after the untrack, nodes, outbound edges,
+**inbound edges**, `symbol_fts`, `files`, `file_mtimes` and both path columns all
+read 0 for the prefix, while `local` was untouched (121,328 / 900,021 / 110,865 /
+74,149). Had purge been source-keyed only, 185k edges would have been left
+pointing at a dead prefix for the next copy to insert on top of.
+
+### A second truncation trap, not a defect
+
+From the odoo side, `get_dependencies` on `odoo/odoo::record::base.default_user`
+returned `local` 24 and `aurora` 11 neighbours and **`test_w` 0** — which reads
+exactly like the copy missing its inbound edges again. It is not. Results are
+sorted by id ascending and the response truncated at 87 of 198 nodes; the cut
+fell inside `local@aurora-redesign/…`, so `odoo` **and** `test_w@docker-env`
+were both past it. In the store all three checkouts are symmetric: `local` 600
+edges from that record, `test_w` 600, `aurora` 625.
+
+`test_w@docker-env` sorts last among these prefixes, so it is systematically the
+first thing dropped whenever a neighbourhood truncates. This is the same trap as
+the retracted search-ranking claim in §2 — the second time a long prefix has
+looked like missing data. **The discriminator is an untruncated control:** 30
+probes whose neighbourhoods fit the budget all return `test_w` == `local`
+exactly. Never call a long-prefixed repo's absence a defect without one.
+
+### The last unexplained number in the probe: 6,602 bare edge paths
+
+`edges.file_path` reads 6,602 rows per checkout that do **not** start with the
+owning prefix. Both sides carry exactly 6,602, and cross-contamination is 0 in
+each direction, so it is not a copy artifact — but "equal on both sides" is the
+same reasoning that let §7 hide, so it was worth resolving rather than noting.
+
+They are `his_website/…`, `his_dhp_lis/…`, `his/…` — the *bare repo-relative*
+form, not another repository: there are 5,097 nodes under `local/his_website/`
+and no repo named `his_website`. So this is the third place the two path
+conventions coexist, alongside `files.file_path` (prefixed) and
+`file_mtimes.file_path` (bare). Carrying them verbatim is correct on both counts:
+a bare path is checkout-independent, and `pathExpr` anchors on `"<prefix>/"`, so
+it leaves them alone rather than prefixing them.
