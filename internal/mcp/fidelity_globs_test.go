@@ -376,10 +376,11 @@ func TestFidelityGlobDecideForPath_SubtreeComposition(t *testing.T) {
 // gated on an existing `**`, so a pattern without one could never gain a
 // match there and only paid for the split and the working row. find_files
 // runs the matcher against every candidate ahead of `limit`, which made the
-// cost of an oversized pattern a multiplier on the whole scan: this input
-// is ~8 KB with no `**` in it and measured 99,009 B/op before the gate.
+// cost of a long pattern a multiplier on the whole scan. Keep this fixture
+// within the admission bounds so it exercises the gate rather than being
+// rejected before compilation.
 func BenchmarkMatchFidelityGlob_LongTerminalStarWithoutGlobstar(b *testing.B) {
-	pattern := strings.Repeat("segment/", 999) + "*"
+	pattern := strings.Repeat("segment/", 63) + "*"
 	rel := strings.Repeat("segment/", 39) + "leaf.go"
 
 	b.ReportAllocs()
@@ -470,42 +471,22 @@ func TestParseFidelityGlobs_RejectsOversizedClause(t *testing.T) {
 
 // TestMatchFidelityGlob_NonGlobstarPatternDoesNotEnterTheWalk binds what
 // the benchmark above only reports. A benchmark is not run by CI and
-// nothing fails when its numbers regress, so the allocation ceiling that
-// actually matters is asserted here.
-//
-// Measured on this input (~8 KB pattern, no `**`, 40-segment path):
-//
-//	before the entry gate   99,009 B/op   6 allocs
-//	after                   16,384 B/op   2 allocs
-//
-// The remaining bytes are the `pattern + "/"` concatenations in the legacy
-// prefix fallback, which the handler's size bound now caps. The threshold
-// sits between the two with roughly 2.4x of headroom either way — wide
-// enough that allocator noise cannot trip it, tight enough that putting
-// the dense walk back cannot pass.
+// nothing fails when its numbers regress, so the gate itself is asserted here.
+// The fixture must be within the admission bounds; otherwise compileGlob
+// rejects it before the globstar gate is reached.
 func TestMatchFidelityGlob_NonGlobstarPatternDoesNotEnterTheWalk(t *testing.T) {
-	pattern := strings.Repeat("segment/", 999) + "*"
+	pattern := strings.Repeat("segment/", 63) + "*"
 	rel := strings.Repeat("segment/", 39) + "leaf.go"
 
 	require.False(t, patternHasGlobstarSegment(pattern),
 		"the fixture must have no whole-segment globstar, or it proves nothing")
+	compiled := compileGlob(pattern)
+	require.False(t, compiled.tooComplex(),
+		"the fixture must be admitted so the globstar gate is exercised")
+	assert.Nil(t, compiled.segments,
+		"a pattern with no whole-segment globstar must not compile a segment walk")
 	require.False(t, matchFidelityGlob(pattern, rel),
 		"the deliberately shallower path must not match")
-
-	const runs = 200
-	var before, after runtime.MemStats
-	runtime.GC()
-	runtime.ReadMemStats(&before)
-	for i := 0; i < runs; i++ {
-		_ = matchFidelityGlob(pattern, rel)
-	}
-	runtime.ReadMemStats(&after)
-
-	perOp := (after.TotalAlloc - before.TotalAlloc) / runs
-	assert.Lessf(t, perOp, uint64(40_000),
-		"matchFidelityGlob allocated %d B/op for a pattern with no globstar; "+
-			"find_files runs this per candidate file ahead of `limit`, so this "+
-			"is user-controlled memory pressure", perOp)
 }
 
 // TestFidelityGlobsOversizedRuleCannotWeakenThePolicy_Endpoints is the
