@@ -735,3 +735,81 @@ const DEFAULT = 42
 	require.NotNil(t, c)
 	assert.Equal(t, graph.KindVariable, c.Kind)
 }
+
+// Julia attaches a docstring to the object IMMEDIATELY below it: its
+// parser allows exactly one newline between the two, and the manual says
+// twice that no blank line or comment may intervene. A string at the top
+// of a function BODY is not documentation at all — a function body is
+// parsed with the ordinary expression production — so a helper that
+// returns a string used to document itself with its own return value.
+func TestJuliaExtractor_DocstringAttachment(t *testing.T) {
+	src := []byte(`"""
+    radius(c)
+
+Return the radius of ` + "`c`" + `.
+"""
+long(c) = c.r
+
+"""short doc"""
+short(x) = x
+
+"""const doc"""
+const TUNED = 1
+
+"""type doc"""
+struct Documented
+    a
+end
+
+"""trailing comment doc""" # still adjacent
+adjacent(x) = x
+
+"""detached by a blank line"""
+
+blank(x) = x
+
+"""detached by a comment"""
+# an own line
+commented(x) = x
+
+function returns_a_string()
+    "not documentation, just the return value"
+end
+
+function outer()
+    "not documentation either"
+    function nested()
+        1
+    end
+end
+`)
+	res, err := NewJuliaExtractor().Extract("attach.jl", src)
+	require.NoError(t, err)
+
+	docs := map[string]string{}
+	for _, n := range res.Nodes {
+		if d, ok := n.Meta["doc"].(string); ok {
+			docs[n.ID] = d
+		}
+	}
+
+	// Julia's own convention opens a docstring with the signature,
+	// indented, then a blank line, then the prose — so the summary is the
+	// FIRST PROSE paragraph, not literally the first one.
+	assert.Equal(t, "Return the radius of `c`.", docs["attach.jl::long"],
+		"the indented signature block is not the documentation")
+	assert.Equal(t, "short doc", docs["attach.jl::short"],
+		"a short-form definition takes a docstring like any other")
+	assert.Equal(t, "const doc", docs["attach.jl::TUNED"])
+	assert.Equal(t, "type doc", docs["attach.jl::Documented"])
+	assert.Equal(t, "trailing comment doc", docs["attach.jl::adjacent"],
+		"a comment on the docstring's own line does not detach it")
+
+	for _, id := range []string{
+		"attach.jl::blank", "attach.jl::commented",
+		"attach.jl::returns_a_string", "attach.jl::nested",
+	} {
+		_, ok := docs[id]
+		assert.False(t, ok, "%s must not be documented, got %q", id, docs[id])
+	}
+}

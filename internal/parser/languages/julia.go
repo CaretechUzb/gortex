@@ -53,8 +53,9 @@ import (
 // `unresolved::[Mod.]name`. Unicode identifiers (θ, σ̂), bang names
 // (`foo!`), and broadcast (`f.(x)`) are native grammar forms.
 //
-// Docstrings — a string literal directly preceding a definition, or the
-// first statement of a function/module body — attach as Meta["doc"].
+// Docstrings — a string literal on the line DIRECTLY above a definition,
+// which is the adjacency Julia itself requires — attach as Meta["doc"],
+// on long and short definitions, types, modules and constants alike.
 type JuliaExtractor struct {
 	lang *sitter.Language
 }
@@ -137,61 +138,92 @@ func (e *JuliaExtractor) Extract(filePath string, src []byte) (*parser.Extractio
 }
 
 // walk iterates a node's named children, dispatching definition / import
-// / call handlers and recursing with updated scope. pendingDoc is the
-// last sibling string literal (Julia docstring convention).
+// / call handlers and recursing with updated scope.
+//
+// A string literal standing alone before a definition is that
+// definition's docstring — but only when it is IMMEDIATELY before it.
+// Julia's parser allows exactly one newline between the two, so a blank
+// line or an own-line comment detaches the string and leaves the
+// definition undocumented (the manual says so twice: "no blank lines or
+// comments may intervene"). tree-sitter gives no blank-line signal — the
+// adjacent and detached parses are structurally identical — so the line
+// numbers are the only discriminator.
 func (e *JuliaExtractor) walk(n *sitter.Node, src []byte, scope juliaScope, st *juliaWalkState) {
-	pendingDoc := ""
+	// Only a few blocks can hold documentation: the file, a module body,
+	// and a begin / quote block. A string standing at the top of a
+	// FUNCTION body is ordinary executable code — Julia parses a function
+	// body with its plain expression production, never the docstring one
+	// — so a value returned from a helper must not become the doc of
+	// whatever is defined after it.
+	docContext := false
+	switch n.Type() {
+	case "source_file", "module_definition", "compound_statement", "quote_statement":
+		docContext = true
+	}
+
+	pendingDoc, pendingEnd, commentRows := "", 0, 0
+	// docFor returns the pending docstring when it sits directly above c.
+	// Julia's lexer allows exactly one newline between a docstring and the
+	// object it documents, so a blank line detaches it. Comments are not
+	// newlines: a trailing `# note` on the docstring's own line, or a
+	// block comment that opens there, keeps the two adjacent — so the rows
+	// comments occupy are discounted from the distance.
+	docFor := func(c *sitter.Node) string {
+		if pendingDoc == "" || int(c.StartPoint().Row)-pendingEnd-commentRows > 1 {
+			return ""
+		}
+		return pendingDoc
+	}
 	for c := range n.NamedChildren() {
 		switch c.Type() {
 		case "string_literal":
-			pendingDoc = juliaDocText(c, src)
+			if docContext {
+				pendingDoc, pendingEnd, commentRows = juliaDocText(c, src), int(c.EndPoint().Row), 0
+				continue
+			}
+
+		case "line_comment", "block_comment":
+			commentRows += int(c.EndPoint().Row) - int(c.StartPoint().Row)
+			continue
 
 		case "module_definition":
-			e.handleModule(c, src, scope, st, pendingDoc)
-			pendingDoc = ""
+			e.handleModule(c, src, scope, st, docFor(c))
 
 		case "struct_definition", "abstract_definition", "primitive_definition":
-			e.handleType(c, src, scope, st, pendingDoc)
-			pendingDoc = ""
+			e.handleType(c, src, scope, st, docFor(c))
 
 		case "function_definition", "macro_definition":
-			e.handleFunction(c, src, scope, st, pendingDoc)
-			pendingDoc = ""
+			e.handleFunction(c, src, scope, st, docFor(c))
 
 		case "const_statement":
-			pendingDoc = ""
+			doc := docFor(c)
 			for a := range c.NamedChildren() {
 				if a.Type() == "assignment" {
-					e.handleAssignment(a, src, scope, st, true)
+					e.handleAssignment(a, src, scope, st, true, doc)
 				}
 			}
 
 		case "assignment":
-			e.handleAssignment(c, src, scope, st, false)
-			pendingDoc = ""
+			e.handleAssignment(c, src, scope, st, false, docFor(c))
 
 		case "using_statement", "import_statement":
 			e.handleImport(c, src, st)
-			pendingDoc = ""
 
 		case "export_statement":
 			e.handleExport(c, src, scope, st)
-			pendingDoc = ""
 
 		case "call_expression", "broadcast_call_expression":
 			e.handleCall(c, src, scope, st)
 			e.walk(c, src, scope, st)
-			pendingDoc = ""
 
 		case "macrocall_expression":
 			e.handleMacroCall(c, src, scope, st)
 			e.walk(c, src, scope, st)
-			pendingDoc = ""
 
 		default:
-			pendingDoc = ""
 			e.walk(c, src, scope, st)
 		}
+		pendingDoc, pendingEnd, commentRows = "", 0, 0
 	}
 }
 
@@ -537,18 +569,6 @@ func (e *JuliaExtractor) handleFunction(n *sitter.Node, src []byte, scope juliaS
 	if name != "" {
 		inner = e.emitCallable(n, name, receiver, doc, n.Type() == "macro_definition", scope, st)
 	}
-	// Body docstring: first body statement that is a string literal.
-	bodyDoc := ""
-	if name != "" && doc == "" {
-		if second := n.NamedChild(1); second != nil && second.Type() == "string_literal" {
-			bodyDoc = juliaDocText(second, src)
-		}
-	}
-	if bodyDoc != "" {
-		if node, ok := st.nodes[inner.functionID]; ok && node.Meta == nil {
-			node.Meta = map[string]any{"doc": bodyDoc}
-		}
-	}
 	e.walk(n, src, inner, st)
 }
 
@@ -556,7 +576,7 @@ func (e *JuliaExtractor) handleFunction(n *sitter.Node, src []byte, scope juliaS
 // short-form function definitions — the LHS is a call_expression,
 // directly or under a where_expression. `const X = ...` arrives with
 // isConst and a plain identifier LHS.
-func (e *JuliaExtractor) handleAssignment(n *sitter.Node, src []byte, scope juliaScope, st *juliaWalkState, isConst bool) {
+func (e *JuliaExtractor) handleAssignment(n *sitter.Node, src []byte, scope juliaScope, st *juliaWalkState, isConst bool, doc string) {
 	lhs := n.NamedChild(0)
 
 	// Short-form definition? The left-hand side carries the same
@@ -565,7 +585,7 @@ func (e *JuliaExtractor) handleAssignment(n *sitter.Node, src []byte, scope juli
 	// instead of unwrapping one fixed level.
 	if sig := juliaSignatureCall(lhs); sig != nil {
 		if name, receiver := juliaCalleeName(sig.NamedChild(0), src); name != "" {
-			e.emitShortFunction(n, sig, name, receiver, src, scope, st)
+			e.emitShortFunction(n, sig, name, receiver, doc, src, scope, st)
 			return
 		}
 	}
@@ -581,8 +601,15 @@ func (e *JuliaExtractor) handleAssignment(n *sitter.Node, src []byte, scope juli
 				EndLine:   int(n.EndPoint().Row) + 1,
 				Language:  "julia",
 			}
+			meta := map[string]any{}
+			if doc != "" {
+				meta["doc"] = doc
+			}
 			if scope.modulePath != "" {
-				node.Meta = map[string]any{"scope_mod": scope.modulePath}
+				meta["scope_mod"] = scope.modulePath
+			}
+			if len(meta) > 0 {
+				node.Meta = meta
 			}
 			st.result.Nodes = append(st.result.Nodes, node)
 			st.nodes[id] = node
@@ -596,8 +623,8 @@ func (e *JuliaExtractor) handleAssignment(n *sitter.Node, src []byte, scope juli
 	e.walk(n, src, scope, st)
 }
 
-func (e *JuliaExtractor) emitShortFunction(n, sig *sitter.Node, name, receiver string, src []byte, scope juliaScope, st *juliaWalkState) {
-	inner := e.emitCallable(n, name, receiver, "", false, scope, st)
+func (e *JuliaExtractor) emitShortFunction(n, sig *sitter.Node, name, receiver, doc string, src []byte, scope juliaScope, st *juliaWalkState) {
+	inner := e.emitCallable(n, name, receiver, doc, false, scope, st)
 	e.walk(n, src, inner, st)
 }
 
@@ -975,14 +1002,44 @@ func (e *JuliaExtractor) handleMacroCall(n *sitter.Node, src []byte, scope julia
 	}
 }
 
-// juliaDocText normalises a docstring string literal: strips quotes and
-// collapses to the first paragraph.
+// juliaDocText normalises a docstring literal down to its first prose
+// paragraph. Julia's own documentation convention opens a docstring with
+// the signature, indented by four spaces, then a blank line, then the
+// description — so taking the first paragraph blindly stores "radius(c)"
+// as the documentation of `radius`. Leading paragraphs whose every line
+// is indented are that signature block and are skipped.
 func juliaDocText(n *sitter.Node, src []byte) string {
-	s := juliaUnquote(n.Content(src))
-	if i := strings.Index(s, "\n\n"); i > 0 {
-		s = s[:i]
+	s := strings.TrimSpace(n.Content(src))
+	if strings.HasPrefix(s, `"""`) {
+		s = strings.TrimSuffix(strings.TrimPrefix(s, `"""`), `"""`)
+	} else {
+		s = strings.TrimSuffix(strings.TrimPrefix(s, `"`), `"`)
 	}
-	return strings.TrimSpace(s)
+	for {
+		s = strings.TrimLeft(s, "\n")
+		para, rest, found := strings.Cut(s, "\n\n")
+		if !found || !juliaIndentedParagraph(para) {
+			return strings.TrimSpace(para)
+		}
+		s = rest
+	}
+}
+
+// juliaIndentedParagraph reports whether every non-empty line of a
+// paragraph is indented — the shape of the signature block a Julia
+// docstring conventionally opens with.
+func juliaIndentedParagraph(p string) bool {
+	indented := false
+	for _, line := range strings.Split(p, "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		if !strings.HasPrefix(line, " ") && !strings.HasPrefix(line, "\t") {
+			return false
+		}
+		indented = true
+	}
+	return indented
 }
 
 func juliaUnquote(s string) string {

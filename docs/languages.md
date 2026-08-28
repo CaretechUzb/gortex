@@ -141,8 +141,14 @@ Calls attribute to the enclosing function-like definition (long form, short
 form, macro, or nested closure) and cover qualified (`Mod.f`) and broadcast
 (`f.(x)`, `Meta["broadcast"]`) callees plus macro invocations
 (`Meta["macro"]`). Operator calls (`a + b`) are not emitted — dispatch on
-operators is not statically attributable. Docstrings (preceding string
-literal or first body statement) attach as `Meta["doc"]`.
+operators is not statically attributable. Docstrings attach as
+`Meta["doc"]` to long and short definitions, types, modules and constants,
+but only when the string sits immediately above the documented object —
+the adjacency Julia itself enforces, where a blank line or an own-line
+comment detaches the string and leaves the definition undocumented. A
+string at the top of a function body is executable code, not
+documentation. The stored text is the first PROSE paragraph, skipping the
+indented signature block Julia's convention opens a docstring with.
 
 ## Data, config, build
 
