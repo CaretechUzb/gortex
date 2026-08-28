@@ -795,6 +795,12 @@ func (e *JuliaExtractor) emitCallable(
 	return inner
 }
 
+// juliaImportBindingCap bounds how many per-binding import edges one
+// statement may contribute, mirroring jsImportBindingCap. Above it the
+// module edge alone records the dependency: the selected names stay in
+// that edge's Meta, so nothing is lost that a reader cannot recover.
+const juliaImportBindingCap = 64
+
 // juliaImportHead returns what a `selected_import` / `import_alias` names
 // first, plus the index of the child after it. For a statement-level node
 // that is the module: a dotted or relative path (`A.B`, `.Local`, `..Up`)
@@ -917,17 +923,23 @@ func (e *JuliaExtractor) handleImport(n *sitter.Node, src []byte, st *juliaWalkS
 	}
 	// One edge per selected binding, targeting the binding rather than
 	// the module — the representation JS/TS already emits for
-	// `import { a, b as c } from "mod"`.
+	// `import { a, b as c } from "mod"`. A rename rides on Edge.Alias
+	// and, because the SQLite edges table has no alias column, on Meta
+	// as well, which is the half that survives the round-trip.
 	emitBinding := func(module, orig, alias string) {
 		if module == "" || orig == "" {
 			return
 		}
-		st.result.Edges = append(st.result.Edges, &graph.Edge{
+		edge := &graph.Edge{
 			From: st.fileNode.ID, To: "unresolved::import::" + module + "::" + orig,
 			Kind:     graph.EdgeImports,
 			FilePath: st.filePath, Line: line,
 			Alias: alias,
-		})
+		}
+		if alias != "" {
+			edge.Meta = map[string]any{"alias": alias}
+		}
+		st.result.Edges = append(st.result.Edges, edge)
 	}
 	for c := range n.NamedChildren() {
 		switch c.Type() {
@@ -972,8 +984,13 @@ func (e *JuliaExtractor) handleImport(n *sitter.Node, src []byte, st *juliaWalkS
 				meta["names"] = names
 			}
 			emit(module, "", meta)
-			for _, b := range bindings {
-				emitBinding(module, b.orig, b.alias)
+			// Past the cap only the module edge is kept, so one
+			// statement cannot dwarf a file's graph — the same bound the
+			// JS/TS per-binding helper applies for the same reason.
+			if len(bindings) <= juliaImportBindingCap {
+				for _, b := range bindings {
+					emitBinding(module, b.orig, b.alias)
+				}
 			}
 		case "import_alias":
 			path, alias := juliaAliasParts(c, src)

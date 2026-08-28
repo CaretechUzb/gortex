@@ -1,6 +1,7 @@
 package languages
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -832,6 +833,43 @@ import Base: + as plus, -
 		"a renamed operator selection must not vanish")
 	assert.Equal(t, "plus", bindings["unresolved::import::Base::+"])
 	require.Contains(t, bindings, "unresolved::import::Base::-")
+
+	// A rename must survive the store, which drops Edge.Alias — so it
+	// rides on Meta too.
+	for _, ed := range res.Edges {
+		if ed.To == "unresolved::import::Base::+" {
+			assert.Equal(t, "plus", ed.Meta["alias"],
+				"the local name needs a persisted half, not only Edge.Alias")
+		}
+	}
+
+	// One statement must not dwarf a file's graph: past the cap only the
+	// module edge is kept, and the selected names stay in its Meta.
+	var wide strings.Builder
+	wide.WriteString("using Base: ")
+	for i := 0; i < juliaImportBindingCap+1; i++ {
+		if i > 0 {
+			wide.WriteString(", ")
+		}
+		fmt.Fprintf(&wide, "n%d", i)
+	}
+	wide.WriteString("\n")
+	big, err := NewJuliaExtractor().Extract("big.jl", []byte(wide.String()))
+	require.NoError(t, err)
+	var bigImports int
+	var bigNames []string
+	for _, ed := range big.Edges {
+		if ed.Kind != graph.EdgeImports {
+			continue
+		}
+		bigImports++
+		if v, ok := ed.Meta["names"].([]string); ok {
+			bigNames = v
+		}
+	}
+	assert.Equal(t, 1, bigImports, "past the cap only the module edge is emitted")
+	assert.Len(t, bigNames, juliaImportBindingCap+1,
+		"and the selected names are still recorded on it")
 }
 
 func TestJuliaExtractor_Calls(t *testing.T) {

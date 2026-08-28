@@ -130,9 +130,10 @@ right-hand path in `Meta["base_path"]` (python extractor convention).
 including when the path is dotted or relative (`using A.B: x`, `import
 ..Up: q`). A selective list additionally emits one edge per binding to
 `unresolved::import::<module>::<name>` — the per-binding shape JS/TS
-already uses — and a rename rides on `Edge.Alias`, with the module edge
-keeping it in `Meta` too because the SQLite edges table has no alias
-column. A module alias is applied at extraction time, so `import Foo as F`
+already uses, bounded by the same cap so one statement cannot dwarf a
+file's graph — and a rename rides on `Edge.Alias` plus `Meta["alias"]`,
+because the SQLite edges table has no alias column and Meta is the half
+that survives the round-trip. A module alias is applied at extraction time, so `import Foo as F`
 followed by `F.process(x)` records a call to `Foo.process`: the same target
 the unaliased spelling produces. Nothing in the resolver reads the import
 `Meta` — the edge targets are the consumable surface. All imports including
