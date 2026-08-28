@@ -28,11 +28,10 @@ func snapshotJSON(t *testing.T, overrides map[string]int, drop ...string) string
 	return string(b)
 }
 
-// TestStaleLangsDetection proves the per-language extractor-staleness signal:
-// only languages whose stored version is behind the current one are flagged
-// (so the advisory names the exact languages to reindex — a scoped reindex
-// rather than a full cold rebuild), a language the snapshot recorded at the
-// current version is left alone, and an empty baseline reports nothing.
+// TestStaleLangsDetection proves both extractor-version precision and the
+// global post-extraction policy epoch: new or behind language versions restage
+// only their language, while a missing or behind global epoch restages every
+// real current language. An empty baseline remains fail-inert.
 func TestStaleLangsDetection(t *testing.T) {
 	t.Run("only_behind_langs", func(t *testing.T) {
 		stored := map[string]int{"go": 1, "python": 2, "ruby": 1}
@@ -98,6 +97,69 @@ func TestStaleLangsDetection(t *testing.T) {
 		}
 	})
 
+	t.Run("post_extraction_policy_epoch", func(t *testing.T) {
+		current := map[string]int{
+			postExtractionPolicySnapshotKey: postExtractionPolicyVersion,
+			"go":                            3,
+			"java":                          1,
+			"ruby":                          1,
+		}
+		cases := []struct {
+			name   string
+			stored map[string]int
+			want   []string
+		}{
+			{
+				name:   "legacy_snapshot_missing_epoch",
+				stored: map[string]int{"go": 3, "java": 1, "ruby": 1},
+				want:   []string{"go", "java", "ruby"},
+			},
+			{
+				name: "epoch_behind",
+				stored: map[string]int{
+					postExtractionPolicySnapshotKey: postExtractionPolicyVersion - 1,
+					"go":                            3,
+					"java":                          1,
+					"ruby":                          1,
+				},
+				want: []string{"go", "java", "ruby"},
+			},
+			{
+				name: "epoch_current_keeps_per_language_precision",
+				stored: map[string]int{
+					postExtractionPolicySnapshotKey: postExtractionPolicyVersion,
+					"go":                            2,
+					"java":                          1,
+					"ruby":                          1,
+				},
+				want: []string{"go"},
+			},
+			{
+				name: "all_current",
+				stored: map[string]int{
+					postExtractionPolicySnapshotKey: postExtractionPolicyVersion,
+					"go":                            3,
+					"java":                          1,
+					"ruby":                          1,
+				},
+				want: nil,
+			},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				got := staleLangsBetween(tc.stored, current)
+				if !reflect.DeepEqual(got, tc.want) {
+					t.Fatalf("staleLangsBetween = %v, want %v", got, tc.want)
+				}
+				for _, lang := range got {
+					if lang == postExtractionPolicySnapshotKey {
+						t.Fatalf("reserved policy key leaked as a language: %v", got)
+					}
+				}
+			})
+		}
+	})
+
 	t.Run("json_and_empty", func(t *testing.T) {
 		// An empty / unparseable baseline reports nothing.
 		if got := ExtractorVersionStaleLangs(""); got != nil {
@@ -144,22 +206,40 @@ func TestStaleLangsDetection(t *testing.T) {
 			snapshotJSON(t, nil, "julia")); !reflect.DeepEqual(got, []string{"julia"}) {
 			t.Errorf("previous-release snapshot without julia = %v, want [julia]", got)
 		}
-		for _, path := range []string{"src/Handler.cs", "Views/Page.razor", "Views/Page.cshtml"} {
-			if got := merkleSaltFor(path); got != "csharp@12" {
-				t.Errorf("C# extractor salt for %s = %q, want csharp@12", path, got)
+		if got := extractorVersionsSnapshot()[postExtractionPolicySnapshotKey]; got != postExtractionPolicyVersion {
+			t.Errorf("persisted policy epoch = %d, want %d", got, postExtractionPolicyVersion)
+		}
+
+		policySalt := "_post_extraction_policy@2"
+		for _, path := range []string{"model.py", "Model.java", "model.rb", "model.ts", "schema.ex", "model.js"} {
+			if got := merkleSaltFor(path); got != policySalt {
+				t.Errorf("global policy salt for %s = %q, want %q", path, got, policySalt)
 			}
 		}
-		if got := merkleSaltFor("src/Handler.php"); got != "php@2" {
-			t.Errorf("PHP extractor salt = %q, want php@2", got)
+		if got, want := merkleSaltFor("model.go"), policySalt+"|go@3"; got != want {
+			t.Errorf("Go extractor salt = %q, want %q", got, want)
 		}
-		if got := merkleSaltFor("include/widget.hxx"); got != "cpp@2" {
-			t.Errorf("C++ extractor salt for .hxx = %q, want cpp@2", got)
+
+		for _, path := range []string{"src/Handler.cs", "Views/Page.razor", "Views/Page.cshtml"} {
+			want := policySalt + "|csharp@13"
+			if got := merkleSaltFor(path); got != want {
+				t.Errorf("C# extractor salt for %s = %q, want %q", path, got, want)
+			}
+		}
+		if got, want := merkleSaltFor("src/Handler.php"), policySalt+"|php@2"; got != want {
+			t.Errorf("PHP extractor salt = %q, want %q", got, want)
+		}
+		if got, want := merkleSaltFor("include/widget.hxx"), policySalt+"|cpp@2"; got != want {
+			t.Errorf("C++ extractor salt for .hxx = %q, want %q", got, want)
+		}
+		if got := merkleSaltFor("README.zzz"); got != "" {
+			t.Errorf("unmapped extension salt = %q, want empty", got)
 		}
 		// The Merkle half of the Julia bump: without the .jl → julia
 		// mapping the leaf salt stays empty and Merkle mode misses the
 		// bump the same way the mtime path did.
-		if got := merkleSaltFor("src/model.jl"); got != "julia@2" {
-			t.Errorf("Julia extractor salt = %q, want julia@2", got)
+		if got, want := merkleSaltFor("src/model.jl"), policySalt+"|julia@2"; got != want {
+			t.Errorf("Julia extractor salt = %q, want %q", got, want)
 		}
 	})
 

@@ -67,9 +67,11 @@ func TestFreshnessRider_ExtractorStalenessIsScopedToTheFilesLanguage(t *testing.
 	_, err = mi.IndexAll()
 	require.NoError(t, err)
 
-	// The previous release's snapshot: every language it tracked, but no
-	// julia key, because it had no .jl mapping yet.
-	previous := map[string]int{}
+	// A snapshot at the current global post-extraction policy epoch, with
+	// every language it tracked except julia. Keeping the policy epoch
+	// current isolates the per-language Julia bump; without it, the global
+	// policy upgrade intentionally makes every real language stale.
+	previous := map[string]int{"_post_extraction_policy": 2}
 	for _, lang := range []string{"go", "python", "java", "ruby", "rust", "c", "cpp",
 		"csharp", "php", "swift", "kotlin", "scala", "objc", "objcpp", "lua",
 		"dart", "elixir", "bash", "javascript", "typescript"} {
