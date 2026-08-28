@@ -80,36 +80,38 @@ func (s *Store) evictByPredicateResult(predicate string, arg any, exactReceipt b
 	// prepareSQLiteReindexReceiptTx makes for its identity read.
 	var receiptDelta *sqliteMutationReceiptAccumulator
 	if exactReceipt && s.hasActiveMutationReceiptsLocked() {
-		// A RESOLVED incoming edge from a surviving source is deleted by
-		// this eviction rather than parked under an unresolved stub, so no
-		// resolution pass can reconstruct it afterwards - no exact frontier
-		// exists and the receipt fails closed (receiptDelta stays nil). In
-		// the reindex composition restubIncomingRefs parks those edges
-		// first; their stub targets are not node IDs, so this probe finds
-		// nothing there and exactness is preserved.
-		survivorIncoming := true
-		probeErr := tx.QueryRowContext(ctx,
-			`SELECT EXISTS(SELECT 1 FROM edges WHERE to_id IN (SELECT id FROM nodes WHERE `+predicate+`) AND from_id NOT IN (SELECT id FROM nodes WHERE `+predicate+`))`,
-			arg, arg).Scan(&survivorIncoming)
-		if probeErr == nil && !survivorIncoming {
-			delta := newSQLiteMutationReceiptAccumulator()
-			rows, err := tx.QueryContext(ctx, `SELECT id, kind, name, qual_name, file_path FROM nodes WHERE `+predicate, arg)
-			if err == nil {
-				for rows.Next() {
-					var id, kind, name, qualName, filePath string
-					if err = rows.Scan(&id, &kind, &name, &qualName, &filePath); err != nil {
-						break
-					}
-					recordSQLiteEvictedNode(delta, id, kind, name, qualName, filePath)
+		// The DELETEs below remove every edge touching a doomed node,
+		// including edges whose SOURCE survives. restubIncomingRefs parks the
+		// IsResolvableRefEdge kinds under a stub first, so those stay
+		// described by the name and file frontiers; the rest -
+		// accesses_field, arg_of, tests, imports, contains - are destroyed.
+		//
+		// An earlier revision probed for exactly that and failed the receipt
+		// closed, forcing the whole-graph fallback resolve. The fallback
+		// cannot repair it: it retargets edges that still exist and are
+		// parked under a stub, and a deleted edge is neither. Both paths
+		// reach the same graph, so the probe bought only the cost of the
+		// larger pass, and on a real package it fired on nearly every
+		// reindex. The eviction still describes its RESOLUTION delta
+		// exactly, which is the only question a receipt answers; the
+		// destruction is a real pre-existing defect tracked separately.
+		delta := newSQLiteMutationReceiptAccumulator()
+		rows, err := tx.QueryContext(ctx, `SELECT id, kind, name, qual_name, file_path FROM nodes WHERE `+predicate, arg)
+		if err == nil {
+			for rows.Next() {
+				var id, kind, name, qualName, filePath string
+				if err = rows.Scan(&id, &kind, &name, &qualName, &filePath); err != nil {
+					break
 				}
-				if err == nil {
-					err = rows.Err()
-				}
-				_ = rows.Close()
+				recordSQLiteEvictedNode(delta, id, kind, name, qualName, filePath)
 			}
 			if err == nil {
-				receiptDelta = delta
+				err = rows.Err()
 			}
+			_ = rows.Close()
+		}
+		if err == nil {
+			receiptDelta = delta
 		}
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM semantic_binding_types WHERE `+predicate, arg); err != nil {

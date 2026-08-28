@@ -605,11 +605,12 @@ END`)
 	require.Equal(t, 2, nodes)
 	require.Equal(t, 3, edges)
 	receipt = store.EndMutationReceipt(token)
-	// The fixture keeps a RESOLVED surviving caller (Keep -> A): the evict
-	// deletes that edge rather than parking it, so no exact frontier exists
-	// and the receipt fails closed.
-	require.False(t, receipt.Complete,
-		"evicting a definition with a resolved surviving caller must fail the receipt closed")
+	// The fixture keeps a RESOLVED surviving caller (Keep -> A). The evict
+	// destroys that edge rather than parking it, and no resolution pass
+	// reconstructs a deleted edge, so the eviction's resolution delta is
+	// still exactly describable and the receipt stays complete.
+	require.True(t, receipt.Complete,
+		"an eviction that destroys a surviving caller edge still describes its resolution delta exactly")
 	require.False(t, store.analysisGenerationPresent)
 	require.Greater(t, store.AnalysisMutationRevision(), analysisRevision)
 	require.Greater(t, store.EdgeMutationRevision(), edgeRevision)

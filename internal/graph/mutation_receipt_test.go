@@ -266,12 +266,15 @@ func TestMutationReceiptRestubWriteStaysOutOfUnresolvedFiles(t *testing.T) {
 	assertReceiptContains(t, "target names", receipt.TargetNames, "A")
 }
 
-// A bare eviction that deletes a RESOLVED incoming edge from a surviving
-// source cannot describe itself exactly: the surviving caller's edge is
-// removed rather than parked under a stub, so neither the exact frontier nor
-// the whole-graph fallback can reconstruct it. The receipt must fail closed --
-// on every active window.
-func TestMutationReceiptEvictSurvivingIncomingEdgeFailsClosed(t *testing.T) {
+// An eviction that deletes a RESOLVED incoming edge from a surviving source
+// still describes its RESOLUTION delta exactly, on every active window. The
+// caller's edge is destroyed rather than parked, and no resolution pass
+// reconstructs a deleted edge -- not the exact frontier and not the
+// whole-graph fallback, which retargets only edges that still exist under a
+// stub. Failing the receipt closed here would force the larger pass to reach
+// an identical graph. The destruction is asserted, not glossed: it is a real
+// pre-existing defect, tracked on its own rather than as receipt exactness.
+func TestMutationReceiptEvictSurvivingIncomingEdgeStaysExact(t *testing.T) {
 	g := New()
 	g.AddBatch([]*Node{
 		{ID: "repo/a.go::A", Kind: KindFunction, Name: "A", QualName: "pkg.A", FilePath: "a.go", RepoPrefix: "repo"},
@@ -282,28 +285,41 @@ func TestMutationReceiptEvictSurvivingIncomingEdgeFailsClosed(t *testing.T) {
 	inner := g.BeginMutationReceipt()
 	g.EvictFile("a.go")
 	g.AddNode(&Node{ID: "repo/a.go::A", Kind: KindFunction, Name: "A", QualName: "pkg.A", FilePath: "a.go", RepoPrefix: "repo"})
-	if receipt := g.EndMutationReceipt(inner); receipt.Complete {
-		t.Fatalf("inner receipt claimed complete over a deleted surviving caller edge: %+v", receipt)
+	innerReceipt := g.EndMutationReceipt(inner)
+	outerReceipt := g.EndMutationReceipt(outer)
+
+	if !innerReceipt.Complete || !innerReceipt.ResolutionRelevant {
+		t.Fatalf("inner receipt = %+v, want a complete resolution-relevant delta", innerReceipt)
 	}
-	if receipt := g.EndMutationReceipt(outer); receipt.Complete {
-		t.Fatalf("outer receipt claimed complete over a deleted surviving caller edge: %+v", receipt)
+	if !outerReceipt.Complete || !outerReceipt.ResolutionRelevant {
+		t.Fatalf("outer receipt = %+v, want a complete resolution-relevant delta", outerReceipt)
+	}
+	assertReceiptContains(t, "evicted names", innerReceipt.EvictedNames, "A", "pkg.A")
+	if edges := g.GetOutEdges("repo/keep.go::Keep"); len(edges) != 0 {
+		t.Fatalf("surviving caller edges = %v, want the eviction to have destroyed it", edges)
 	}
 }
 
-// An import edge from a surviving file to a non-referenceable doomed node
-// (e.g. a package) is deleted by the eviction just the same -- the previously
-// "neutral" classification hid real damage. Fail closed.
-func TestMutationReceiptEvictImportToNonreferenceableFailsClosed(t *testing.T) {
+// The same for an import edge from a surviving file into a non-referenceable
+// doomed node. The evicted package's own import stubs are what the receipt
+// must describe, and they are: the edge's destruction is orthogonal.
+func TestMutationReceiptEvictImportToNonreferenceableStaysExact(t *testing.T) {
 	g := New()
 	g.AddBatch([]*Node{
-		{ID: "repo/a.go::pkg", Kind: KindPackage, Name: "pkg", FilePath: "a.go", RepoPrefix: "repo"},
+		{ID: "repo/a.go::pkg", Kind: KindPackage, Name: "pkg", QualName: "example/pkg", FilePath: "a.go", RepoPrefix: "repo"},
 		{ID: "repo/keep.go::Keep", Kind: KindFunction, Name: "Keep", FilePath: "keep.go", RepoPrefix: "repo"},
 	}, []*Edge{{From: "repo/keep.go::Keep", To: "repo/a.go::pkg", Kind: EdgeImports, FilePath: "keep.go"}})
 
 	token := g.BeginMutationReceipt()
 	g.EvictFiles([]string{"a.go"})
-	if receipt := g.EndMutationReceipt(token); receipt.Complete {
-		t.Fatalf("receipt claimed complete over a deleted surviving import edge: %+v", receipt)
+	receipt := g.EndMutationReceipt(token)
+
+	if !receipt.Complete || !receipt.ResolutionRelevant {
+		t.Fatalf("receipt = %+v, want a complete resolution-relevant delta", receipt)
+	}
+	assertReceiptContains(t, "evicted names", receipt.EvictedNames, "import::example/pkg", "import::pkg")
+	if edges := g.GetOutEdges("repo/keep.go::Keep"); len(edges) != 0 {
+		t.Fatalf("surviving importer edges = %v, want the eviction to have destroyed it", edges)
 	}
 }
 

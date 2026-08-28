@@ -888,9 +888,11 @@ func TestSQLiteMutationReceiptRestubWriteStaysOutOfUnresolvedFiles(t *testing.T)
 	assertSQLiteReceiptContains(t, "target names", receipt.TargetNames, "A")
 }
 
-// SQLite twin: a bare eviction deleting a resolved incoming edge from a
-// surviving source fails the receipt closed, on every active window.
-func TestSQLiteMutationReceiptEvictSurvivingIncomingEdgeFailsClosed(t *testing.T) {
+// SQLite twin: an eviction deleting a resolved incoming edge from a surviving
+// source still describes its resolution delta exactly, on every active
+// window. No pass reconstructs a deleted edge, so failing closed would only
+// buy a larger pass onto the same graph.
+func TestSQLiteMutationReceiptEvictSurvivingIncomingEdgeStaysExact(t *testing.T) {
 	store := openMutationReceiptStore(t)
 	store.AddBatch([]*graph.Node{
 		{ID: "repo/a.go::A", Kind: graph.KindFunction, Name: "A", QualName: "pkg.A", FilePath: "a.go", RepoPrefix: "repo"},
@@ -903,20 +905,28 @@ func TestSQLiteMutationReceiptEvictSurvivingIncomingEdgeFailsClosed(t *testing.T
 	inner := store.BeginMutationReceipt()
 	store.EvictFile("a.go")
 	store.AddNode(&graph.Node{ID: "repo/a.go::A", Kind: graph.KindFunction, Name: "A", QualName: "pkg.A", FilePath: "a.go", RepoPrefix: "repo"})
-	if receipt := store.EndMutationReceipt(inner); receipt.Complete {
-		t.Fatalf("inner receipt claimed complete over a deleted surviving caller edge: %+v", receipt)
+	innerReceipt := store.EndMutationReceipt(inner)
+	outerReceipt := store.EndMutationReceipt(outer)
+
+	if !innerReceipt.Complete || !innerReceipt.ResolutionRelevant {
+		t.Fatalf("inner receipt = %+v, want a complete resolution-relevant delta", innerReceipt)
 	}
-	if receipt := store.EndMutationReceipt(outer); receipt.Complete {
-		t.Fatalf("outer receipt claimed complete over a deleted surviving caller edge: %+v", receipt)
+	if !outerReceipt.Complete || !outerReceipt.ResolutionRelevant {
+		t.Fatalf("outer receipt = %+v, want a complete resolution-relevant delta", outerReceipt)
+	}
+	assertSQLiteReceiptContains(t, "evicted names", innerReceipt.EvictedNames, "A", "pkg.A")
+	if edges := store.GetOutEdges("repo/keep.go::Keep"); len(edges) != 0 {
+		t.Fatalf("surviving caller edges = %v, want the eviction to have destroyed it", edges)
 	}
 }
 
-// SQLite twin of the non-referenceable case: a surviving file's import edge
-// to a doomed package node is deleted -- the receipt must not stay neutral.
-func TestSQLiteMutationReceiptEvictImportToNonreferenceableFailsClosed(t *testing.T) {
+// SQLite twin of the non-referenceable case: the surviving file's import edge
+// into a doomed package node is destroyed, and the package's own import stubs
+// are what the receipt has to describe.
+func TestSQLiteMutationReceiptEvictImportToNonreferenceableStaysExact(t *testing.T) {
 	store := openMutationReceiptStore(t)
 	store.AddBatch([]*graph.Node{
-		{ID: "repo/a.go::pkg", Kind: graph.KindPackage, Name: "pkg", FilePath: "a.go", RepoPrefix: "repo"},
+		{ID: "repo/a.go::pkg", Kind: graph.KindPackage, Name: "pkg", QualName: "example/pkg", FilePath: "a.go", RepoPrefix: "repo"},
 		{ID: "repo/keep.go::Keep", Kind: graph.KindFunction, Name: "Keep", FilePath: "keep.go", RepoPrefix: "repo"},
 	}, []*graph.Edge{{
 		From: "repo/keep.go::Keep", To: "repo/a.go::pkg", Kind: graph.EdgeImports, FilePath: "keep.go",
@@ -924,8 +934,14 @@ func TestSQLiteMutationReceiptEvictImportToNonreferenceableFailsClosed(t *testin
 
 	token := store.BeginMutationReceipt()
 	store.EvictFiles([]string{"a.go"})
-	if receipt := store.EndMutationReceipt(token); receipt.Complete {
-		t.Fatalf("receipt claimed complete over a deleted surviving import edge: %+v", receipt)
+	receipt := store.EndMutationReceipt(token)
+
+	if !receipt.Complete || !receipt.ResolutionRelevant {
+		t.Fatalf("receipt = %+v, want a complete resolution-relevant delta", receipt)
+	}
+	assertSQLiteReceiptContains(t, "evicted names", receipt.EvictedNames, "import::example/pkg", "import::pkg")
+	if edges := store.GetOutEdges("repo/keep.go::Keep"); len(edges) != 0 {
+		t.Fatalf("surviving importer edges = %v, want the eviction to have destroyed it", edges)
 	}
 }
 

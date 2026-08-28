@@ -397,30 +397,3 @@ func (g *Graph) recordReindexedEdgeForReceipts(e *Edge) {
 	}
 	g.recordAddedEdgeForReceipts(e, file)
 }
-
-// recordFileEvictionForReceipts is the receipt gate for file-scoped
-// evictions: it records the exact frontier only when no RESOLVED incoming
-// edge from a surviving source is about to be deleted. Such an edge is
-// removed rather than parked under an unresolved stub, so neither the exact
-// frontier nor the whole-graph fallback can reconstruct it afterwards — no
-// complete receipt exists, and the receipt fails closed. In the reindex
-// composition restubIncomingRefs parks those edges first (stub targets are
-// not node IDs and never reach these buckets), so the scan finds nothing
-// there and exactness is preserved. Caller holds the graph-wide write lock.
-func (g *Graph) recordFileEvictionForReceipts(nodes []*Node, evictedIDs map[string]string) {
-	if len(nodes) == 0 || g.mutationReceipts.activeCount.Load() == 0 {
-		return
-	}
-	for id := range evictedIDs {
-		for _, e := range g.shardFor(id).inEdges[id] {
-			if e == nil {
-				continue
-			}
-			if _, doomed := evictedIDs[e.From]; !doomed {
-				g.markMutationReceiptsIncomplete()
-				return
-			}
-		}
-	}
-	g.recordEvictedNodesForReceipts(nodes)
-}

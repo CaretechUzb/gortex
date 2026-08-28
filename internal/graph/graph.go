@@ -3237,7 +3237,11 @@ func (g *Graph) EvictFile(filePath string) (nodesRemoved, edgesRemoved int) {
 	for _, n := range nodes {
 		evictedIDs[n.ID] = n.RepoPrefix
 	}
-	g.recordFileEvictionForReceipts(nodes, evictedIDs)
+	// See EvictFiles: the edges this eviction destroys from surviving
+	// sources are not reconstructible by any resolution pass, so failing the
+	// receipt closed over them would force a fallback that reaches the same
+	// graph. The RESOLUTION delta stays exactly describable.
+	g.recordEvictedNodesForReceipts(nodes)
 
 	for _, n := range nodes {
 		s := g.shardFor(n.ID)
