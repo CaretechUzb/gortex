@@ -189,8 +189,21 @@ The 105.5 s first measurement ran on an otherwise idle daemon; both figures
 above shared the machine with a full `gortex` re-index.
 
 `internal/graph`, `internal/graph/store_sqlite` and `internal/graph/storetest`
-are green under `-race`. `internal/indexer` fails 3–4 tests per full `-race`
-run with a **different set each time** (`TestGDScriptResolution_*`,
-`TestNodeNextEmittedJSSpecifier_CallGraph`, `TestContracts_*`,
-`TestInlineContractPassRecordsCompletionMarker`); every one passes in
-isolation, and none touches the copy path.
+are green under `-race`.
+
+`internal/indexer` is not, and the first explanation for it was wrong. It fails
+3–4 tests per full `-race` run with a **different set each time** — across five
+runs: `TestGDScriptResolution_ReceiverGate`,
+`TestGDScriptResolution_MethodReferencesAreUsages`,
+`TestGDScriptResolution_AutoloadScriptAsCaller`,
+`TestContracts_CrossFileHandlerStillResolvesResponseType`,
+`TestInlineContractPassRecordsCompletionMarker`,
+`TestNodeNextEmittedJSSpecifier_CallGraph`. Every one passes in isolation, and
+none touches the copy path.
+
+That first looked load-induced, since the early runs shared the machine with a
+full re-index. It is not: HEAD fails on a quiet machine too. It is also **not
+introduced by these commits** — the same failures reproduce at `527d3f3e`,
+before either of them. `4b102487` (30 commits back) passed once, which is not
+enough to place the origin; a single green run of a non-deterministic suite
+proves nothing. Left as an open, pre-existing item.
