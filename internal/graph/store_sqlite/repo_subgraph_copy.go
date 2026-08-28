@@ -193,6 +193,12 @@ func (s *Store) CopyRepoSubgraph(srcPrefix, dstPrefix string) (graph.RepoSubgrap
 	}
 	out.Edges = rowsAffected(res)
 
+	inbound, err := s.copyInboundEdges(tx, srcPrefix, dstPrefix, edgeCols, idExpr)
+	if err != nil {
+		return out, err
+	}
+	out.InboundEdges = inbound
+
 	for _, table := range repoSubgraphSidecarTables {
 		cols, err := s.realColumns(table)
 		if err != nil || len(cols) == 0 {
@@ -228,6 +234,98 @@ func (s *Store) CopyRepoSubgraph(srcPrefix, dstPrefix string) (graph.RepoSubgrap
 	}
 	s.markMutationReceiptsIncompleteLocked()
 	return out, nil
+}
+
+// prefixKeyRanges returns the two half-open key ranges that select every node
+// id under a prefix, in the form the edges_by_to index can seek rather than
+// the substr() form idExpr uses for rewriting. '/'+1 is '0' and ':'+1 is ';',
+// so each id grammar is exactly one range, and both exclude a sibling
+// checkout: '@' sorts above both terminators.
+func prefixKeyRanges(prefix string) []any {
+	return []any{prefix + "/", prefix + "0", prefix + "::", prefix + ";"}
+}
+
+// copyInboundEdges carries the edges OTHER repositories mint into srcPrefix
+// across to dstPrefix. Only to_id moves: from_id stays with its owner, and so
+// does file_path, which names a file in the *source* repository of the edge.
+//
+// These edges are invisible to the outbound copy because a global pass owns an
+// edge by its source node, and they are not a rounding error — on the measured
+// Odoo workspace a derived checkout carries 185,023 of them (110,865 from
+// `odoo`, 74,149 from `addons`), a fifth of everything touching it. Without
+// them the copy answers "what does this reference" perfectly and "who uses
+// this" with silence.
+//
+// That these belong in a copy at all was measured, not assumed: across the two
+// derived checkouts of one repository, 14,067 `odoo` symbols bind into `local`
+// and 13,960 into `local@aurora-redesign` — 13,954 into BOTH. The binder fans
+// out to every checkout, so a derive that saw the destination would mint these
+// same edges. The copy anticipates it; it does not invent state a derive would
+// contradict.
+//
+// A sibling checkout must never be a source. Two checkouts of one repository
+// binding to each other is the exact contamination checkout groups exist to
+// prevent, and today no such edge exists to copy — but the filter is what
+// keeps that true rather than lucky.
+func (s *Store) copyInboundEdges(
+	tx txExecer, srcPrefix, dstPrefix string, edgeCols []string, idExpr func(string) (string, []any),
+) (int, error) {
+	ranges := prefixKeyRanges(srcPrefix)
+	rows, err := s.db.Query(
+		`SELECT DISTINCT from_repo FROM edges `+
+			`WHERE ((to_id >= ? AND to_id < ?) OR (to_id >= ? AND to_id < ?)) AND from_repo <> ''`,
+		ranges...)
+	if err != nil {
+		return 0, fmt.Errorf("store_sqlite: CopyRepoSubgraph inbound sources: %w", err)
+	}
+	var sources []any
+	for rows.Next() {
+		var repo string
+		if err := rows.Scan(&repo); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		if repo == srcPrefix || repo == dstPrefix || graph.SiblingCheckouts(s, srcPrefix, repo) {
+			continue
+		}
+		sources = append(sources, repo)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	if len(sources) == 0 {
+		return 0, nil
+	}
+
+	sel, args := projectEdgeInbound(edgeCols, idExpr)
+	args = append(args, ranges...)
+	args = append(args, sources...)
+	res, err := tx.Exec(
+		`INSERT OR IGNORE INTO edges (`+strings.Join(edgeCols, ",")+`) SELECT `+sel+
+			` FROM edges WHERE ((to_id >= ? AND to_id < ?) OR (to_id >= ? AND to_id < ?)) AND from_repo IN (`+
+			strings.TrimSuffix(strings.Repeat("?,", len(sources)), ",")+`)`, args...)
+	if err != nil {
+		return 0, fmt.Errorf("store_sqlite: CopyRepoSubgraph inbound edges: %w", err)
+	}
+	return rowsAffected(res), nil
+}
+
+// projectEdgeInbound is the outbound projection's mirror: to_id is rewritten
+// and every other column, from_id and file_path included, is carried verbatim.
+func projectEdgeInbound(cols []string, idExpr func(string) (string, []any)) (string, []any) {
+	sel := make([]string, 0, len(cols))
+	var args []any
+	for _, c := range cols {
+		if c == "to_id" {
+			expr, a := idExpr(c)
+			sel = append(sel, expr)
+			args = append(args, a...)
+			continue
+		}
+		sel = append(sel, c)
+	}
+	return strings.Join(sel, ","), args
 }
 
 // copyFTSCorpora duplicates the FTS5 search corpora under the new prefix.

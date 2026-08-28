@@ -323,3 +323,82 @@ func TestCopyRepoSubgraph_RewritesPrefixedPathColumns(t *testing.T) {
 		t.Errorf("sibling checkout's path was rewritten: %v", got)
 	}
 }
+
+// A global pass owns an edge by its SOURCE node, so the outbound copy carries
+// nothing that another repository points back at the checkout. On the measured
+// workspace that is 185,023 edges — a fifth of everything touching it — and
+// their absence turns "who uses this" into silence while "what does this
+// reference" stays perfect. The asymmetry is invisible to a count of the rows
+// the copy did move.
+func TestCopyRepoSubgraph_CarriesInboundCrossRepoEdges(t *testing.T) {
+	store := copyFixture(t)
+
+	store.AddBatch(nil, []*graph.Edge{
+		// Another repository referencing this checkout: must come across, with
+		// only to_id moved.
+		{From: "odoo/base/models/res.py::Partner", To: "local/models/order.py::Order",
+			Kind: graph.EdgeReferences, FilePath: "odoo/base/models/res.py"},
+		// A SIBLING checkout referencing it: must not, ever.
+		{From: "local@wt/models/order.py::Order", To: "local/models/order.py::Order",
+			Kind: graph.EdgeReferences, FilePath: "local@wt/models/order.py"},
+	})
+	// Without a published grouping the store cannot tell a sibling from a
+	// different repository, and the filter below has nothing to filter on.
+	store.SetCheckoutGroups(map[string]string{"local": "g1", "local@wt": "g1", "odoo": "g2"})
+
+	res, err := store.CopyRepoSubgraph("local", "wt2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.InboundEdges != 1 {
+		t.Fatalf("InboundEdges = %d, want 1 (the odoo edge, not the sibling's)", res.InboundEdges)
+	}
+
+	got := copyIDs(t, store,
+		`SELECT from_id FROM edges WHERE to_id = 'wt2/models/order.py::Order' AND from_repo <> 'wt2'`)
+	if len(got) != 1 || got[0] != "odoo/base/models/res.py::Partner" {
+		t.Fatalf("inbound edges into the copy = %v, want just the odoo one", got)
+	}
+
+	// from_id and file_path name the SOURCE repository's symbol and file. They
+	// belong to odoo and must survive the copy untouched.
+	if paths := copyIDs(t, store,
+		`SELECT file_path FROM edges WHERE to_id = 'wt2/models/order.py::Order' AND from_repo = 'odoo'`); len(paths) != 1 ||
+		paths[0] != "odoo/base/models/res.py" {
+		t.Errorf("inbound edge's file_path = %v, want the source repository's own path", paths)
+	}
+
+	// The sibling's edge is the cross-checkout contamination checkout groups
+	// exist to prevent: two checkouts of one repository bound to each other.
+	if leaked := copyIDs(t, store,
+		`SELECT from_id FROM edges WHERE to_id LIKE 'wt2/%' AND from_repo = 'local@wt'`); len(leaked) != 0 {
+		t.Errorf("a sibling checkout's edge was copied into the new checkout: %v", leaked)
+	}
+
+	// The source keeps everything it had.
+	if orig := copyIDs(t, store,
+		`SELECT from_id FROM edges WHERE to_id = 'local/models/order.py::Order' ORDER BY from_id`); len(orig) != 2 {
+		t.Errorf("source's inbound edges = %v, want both still present", orig)
+	}
+}
+
+// An ungrouped store cannot identify a sibling, so it must not be handed one:
+// the copy path publishes the grouping first. This pins the store-level half —
+// with no grouping the sibling filter is inert, which is exactly why the
+// caller's publish is load-bearing rather than decorative.
+func TestCopyRepoSubgraph_InboundFilterNeedsAPublishedGrouping(t *testing.T) {
+	store := copyFixture(t)
+	store.AddBatch(nil, []*graph.Edge{
+		{From: "local@wt/models/order.py::Order", To: "local/models/order.py::Order",
+			Kind: graph.EdgeReferences},
+	})
+
+	if _, err := store.CopyRepoSubgraph("local", "wt2"); err != nil {
+		t.Fatal(err)
+	}
+	leaked := copyIDs(t, store,
+		`SELECT from_id FROM edges WHERE to_id LIKE 'wt2/%' AND from_repo = 'local@wt'`)
+	if len(leaked) == 0 {
+		t.Skip("store now identifies siblings without a published grouping; the caller's publish is no longer load-bearing")
+	}
+}

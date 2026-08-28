@@ -128,6 +128,14 @@ func (mi *MultiIndexer) trackWorktreeByCopy(
 		return nil, false, nil
 	}
 
+	// Publish the grouping before copying, not only after. The copy's inbound
+	// pass asks the store which prefixes are sibling checkouts of the source,
+	// and a store that has been told nothing answers "none" — which would let
+	// a sibling's edges through and put two checkouts of one repository in
+	// contact. At runtime the earlier tracks have already published it; inside
+	// a cold batch they may not have.
+	mi.publishCheckoutGroups()
+
 	res, supported, err := graph.CopyRepoSubgraph(mi.graph, src, prefix)
 	if err != nil || !supported || res.Nodes == 0 {
 		// A refusal is not a failure: the destination may already hold rows,
@@ -167,6 +175,7 @@ func (mi *MultiIndexer) trackWorktreeByCopy(
 			zap.String("from", src),
 			zap.Int("nodes", res.Nodes),
 			zap.Int("edges", res.Edges),
+			zap.Int("inbound_edges", res.InboundEdges),
 			zap.Int("sidecar_rows", res.Sidecars),
 			zap.Int("files", len(mtimes)))
 	}

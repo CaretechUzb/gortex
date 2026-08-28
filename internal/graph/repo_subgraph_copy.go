@@ -17,10 +17,17 @@ package graph
 // in-place re-key, which has the opposite failure mode.
 
 // RepoSubgraphCopyResult reports what a copy moved.
+//
+// Edges and InboundEdges are counted apart because they answer different
+// questions and fail differently: Edges is what the checkout itself declares
+// (a global pass owns an edge by its source node), InboundEdges is what every
+// other repository points back at it. A copy that carries only the first is
+// complete for "what does this reference" and empty for "who uses this".
 type RepoSubgraphCopyResult struct {
-	Nodes    int
-	Edges    int
-	Sidecars int
+	Nodes        int
+	Edges        int
+	InboundEdges int
+	Sidecars     int
 }
 
 // RepoSubgraphCopier duplicates one repository's nodes, edges and

@@ -1,17 +1,22 @@
 # Query quality of the copy-installed worktree (`test_w@docker-env`)
 
-Measured 2026-08-28 against the live store, `test_w@docker-env` (installed in 105.5 s
-by `CopyRepoSubgraph`) versus its source checkout `local` (indexed + derived normally)
-and `local@aurora-redesign` (a *normally derived* worktree — the fidelity reference).
+Measured 2026-08-28 against the live store: `test_w@docker-env`, installed by
+`CopyRepoSubgraph` rather than indexed, versus its source checkout `local` and
+versus `local@aurora-redesign` — a *normally derived* worktree, which is the
+fidelity reference and the control for anything that looks like a copy artifact.
 
-**Headline: the graph is faithful, the paths are not.** Every id-keyed dimension is at
-exact parity. Every *path*-keyed column still points at the source checkout, so the
-worktree cannot serve source reads. A second, separate gap: the copy carries no
-inbound cross-repo edges.
+**Original headline: the graph was faithful, the paths were not.** Every id-keyed
+dimension was at exact parity. Every *path*-keyed column still pointed at the
+source checkout, so the worktree could not serve a single source read. A second,
+independent gap: the copy carried no inbound cross-repo edges.
 
-The earlier parity check that cleared this path was **cardinality-only** — it counted
-nodes, edges, `references` into `odoo/` and `addons/`, and FTS rows. All of those are
-still correct. None of them touches the path dimension, which is why this shipped.
+The parity check that cleared this path in the first place was **cardinality
+only** — nodes, edges, `references` into `odoo/` and `addons/`, FTS rows. All of
+those were and are correct. None of them reads a path column. That is why it
+shipped, and it is the lesson worth keeping: counting rows cannot see a value
+that is wrong in every row.
+
+Both gaps are now fixed (`d4ad2206`, and the inbound commit that follows it).
 
 ---
 
@@ -31,83 +36,108 @@ still correct. None of them touches the path dimension, which is why this shippe
 | `file_mtimes` | 9,629 | 9,627 | delta = 2 `.ruff_cache/.gitignore`, absent from the worktree — correct |
 | `contract_state` / `enrichment_state` / `repo_index_state` | 1 / 5 / 1 | 1 / 5 / 1 | exact |
 | Odoo CSV data records | 20,025 | 20,025 | exact |
-| search corpus recall (`HisVisitQueue`) | total 504, pre-rank 312 | total 504, pre-rank 312 | exact |
 
-Node-id set diff, prefix-normalised: **one** entry, the global contract node. No
-sibling-checkout leakage in either direction.
+Node-id set diff, prefix-normalised: **one** entry, the global contract node.
+No sibling-checkout leakage in either direction.
 
-## 2. Broken — the path dimension
+## 2. Was broken: the path dimension — FIXED and verified live
 
-`CopyRepoSubgraph` rewrites node **ids** (both `<prefix>/…` and `<prefix>::…` grammars)
-but never the columns that carry a *path*. All four still read `local/…`:
+`CopyRepoSubgraph` rewrote node **ids** (both `<prefix>/…` and `<prefix>::…`
+grammars) and never the columns carrying a *path*. All of them read `local/…`:
 
-| column | stale rows under `test_w` |
-|---|---:|
-| `nodes.file_path` | 120,951 (100%) |
-| `nodes.file_dir` | 120,951 (100%) — of which **73 are the bare `local`**, no trailing slash |
-| `edges.file_path` | 893,174 |
-| `files.file_path` | 9,616 |
+| column | stale rows, before | after the fix |
+|---|---:|---:|
+| `nodes.file_path` | 120,951 (100%) | 0 of 121,328 |
+| `nodes.file_dir` | 120,951 (100%) | 0 — it is VIRTUAL over `file_path`, so it follows |
+| `edges.file_path` | 893,174 | 0 of 899,776 |
+| `files.file_path` | 9,616 | 0 of 9,616 |
+| `content_fts.file_path` | 41 | 0 of 41 |
 
-The convention is settled by the normally derived worktree: `local@aurora-redesign` has
+The convention is settled by the derived worktree: `local@aurora-redesign` has
 140,434 nodes and 1,053,393 edges whose `file_path` carries **its own** prefix.
 
-**Consequence — every source read fails:**
+**Every source read failed.** `absolute_file_path` is built by stripping the
+node's own repo prefix from `file_path` and joining to the repository root; the
+strip found `test_w@docker-env/` against a value starting `local/`, stripped
+nothing, and appended the stale segment whole:
 
 ```
-$ get_symbol_source test_w@docker-env/his/models/common/localtion_inherit_models.py::State
-Error: could not read source: open
-  .../src/local.worktrees/test_w/local/his/models/common/localtion_inherit_models.py:
-  no such file or directory
+before: open .../src/local.worktrees/test_w/local/his/models/common/...: no such file or directory
+after:  606 bytes, byte-identical to the same symbol read from `local`
 ```
 
-`absolute_file_path` is built by stripping the node's own repo prefix from `file_path`
-and joining to the repo root. The strip finds `test_w@docker-env/` and the value starts
-with `local/`, so nothing is stripped and the stale segment is appended to the worktree
-root. Everything downstream of a file read is affected: `read`, `get_editing_context`,
-`smart_context` bodies, `edit_symbol`, `review`, snippets.
+Everything downstream of a file read was affected: `read`,
+`get_editing_context`, `smart_context` bodies, `edit_symbol`, `review`, snippets.
 
-Symbol search retrieval is unharmed (identical corpus, identical pre-rank count) but the
-returned set shrinks: **75 results from `local`, 69 from `test_w`**, the 6 missing ones
-all body-dependent (test methods, a `_compute_`, a JS `attr@320`). *Falsifiable
-prediction:* after the path fix the worktree must return exactly 75. If it does not,
-there is a second defect — note the tier-drop counts were identical (135/53) in both
-runs, so the loss happens after tiering, and the file-read explanation is unconfirmed.
+### Retraction: search ranking was never degraded
 
-Free-text columns were swept too: `search_signature` (3), `section_text` (4),
-`search_doc` (1) contain the literal `local/` — all genuine source text (a hardcoded
-`/Users/mack/…` path, a `src/local/` mention in docs). These must **not** be rewritten.
-`qual_name`, `search_qual_name`, `signature`, `clone_sig`, `doc`, `external`,
-`nodes.meta`, `edges.meta`, `edges.member_receiver_dir`: 0 stale rows.
+This document previously recorded, as a falsifiable prediction, that the
+worktree returned 69 ranked results where `local` returned 75 because failed
+file reads dropped six of them, and that the path fix should restore 75.
 
-## 3. Incomplete — inbound cross-repo edges
+**The prediction was wrong and the measurement that follows kills it.** After
+the fix the counts are unchanged, and the cause is the response payload, not the
+data:
 
-A global pass owns an edge by its **source** node, so the copy (keyed on source prefix)
-carries nothing that other repos mint *into* the checkout.
+| checkout | prefix length | `total` | `max_returned` |
+|---|---:|---:|---:|
+| `local` | 5 | 504 | 75 |
+| `test_w@docker-env` (copied) | 17 | 504 | 69 |
+| `local@aurora-redesign` (**derived**) | 21 | 504 | 65 |
+
+`max_returned` is a token budget, and every id and path in the payload carries
+the prefix. A longer prefix buys fewer results. The *derived* worktree, which
+was never copied, sits below the copy — so this is a property of the repo's
+name, not of how its graph was installed.
+
+The direct check: three queries small enough not to truncate return
+**byte-identical** result sets from both checkouts (sha1 of the sorted,
+prefix-stripped id list): `VisitQueueServiceStatus` 2/2, `AdmissionExamination`
+8/8, `cyrillic_latin_translator` 131 total → 40/40 identical even under
+truncation. The four symbols that appeared "missing" all exist under `test_w`
+as both a node and a `symbol_fts` row.
+
+## 3. Was incomplete: inbound cross-repo edges — FIXED
+
+A global pass owns an edge by its **source** node, so a copy keyed on the source
+prefix carries nothing that other repositories mint *into* the checkout.
 
 | checkout | from `odoo` | from `addons` | total inbound |
 |---|---:|---:|---:|
 | `local` (derived) | 110,865 | 74,149 | **185,023** |
 | `local@aurora-redesign` (derived) | 103,777 | 65,208 | **169,157** |
-| `test_w` (copied) | 0 | 0 | **0** |
+| `test_w` (copied, before) | 0 | 0 | **0** |
 
 Inbound kinds into `local`: `references` 180,458 · `cross_repo_extends` 2,149 ·
 `extends` 2,149 · `overrides` 163 · `composes` 95.
 
-**What this costs a query.** Outbound questions are complete — go-to-definition, "what
-does this reference", Odoo model/xmlid/JS binding, impact *from* the worktree. Reverse
-questions under-report:
+Outbound questions were already complete — go-to-definition, "what does this
+reference", Odoo model/xmlid/JS binding, impact *from* the worktree. Reverse
+questions under-reported badly:
 
-| `find_usages` (nodes / edges in the neighbourhood) | `local` | `test_w` |
+| `find_usages` neighbourhood (nodes / edges) | `local` | `test_w` before |
 |---|---:|---:|
 | `…/web_view_leaflet_map/models/ir_ui_view.py::IrUiView` | 1,946 / 2,000 | 1,992 / 2,000 |
 | `…/his/models/common/localtion_inherit_models.py::State` | 1,789 / 1,824 | **40 / 39** |
 | `…/dms_attachments_viewer/models/dms_file.py::DmsFile` | 1,580 / 2,000 | **1 / 0** |
 
-Sibling-invariant probe: `aurora → local` = 0 and `local → aurora` = 0. No checkout of
-one repository ever sources an edge into another checkout of it, so an inbound copy is
-safe provided it excludes every sibling prefix as a source.
+**That these belong in a copy was measured, not assumed.** Across the two derived
+checkouts of one repository, 14,067 `odoo` symbols bind into `local` and 13,960
+into `local@aurora-redesign` — **13,954 into both**. The binder fans out to every
+checkout, so a derive that had seen the destination would mint these same edges;
+the copy anticipates a derive rather than inventing state one would contradict.
+Had the binder picked a single checkout, copying inbound would have produced a
+graph the next derive silently halved.
 
-## 4. Minor — sidecars the copy skips
+Two constraints the fix respects. Only `to_id` moves: `from_id` and `file_path`
+name the *source* repository's symbol and file. And a sibling checkout may never
+be a source — two checkouts of one repository bound to each other is exactly the
+contamination checkout groups exist to prevent. Probed before writing the filter:
+`aurora → local` = 0 and `local → aurora` = 0, so no such edge exists today; the
+filter is what keeps that true rather than lucky. `PurgeRepo` already deletes by
+both `from_id` and `to_id`, so untracking the copy removes them again.
+
+## 4. Minor — sidecars the copy still skips
 
 | table | `local` | `test_w` | effect |
 |---|---:|---:|---|
@@ -117,16 +147,16 @@ safe provided it excludes every sibling prefix as a source.
 
 ## 5. Verdict
 
-| surface | quality |
-|---|---|
-| symbol search / FTS recall | **full** |
-| graph structure, outbound + cross-repo binding to `odoo` / `addons` | **full** |
-| Odoo model / xmlid / JS binding, CSV vocabulary | **full** |
-| go-to-definition, "what does X reference", impact *from* the worktree | **full** |
-| ranked search results | degraded (69/75) |
-| "who uses X" / impact *into* the worktree from `odoo`/`addons` | **empty** |
-| source read, editing context, snippets, edit, review | **broken** |
+| surface | before | after |
+|---|---|---|
+| symbol search / FTS recall | full | full |
+| graph structure, outbound binding to `odoo` / `addons` | full | full |
+| Odoo model / xmlid / JS binding, CSV vocabulary | full | full |
+| go-to-definition, impact *from* the worktree | full | full |
+| ranked search results | *thought degraded — was not* | full |
+| "who uses X", impact *into* the worktree | **empty** | full |
+| source read, editing context, snippets, edit, review | **broken** | full |
 
-The 105.5 s install stands, and so does the binding claim the goal asked for — but
-"100% ready" does not, until §2 is fixed. §3 must be fixed before claiming parity with
-a derived worktree.
+Install time on the reinstall that verified §2: **188 s** against a 300 s goal
+(the 105.5 s first measurement ran on an otherwise idle daemon; this one shared
+the machine with a full `gortex` re-index).
