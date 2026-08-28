@@ -868,6 +868,69 @@ end
 	}
 }
 
+// A chained callee's base is a call, not a name: `get(cfg).run(x)` used
+// to reach the graph as `unresolved::get(cfg).run` — arguments and all —
+// because the callee was decoded by splitting its source text on the
+// last dot, and a chain broken across lines even carried the line break
+// into the target. Decoding the field_expression's children instead
+// degrades the callee to its method name, the only part a resolver
+// could ever match, while a genuinely dotted base (A.B.c) keeps its
+// full qualification.
+func TestJuliaExtractor_ChainedCalleeDegradesToMethodName(t *testing.T) {
+	src := []byte(`launch(cfg) = get(cfg).run(x)
+
+wrapped(x) = foo(x,
+    1,
+).bar(y)
+
+deep(x) = A.B.c(x)
+`)
+	res, err := NewJuliaExtractor().Extract("chain.jl", src)
+	require.NoError(t, err)
+
+	calls := map[string]bool{}
+	for _, ed := range res.Edges {
+		if ed.Kind == graph.EdgeCalls {
+			calls[ed.From+" -> "+ed.To] = true
+		}
+		require.NotContains(t, ed.To, "\n", "a target must never carry a line break")
+		require.NotContains(t, ed.To, "(", "a target must never carry argument text")
+	}
+	require.True(t, calls["chain.jl::launch -> unresolved::run"],
+		"a chained callee degrades to its method name, not its argument text")
+	require.True(t, calls["chain.jl::wrapped -> unresolved::bar"],
+		"a chain broken across lines must not leak the break into the target")
+	require.True(t, calls["chain.jl::deep -> unresolved::A.B.c"],
+		"a dotted base keeps its full qualification")
+}
+
+// `Base.:(==)(a, b)` used to normalise its callee to `(==)` — the
+// parenthesised quote survived the text trim — while `Base.:+` trimmed
+// to `+`. Both spellings name the same operator, so both must decode to
+// the operator's own name; a bare `(==)(a, b)` callee, which wears only
+// the parentheses, does too.
+func TestJuliaExtractor_QuotedOperatorCallee(t *testing.T) {
+	src := []byte(`same(a, b) = Base.:(==)(a, b)
+plus(a, b) = Base.:+(a, b)
+plain(a, b) = (==)(a, b)
+`)
+	res, err := NewJuliaExtractor().Extract("op.jl", src)
+	require.NoError(t, err)
+
+	calls := map[string]bool{}
+	for _, ed := range res.Edges {
+		if ed.Kind == graph.EdgeCalls {
+			calls[ed.From+" -> "+ed.To] = true
+		}
+	}
+	require.True(t, calls["op.jl::same -> unresolved::Base.=="],
+		"`:(==)` must normalise to the operator name like `:+` does")
+	require.True(t, calls["op.jl::plus -> unresolved::Base.+"],
+		"`:+` keeps its existing normalisation")
+	require.True(t, calls["op.jl::plain -> unresolved::=="],
+		"a bare parenthesised operator callee decodes too")
+}
+
 func TestJuliaExtractor_ConstAndDocstrings(t *testing.T) {
 	src := []byte(`"""
 Circle radius helpers.

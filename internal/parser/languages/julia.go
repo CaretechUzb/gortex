@@ -538,27 +538,69 @@ func (e *JuliaExtractor) handleType(n *sitter.Node, src []byte, scope juliaScope
 	e.walk(n, src, inner, st)
 }
 
-// juliaCalleeName decodes a call callee: bare identifier or qualified
-// field_expression (`Base.show`, `Base.:+`). Returns name, receiver.
+// juliaUnwrappedName decodes a single possibly-wrapped name down to its
+// plain spelling. An operator callee can wear two wrappers: `:+` is a
+// quote_expression around the operator and `:(==)` a quote_expression
+// around a parenthesized_expression around it, while a bare `(==)` callee
+// wears only the parenthesized one. Returns "" when the node is not a
+// name in any of these shapes.
+func juliaUnwrappedName(n *sitter.Node, src []byte) string {
+	for n != nil {
+		switch n.Type() {
+		case "identifier", "operator":
+			return n.Content(src)
+		case "quote_expression", "parenthesized_expression":
+			n = n.NamedChild(0)
+		default:
+			return ""
+		}
+	}
+	return ""
+}
+
+// juliaCalleeName decodes a call callee: bare identifiers, qualified
+// field_expressions (`Base.show`, `A.B.c`), and quoted operators (`:+`,
+// `:(==)`). The field_expression is decoded from its base and property
+// CHILDREN, never from source text: text split on the last dot dragged a
+// chained callee's arguments (`get(cfg).run`) and even a line break
+// inside a multi-line chain into the call target. A base that is not
+// itself a dotted name leaves only the property decodable, so the callee
+// degrades to its bare method name — the only part a resolver could ever
+// match. Returns name, receiver.
 func juliaCalleeName(n *sitter.Node, src []byte) (name, receiver string) {
 	if n == nil {
 		return "", ""
 	}
 	switch n.Type() {
-	case "identifier":
+	case "identifier", "operator":
 		return n.Content(src), ""
+	case "quote_expression", "parenthesized_expression": // bare `:+` / `(==)` callee
+		return juliaUnwrappedName(n, src), ""
 	case "field_expression":
-		full := n.Content(src)
-		idx := strings.LastIndex(full, ".")
-		if idx <= 0 {
-			return strings.TrimPrefix(full, ":"), ""
+		count := int(n.NamedChildCount())
+		if count < 2 {
+			return "", ""
 		}
-		receiver = full[:idx]
-		name = strings.TrimPrefix(full[idx+1:], ":") // Base.:+ → +
-		return name, receiver
-	case "quote_expression": // bare operator callee, e.g. `:+`
-		if inner := n.NamedChild(0); inner != nil {
-			return inner.Content(src), ""
+		name = juliaUnwrappedName(n.NamedChild(count-1), src)
+		if name == "" {
+			return "", ""
+		}
+		switch base := n.NamedChild(0); base.Type() {
+		case "identifier":
+			return name, base.Content(src)
+		case "field_expression":
+			inner, recv := juliaCalleeName(base, src)
+			if inner == "" {
+				return "", ""
+			}
+			if recv == "" {
+				return name, inner
+			}
+			return name, recv + "." + inner
+		default:
+			// `get(cfg).run(x)` — the base is a call, not a name, so
+			// only the method name is decodable.
+			return name, ""
 		}
 	}
 	return "", ""
