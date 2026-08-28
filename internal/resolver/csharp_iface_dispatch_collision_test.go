@@ -84,3 +84,47 @@ func TestResolveCSharpInterfaceDispatch_NonGenericTwinKeepsVarianceStamp(t *test
 		})
 	}
 }
+
+// Same-file partial parts. Each part is its own declaration with its own
+// base list, so the duplicate guard - which counts base entries within
+// ONE base list - sees an unambiguous single IBox in each and lets both
+// stamp. They are the same type: both mint `Boxes.cs::Store`, the second
+// declaration is dropped whole, and the one surviving implements edge
+// carries whichever closure was written first.
+//
+// The gate then paints that single closure onto every same-named member
+// of the type and filters both Put overloads against it. Which closure
+// wins is source-order dependent, so the fan-out is not merely wrong, it
+// is unstable under reordering.
+func TestResolveCSharpInterfaceDispatch_SameFilePartialPartsKeepBothOverloads(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Boxes.cs": `namespace App {
+    public class Crate { }
+    public class Widget { }
+    public interface IBox<T> { void Put(T item); }
+    public partial class Store : IBox<Widget> { public void Put(Widget w) { } }
+    public partial class Store : IBox<Crate> { public void Put(Crate c) { } }
+    public class Flow {
+        private readonly IBox<Crate> _box;
+        public Flow(IBox<Crate> b) { _box = b; }
+        public void Pull(Crate c) { _box.Put(c); }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	const callerID = "Boxes.cs::Flow.Pull"
+	bindFieldReceiverCall(t, g, callerID, "_box", "Boxes.cs::IBox.Put")
+	ResolveCSharpInterfaceDispatch(g)
+
+	// One type reaching IBox through two closures cannot be filtered on
+	// either of them, so both overloads stay. The declaration that lost
+	// the ID race is exactly the evidence that would have been needed to
+	// filter correctly - which is why its absence has to disarm the gate
+	// rather than license it.
+	assert.ElementsMatch(t, []string{
+		"Boxes.cs::Store.Put",
+		"Boxes.cs::Store.Put_L6",
+	}, dispatchTargets(g, callerID),
+		"a type whose parts close IBox twice must keep its whole fan-out")
+}

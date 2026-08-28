@@ -370,6 +370,10 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 	// (emitCSharpBaseList) checks this set before falling back to name
 	// shape so a locally-known interface always wins.
 	localInterfaces := collectCSharpInterfaceNames(root, src)
+	// Per type node ID, across every declaration in the file — see
+	// csharpBaseNameCounts for why one declaration's own base list is not
+	// a sufficient ambiguity check.
+	baseNameCounts := csharpBaseNameCounts(root, src, filePath)
 
 	// Using-alias names, collected once per file: the type-argument stamp
 	// sites consult them per declaration, and a per-declaration rescan of
@@ -389,19 +393,19 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 			e.emitNamespace(m, filePath, fileID, result, seen)
 
 		case m.Captures["class.def"] != nil:
-			e.emitContainer(m, "class", graph.KindType, filePath, fileID, src, result, seen, annotationSeen, localInterfaces, fileAliases)
+			e.emitContainer(m, "class", graph.KindType, filePath, fileID, src, result, seen, annotationSeen, localInterfaces, fileAliases, baseNameCounts)
 
 		case m.Captures["iface.def"] != nil:
-			e.emitContainer(m, "iface", graph.KindInterface, filePath, fileID, src, result, seen, annotationSeen, localInterfaces, fileAliases)
+			e.emitContainer(m, "iface", graph.KindInterface, filePath, fileID, src, result, seen, annotationSeen, localInterfaces, fileAliases, baseNameCounts)
 
 		case m.Captures["struct.def"] != nil:
-			e.emitContainer(m, "struct", graph.KindType, filePath, fileID, src, result, seen, annotationSeen, localInterfaces, fileAliases)
+			e.emitContainer(m, "struct", graph.KindType, filePath, fileID, src, result, seen, annotationSeen, localInterfaces, fileAliases, baseNameCounts)
 
 		case m.Captures["record.def"] != nil:
-			e.emitContainer(m, "record", graph.KindType, filePath, fileID, src, result, seen, annotationSeen, localInterfaces, fileAliases)
+			e.emitContainer(m, "record", graph.KindType, filePath, fileID, src, result, seen, annotationSeen, localInterfaces, fileAliases, baseNameCounts)
 
 		case m.Captures["enum.def"] != nil:
-			e.emitContainer(m, "enum", graph.KindType, filePath, fileID, src, result, seen, annotationSeen, localInterfaces, fileAliases)
+			e.emitContainer(m, "enum", graph.KindType, filePath, fileID, src, result, seen, annotationSeen, localInterfaces, fileAliases, baseNameCounts)
 
 		case m.Captures["anon.def"] != nil:
 			e.emitAnonymousType(m, filePath, fileID, result, seen)
@@ -934,7 +938,7 @@ func csharpMarkVariantTypeParams(result *parser.ExtractionResult, id string) {
 // emitContainer collapses the per-kind class/interface/struct/enum
 // node emission. The capture-name prefix selects which capture set to
 // read from (the legacy code repeated this body four times).
-func (e *CSharpExtractor) emitContainer(m parser.QueryResult, kind string, nodeKind graph.NodeKind, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen, annotationSeen map[string]bool, localInterfaces, fileAliases map[string]bool) {
+func (e *CSharpExtractor) emitContainer(m parser.QueryResult, kind string, nodeKind graph.NodeKind, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen, annotationSeen map[string]bool, localInterfaces, fileAliases map[string]bool, baseNameCounts map[string]map[string]int) {
 	name := m.Captures[kind+".name"].Text
 	def := m.Captures[kind+".def"]
 	id := filePath + "::" + name
@@ -999,7 +1003,7 @@ func (e *CSharpExtractor) emitContainer(m parser.QueryResult, kind string, nodeK
 	// for structs and records, inheritance for interfaces).
 	switch kind {
 	case "class", "struct", "record", "iface":
-		emitCSharpBaseList(id, def.Node, src, filePath, localInterfaces, fileAliases, result)
+		emitCSharpBaseList(id, def.Node, src, filePath, localInterfaces, fileAliases, baseNameCounts, result)
 	case "enum":
 		e.emitCSharpEnumMembers(def.Node, src, filePath, id, name, result, seen)
 	}
@@ -1909,6 +1913,54 @@ func csharpDirectMemberOwner(member *sitter.Node, src []byte, allowed ...string)
 // heuristic consults this set first: a base type that names a
 // locally-declared interface is unambiguously an interface, regardless
 // of whether its name follows the `I`-prefix convention.
+// csharpBaseNameCounts counts, per type node ID, how many base-list
+// entries across EVERY declaration of that type in the file name the
+// same erased base.
+//
+// A type node ID carries neither arity nor namespace, so same-file
+// partial parts and arity twins share one ID. Each part's own base list
+// reads as unambiguous while the type AS A WHOLE closes one interface
+// twice, and only the first declaration reaches the graph - so a stamp
+// taken from it describes one closure and is then applied to members
+// implementing the other. Counting across declarations is what makes
+// that ambiguity visible at the one place still able to refuse it.
+//
+// Walking base_list nodes and reading the parent's name avoids
+// enumerating declaration node types, which differ across grammar
+// revisions.
+func csharpBaseNameCounts(root *sitter.Node, src []byte, filePath string) map[string]map[string]int {
+	counts := map[string]map[string]int{}
+	walkNodes(root, func(n *sitter.Node) {
+		if n.Type() != "base_list" {
+			return
+		}
+		decl := n.Parent()
+		if decl == nil {
+			return
+		}
+		nameNode := decl.ChildByFieldName("name")
+		if nameNode == nil {
+			return
+		}
+		id := filePath + "::" + nameNode.Content(src)
+		m := counts[id]
+		if m == nil {
+			m = map[string]int{}
+			counts[id] = m
+		}
+		for i, _nc := 0, int(n.NamedChildCount()); i < _nc; i++ {
+			entry := n.NamedChild(i)
+			if entry == nil {
+				continue
+			}
+			if name, _ := csharpBaseTypeName(entry, src); name != "" {
+				m[name]++
+			}
+		}
+	})
+	return counts
+}
+
 func collectCSharpInterfaceNames(root *sitter.Node, src []byte) map[string]bool {
 	names := make(map[string]bool)
 	walkNodes(root, func(n *sitter.Node) {
@@ -1949,7 +2001,7 @@ func collectCSharpInterfaceNames(root *sitter.Node, src []byte) map[string]bool 
 // the resolver binds them like every other C# reference. A base that
 // resolves to a same-file class still flows through unchanged — it is
 // neither a known interface nor I-prefixed, so it lands as EdgeExtends.
-func emitCSharpBaseList(typeID string, decl *sitter.Node, src []byte, filePath string, localInterfaces, fileAliases map[string]bool, result *parser.ExtractionResult) {
+func emitCSharpBaseList(typeID string, decl *sitter.Node, src []byte, filePath string, localInterfaces, fileAliases map[string]bool, baseNameCounts map[string]map[string]int, result *parser.ExtractionResult) {
 	if decl == nil {
 		return
 	}
@@ -1981,19 +2033,19 @@ func emitCSharpBaseList(typeID string, decl *sitter.Node, src []byte, filePath s
 	// or a type nested inside a generic outer), plus in-scope using
 	// aliases (opaque spellings).
 	declTypeParams := csharpUnstampableArgNames(decl, src, fileAliases)
-	// A base list closing the SAME erased target twice
+	// A type closing the SAME erased target twice
 	// (Both : IBoxStore<Crate>, IBoxStore<Widget>) collapses to one stored
 	// edge — identical (from, to, kind, file, line) — so a stamp would
 	// arbitrarily keep one closure and suppress the other's implementors
-	// downstream. Count targets first; a repeated one stamps nothing.
-	baseNameCount := map[string]int{}
-	for i, _nc := 0, int(baseList.NamedChildCount()); i < _nc; i++ {
-		if entry := baseList.NamedChild(i); entry != nil {
-			if name, _ := csharpBaseTypeName(entry, src); name != "" {
-				baseNameCount[name]++
-			}
-		}
-	}
+	// downstream. A repeated target stamps nothing.
+	//
+	// The count spans every declaration sharing this type's node ID, not
+	// just this base list: same-file partial parts and arity twins each
+	// look unambiguous alone while the type as a whole is not, and the
+	// part that loses the ID race never reaches the graph to contradict
+	// the winner's stamp. An absent entry counts as 0 and stamps nothing,
+	// so a shape the prescan cannot attribute keeps the full fan-out.
+	baseNameCount := baseNameCounts[typeID]
 	extendsTaken := false
 	for i, _nc := 0, int(baseList.NamedChildCount()); i < _nc; i++ {
 		entry := baseList.NamedChild(i)
