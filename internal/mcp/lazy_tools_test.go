@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 
 	mcplib "github.com/mark3labs/mcp-go/mcp"
@@ -392,4 +393,53 @@ func decodeStructured(t *testing.T, result *mcplib.CallToolResult) toolsSearchPa
 	var body toolsSearchPayload
 	require.NoError(t, json.Unmarshal(raw, &body))
 	return body
+}
+
+// TestPromote_ConcurrentCallersNeverFalse404 is the reviewer-required
+// synchronized two-request regression: two goroutines race to promote the
+// same deferred tool. Before the atomic fix, Promote marked the tool
+// promoted under the lock, released it, then AddTool'd outside the lock —
+// so the second caller saw IsDeferred=true but Promote returned empty
+// (already marked) and concluded the tool was missing. Now the mark and
+// the live registration happen under one lock, so every concurrent caller
+// either transitions the tool itself or observes it already live.
+func TestPromote_ConcurrentCallersNeverFalse404(t *testing.T) {
+	r := newLazyToolRegistry(true)
+	registered := make(chan struct{}, 1)
+	var mu sync.Mutex
+	live := map[string]bool{}
+	r.promote = func(dt *deferredTool) {
+		// Simulate the real AddTool latency: the registration is not
+		// visible to GetTool until promote returns.
+		mu.Lock()
+		live[dt.tool.Name] = true
+		mu.Unlock()
+		registered <- struct{}{}
+	}
+	r.Register(mcplib.NewTool("race_tool", mcplib.WithDescription("race")), func(context.Context, mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+		return mcplib.NewToolResultText("ok"), nil
+	})
+
+	// Wire GetTool through the same live map the promote closure fills.
+	// (lazyToolRegistry has no GetTool of its own; the live registry is
+	// the mcp.Server's. We assert on the transition contract instead:
+	// every caller that saw IsDeferred must end up able to observe the
+	// tool live.)
+	start := make(chan struct{})
+	results := make(chan bool, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			<-start
+			transitioned := r.Promote("race_tool")
+			mu.Lock()
+			_, isLive := live["race_tool"]
+			mu.Unlock()
+			results <- (len(transitioned) > 0 || isLive)
+		}()
+	}
+	close(start)
+	ok1, ok2 := <-results, <-results
+	require.True(t, ok1, "first concurrent caller must see the tool live or transition it")
+	require.True(t, ok2, "second concurrent caller must see the tool live or transition it (no false 404)")
+	require.NotContains(t, r.DeferredNames(), "race_tool", "a promoted tool must leave the deferred catalog")
 }

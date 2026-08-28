@@ -493,7 +493,7 @@ func categorizeProcess(entry string) string {
 }
 
 func (h *Handler) handleProcesses(w http.ResponseWriter, r *http.Request) {
-	raw, err := h.CallToolStrict(r.Context(), "get_processes", map[string]any{})
+	raw, err := h.CallToolStrict(r.Context(), "analyze", map[string]any{"kind": "processes"})
 	if err != nil {
 		WriteJSONError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -636,7 +636,7 @@ type contractLocation struct {
 }
 
 func (h *Handler) handleContracts(w http.ResponseWriter, r *http.Request) {
-	raw, err := h.CallToolStrict(r.Context(), "contracts", map[string]any{"action": "list"})
+	raw, err := h.CallToolStrict(r.Context(), "analyze", map[string]any{"kind": "contracts", "action": "list"})
 	if err != nil {
 		WriteJSONError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -746,7 +746,7 @@ func (h *Handler) handleContracts(w http.ResponseWriter, r *http.Request) {
 // counts and render a per-contract diff panel.
 
 func (h *Handler) handleContractsValidate(w http.ResponseWriter, r *http.Request) {
-	raw, err := h.CallToolStrict(r.Context(), "contracts", map[string]any{"action": "validate"})
+	raw, err := h.CallToolStrict(r.Context(), "analyze", map[string]any{"kind": "contracts", "action": "validate"})
 	if err != nil {
 		WriteJSONError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1138,7 +1138,7 @@ type communityEntry struct {
 }
 
 func (h *Handler) handleCommunities(w http.ResponseWriter, r *http.Request) {
-	raw, err := h.CallToolStrict(r.Context(), "get_communities", map[string]any{})
+	raw, err := h.CallToolStrict(r.Context(), "analyze", map[string]any{"kind": "communities"})
 	if err != nil {
 		WriteJSONError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1596,7 +1596,7 @@ func (h *Handler) handleDashboard(w http.ResponseWriter, r *http.Request) {
 
 	// Top processes for the inline preview. The full list is on the
 	// Processes page; here we cap at 6 so the dashboard stays compact.
-	if raw, err := h.CallToolStrict(ctx, "get_processes", map[string]any{}); err != nil {
+	if raw, err := h.CallToolStrict(ctx, "analyze", map[string]any{"kind": "processes"}); err != nil {
 		h.logger.Warn("dashboard: get_processes failed; processes section will be empty",
 			zap.Error(err))
 	} else if raw != "" {

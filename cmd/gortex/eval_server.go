@@ -90,7 +90,6 @@ func runEvalServer(cmd *cobra.Command, args []string) error {
 
 	// Wire the MCP server's tool dispatch into an HTTP handler.
 	handler := eval.NewHandler(srv.MCPServer(), g, version, logger)
-	handler.SetToolPromoter(srv.EnsureToolPromoted)
 
 	// Bind loopback by default and refuse a wider bind without a token.
 	// This surface publishes the daemon's whole tool catalogue — including

@@ -90,7 +90,6 @@ func main() {
 	fmt.Fprintf(os.Stderr, "[daemon-latency] indexed %d nodes\n", g.NodeCount())
 
 	handler := internalserver.NewHandler(srv.MCPServer(), g, "bench", zap.NewNop())
-	handler.SetToolPromoter(srv.EnsureToolPromoted)
 
 	// Build the call set against the freshly indexed graph so each
 	// synthetic request has at least some structural validity (a

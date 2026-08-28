@@ -442,7 +442,6 @@ func runMCP(cmd *cobra.Command, args []string) error {
 		}
 
 		serverHandler := server.NewHandler(srv.MCPServer(), g, version, logger)
-		serverHandler.SetToolPromoter(srv.EnsureToolPromoted)
 		if cm != nil {
 			serverHandler.SetConfigManager(cm)
 		}

@@ -32,12 +32,48 @@ func newLocalToolExecutor(srv *gortexmcp.Server, logger *zap.Logger) daemon.Loca
 		}
 	}
 	return func(ctx context.Context, toolName string, body []byte) ([]byte, int, error) {
+		// Validate the request body before any lookup, promotion, or
+		// invocation: malformed JSON must 400 without touching the
+		// registry or running a handler.
+		var args map[string]any
+		if len(body) > 0 {
+			var nested struct {
+				Arguments map[string]any `json:"arguments"`
+			}
+			if err := json.Unmarshal(body, &nested); err != nil {
+				payload := map[string]any{
+					"error":   "invalid_json",
+					"message": fmt.Sprintf("malformed request body: %s", err.Error()),
+				}
+				out, _ := json.Marshal(payload)
+				return out, 400, nil
+			}
+			if nested.Arguments != nil {
+				args = nested.Arguments
+			} else if err := json.Unmarshal(body, &args); err != nil {
+				payload := map[string]any{
+					"error":   "invalid_json",
+					"message": fmt.Sprintf("malformed request body: %s", err.Error()),
+				}
+				out, _ := json.Marshal(payload)
+				return out, 400, nil
+			}
+		}
+
 		tool := srv.MCPServer().GetTool(toolName)
-		if tool == nil && srv.EnsureToolPromoted(toolName) {
-			// Deferred/lazy catalog under the defer-mode tools_search
-			// split (the shipped core-preset default) — not yet in the
-			// live registry until promoted just now.
-			tool = srv.MCPServer().GetTool(toolName)
+		if tool == nil {
+			// Promote-on-demand, session-aware: a deferred/lazy tool
+			// (the defer-mode tools_search split, the shipped core-preset
+			// default) is not in the live registry until promoted. Mirror
+			// the daemon dispatcher: check the effective session surface
+			// before touching the process-global lazy registry so a
+			// facade-v1 / hide-mode session cannot mutate it, then mark
+			// the call authorized so the MCP surface filter recognises it
+			// (the per-call gate inside the handler still decides).
+			if srv.IsToolEnabledForSession(ctx, toolName) && srv.EnsureToolPromotedForSession(ctx, toolName) {
+				ctx = gortexmcp.WithAuthorizedToolCall(ctx, toolName)
+				tool = srv.MCPServer().GetTool(toolName)
+			}
 		}
 		if tool == nil {
 			payload := map[string]any{
@@ -46,18 +82,6 @@ func newLocalToolExecutor(srv *gortexmcp.Server, logger *zap.Logger) daemon.Loca
 			}
 			out, _ := json.Marshal(payload)
 			return out, 404, nil
-		}
-
-		var args map[string]any
-		if len(body) > 0 {
-			var nested struct {
-				Arguments map[string]any `json:"arguments"`
-			}
-			if err := json.Unmarshal(body, &nested); err == nil && nested.Arguments != nil {
-				args = nested.Arguments
-			} else {
-				_ = json.Unmarshal(body, &args)
-			}
 		}
 
 		mcpReq := mcp.CallToolRequest{

@@ -75,35 +75,6 @@ type Handler struct {
 	convDir     string
 	convAllow   []string
 	convTokenFn func() string
-
-	// promoteTool, when set, is called by CallToolStrict on a registry
-	// miss to promote a deferred (lazy-catalog) tool into the live MCP
-	// server before giving up. Wired via SetToolPromoter with
-	// (*mcp.Server).EnsureToolPromoted so internal dashboard callers can
-	// reach any tool regardless of the eager/defer tools_search split.
-	// nil is safe (no-op) — e.g. in tests that construct Handler directly.
-	promoteTool func(name string) bool
-}
-
-// SetToolPromoter wires the deferred-tool promotion hook used by
-// CallToolStrict. Pass (*mcp.Server).EnsureToolPromoted from the caller that
-// owns the MCP server's lazy tool registry.
-func (h *Handler) SetToolPromoter(f func(name string) bool) {
-	h.promoteTool = f
-}
-
-// getToolOrPromote looks up a tool in the live MCP registry, and — on a
-// miss — asks the wired promoter to pull it out of the deferred/lazy
-// catalog (the defer-mode tools_search split) before giving up. Shared by
-// every internal-dispatch call site (CallToolStrict, handleToolCall) so a
-// tool is reachable by name here exactly as it is via the CLI's
-// `gortex call`, regardless of whether tools_search has run yet.
-func (h *Handler) getToolOrPromote(toolName string) *mcpserver.ServerTool {
-	tool := h.mcpServer.GetTool(toolName)
-	if tool == nil && h.promoteTool != nil && h.promoteTool(toolName) {
-		tool = h.mcpServer.GetTool(toolName)
-	}
-	return tool
 }
 
 // NewHandler creates an HTTP handler that dispatches to MCP tools.
@@ -443,7 +414,7 @@ func (h *Handler) handleToolCall(w http.ResponseWriter, r *http.Request) {
 		// dispatch below.
 	}
 
-	tool := h.getToolOrPromote(toolName)
+	tool := h.mcpServer.GetTool(toolName)
 	if tool == nil {
 		available := h.availableToolNames()
 		WriteJSON(w, http.StatusNotFound, map[string]any{
@@ -598,7 +569,7 @@ func (h *Handler) CallTool(ctx context.Context, toolName string, args map[string
 // error cases — callers that want to render the message verbatim can do so
 // regardless of whether they treat it as an error.
 func (h *Handler) CallToolStrict(ctx context.Context, toolName string, args map[string]any) (string, error) {
-	tool := h.getToolOrPromote(toolName)
+	tool := h.mcpServer.GetTool(toolName)
 	if tool == nil {
 		return "", fmt.Errorf("tool %q is not registered", toolName)
 	}

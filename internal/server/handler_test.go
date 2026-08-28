@@ -146,37 +146,37 @@ func TestToolCallUnknownTool(t *testing.T) {
 	assert.Contains(t, available, "echo")
 }
 
-// TestToolCallPromotesDeferredTool covers the same defer-mode promotion
-// fix as TestCallToolStrict_PromotesDeferredTool (handler_strict_test.go),
-// but through the public POST /v1/tools/{name} HTTP path (handleToolCall)
-// rather than the internal CallToolStrict caller — both routes share the
-// new getToolOrPromote helper, and this pins the HTTP-facing contract
-// separately since it serializes a different response shape (ToolResponse,
-// not a plain string).
-func TestToolCallPromotesDeferredTool(t *testing.T) {
+// TestToolCallAnalyzeAliasedKindRoutesThroughFacade pins the HTTP-facing
+// contract: POST /v1/tools/analyze with kind=processes reaches the facade
+// (which routes to the captured legacy handler) without any registry
+// promotion. This is the dashboard's /v1/processes path under core/defer.
+func TestToolCallAnalyzeAliasedKindRoutesThroughFacade(t *testing.T) {
 	h := newTestHandler(t)
-	h.SetToolPromoter(func(name string) bool {
-		if name != "deferred_tool" {
-			return false
-		}
-		h.mcpServer.AddTool(
-			mcp.NewTool("deferred_tool", mcp.WithDescription("registered on promotion")),
-			func(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-				return mcp.NewToolResultText("promoted"), nil
-			},
-		)
-		return true
-	})
+	legacyCalled := false
+	h.mcpServer.AddTool(
+		mcp.NewTool("analyze", mcp.WithDescription("dispatcher"),
+			mcp.WithString("kind", mcp.Required())),
+		func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			kind, _ := req.GetArguments()["kind"].(string)
+			if kind == "processes" {
+				legacyCalled = true
+				return mcp.NewToolResultText(`{"processes":[]}`), nil
+			}
+			return mcp.NewToolResultError("unknown analyze kind: " + kind), nil
+		},
+	)
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/tools/deferred_tool", strings.NewReader("{}"))
+	req := httptest.NewRequest(http.MethodPost, "/v1/tools/analyze",
+		strings.NewReader(`{"arguments":{"kind":"processes"}}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 
 	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.True(t, legacyCalled, "analyze kind=processes must reach the legacy handler")
 	var resp ToolResponse
 	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
 	require.Len(t, resp.Content, 1)
-	assert.Equal(t, "promoted", resp.Content[0].Text)
+	assert.Contains(t, resp.Content[0].Text, `"processes"`)
 }
 
 func TestToolCallMalformedJSON(t *testing.T) {

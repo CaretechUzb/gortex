@@ -3176,6 +3176,11 @@ func (s *Server) attachLazyRegistry() {
 // without a discovery round-trip. It is a no-op (returns false) when there is
 // no lazy registry or the tool is live, absent, or already promoted; a hidden
 // (hide-mode) tool is never deferred, so this never bypasses the hide gate.
+//
+// The return value reports whether the tool is now live in the registry —
+// promoted by this call OR already promoted by a concurrent caller. It is
+// false only when the name is absent or not deferred. Callers must treat a
+// true return as "re-check GetTool", never as "I transitioned it".
 func (s *Server) EnsureToolPromoted(name string) bool {
 	if s == nil || s.lazy == nil || name == "" {
 		return false
@@ -3183,7 +3188,8 @@ func (s *Server) EnsureToolPromoted(name string) bool {
 	if !s.lazy.IsDeferred(name) {
 		return false
 	}
-	return len(s.lazy.Promote(name)) > 0
+	s.lazy.Promote(name)
+	return s.MCPServer().GetTool(name) != nil
 }
 
 // EnsureToolPromotedForSession is the per-connection promote-on-demand entry
