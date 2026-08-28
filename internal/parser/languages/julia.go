@@ -302,14 +302,22 @@ func (st *juliaWalkState) lookupType(modulePath, name string) (id, declared stri
 
 // juliaTypeHeadInfo decodes a `type_head` child: the declared name
 // (inside identifier / parametrized_type_expression / the lhs of the
-// `<:` binary_expression), its type parameters, and the supertype text.
-func juliaTypeHeadInfo(head *sitter.Node, src []byte) (name, super string, params []string) {
+// `<:` binary_expression) and the supertype text.
+//
+// Type parameters are deliberately not collected. The house key for them
+// is Node.Meta["type_params"], whose readers are language-gated (the Go
+// generic-instantiation lookup and the Rust scope index), and whose
+// []map[string]string shape falls outside the store's flat meta codec —
+// so stamping it here would spill every parametric type node's metadata
+// into the JSON fallback to feed nothing. The supertype's own parameters
+// are already preserved on the extends edge as Meta["base_path"].
+func juliaTypeHeadInfo(head *sitter.Node, src []byte) (name, super string) {
 	if head == nil || head.Type() != "type_head" {
-		return "", "", nil
+		return "", ""
 	}
 	c := head.NamedChild(0)
 	if c == nil {
-		return "", "", nil
+		return "", ""
 	}
 	if c.Type() == "binary_expression" {
 		// Named children are [lhs, operator, rhs] — the operator is a
@@ -317,46 +325,33 @@ func juliaTypeHeadInfo(head *sitter.Node, src []byte) (name, super string, param
 		lhs := c.NamedChild(0)
 		rhs := c.NamedChild(int(c.NamedChildCount()) - 1)
 		if lhs != nil {
-			name, params = juliaNameAndParams(lhs, src)
+			name = juliaTypeHeadName(lhs, src)
 		}
 		if rhs != nil && rhs.Type() != "operator" {
 			super = rhs.Content(src)
 		}
-		return name, super, params
+		return name, super
 	}
-	name, params = juliaNameAndParams(c, src)
-	return name, "", params
+	return juliaTypeHeadName(c, src), ""
 }
 
-// juliaNameAndParams extracts name + type parameters from an identifier
-// or a parametrized_type_expression (`Pair{T,S}`).
-func juliaNameAndParams(n *sitter.Node, src []byte) (string, []string) {
+// juliaTypeHeadName extracts the declared name from an identifier or a
+// parametrized_type_expression (`Pair{T,S}` → `Pair`).
+func juliaTypeHeadName(n *sitter.Node, src []byte) string {
 	if n == nil {
-		return "", nil
+		return ""
 	}
 	switch n.Type() {
 	case "identifier":
-		return n.Content(src), nil
+		return n.Content(src)
 	case "parametrized_type_expression":
-		var params []string
-		name := ""
 		for c := range n.NamedChildren() {
-			switch c.Type() {
-			case "identifier":
-				if name == "" {
-					name = c.Content(src)
-				}
-			case "curly_expression":
-				for g := range c.NamedChildren() {
-					if g.Type() == "identifier" {
-						params = append(params, g.Content(src))
-					}
-				}
+			if c.Type() == "identifier" {
+				return c.Content(src)
 			}
 		}
-		return name, params
 	}
-	return "", nil
+	return ""
 }
 
 // juliaFieldName returns the field a direct struct member declares, or ""
@@ -403,7 +398,7 @@ func (e *JuliaExtractor) handleType(n *sitter.Node, src []byte, scope juliaScope
 			break
 		}
 	}
-	name, super, _ := juliaTypeHeadInfo(head, src)
+	name, super := juliaTypeHeadInfo(head, src)
 	if name == "" {
 		e.walk(n, src, scope, st)
 		return
@@ -585,7 +580,7 @@ func (e *JuliaExtractor) handleAssignment(n *sitter.Node, src []byte, scope juli
 	// instead of unwrapping one fixed level.
 	if sig := juliaSignatureCall(lhs); sig != nil {
 		if name, receiver := juliaCalleeName(sig.NamedChild(0), src); name != "" {
-			e.emitShortFunction(n, sig, name, receiver, doc, src, scope, st)
+			e.emitShortFunction(n, name, receiver, doc, src, scope, st)
 			return
 		}
 	}
@@ -623,7 +618,7 @@ func (e *JuliaExtractor) handleAssignment(n *sitter.Node, src []byte, scope juli
 	e.walk(n, src, scope, st)
 }
 
-func (e *JuliaExtractor) emitShortFunction(n, sig *sitter.Node, name, receiver, doc string, src []byte, scope juliaScope, st *juliaWalkState) {
+func (e *JuliaExtractor) emitShortFunction(n *sitter.Node, name, receiver, doc string, src []byte, scope juliaScope, st *juliaWalkState) {
 	inner := e.emitCallable(n, name, receiver, doc, false, scope, st)
 	e.walk(n, src, inner, st)
 }
