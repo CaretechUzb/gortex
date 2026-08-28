@@ -154,15 +154,19 @@ func (e *JuliaExtractor) Extract(filePath string, src []byte) (*parser.Extractio
 // numbers are the only discriminator.
 func (e *JuliaExtractor) walk(n *sitter.Node, src []byte, scope juliaScope, st *juliaWalkState) {
 	// Only a few blocks can hold documentation: the file, a module body,
-	// and a begin / quote block. A string standing at the top of a
-	// FUNCTION body is ordinary executable code — Julia parses a function
-	// body with its plain expression production, never the docstring one
-	// — so a value returned from a helper must not become the doc of
-	// whatever is defined after it.
+	// and a begin / quote block outside any definition. A string standing
+	// in a FUNCTION body is ordinary executable code — Julia parses a
+	// function body with its plain expression production, never the
+	// docstring one — so a value returned from a helper must not become
+	// the doc of whatever is defined after it. The scope check matters
+	// for `quote ... end` in particular, which is how nearly every macro
+	// body is written.
 	docContext := false
 	switch n.Type() {
-	case "source_file", "module_definition", "compound_statement", "quote_statement":
+	case "source_file", "module_definition":
 		docContext = true
+	case "compound_statement", "quote_statement":
+		docContext = scope.functionID == ""
 	}
 
 	pendingDoc, pendingEnd, commentRows := "", 0, 0
@@ -222,12 +226,40 @@ func (e *JuliaExtractor) walk(n *sitter.Node, src []byte, scope juliaScope, st *
 
 		case "macrocall_expression":
 			e.handleMacroCall(c, src, scope, st)
-			e.walk(c, src, scope, st)
+			e.walkMacroArgs(c, src, scope, st, docFor(c))
 
 		default:
 			e.walk(c, src, scope, st)
 		}
 		pendingDoc, pendingEnd, commentRows = "", 0, 0
+	}
+}
+
+// walkMacroArgs walks a macro call's arguments, carrying a docstring that
+// sat above the macro CALL into the definition it wraps.
+// `Base.@kwdef struct S ... end` is a documented struct whose docstring
+// attaches to the wrapper, so stopping at the macro boundary would leave
+// the single most common documented struct form undocumented.
+func (e *JuliaExtractor) walkMacroArgs(n *sitter.Node, src []byte, scope juliaScope, st *juliaWalkState, doc string) {
+	for c := range n.NamedChildren() {
+		if doc == "" || c.Type() != "macro_argument_list" {
+			e.walk(c, src, scope, st)
+			continue
+		}
+		for a := range c.NamedChildren() {
+			switch a.Type() {
+			case "struct_definition", "abstract_definition", "primitive_definition":
+				e.handleType(a, src, scope, st, doc)
+			case "function_definition", "macro_definition":
+				e.handleFunction(a, src, scope, st, doc)
+			case "module_definition":
+				e.handleModule(a, src, scope, st, doc)
+			default:
+				e.walk(a, src, scope, st)
+				continue
+			}
+			doc = ""
+		}
 	}
 }
 

@@ -926,6 +926,46 @@ end
 	}
 	assert.Equal(t, "sig(x)", onlyDoc, "a signature-only docstring must not vanish")
 
+	// A block comment spans rows, and those rows must be discounted from
+	// the adjacency distance rather than breaking it — the single-line
+	// case above spans zero rows and so cannot pin the arithmetic.
+	// A macro-wrapped definition takes the docstring above the WRAPPER,
+	// and a `quote` block inside a macro body is code, not a doc context.
+	more, err := NewJuliaExtractor().Extract("more.jl", []byte(`"""block doc""" #=
+spanning
+three rows
+=#
+blocked(x) = x
+
+"""kwdef doc"""
+Base.@kwdef struct Wrapped
+    n::Int = 1
+end
+
+macro gen(ex)
+    quote
+        "not documentation"
+        function generated()
+            1
+        end
+    end
+end
+`))
+	require.NoError(t, err)
+	moreDocs := map[string]string{}
+	for _, n := range more.Nodes {
+		if d, ok := n.Meta["doc"].(string); ok {
+			moreDocs[n.ID] = d
+		}
+	}
+	assert.Equal(t, "block doc", moreDocs["more.jl::blocked"],
+		"a block comment opening on the docstring's line does not detach it")
+	assert.Equal(t, "kwdef doc", moreDocs["more.jl::Wrapped"],
+		"a macro-wrapped struct takes the docstring above the macro call")
+	_, generatedDoc := moreDocs["more.jl::generated"]
+	assert.False(t, generatedDoc,
+		"a string inside a quote block in a macro body is code, not documentation")
+
 	for _, id := range []string{
 		"attach.jl::blank", "attach.jl::commented",
 		"attach.jl::returns_a_string", "attach.jl::nested",
