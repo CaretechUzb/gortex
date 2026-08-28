@@ -374,6 +374,19 @@ const ImportStubNamePrefix = "import::"
 //
 // Extractors set QualName almost exclusively on referenceable symbols
 // and packages, so the fail-closed branch is rare in practice.
+//
+// The remaining fall-through — a kind carrying no qualified name —
+// reports (nil, exact), i.e. resolution-neutral. That is deliberate, and
+// it is an approximation rather than a proof: import stubs can bind to a
+// KindFile node (relative imports, Lua requires, Godot res:// paths), and
+// a file node has no qualified name to derive a stub key from, so an
+// eviction that collapses an import ambiguity onto a surviving candidate
+// is not described here. Failing closed instead is not available: every
+// file reindex evicts its own file node, so that branch would retire the
+// exact path altogether. The residual gap is a pre-existing resolver
+// ambiguity, and it is bounded by the same rule as every other name — a
+// pending stub that could rebind is only reachable by name, never by the
+// file frontier.
 func ReceiptNamesForEvictedSymbol(kind NodeKind, name, qualName string) (names []string, exact bool) {
 	switch {
 	case IsReferenceableSymbol(kind):

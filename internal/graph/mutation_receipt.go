@@ -383,6 +383,7 @@ func (g *Graph) recordReindexedEdgeForReceipts(e *Edge) {
 	}
 	g.recordAddedEdgeForReceipts(e, file)
 }
+
 // recordFileEvictionForReceipts is the receipt gate for file-scoped
 // evictions: it records the exact frontier only when no RESOLVED incoming
 // edge from a surviving source is about to be deleted. Such an edge is
