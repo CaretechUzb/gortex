@@ -1547,6 +1547,8 @@ func (l *CheckoutLifecycle) buildCoordinator(
 		CheckoutID:   checkout.CheckoutID,
 		CheckoutRoot: checkout.RootPath,
 		FamilyID:     checkout.FamilyID,
+		HeadCommit:   checkout.HeadCommit,
+		HeadTree:     checkout.HeadTree,
 		RepoPrefix:   primary.RepoPrefix,
 		WorkspaceID:  idx.WorkspaceID(),
 		ProjectID:    idx.ProjectID(),
