@@ -739,12 +739,6 @@ func csharpEFActionsFromFile(n *graph.Node) []csharpEFAction {
 	return out
 }
 
-// csharpEFInlineFactsFromFile is retained as the narrow decoder entry point
-// used by focused tests; actions now include mapping and activation sites.
-func csharpEFInlineFactsFromFile(n *graph.Node) []csharpEFAction {
-	return csharpEFActionsFromFile(n)
-}
-
 func csharpEFLegacyAction(n *graph.Node, entry string, ordinal int) (csharpEFAction, bool) {
 	parts := strings.SplitN(entry, "|", 5)
 	if len(parts) != 5 || parts[0] == "" || parts[1] == "" {

@@ -165,23 +165,6 @@ func csharpIsTableAttr(name string) bool {
 	return name == "Table" || name == "TableAttribute"
 }
 
-// csharpAttrPositionalString extracts and decodes the first positional
-// string literal from an attribute's verbatim argument text. Only C#
-// regular and verbatim literals are accepted; constants, interpolated
-// strings, raw strings, UTF-8 literals, and malformed escapes fail open.
-func csharpAttrPositionalString(args string) string {
-	text := strings.TrimSpace(args)
-	value, consumed, ok := csharpDecodeStringLiteralPrefix(text)
-	if !ok {
-		return ""
-	}
-	rest := strings.TrimSpace(text[consumed:])
-	if rest != "" && rest[0] != ',' {
-		return ""
-	}
-	return value
-}
-
 // csharpDecodeStringLiteral decodes one complete C# regular or verbatim
 // string literal. It intentionally rejects newer raw/interpolated/UTF-8
 // spellings: accepting a prefix of one of those would manufacture a table
@@ -738,13 +721,6 @@ var csharpEFSubjectChangers = map[string]bool{
 	"Navigation": true, "ComplexProperty": true,
 }
 
-// csharpEFEntityFromChain retains the existing helper contract; context
-// extraction uses the rooted variant so only the ModelBuilder parameter
-// can establish Entity<T>.
-func csharpEFEntityFromChain(fn *sitter.Node, src []byte) string {
-	return csharpEFEntityFromChainRoot(fn, src, "")
-}
-
 func csharpEFEntityFromChainRoot(fn *sitter.Node, src []byte, root string) string {
 	if fn == nil || fn.Type() != "member_access_expression" {
 		return ""
@@ -976,11 +952,12 @@ func csharpEFApplyAssembly(inv *sitter.Node, src []byte, receiver, context strin
 	for _, arg := range args {
 		switch arg.name {
 		case "":
-			if position == 0 {
+			switch position {
+			case 0:
 				assembly, assemblySet = arg.value, true
-			} else if position == 1 {
+			case 1:
 				predicate, predicateSet = arg.value, true
-			} else {
+			default:
 				return false
 			}
 			position++
