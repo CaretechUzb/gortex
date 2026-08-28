@@ -805,6 +805,20 @@ end
 	assert.Equal(t, "trailing comment doc", docs["attach.jl::adjacent"],
 		"a comment on the docstring's own line does not detach it")
 
+	// A Windows-authored file separates paragraphs with "\r\n\r\n",
+	// which holds no "\n\n" — the signature block has to be recognised
+	// there too, or it becomes the documentation.
+	crlf, err := NewJuliaExtractor().Extract("crlf.jl",
+		[]byte("\"\"\"\r\n    api(x)\r\n\r\nProse here.\r\n\"\"\"\r\napi(x) = x\r\n"))
+	require.NoError(t, err)
+	var crlfDoc string
+	for _, n := range crlf.Nodes {
+		if n.ID == "crlf.jl::api" {
+			crlfDoc, _ = n.Meta["doc"].(string)
+		}
+	}
+	assert.Equal(t, "Prose here.", crlfDoc, "CRLF paragraphs must split like LF ones")
+
 	for _, id := range []string{
 		"attach.jl::blank", "attach.jl::commented",
 		"attach.jl::returns_a_string", "attach.jl::nested",

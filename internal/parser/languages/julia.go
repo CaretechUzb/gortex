@@ -1004,7 +1004,12 @@ func (e *JuliaExtractor) handleMacroCall(n *sitter.Node, src []byte, scope julia
 // as the documentation of `radius`. Leading paragraphs whose every line
 // is indented are that signature block and are skipped.
 func juliaDocText(n *sitter.Node, src []byte) string {
-	s := strings.TrimSpace(n.Content(src))
+	// A Windows-authored file separates paragraphs with "\r\n\r\n",
+	// which holds no "\n\n" — without normalising first, the signature
+	// block below would never be recognised and would be stored as the
+	// documentation.
+	s := strings.ReplaceAll(n.Content(src), "\r\n", "\n")
+	s = strings.TrimSpace(s)
 	if strings.HasPrefix(s, `"""`) {
 		s = strings.TrimSuffix(strings.TrimPrefix(s, `"""`), `"""`)
 	} else {
