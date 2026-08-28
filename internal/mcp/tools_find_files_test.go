@@ -285,20 +285,29 @@ func TestFindFiles_GlobOversizedIsRejectedBeforeScanning(t *testing.T) {
 		glob := strings.Repeat(`x\`, maxGlobSegments) + `**`
 		require.Equal(t, 1, strings.Count(glob, "/")+1,
 			"the fixture must look small before normalisation, or it proves nothing")
-		require.Greater(t, strings.Count(filepath.ToSlash(glob), "/")+1, maxGlobSegments)
-		if runtime.GOOS == "windows" {
-			refused(t, glob)
-		} else {
+
+		if runtime.GOOS != "windows" {
 			// filepath.ToSlash is a no-op on POSIX, where a backslash is an
-			// ordinary filename byte; there is nothing to normalise and
-			// nothing to bypass.
+			// ordinary filename byte. There is no expansion here, so there
+			// is no bypass to guard and this is a legitimate one-segment
+			// pattern. Asserting the expansion outside this branch would be
+			// asserting a Windows fact on a platform that lacks it.
 			served(t, glob)
+			return
 		}
+		require.Greater(t, strings.Count(filepath.ToSlash(glob), "/")+1, maxGlobSegments,
+			"on Windows the fixture must expand past the bound, or it proves nothing")
+		refused(t, glob)
 	})
 	t.Run("mixed separators", func(t *testing.T) {
+		// Refused on both platforms, for different reasons: POSIX counts the
+		// forward slashes alone and is already past the bound, Windows
+		// counts twice as many after normalisation. An assertion that only
+		// fires on one platform would leave an empty passing subtest on the
+		// other.
 		glob := strings.Repeat(`a/b\`, maxGlobSegments) + `**`
-		if runtime.GOOS == "windows" {
-			refused(t, glob)
-		}
+		require.Greater(t, strings.Count(glob, "/")+1, maxGlobSegments,
+			"the forward slashes alone must already exceed the bound")
+		refused(t, glob)
 	})
 }
