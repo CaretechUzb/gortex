@@ -144,6 +144,56 @@ end
 	assert.True(t, macroFlag)
 }
 
+// A declared return type nests the callee one level deeper — the grammar
+// parses `f(x)::Int` as typed_expression(call_expression) and
+// `f(x)::T where T` as where_expression(typed_expression(call_expression)) —
+// so a peeler that knew only `where_expression` lost the definition AND
+// every call in its body. The base regex extractor still emitted the long
+// form, which makes that half a straight regression.
+func TestJuliaExtractor_ReturnTypeAnnotatedDefinitions(t *testing.T) {
+	src := []byte(`function long_form(x)::Int
+    helper(x)
+end
+
+short_plain(x)::Int = helper(x)
+
+short_where(x)::T where T = helper(x)
+
+function bare_where(x) where T
+    helper(x)
+end
+
+function empty_generic end
+`)
+	res, err := NewJuliaExtractor().Extract("ret.jl", src)
+	require.NoError(t, err)
+
+	nodes := map[string]*graph.Node{}
+	for _, n := range res.Nodes {
+		nodes[n.ID] = n
+	}
+	calls := map[string]bool{}
+	for _, ed := range res.Edges {
+		if ed.Kind == graph.EdgeCalls {
+			calls[ed.From+" -> "+ed.To] = true
+		}
+	}
+
+	for _, name := range []string{"long_form", "short_plain", "short_where", "bare_where"} {
+		n, ok := nodes["ret.jl::"+name]
+		require.True(t, ok, "missing definition %s", name)
+		assert.Equal(t, graph.KindFunction, n.Kind)
+		assert.True(t, calls["ret.jl::"+name+" -> unresolved::helper"],
+			"%s should attribute its body call", name)
+	}
+
+	// `function f end` declares an empty generic function: the signature
+	// holds the name directly, with no argument list to peel to.
+	n, ok := nodes["ret.jl::empty_generic"]
+	require.True(t, ok, "empty generic declaration should still be a definition")
+	assert.Equal(t, graph.KindFunction, n.Kind)
+}
+
 func TestJuliaExtractor_TypesAndFields(t *testing.T) {
 	src := []byte(`module Shapes
 

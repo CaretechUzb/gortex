@@ -15,10 +15,12 @@ import (
 //
 // Covered definition forms:
 //   - `function f(...) ... end`, including `where`-parametrised
-//     signatures and qualified/ operator callees (`function Base.show`,
-//     `function Base.:+`)
-//   - short-form definitions `f(x) = body` and `f(x)::T where T = body`,
-//     including nested closures inside `begin` blocks
+//     signatures, declared return types (`function f(x)::Int`), the
+//     empty generic declaration `function f end`, and qualified /
+//     operator callees (`function Base.show`, `function Base.:+`)
+//   - short-form definitions `f(x) = body`, `f(x)::T = body` and
+//     `f(x)::T where T = body`, including nested closures inside `begin`
+//     blocks
 //   - `macro m(...) ... end`
 //   - `struct` / `mutable struct` / `abstract type` / `primitive type`
 //     with parametric names (`struct Pair{T,S}`) and supertypes
@@ -377,24 +379,29 @@ func juliaCalleeName(n *sitter.Node, src []byte) (name, receiver string) {
 	return "", ""
 }
 
-// juliaUnwrapSignature returns the call_expression behind a `signature`
-// node, descending through `where_expression`.
-func juliaUnwrapSignature(sig *sitter.Node) *sitter.Node {
-	if sig == nil {
-		return nil
-	}
-	c := sig
-	if c.Type() == "signature" {
-		c = c.NamedChild(0)
-	}
-	if c == nil {
-		return nil
-	}
-	if c.Type() == "where_expression" {
-		c = c.NamedChild(0)
-	}
-	if c != nil && c.Type() == "call_expression" {
-		return c
+// juliaSignatureCall peels the wrappers a definition head can carry until
+// it reaches the call_expression that names the definition. Three wrappers
+// occur, and they nest in either order:
+//
+//	signature          the long form's head, `function f(x) ... end`
+//	where_expression   `f(x) where T`          → where(call)
+//	typed_expression   `f(x)::Int`             → typed(call)
+//	                   `f(x)::T where T`       → where(typed(call))
+//
+// so the peel is a loop rather than a fixed descent. Anything else stops
+// it: an assignment whose left-hand side is `x::Int` peels the
+// typed_expression and finds a bare identifier, which is a typed variable,
+// not a definition.
+func juliaSignatureCall(n *sitter.Node) *sitter.Node {
+	for n != nil {
+		switch n.Type() {
+		case "call_expression":
+			return n
+		case "signature", "where_expression", "typed_expression":
+			n = n.NamedChild(0)
+		default:
+			return nil
+		}
 	}
 	return nil
 }
@@ -405,10 +412,14 @@ func juliaUnwrapSignature(sig *sitter.Node) *sitter.Node {
 // where_expression). Qualified callees become KindMethod with
 // Meta["receiver"] + EdgeMemberOf, mirroring the luau extractor.
 func (e *JuliaExtractor) handleFunction(n *sitter.Node, src []byte, scope juliaScope, st *juliaWalkState, doc string) {
-	call := juliaUnwrapSignature(n.NamedChild(0))
+	head := n.NamedChild(0)
 	name, receiver := "", ""
-	if call != nil {
+	if call := juliaSignatureCall(head); call != nil {
 		name, receiver = juliaCalleeName(call.NamedChild(0), src)
+	} else if head != nil && head.Type() == "signature" {
+		// `function f end` declares an empty generic function: there is
+		// no argument list, so the signature holds the callee directly.
+		name, receiver = juliaCalleeName(head.NamedChild(0), src)
 	}
 
 	inner := scope
@@ -486,12 +497,11 @@ func (e *JuliaExtractor) handleFunction(n *sitter.Node, src []byte, scope juliaS
 func (e *JuliaExtractor) handleAssignment(n *sitter.Node, src []byte, scope juliaScope, st *juliaWalkState, isConst bool) {
 	lhs := n.NamedChild(0)
 
-	// Short-form definition?
-	sig := lhs
-	if sig != nil && sig.Type() == "where_expression" {
-		sig = sig.NamedChild(0)
-	}
-	if sig != nil && sig.Type() == "call_expression" {
+	// Short-form definition? The left-hand side carries the same
+	// wrappers a long-form signature does — `f(x) where T`,
+	// `f(x)::Int`, `f(x)::T where T` — so peel with the shared helper
+	// instead of unwrapping one fixed level.
+	if sig := juliaSignatureCall(lhs); sig != nil {
 		if name, receiver := juliaCalleeName(sig.NamedChild(0), src); name != "" {
 			e.emitShortFunction(n, sig, name, receiver, src, scope, st)
 			return
