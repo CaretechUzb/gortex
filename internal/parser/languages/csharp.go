@@ -2118,7 +2118,18 @@ func csharpBaseTypeName(entry *sitter.Node, src []byte) (string, bool) {
 			}
 		}
 	case "qualified_name":
-		// System.Object → Object (the last identifier).
+		// System.Object → Object, App.IBox<Crate> → IBox. The final
+		// segment is not always an identifier: a constructed generic
+		// spells it `generic_name`, and a nested qualification spells it
+		// `qualified_name`. Scanning only direct identifier children
+		// walked past those and returned the PENULTIMATE segment — the
+		// namespace — which then disagreed with the type-argument
+		// extractor about what the entry even names.
+		if name := entry.ChildByFieldName("name"); name != nil {
+			if n, _ := csharpBaseTypeName(name, src); n != "" {
+				return n, false
+			}
+		}
 		var last string
 		for i, _nc := 0, int(entry.ChildCount()); i < _nc; i++ {
 			if c := entry.Child(i); c != nil && c.Type() == "identifier" {
