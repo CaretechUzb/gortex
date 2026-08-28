@@ -960,6 +960,55 @@ table(xs) = Dict{String,Int}(xs)
 		"multi-parameter constructors carry their parameters")
 }
 
+// A module-qualified macro call nests its macro_identifier under a
+// field_expression (Base.@time), so a scan that matches only a direct
+// macro_identifier child recorded the inner helper call but never the
+// macro's own edge. The qualified form must record both, with the
+// module as receiver — the same spelling qualified call callees use —
+// and the import-alias rewrite applies to it just as it does to calls.
+func TestJuliaExtractor_QualifiedMacroCall(t *testing.T) {
+	src := []byte(`module M
+import Foo as F
+
+function work(xs)
+    Base.@time helper(xs)
+    F.@spawn helper(xs)
+end
+end
+`)
+	res, err := NewJuliaExtractor().Extract("qmac.jl", src)
+	require.NoError(t, err)
+
+	type call struct {
+		to   string
+		meta map[string]any
+	}
+	calls := map[string][]call{}
+	for _, ed := range res.Edges {
+		if ed.Kind == graph.EdgeCalls {
+			meta := map[string]any{}
+			for k, v := range ed.Meta {
+				meta[k] = v
+			}
+			calls[ed.From] = append(calls[ed.From], call{ed.To, meta})
+		}
+	}
+	var sawBase, sawAliased, sawHelper bool
+	for _, c := range calls["qmac.jl::work"] {
+		switch c.to {
+		case "unresolved::Base.time":
+			sawBase = c.meta["macro"] == true
+		case "unresolved::Foo.spawn":
+			sawAliased = c.meta["macro"] == true
+		case "unresolved::helper":
+			sawHelper = true
+		}
+	}
+	assert.True(t, sawBase, "Base.@time needs its macro edge, receiver included")
+	assert.True(t, sawAliased, "an aliased module qualifies the macro edge, as it does for calls")
+	assert.True(t, sawHelper, "the inner call of a qualified macro keeps its own edge")
+}
+
 func TestJuliaExtractor_ConstAndDocstrings(t *testing.T) {
 	src := []byte(`"""
 Circle radius helpers.

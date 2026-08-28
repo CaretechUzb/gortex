@@ -1205,25 +1205,58 @@ func (e *JuliaExtractor) handleCall(n *sitter.Node, src []byte, scope juliaScope
 	st.result.Edges = append(st.result.Edges, edge)
 }
 
-// handleMacroCall attributes `@macroname ...` invocations to the
-// enclosing function as calls to the bare macro name.
+// handleMacroCall attributes `@macroname ...` and `Mod.@macroname ...`
+// invocations to the enclosing function as EdgeCalls with macro:true
+// meta. The macro's name lives in a disjoint namespace from types and
+// functions, so the target carries the bare name (time, not @time) with
+// the module as receiver — the same receiver.name spelling qualified
+// call callees use.
 func (e *JuliaExtractor) handleMacroCall(n *sitter.Node, src []byte, scope juliaScope, st *juliaWalkState) {
 	if scope.functionID == "" {
 		return
 	}
+	emit := func(target string) {
+		st.result.Edges = append(st.result.Edges, &graph.Edge{
+			From: scope.functionID, To: "unresolved::" + target,
+			Kind:     graph.EdgeCalls,
+			Meta:     map[string]any{"macro": true},
+			FilePath: st.filePath, Line: int(n.StartPoint().Row) + 1,
+		})
+	}
 	for c := range n.NamedChildren() {
-		if c.Type() != "macro_identifier" {
-			continue
-		}
-		for m := range c.NamedChildren() {
-			if m.Type() == "identifier" {
-				st.result.Edges = append(st.result.Edges, &graph.Edge{
-					From: scope.functionID, To: "unresolved::" + m.Content(src),
-					Kind:     graph.EdgeCalls,
-					Meta:     map[string]any{"macro": true},
-					FilePath: st.filePath, Line: int(n.StartPoint().Row) + 1,
-				})
+		switch c.Type() {
+		case "macro_identifier": // `@time x`
+			for m := range c.NamedChildren() {
+				if m.Type() == "identifier" {
+					emit(m.Content(src))
+				}
 			}
+		case "field_expression": // `Base.@time x`
+			count := int(c.NamedChildCount())
+			if count < 2 {
+				continue
+			}
+			prop, base := c.NamedChild(count-1), c.NamedChild(0)
+			if prop.Type() != "macro_identifier" || base.Type() != "identifier" {
+				continue
+			}
+			name := ""
+			for m := range prop.NamedChildren() {
+				if m.Type() == "identifier" {
+					name = m.Content(src)
+				}
+			}
+			if name == "" {
+				continue
+			}
+			// `import Foo as F` then `F.@spawn ...`: name the module,
+			// not the file-local nickname, exactly as a qualified call
+			// callee does.
+			receiver := base.Content(src)
+			if module, ok := st.importAliases[juliaTypeKey(scope.modulePath, receiver)]; ok {
+				receiver = module
+			}
+			emit(receiver + "." + name)
 		}
 	}
 }
