@@ -29,11 +29,15 @@ import (
 //     module's `export` list; definitions inside get EdgeMemberOf
 //   - `const X = ...` constants (KindVariable)
 //
-// Imports: `using M`, `using M: a, b` (selected names in edge Meta),
-// `import M`, `import M as Alias` (alias in edge Meta), dotted and
-// relative import paths (`A.B`, `.Local`, `..Up`), and
+// Imports: `using M`, `using M: a, b`, `import M`, `import M as Alias`,
+// dotted and relative import paths (`A.B`, `.Local`, `..Up`), and
 // `include("file.jl")` — all as EdgeImports to
-// `unresolved::import::<module>`, never to a selected name.
+// `unresolved::import::<module>`, never to a selected name. A selective
+// list also emits one edge per binding to
+// `unresolved::import::<module>::<name>`, and a rename rides on
+// Edge.Alias (and on the module edge's Meta, which is the persisted
+// half). A module alias additionally rewrites qualified callees, so
+// `import Foo as F` + `F.process(x)` calls `Foo.process`.
 //
 // Calls: call_expression / broadcast_call_expression / macrocall
 // callees (identifier or qualified field_expression) attribute to the
@@ -70,6 +74,10 @@ type juliaWalkState struct {
 	result   *parser.ExtractionResult
 	seen     map[string]bool
 	nodes    map[string]*graph.Node
+	// importAliases maps a local module alias to the module it renames
+	// (`import Foo as F` → F→Foo), so a qualified call can name the
+	// module the resolver can find rather than a file-local nickname.
+	importAliases map[string]string
 }
 
 func (e *JuliaExtractor) Extract(filePath string, src []byte) (*parser.ExtractionResult, error) {
@@ -90,12 +98,17 @@ func (e *JuliaExtractor) Extract(filePath string, src []byte) (*parser.Extractio
 	result.Nodes = append(result.Nodes, fileNode)
 
 	st := &juliaWalkState{
-		filePath: filePath,
-		fileNode: fileNode,
-		result:   result,
-		seen:     make(map[string]bool),
-		nodes:    map[string]*graph.Node{filePath: fileNode},
+		filePath:      filePath,
+		fileNode:      fileNode,
+		result:        result,
+		seen:          make(map[string]bool),
+		nodes:         map[string]*graph.Node{filePath: fileNode},
+		importAliases: map[string]string{},
 	}
+	// Aliases are collected up front: the emitting walk is a single
+	// forward pass, and Julia does not require `import ... as ...` to
+	// precede the code that uses the alias.
+	juliaCollectImportAliases(root, src, st.importAliases)
 	e.walk(root, src, juliaScope{}, st)
 	return result, nil
 }
@@ -613,12 +626,38 @@ func juliaAliasParts(n *sitter.Node, src []byte) (orig, alias string) {
 	return orig, alias
 }
 
+// juliaCollectImportAliases records every `import M as A` / `using M as A`
+// module rename in the file, so handleCall can rewrite a qualified callee
+// onto the module it actually names. Only MODULE aliases are collected: a
+// renamed binding inside a selected list (`import Foo: bar as baz`)
+// renames a function, and rewriting a bare call through it would fight
+// any local shadowing the extractor cannot see.
+func juliaCollectImportAliases(n *sitter.Node, src []byte, out map[string]string) {
+	if n.Type() == "using_statement" || n.Type() == "import_statement" {
+		for c := range n.NamedChildren() {
+			if c.Type() != "import_alias" {
+				continue
+			}
+			if module, alias := juliaAliasParts(c, src); module != "" && alias != "" && alias != module {
+				out[alias] = module
+			}
+		}
+		return
+	}
+	for c := range n.NamedChildren() {
+		juliaCollectImportAliases(c, src, out)
+	}
+}
+
 // handleImport covers `using M`, `using M: a, b`, `import M`,
 // `import M as Alias`, and dotted / relative import paths. The import
-// target is always the MODULE; selected names and aliases ride on the
-// edge Meta.
+// target is always the MODULE; a selective list additionally emits one
+// binding-aware edge per selected name (the JS/TS per-binding
+// convention), so "who imports `mean` from Statistics" is a traversable
+// question rather than a Meta key nothing reads.
 func (e *JuliaExtractor) handleImport(n *sitter.Node, src []byte, st *juliaWalkState) {
-	emit := func(target string, meta map[string]any) {
+	line := int(n.StartPoint().Row) + 1
+	emit := func(target, alias string, meta map[string]any) {
 		if target == "" {
 			return
 		}
@@ -628,14 +667,32 @@ func (e *JuliaExtractor) handleImport(n *sitter.Node, src []byte, st *juliaWalkS
 		st.result.Edges = append(st.result.Edges, &graph.Edge{
 			From: st.fileNode.ID, To: "unresolved::import::" + target,
 			Kind:     graph.EdgeImports,
-			FilePath: st.filePath, Line: int(n.StartPoint().Row) + 1,
-			Meta: meta,
+			FilePath: st.filePath, Line: line,
+			// Edge.Alias is the graph's canonical spelling for a renamed
+			// binding; Meta keeps the same fact on the durable side,
+			// since the SQLite edges table has no alias column.
+			Alias: alias,
+			Meta:  meta,
+		})
+	}
+	// One edge per selected binding, targeting the binding rather than
+	// the module — the representation JS/TS already emits for
+	// `import { a, b as c } from "mod"`.
+	emitBinding := func(module, orig, alias string) {
+		if module == "" || orig == "" {
+			return
+		}
+		st.result.Edges = append(st.result.Edges, &graph.Edge{
+			From: st.fileNode.ID, To: "unresolved::import::" + module + "::" + orig,
+			Kind:     graph.EdgeImports,
+			FilePath: st.filePath, Line: line,
+			Alias: alias,
 		})
 	}
 	for c := range n.NamedChildren() {
 		switch c.Type() {
 		case "identifier", "import_path":
-			emit(c.Content(src), nil)
+			emit(c.Content(src), "", nil)
 		case "selected_import":
 			// `using A.B: x, y` — the module is the FIRST child and is
 			// an import_path whenever the path is dotted or relative.
@@ -643,6 +700,8 @@ func (e *JuliaExtractor) handleImport(n *sitter.Node, src []byte, st *juliaWalkS
 			// the first selected name to the import target.
 			module, next := juliaImportModule(c, src)
 			var names []string
+			type binding struct{ orig, alias string }
+			var bindings []binding
 			for i, count := next, int(c.NamedChildCount()); i < count; i++ {
 				s := c.NamedChild(i)
 				if s == nil {
@@ -653,25 +712,38 @@ func (e *JuliaExtractor) handleImport(n *sitter.Node, src []byte, st *juliaWalkS
 					// `using Base: +, -` selects operators, which are
 					// `operator` nodes rather than identifiers.
 					names = append(names, s.Content(src))
+					bindings = append(bindings, binding{orig: s.Content(src)})
 				case "import_alias":
 					// `import Foo: bar as baz` renames one binding.
-					if orig, _ := juliaAliasParts(s, src); orig != "" {
-						names = append(names, orig)
+					orig, alias := juliaAliasParts(s, src)
+					if orig == "" {
+						continue
 					}
+					names = append(names, orig)
+					if alias == orig {
+						alias = ""
+					}
+					bindings = append(bindings, binding{orig: orig, alias: alias})
 				}
 			}
 			meta := map[string]any{}
 			if len(names) > 0 {
 				meta["names"] = names
 			}
-			emit(module, meta)
+			emit(module, "", meta)
+			for _, b := range bindings {
+				emitBinding(module, b.orig, b.alias)
+			}
 		case "import_alias":
 			path, alias := juliaAliasParts(c, src)
+			if alias == path {
+				alias = ""
+			}
 			meta := map[string]any{}
 			if alias != "" {
 				meta["alias"] = alias
 			}
-			emit(path, meta)
+			emit(path, alias, meta)
 		}
 	}
 }
@@ -733,6 +805,12 @@ func (e *JuliaExtractor) handleCall(n *sitter.Node, src []byte, scope juliaScope
 	}
 	target := name
 	if receiver != "" {
+		// `import Foo as F` then `F.process(x)`: name the module, not
+		// the file-local nickname, so the call target is something
+		// another file's `module Foo` can be matched against.
+		if module, ok := st.importAliases[receiver]; ok {
+			receiver = module
+		}
 		target = receiver + "." + name
 	}
 	meta := map[string]any{}

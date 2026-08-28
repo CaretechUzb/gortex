@@ -120,9 +120,17 @@ convention. Struct fields are `KindField` nodes with `member_of` into the
 struct; supertypes (`struct X <: Y`) emit `extends` edges with the full
 right-hand path in `Meta["base_path"]` (python extractor convention).
 
-`using M: a, b` / `import M as Alias` keep the module as the import target
-with the selected names / alias in the edge `Meta` for the resolver; all
-imports including `include("file.jl")` target `unresolved::import::<path>`.
+`using M: a, b` / `import M as Alias` keep the module as the import target,
+including when the path is dotted or relative (`using A.B: x`, `import
+..Up: q`). A selective list additionally emits one edge per binding to
+`unresolved::import::<module>::<name>` — the per-binding shape JS/TS
+already uses — and a rename rides on `Edge.Alias`, with the module edge
+keeping it in `Meta` too because the SQLite edges table has no alias
+column. A module alias is applied at extraction time, so `import Foo as F`
+followed by `F.process(x)` records a call to `Foo.process`: the same target
+the unaliased spelling produces. Nothing in the resolver reads the import
+`Meta` — the edge targets are the consumable surface. All imports including
+`include("file.jl")` target `unresolved::import::<path>`.
 Calls attribute to the enclosing function-like definition (long form, short
 form, macro, or nested closure) and cover qualified (`Mod.f`) and broadcast
 (`f.(x)`, `Meta["broadcast"]`) callees plus macro invocations
