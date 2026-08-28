@@ -830,13 +830,23 @@ func (e *JuliaExtractor) emitCallable(
 	kind := graph.KindMethod
 	nodeName := name
 	isCtor := false
-	var baseID, ownerID, ownerName string
+	var baseID, ownerID, ownerTarget, ownerName string
 
 	switch {
 	case receiver != "":
 		ownerID, ownerName = st.filePath+"::"+receiver, receiver
+		ownerTarget = ownerID
 		if id, _, ok := st.lookupType(scope.modulePath, receiver); ok {
 			ownerID = id
+			ownerTarget = id
+		} else {
+			// `function Base.show` extends a module this file does not
+			// declare, so no node carries the receiver's name — a
+			// member_of to the node-shaped id would claim a resident
+			// of the graph that does not exist. The method's own id
+			// stays flat; the edge target becomes self-describing, the
+			// same honesty extends and call edges already carry.
+			ownerTarget = "unresolved::" + receiver
 		}
 		baseID = ownerID + "." + name
 
@@ -863,7 +873,7 @@ func (e *JuliaExtractor) emitCallable(
 		}
 		if typeID != "" {
 			baseID = typeID + ".<init>"
-			ownerID, ownerName = typeID, typeName
+			ownerID, ownerTarget, ownerName = typeID, typeID, typeName
 			nodeName = typeName + ".<init>"
 			isCtor = true
 		} else {
@@ -921,7 +931,7 @@ func (e *JuliaExtractor) emitCallable(
 	})
 	if ownerID != "" {
 		st.result.Edges = append(st.result.Edges, &graph.Edge{
-			From: id, To: ownerID, Kind: graph.EdgeMemberOf,
+			From: id, To: ownerTarget, Kind: graph.EdgeMemberOf,
 			FilePath: st.filePath, Line: line,
 		})
 	}

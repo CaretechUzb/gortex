@@ -1117,6 +1117,82 @@ const TOP = 3
 		"a top-level module has no enclosing module to belong to")
 }
 
+// A qualified definition's member_of names its receiver. When the
+// receiver is a type in the same file the edge targets that node — but
+// `function Base.show` extends a module this file does not declare, and
+// a member_of to a node-shaped id that has no node claims a resident of
+// the graph that does not exist. Such a target must be self-describing,
+// the way extends and call edges already are: prefixed unresolved::,
+// while the method's own id stays flat.
+func TestJuliaExtractor_ExternalReceiverMemberOfIsUnresolved(t *testing.T) {
+	src := []byte(`function Base.show(io, x)
+    nothing
+end
+
+struct Box
+    v::Int
+end
+
+function Box.f(x)
+    x
+end
+`)
+	res, err := NewJuliaExtractor().Extract("ext.jl", src)
+	require.NoError(t, err)
+
+	owners := juliaOwners(res.Edges)
+	assert.True(t, owners["ext.jl::Base.show"]["unresolved::Base"],
+		"a receiver no node in the file declares must not be minted as a node id")
+	nodes := map[string]bool{}
+	for _, n := range res.Nodes {
+		nodes[n.ID] = true
+	}
+	assert.False(t, nodes["ext.jl::Base"],
+		"the external receiver itself must not become a phantom node")
+	assert.True(t, owners["ext.jl::Box.f"]["ext.jl::Box"],
+		"an in-file receiver still targets the real type node")
+}
+
+// A docstring and the other Meta a definition carries are not in
+// competition: a qualified method keeps its doc next to its receiver,
+// and a macro keeps its doc next to its macro flag. Docstring handling
+// builds the node's Meta in one place, so no key can evict another.
+func TestJuliaExtractor_DocstringSurvivesOtherMeta(t *testing.T) {
+	src := []byte(`module M
+
+"""Render p compactly."""
+function Base.show(io, p)
+    nothing
+end
+
+"""Build a point."""
+macro point(x)
+    x
+end
+
+end
+`)
+	res, err := NewJuliaExtractor().Extract("meta.jl", src)
+	require.NoError(t, err)
+
+	nodes := map[string]*graph.Node{}
+	for _, n := range res.Nodes {
+		nodes[n.ID] = n
+	}
+
+	show := nodes["meta.jl::Base.show"]
+	require.NotNil(t, show, "the qualified method must exist")
+	assert.Equal(t, "Base", show.Meta["receiver"])
+	assert.Equal(t, "Render p compactly.", show.Meta["doc"],
+		"a docstring must survive a receiver already on Meta")
+
+	pt := nodes["meta.jl::point"]
+	require.NotNil(t, pt, "the macro must exist")
+	assert.Equal(t, true, pt.Meta["macro"])
+	assert.Equal(t, "Build a point.", pt.Meta["doc"],
+		"a docstring must survive the macro flag already on Meta")
+}
+
 func TestJuliaExtractor_ConstAndDocstrings(t *testing.T) {
 	src := []byte(`"""
 Circle radius helpers.
