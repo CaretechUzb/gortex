@@ -32,6 +32,16 @@ type MutationReceipt struct {
 	TargetNames      []string `json:"target_names,omitempty"`
 	TargetIDs        []string `json:"target_ids,omitempty"`
 	ImportCandidates []string `json:"import_candidates,omitempty"`
+	// EvictedNames is the subset of TargetNames a vanished definition
+	// contributed, and it is what the name frontier consumes. An ADDED
+	// definition never needs that pass: its file is in DefinitionFiles, so
+	// the file frontier enumerates the stub forms of every name it declares
+	// and rebinds their pending references itself. Only a name no file
+	// declares any more is reachable by name alone. Keeping the two apart
+	// matters because TargetNames carries every added node's Name and
+	// QualName — thousands per batch — while the name pass expands each
+	// entry into four stub forms per repository prefix.
+	EvictedNames []string `json:"evicted_names,omitempty"`
 	// IncompleteReason names the FIRST mutation shape that voided the
 	// receipt (a writer call site, or a semantic slug like
 	// "edge_missing_file"). An incomplete receipt forces a whole-graph
@@ -104,6 +114,7 @@ type mutationReceiptAccumulator struct {
 	unresolvedFiles    map[string]struct{}
 	definitionFiles    map[string]struct{}
 	targetNames        map[string]struct{}
+	evictedNames       map[string]struct{}
 	targetIDs          map[string]struct{}
 	importCandidates   map[string]struct{}
 }
@@ -123,6 +134,7 @@ func newMutationReceiptAccumulator() *mutationReceiptAccumulator {
 		unresolvedFiles:  make(map[string]struct{}),
 		definitionFiles:  make(map[string]struct{}),
 		targetNames:      make(map[string]struct{}),
+		evictedNames:     make(map[string]struct{}),
 		targetIDs:        make(map[string]struct{}),
 		importCandidates: make(map[string]struct{}),
 	}
@@ -137,6 +149,7 @@ func (a *mutationReceiptAccumulator) receipt() MutationReceipt {
 		UnresolvedFiles:    sortedReceiptKeys(a.unresolvedFiles),
 		DefinitionFiles:    sortedReceiptKeys(a.definitionFiles),
 		TargetNames:        sortedReceiptKeys(a.targetNames),
+		EvictedNames:       sortedReceiptKeys(a.evictedNames),
 		TargetIDs:          sortedReceiptKeys(a.targetIDs),
 		ImportCandidates:   sortedReceiptKeys(a.importCandidates),
 	}
@@ -338,6 +351,7 @@ func (g *Graph) recordEvictedNodesForReceipts(nodes []*Node) {
 			}
 			for _, name := range names {
 				acc.targetNames[name] = struct{}{}
+				acc.evictedNames[name] = struct{}{}
 			}
 			if n.FilePath != "" {
 				acc.definitionFiles[n.FilePath] = struct{}{}

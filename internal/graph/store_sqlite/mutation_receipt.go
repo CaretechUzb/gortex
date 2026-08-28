@@ -24,6 +24,7 @@ type sqliteMutationReceiptAccumulator struct {
 	unresolvedFiles    map[string]struct{}
 	definitionFiles    map[string]struct{}
 	targetNames        map[string]struct{}
+	evictedNames       map[string]struct{}
 	targetIDs          map[string]struct{}
 	importCandidates   map[string]struct{}
 }
@@ -51,6 +52,7 @@ func newSQLiteMutationReceiptAccumulator() *sqliteMutationReceiptAccumulator {
 		unresolvedFiles:  make(map[string]struct{}),
 		definitionFiles:  make(map[string]struct{}),
 		targetNames:      make(map[string]struct{}),
+		evictedNames:     make(map[string]struct{}),
 		targetIDs:        make(map[string]struct{}),
 		importCandidates: make(map[string]struct{}),
 	}
@@ -65,6 +67,7 @@ func (a *sqliteMutationReceiptAccumulator) receipt() graph.MutationReceipt {
 		UnresolvedFiles:    sortedSQLiteReceiptKeys(a.unresolvedFiles),
 		DefinitionFiles:    sortedSQLiteReceiptKeys(a.definitionFiles),
 		TargetNames:        sortedSQLiteReceiptKeys(a.targetNames),
+		EvictedNames:       sortedSQLiteReceiptKeys(a.evictedNames),
 		TargetIDs:          sortedSQLiteReceiptKeys(a.targetIDs),
 		ImportCandidates:   sortedSQLiteReceiptKeys(a.importCandidates),
 	}
@@ -148,6 +151,7 @@ func (s *Store) mergeMutationReceiptLocked(delta *sqliteMutationReceiptAccumulat
 		mergeSQLiteReceiptSet(acc.unresolvedFiles, delta.unresolvedFiles)
 		mergeSQLiteReceiptSet(acc.definitionFiles, delta.definitionFiles)
 		mergeSQLiteReceiptSet(acc.targetNames, delta.targetNames)
+		mergeSQLiteReceiptSet(acc.evictedNames, delta.evictedNames)
 		mergeSQLiteReceiptSet(acc.targetIDs, delta.targetIDs)
 		mergeSQLiteReceiptSet(acc.importCandidates, delta.importCandidates)
 	}
@@ -209,6 +213,16 @@ func recordSQLiteChangedNodeIdentity(
 	for _, name := range []string{old.name, old.qualName, final.Name, final.QualName} {
 		if name != "" {
 			acc.targetNames[name] = struct{}{}
+		}
+	}
+	// The old identity's names vanished with it: the file still enters the
+	// definition frontier, but it no longer declares those names, so nothing
+	// in the file pass enumerates their stubs. They belong to the name
+	// frontier for the same reason an evicted definition's names do. The
+	// final identity's names do not — its file declares them.
+	for _, name := range []string{old.name, old.qualName} {
+		if name != "" && name != final.Name && name != final.QualName {
+			acc.evictedNames[name] = struct{}{}
 		}
 	}
 	for _, filePath := range []string{old.filePath, final.FilePath} {

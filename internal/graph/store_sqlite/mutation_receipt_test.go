@@ -944,8 +944,36 @@ func TestSQLiteMutationReceiptEvictAmbiguousImportPackageCandidateRecordsImportS
 		t.Fatalf("receipt = %+v, want a complete resolution-relevant delta", receipt)
 	}
 	assertSQLiteReceiptContains(t, "target names", receipt.TargetNames, "import::example/pkg", "import::pkg")
+	assertSQLiteReceiptContains(t, "evicted names", receipt.EvictedNames, "import::example/pkg", "import::pkg")
 	if want := []string{"a/one.go"}; !slices.Equal(receipt.ResolutionFiles(), want) {
 		t.Fatalf("resolution files = %v, want %v", receipt.ResolutionFiles(), want)
+	}
+}
+
+// The SQLite mirror of the Graph EvictedNames split: the name frontier's input
+// carries the vanished definition and not the added one, which the file
+// frontier already reaches through DefinitionFiles.
+func TestSQLiteMutationReceiptEvictedNamesCarryOnlyVanishedDefinitions(t *testing.T) {
+	store := openMutationReceiptStore(t)
+	store.AddBatch([]*graph.Node{{
+		ID: "repo/gone.go::Gone", Kind: graph.KindFunction, Name: "Gone", QualName: "pkg.Gone",
+		FilePath: "gone.go", RepoPrefix: "repo",
+	}}, nil)
+
+	token := store.BeginMutationReceipt()
+	store.AddBatch([]*graph.Node{{
+		ID: "repo/new.go::Added", Kind: graph.KindFunction, Name: "Added", QualName: "pkg.Added",
+		FilePath: "new.go", RepoPrefix: "repo",
+	}}, nil)
+	store.EvictFiles([]string{"gone.go"})
+	receipt := store.EndMutationReceipt(token)
+
+	assertSQLiteReceiptContains(t, "target names", receipt.TargetNames, "Added", "pkg.Added", "Gone", "pkg.Gone")
+	assertSQLiteReceiptContains(t, "evicted names", receipt.EvictedNames, "Gone", "pkg.Gone")
+	for _, added := range []string{"Added", "pkg.Added"} {
+		if slices.Contains(receipt.EvictedNames, added) {
+			t.Fatalf("evicted names %v include the added definition %q", receipt.EvictedNames, added)
+		}
 	}
 }
 

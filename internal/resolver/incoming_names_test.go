@@ -195,6 +195,47 @@ func BenchmarkResolveIncomingForNamesNoPending(b *testing.B) {
 	}
 }
 
+// The no-pending fast path still pays one probe read whose batch is
+// len(names) x 4 stub forms x len(prefixes), and the single-name benchmark
+// above cannot see that. This is the shape the receipt consumers actually
+// produced before the name pass narrowed to evicted names: a whole batch of
+// added definitions, each contributing a Name and a QualName, against every
+// tracked repository prefix. It exists so the probe's cost stays a function of
+// the evictions and not of the batch.
+func BenchmarkResolveIncomingForNamesNoPendingManyNames(b *testing.B) {
+	g := graph.New()
+	nodes := make([]*graph.Node, 0, 4000)
+	edges := make([]*graph.Edge, 0, 4000)
+	for i := 0; i < 4000; i++ {
+		caller := fmt.Sprintf("repo/c%d.go::Caller%d", i, i)
+		nodes = append(nodes, &graph.Node{
+			ID: caller, Kind: graph.KindFunction, Name: fmt.Sprintf("Caller%d", i),
+			FilePath: fmt.Sprintf("repo/c%d.go", i), RepoPrefix: "repo", Language: "go",
+		})
+		edges = append(edges, &graph.Edge{
+			From: caller, To: graph.UnresolvedMarker + fmt.Sprintf("Pending%d", i), Kind: graph.EdgeCalls,
+			FilePath: fmt.Sprintf("repo/c%d.go", i), Line: 3,
+		})
+	}
+	g.AddBatch(nodes, edges)
+	r := New(g)
+
+	names := make([]string, 0, 2000)
+	for i := 0; i < 1000; i++ {
+		names = append(names, fmt.Sprintf("Added%d", i), fmt.Sprintf("pkg.Added%d", i))
+	}
+	prefixes := make([]string, 0, 20)
+	for i := 0; i < 20; i++ {
+		prefixes = append(prefixes, fmt.Sprintf("repo%d", i))
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		r.ResolveIncomingForNames(names, prefixes)
+	}
+}
+
 // The batched file frontier is the third stub-key builder, and it owns the
 // incoming leg of every incremental resolve. A definition a frontier file
 // declares must have its pending references reached under all four name-owned

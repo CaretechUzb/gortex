@@ -334,10 +334,10 @@ func (idx *Indexer) incrementalWatcherPaths(root string, paths []string, mode in
 // definition's file no longer declares the name, so the file-scoped incoming
 // pass above cannot enumerate their stub.
 func (idx *Indexer) resolveReceiptNamePendings(receipt *graph.MutationReceipt) {
-	if receipt == nil || !receipt.Complete || len(receipt.TargetNames) == 0 || idx.resolver == nil {
+	if receipt == nil || !receipt.Complete || len(receipt.EvictedNames) == 0 || idx.resolver == nil {
 		return
 	}
-	idx.resolver.ResolveIncomingForNames(receipt.TargetNames, []string{idx.repoPrefix})
+	idx.resolver.ResolveIncomingForNames(receipt.EvictedNames, []string{idx.repoPrefix})
 }
 
 func (w *Watcher) reindexStormPaths(paths []string) (*IndexResult, error) {
@@ -397,12 +397,12 @@ func (mi *MultiIndexer) resolveIncrementalRepoMutationMode(
 		})
 		crossRepoFiles = appendUniqueSorted(crossRepoFiles, resolvedFiles...)
 		if receipt != nil && receipt.Complete {
-			mi.runMasterResolveNames(receipt.TargetNames)
+			mi.runMasterResolveNames(receipt.EvictedNames)
 		}
 	} else if needed && len(files) > 0 {
 		mi.runMasterResolveFiles(files, false)
 		if receipt != nil && receipt.Complete {
-			mi.runMasterResolveNames(receipt.TargetNames)
+			mi.runMasterResolveNames(receipt.EvictedNames)
 		}
 	} else if needed {
 		scope := map[string]struct{}{repoPrefix: {}}

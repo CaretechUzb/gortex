@@ -193,6 +193,7 @@ func recordSQLiteEvictedNode(acc *sqliteMutationReceiptAccumulator, id, kind, na
 	}
 	for _, stubName := range names {
 		acc.targetNames[stubName] = struct{}{}
+		acc.evictedNames[stubName] = struct{}{}
 	}
 	if filePath != "" {
 		acc.definitionFiles[filePath] = struct{}{}

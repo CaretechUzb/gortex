@@ -322,8 +322,40 @@ func TestMutationReceiptEvictAmbiguousImportPackageCandidateRecordsImportStub(t 
 		t.Fatalf("receipt = %+v, want a complete resolution-relevant delta", receipt)
 	}
 	assertReceiptContains(t, "target names", receipt.TargetNames, "import::example/pkg", "import::pkg")
+	assertReceiptContains(t, "evicted names", receipt.EvictedNames, "import::example/pkg", "import::pkg")
 	if want := []string{"a/one.go"}; !slices.Equal(receipt.ResolutionFiles(), want) {
 		t.Fatalf("resolution files = %v, want %v", receipt.ResolutionFiles(), want)
+	}
+}
+
+// EvictedNames is the name frontier's input, and it must carry only names that
+// vanished. An added definition is reached through its own file: that file is
+// in DefinitionFiles, and the file frontier enumerates the stub forms of every
+// name the file declares. Handing the name pass the whole target set is what
+// made it scale with batch size instead of with the evictions that motivated
+// it, since TargetNames holds every added node's Name and QualName and each
+// entry costs four stub forms per repository prefix in the pass's probe.
+func TestMutationReceiptEvictedNamesCarryOnlyVanishedDefinitions(t *testing.T) {
+	g := New()
+	g.AddBatch([]*Node{{
+		ID: "repo/gone.go::Gone", Kind: KindFunction, Name: "Gone", QualName: "pkg.Gone",
+		FilePath: "gone.go", RepoPrefix: "repo",
+	}}, nil)
+
+	token := g.BeginMutationReceipt()
+	g.AddNode(&Node{
+		ID: "repo/new.go::Added", Kind: KindFunction, Name: "Added", QualName: "pkg.Added",
+		FilePath: "new.go", RepoPrefix: "repo",
+	})
+	g.EvictFile("gone.go")
+	receipt := g.EndMutationReceipt(token)
+
+	assertReceiptContains(t, "target names", receipt.TargetNames, "Added", "pkg.Added", "Gone", "pkg.Gone")
+	assertReceiptContains(t, "evicted names", receipt.EvictedNames, "Gone", "pkg.Gone")
+	for _, added := range []string{"Added", "pkg.Added"} {
+		if slices.Contains(receipt.EvictedNames, added) {
+			t.Fatalf("evicted names %v include the added definition %q", receipt.EvictedNames, added)
+		}
 	}
 }
 
