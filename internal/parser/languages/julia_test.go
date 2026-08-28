@@ -886,6 +886,46 @@ end
 	}
 	assert.Equal(t, "Prose here.", crlfDoc, "CRLF paragraphs must split like LF ones")
 
+	// A docstring written inside an indented body has EVERY line
+	// indented, so an absolute "is this paragraph indented" test calls
+	// all of them signature blocks and eats the docstring. The signature
+	// block is indented relative to the prose, which only shows after the
+	// literal's own common indent is removed.
+	nested, err := NewJuliaExtractor().Extract("nested.jl", []byte(`module Mod
+    """
+        render(s)
+
+    Renders a shape.
+
+    Returns a string.
+    """
+    function render(s)
+        s
+    end
+end
+`))
+	require.NoError(t, err)
+	var nestedDoc string
+	for _, n := range nested.Nodes {
+		if n.ID == "nested.jl::render" {
+			nestedDoc, _ = n.Meta["doc"].(string)
+		}
+	}
+	assert.Equal(t, "Renders a shape.", nestedDoc,
+		"an indented docstring keeps its first prose paragraph")
+
+	// A docstring that is nothing but a signature still documents better
+	// than nothing.
+	only, err := NewJuliaExtractor().Extract("only.jl", []byte("\"\"\"\n    sig(x)\n\"\"\"\nsig(x) = x\n"))
+	require.NoError(t, err)
+	var onlyDoc string
+	for _, n := range only.Nodes {
+		if n.ID == "only.jl::sig" {
+			onlyDoc, _ = n.Meta["doc"].(string)
+		}
+	}
+	assert.Equal(t, "sig(x)", onlyDoc, "a signature-only docstring must not vanish")
+
 	for _, id := range []string{
 		"attach.jl::blank", "attach.jl::commented",
 		"attach.jl::returns_a_string", "attach.jl::nested",

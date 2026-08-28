@@ -1016,8 +1016,14 @@ func (e *JuliaExtractor) handleMacroCall(n *sitter.Node, src []byte, scope julia
 // paragraph. Julia's own documentation convention opens a docstring with
 // the signature, indented by four spaces, then a blank line, then the
 // description — so taking the first paragraph blindly stores "radius(c)"
-// as the documentation of `radius`. Leading paragraphs whose every line
-// is indented are that signature block and are skipped.
+// as the documentation of `radius`. Leading paragraphs that are indented
+// RELATIVE TO THE BODY are that signature block and are skipped.
+//
+// The relative part is load-bearing: a docstring written inside an
+// indented module or `begin` body has every line indented, so an absolute
+// test would call every paragraph a signature block and eat the whole
+// docstring. Julia's own Docs machinery dedents the literal before
+// anything else; so does this.
 func juliaDocText(n *sitter.Node, src []byte) string {
 	// A Windows-authored file separates paragraphs with "\r\n\r\n",
 	// which holds no "\n\n" — without normalising first, the signature
@@ -1030,19 +1036,63 @@ func juliaDocText(n *sitter.Node, src []byte) string {
 	} else {
 		s = strings.TrimSuffix(strings.TrimPrefix(s, `"`), `"`)
 	}
+	s = juliaDedent(s)
 	for {
 		s = strings.TrimLeft(s, "\n")
 		para, rest, found := strings.Cut(s, "\n\n")
-		if !found || !juliaIndentedParagraph(para) {
+		// Never skip the last paragraph: a docstring that is nothing but
+		// a signature still documents better than an empty string.
+		if !found || strings.TrimSpace(rest) == "" || !juliaIndentedParagraph(para) {
 			return strings.TrimSpace(para)
 		}
 		s = rest
 	}
 }
 
+// juliaDedent strips the whitespace prefix every non-empty line shares,
+// the way Julia's documentation machinery does before storing a
+// docstring. The literal's first line has already lost its indentation to
+// the opening quotes, so it is excluded from the common-prefix scan.
+func juliaDedent(s string) string {
+	lines := strings.Split(s, "\n")
+	prefix, seen := "", false
+	for _, line := range lines[min(1, len(lines)):] {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		indent := line[:len(line)-len(strings.TrimLeft(line, " \t"))]
+		if !seen {
+			prefix, seen = indent, true
+			continue
+		}
+		prefix = juliaCommonPrefix(prefix, indent)
+		if prefix == "" {
+			return s
+		}
+	}
+	if !seen || prefix == "" {
+		return s
+	}
+	for i, line := range lines {
+		lines[i] = strings.TrimPrefix(line, prefix)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func juliaCommonPrefix(a, b string) string {
+	n := min(len(a), len(b))
+	for i := 0; i < n; i++ {
+		if a[i] != b[i] {
+			return a[:i]
+		}
+	}
+	return a[:n]
+}
+
 // juliaIndentedParagraph reports whether every non-empty line of a
 // paragraph is indented — the shape of the signature block a Julia
-// docstring conventionally opens with.
+// docstring conventionally opens with, once the docstring's own common
+// indent has been removed.
 func juliaIndentedParagraph(p string) bool {
 	indented := false
 	for _, line := range strings.Split(p, "\n") {
