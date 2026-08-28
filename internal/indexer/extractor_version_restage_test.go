@@ -136,7 +136,10 @@ func TestIncrementalReindex_NonMerkleNewlyTrackedLanguageRestages(t *testing.T) 
 
 	res, err := idx.incrementalReindexPathsMode(dir, nil, incrementalPathMode{detectDeletions: true})
 	require.NoError(t, err)
-	assert.GreaterOrEqual(t, res.StaleFileCount, 1,
+	// Exactly one: the repository holds a single .jl file and nothing
+	// else, so a count above one would mean the restage stopped being
+	// per-language — the whole point of the design.
+	assert.Equal(t, 1, res.StaleFileCount,
 		"a language whose first tracked version postdates the stored snapshot must restage")
 
 	var restamped map[string]int

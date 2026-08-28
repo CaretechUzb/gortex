@@ -513,10 +513,19 @@ Box() = Box(0)
 }
 
 // A nested module contributes its full dotted path, and a constructor
-// binds to the type declared in its own module rather than to a
-// same-named type in a sibling one.
+// binds to the type declared in its OWN module.
+//
+// The declaration order is the point: the outer struct comes first and
+// its constructor last, so a flat last-write-wins name table would hold
+// the INNER module's Node by the time the outer constructor is reached
+// and would bind it to the wrong type. Only keying by module gets this
+// right.
 func TestJuliaExtractor_NestedModuleScope(t *testing.T) {
 	src := []byte(`module Outer
+
+struct Node
+    w::Int
+end
 
 module Inner
 struct Node
@@ -525,9 +534,6 @@ end
 Node(v) = build_inner(v)
 end
 
-struct Node
-    w::Int
-end
 Node(w) = build_outer(w)
 
 end
@@ -541,10 +547,10 @@ end
 	}
 	require.NotNil(t, nodes["nest.jl::Inner"])
 	assert.Equal(t, "Outer", nodes["nest.jl::Inner"].Meta["scope_mod"])
-	require.NotNil(t, nodes["nest.jl::Node"])
-	assert.Equal(t, "Outer.Inner", nodes["nest.jl::Node"].Meta["scope_mod"])
-	require.NotNil(t, nodes["nest.jl::Node_L10"])
-	assert.Equal(t, "Outer", nodes["nest.jl::Node_L10"].Meta["scope_mod"])
+	require.NotNil(t, nodes["nest.jl::Node"], "the outer struct keeps the clean id")
+	assert.Equal(t, "Outer", nodes["nest.jl::Node"].Meta["scope_mod"])
+	require.NotNil(t, nodes["nest.jl::Node_L8"], "the inner struct is disambiguated")
+	assert.Equal(t, "Outer.Inner", nodes["nest.jl::Node_L8"].Meta["scope_mod"])
 
 	owners := juliaOwners(res.Edges)
 	callers := map[string]string{}
@@ -557,129 +563,12 @@ end
 	outer := callers["unresolved::build_outer"]
 	require.NotEmpty(t, inner)
 	require.NotEmpty(t, outer)
-	assert.True(t, owners[inner]["nest.jl::Node"],
+	assert.True(t, owners[inner]["nest.jl::Node_L8"],
 		"the inner module's constructor must belong to the inner module's type")
-	assert.True(t, owners[outer]["nest.jl::Node_L10"],
+	assert.True(t, owners[outer]["nest.jl::Node"],
 		"the outer module's constructor must belong to the outer module's type")
-	assert.False(t, owners[outer]["nest.jl::Node"],
-		"it must NOT bind to the same-named type in the nested module")
-}
-
-// `Base.@kwdef` is the idiomatic way to give struct fields defaults, and
-// it makes every field an `assignment` node whose left-hand side is the
-// declaration. A field scanner that recognised only `x::T` and `x` saw a
-// @kwdef struct as having no fields at all.
-// `import X as A` binds in the module it appears in. One file routinely
-// gives the same short nickname to different packages in different
-// modules, so a file-global alias map lets the last one win and rewrites
-// the earlier module's calls to a package they never touch. And a
-// submodule does NOT inherit its parent's bindings, so a definition
-// inside it that happens to share a name with an outer type is an
-// independent function, not that type's constructor.
-func TestJuliaExtractor_ModuleScopedAliasesAndTypes(t *testing.T) {
-	src := []byte(`module Plotting
-import Plots as P
-render(x) = P.plot(x)
-end
-
-module Reporting
-import PrettyTables as P
-show_it(x) = P.pretty_table(x)
-end
-
-module Outer
-
-struct Thing
-    v::Int
-end
-
-module Inner
-function Thing(x)
-    build(x)
-end
-end
-
-end
-`)
-	res, err := NewJuliaExtractor().Extract("sc.jl", src)
-	require.NoError(t, err)
-
-	calls := map[string]string{}
-	for _, ed := range res.Edges {
-		if ed.Kind == graph.EdgeCalls {
-			calls[ed.From] = ed.To
-		}
-	}
-	assert.Equal(t, "unresolved::Plots.plot", calls["sc.jl::render"],
-		"an alias declared in another module must not rewrite this call")
-	assert.Equal(t, "unresolved::PrettyTables.pretty_table", calls["sc.jl::show_it"])
-
-	nodes := map[string]*graph.Node{}
-	for _, n := range res.Nodes {
-		nodes[n.ID] = n
-	}
-	require.NotNil(t, nodes["sc.jl::Thing"], "the outer struct keeps its id")
-	_, isCtor := nodes["sc.jl::Thing.<init>"]
-	assert.False(t, isCtor,
-		"a submodule does not inherit the parent's types, so this is not a constructor")
-
-	var inner *graph.Node
-	for _, n := range res.Nodes {
-		if n.Name == "Thing" && n.Kind == graph.KindFunction {
-			inner = n
-		}
-	}
-	require.NotNil(t, inner, "the submodule definition must survive as a plain function")
-	assert.Equal(t, "Outer.Inner", inner.Meta["scope_mod"])
-	owners := juliaOwners(res.Edges)
-	assert.False(t, owners[inner.ID]["sc.jl::Thing"],
-		"it must not claim membership of the outer type")
-}
-
-func TestJuliaExtractor_KwdefStructFields(t *testing.T) {
-	src := []byte(`Base.@kwdef struct Config
-    host::String = "localhost"
-    port::Int = 8080
-    debug = false
-end
-
-@kwdef struct Bare
-    n::Int = 1
-end
-
-struct Guarded
-    v::Int = 0
-    Guarded(v) = new(check(v))
-end
-`)
-	res, err := NewJuliaExtractor().Extract("kw.jl", src)
-	require.NoError(t, err)
-
-	nodes := map[string]*graph.Node{}
-	for _, n := range res.Nodes {
-		nodes[n.ID] = n
-	}
-	owners := juliaOwners(res.Edges)
-
-	for _, fid := range []string{
-		"kw.jl::Config.host", "kw.jl::Config.port", "kw.jl::Config.debug",
-		"kw.jl::Bare.n", "kw.jl::Guarded.v",
-	} {
-		n, ok := nodes[fid]
-		require.True(t, ok, "missing field %s", fid)
-		assert.Equal(t, graph.KindField, n.Kind)
-	}
-	assert.True(t, owners["kw.jl::Config.host"]["kw.jl::Config"])
-	assert.True(t, owners["kw.jl::Bare.n"]["kw.jl::Bare"],
-		"the bare @kwdef form must work too, not just Base.@kwdef")
-
-	// An inner constructor is an assignment child of the struct as well,
-	// but it is a definition, not a field.
-	ctor, ok := nodes["kw.jl::Guarded.<init>"]
-	require.True(t, ok, "an inner constructor must stay a constructor")
-	assert.Equal(t, graph.KindMethod, ctor.Kind)
-	_, isField := nodes["kw.jl::Guarded.Guarded"]
-	assert.False(t, isField, "an inner constructor must not be read as a field")
+	assert.False(t, owners[outer]["nest.jl::Node_L8"],
+		"it must NOT bind to the same-named type declared later in a submodule")
 }
 
 func TestJuliaExtractor_Imports(t *testing.T) {

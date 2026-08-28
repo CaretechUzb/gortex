@@ -110,6 +110,14 @@ func TestStaleLangsDetection(t *testing.T) {
 		if got := ExtractorVersionStaleLangs(snapshotJSON(t, nil)); len(got) != 0 {
 			t.Errorf("stored at current = %v, want empty", got)
 		}
+		// A language MISSING from the snapshot but sitting at the
+		// baseline is not stale: only a version raised above the
+		// baseline is a bump. Java is the exemplar because its extractor
+		// has never been bumped, which keeps the check from being
+		// tautological.
+		if got := ExtractorVersionStaleLangs(snapshotJSON(t, nil, "java")); len(got) != 0 {
+			t.Errorf("absent baseline language = %v, want empty", got)
+		}
 		if got := ExtractorVersionStaleLangs(
 			snapshotJSON(t, map[string]int{"php": 1})); !reflect.DeepEqual(got, []string{"php"}) {
 			t.Errorf("stored PHP structural-edge version = %v, want [php]", got)
