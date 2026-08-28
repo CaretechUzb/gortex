@@ -84,7 +84,7 @@ on interface nodes stores the expected method set for implementation matching.
 | Dart | Full | Full | Classes/Enums/Mixins/Extensions | Abstract interface | Full | Full | Full |
 | OCaml | Full | Full (class) | Types/Modules | Module types | open | Full | Full |
 | Lua | Full | Full (M.func/M:method) | - | - | require() | Full | Full |
-| Julia | Full (long + short form, `where` syntax) | Full (qualified `Base.show`, operators) | Structs/abstract/primitive + fields | - | Full (`using`/`import`/`include`, selective lists) | Full (incl. broadcast, macro calls) | `const` |
+| Julia | Full (long + short form, `where` syntax) | Full (qualified `Base.show`, operators) | Structs/abstract/primitive + fields | - | Full (`using`/`import`/`include`, selective lists incl. macros/operators) | Full (incl. broadcast, macro calls, `Vector{Int}` constructors) | `const` (with `member_of`) |
 
 ### Rust specifics
 
@@ -113,7 +113,9 @@ Recent extraction refinements (each covered by a per-feature CI golden): Java `@
 
 `module` / `baremodule` index as `KindType` nodes (the graph's `KindModule`
 is reserved for ecosystem packages) and carry the module's `export` list in
-`Meta["exports"]`; definitions inside a module get `member_of` edges to it.
+`Meta["exports"]` — including exported macros and operators, recorded
+verbatim (`export @m, ⊗` records `@m` and `⊗`); definitions, constants and
+nested modules inside a module get `member_of` edges to it.
 Node ids stay flat — the enclosing module rides on `Meta["scope_mod"]`, the
 Rust `mod` convention — and two definitions that would collide on one id
 (`f` in module `A` and `f` in module `B`) separate through the shared
@@ -139,10 +141,14 @@ the unaliased spelling produces. Nothing in the resolver reads the import
 `Meta` — the edge targets are the consumable surface. All imports including
 `include("file.jl")` target `unresolved::import::<path>`.
 Calls attribute to the enclosing function-like definition (long form, short
-form, macro, or nested closure) and cover qualified (`Mod.f`) and broadcast
-(`f.(x)`, `Meta["broadcast"]`) callees plus macro invocations
-(`Meta["macro"]`). Operator calls (`a + b`) are not emitted — dispatch on
-operators is not statically attributable. Docstrings attach as
+form, macro, or nested closure) and cover qualified (`Mod.f`),
+parametric-constructor (`Vector{Int}(xs)` → `unresolved::Vector{Int}`), and
+broadcast (`f.(x)`, `Meta["broadcast"]`) callees, plus bare and
+module-qualified macro invocations (`Base.@time` → `unresolved::Base.time`,
+`Meta["macro"]`). A callee chained onto a call result (`get(cfg).run(x)`)
+has no decodable receiver and records its method name (`unresolved::run`);
+quoted operators normalise (`Base.:+` and `Base.:(==)` →
+`unresolved::Base.+` / `unresolved::Base.==`). Docstrings attach as
 `Meta["doc"]` to long and short definitions, types, modules and constants,
 but only when the string sits immediately above the documented object —
 the adjacency Julia itself enforces, where a blank line or an own-line
@@ -150,6 +156,25 @@ comment detaches the string and leaves the definition undocumented. A
 string at the top of a function body is executable code, not
 documentation. The stored text is the first PROSE paragraph, skipping the
 indented signature block Julia's convention opens a docstring with.
+
+What is **not** covered:
+
+- **Operator calls in infix position** (`a + b`) — dispatch on operators is
+  not statically attributable. Explicit call syntax (`Base.:+(a, b)`) is a
+  normal call.
+- **Typed constant declarations** (`const X::Int = 1`) mint no variable node.
+- **Parametric constructor definitions** (`Box{T}(x) where T = …`) are
+  extracted as plain functions named `Box{T}` — not with the
+  `<Type>.<init>` constructor spelling, and not bound to `Box`.
+- **Callable-object definitions** (`(f::Box)(x) = …`) are not extracted.
+- **Calls inside string interpolation** (`"$(f(x))"`) are not walked.
+- **Two methods of one name on one physical line**
+  (`g(x) = h(x); g(y) = k(y)`) collapse onto one node — line numbers cannot
+  separate them — though each body's call edges are preserved.
+- **Call and macro edges are extraction-side facts**: targets are
+  `unresolved::` names, and binding them to definitions in another file —
+  including qualified calls into another file's module, and constructor
+  call sites to `<Type>.<init>` — is resolver work, not attempted here.
 
 ## Data, config, build
 
