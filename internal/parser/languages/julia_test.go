@@ -345,6 +345,21 @@ end
 	require.NotNil(t, nodes["dup.jl::S_L12"])
 	require.NotNil(t, nodes["dup.jl::S.a"])
 	require.NotNil(t, nodes["dup.jl::S_L12.b"])
+	// Two methods of one name written on ONE physical line cannot be
+	// separated by a line suffix. Only one node is minted, but the
+	// second body's calls must still be attributed rather than dropped.
+	oneLine, err := NewJuliaExtractor().Extract("one.jl", []byte("g(x) = h(x); g(y) = k(y)\n"))
+	require.NoError(t, err)
+	oneLineCalls := map[string]bool{}
+	for _, ed := range oneLine.Edges {
+		if ed.Kind == graph.EdgeCalls {
+			oneLineCalls[ed.From+" -> "+ed.To] = true
+		}
+	}
+	assert.True(t, oneLineCalls["one.jl::g -> unresolved::h"])
+	assert.True(t, oneLineCalls["one.jl::g -> unresolved::k"],
+		"a same-line twin's calls must not be dropped")
+
 	assert.True(t, owners["dup.jl::S.a"]["dup.jl::S"])
 	assert.True(t, owners["dup.jl::S_L12.b"]["dup.jl::S_L12"],
 		"a field must belong to its own struct, not to whichever came first")

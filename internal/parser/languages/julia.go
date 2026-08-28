@@ -730,11 +730,19 @@ func (e *JuliaExtractor) emitCallable(
 
 	id, minted := disambiguateID(st.seen, baseID, line)
 	if !minted {
-		// The same declaration reached twice. Leaving the scope
-		// untouched is deliberate: adopting the existing id here is
-		// what used to re-parent a shadowed definition's calls onto
-		// whichever twin was emitted first.
-		return scope
+		// Same base id AND same start line. Two shapes reach here: the
+		// same declaration walked twice, and two `;`-separated methods
+		// written on one physical line, which a line suffix cannot
+		// separate. Neither gets a second node, but the body still has
+		// to attribute its calls somewhere — dropping them loses edges
+		// the line-suffix fix was never meant to touch. Definitions on
+		// DIFFERENT lines no longer land here at all, which is where
+		// the re-parenting this guard used to cause actually mattered.
+		inner := scope
+		inner.functionID = id
+		inner.functionName = name
+		inner.functionRecv = receiver
+		return inner
 	}
 
 	node := &graph.Node{
