@@ -48,10 +48,17 @@ grammars) and never the columns carrying a *path*. All of them read `local/…`:
 | column | stale rows, before | after the fix |
 |---|---:|---:|
 | `nodes.file_path` | 120,951 (100%) | 0 of 121,328 |
-| `nodes.file_dir` | 120,951 (100%) | 0 — it is VIRTUAL over `file_path`, so it follows |
+| `nodes.file_dir` | 120,951 (100%) — *derived*, see below | 0 — it follows `file_path` |
 | `edges.file_path` | 893,174 | 0 of 899,776 |
 | `files.file_path` | 9,616 | 0 of 9,616 |
 | `content_fts.file_path` | 41 | 0 of 41 |
+
+`file_dir` is **not** a fifth column needing its own rewrite: it is a VIRTUAL
+generated column over `file_path` (`fileDirColumnDDL`), excluded from the
+projection by `realColumns` and recomputed by SQLite. It read stale only
+because its source did. Worth knowing anyway, because a repository-root file
+gives it the bare prefix with no separator — the one value an anchor of
+`"<prefix>/"` would miss, had it needed anchoring.
 
 The convention is settled by the derived worktree: `local@aurora-redesign` has
 140,434 nodes and 1,053,393 edges whose `file_path` carries **its own** prefix.
@@ -157,6 +164,33 @@ both `from_id` and `to_id`, so untracking the copy removes them again.
 | "who uses X", impact *into* the worktree | **empty** | full |
 | source read, editing context, snippets, edit, review | **broken** | full |
 
-Install time on the reinstall that verified §2: **188 s** against a 300 s goal
-(the 105.5 s first measurement ran on an otherwise idle daemon; this one shared
-the machine with a full `gortex` re-index).
+## 6. Post-fix verification, on the live store
+
+Both fixes were verified by untracking `test_w`, rebuilding, restarting the
+daemon, and tracking it again — twice, once per commit.
+
+| check | result |
+|---|---|
+| install time | **188 s** (path fix) / **149 s** (inbound), goal 300 s |
+| stale path columns | 0 of 121,328 nodes · 0 of 899,776 edges · 0 of 9,616 files · 0 of 41 content rows |
+| `get_symbol_source` on a copied symbol | 606 bytes, byte-identical to `local` |
+| inbound from `odoo` | 110,865 → `local`, **110,865** → `test_w` |
+| inbound from `addons` | 74,149 → `local`, **74,149** → `test_w` |
+| inbound edges keep their owner's `file_path` | 110,865 carry `odoo/…`, 0 rewritten |
+| cross-checkout invariant, 6 probes both directions | **0** everywhere |
+| `find_usages` `…::State` | 1,789 / 1,824 — was 40 / 39, now equal to `local` |
+| `find_usages` `…::DmsFile` | 1,580 / 2,000 — was 1 / 0, now equal to `local` |
+| `find_usages` `…::IrUiView` | 1,946 / 2,000 — equal to `local` |
+| `odoo_health.sh` §2b | `addons` 99.95% / 99.96% **PASS** · `odoo` 99.92% / 99.95% **PASS** |
+| `odoo_health.sh` §4b canaries for `test_w` | implicit 14, legacy_js 13 — identical to `local` |
+| CSV declaration vocabulary | 20,025 — identical to `local` |
+
+The 105.5 s first measurement ran on an otherwise idle daemon; both figures
+above shared the machine with a full `gortex` re-index.
+
+`internal/graph`, `internal/graph/store_sqlite` and `internal/graph/storetest`
+are green under `-race`. `internal/indexer` fails 3–4 tests per full `-race`
+run with a **different set each time** (`TestGDScriptResolution_*`,
+`TestNodeNextEmittedJSSpecifier_CallGraph`, `TestContracts_*`,
+`TestInlineContractPassRecordsCompletionMarker`); every one passes in
+isolation, and none touches the copy path.
