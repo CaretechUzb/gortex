@@ -42,6 +42,7 @@ func TestOpenPurgesLegacyCoverageSpellings(t *testing.T) {
 		nativeTodo  = nativeA + `::todo:5`
 		legacyTodo  = legacyA + `::todo:3`
 		legacyFix   = `r/testdata/x.json`
+		nativeFix   = `r/testdata\x.json`
 		licMIT      = `r/license::MIT`
 		licGPL      = `r/license::GPL-3.0`
 		teamCore    = `r/team::core`
@@ -58,8 +59,13 @@ func TestOpenPurgesLegacyCoverageSpellings(t *testing.T) {
 	require.NoError(t, err)
 	s.AddBatch([]*graph.Node{
 		// Native file nodes: prove the store keys paths with backslashes.
+		// Every legacy row below is a RE-spelling of one of these, which is
+		// what a real pre-fix store looks like and what the purge requires
+		// before it removes anything.
 		{ID: nativeA, Kind: graph.KindFile, Name: "a.go", FilePath: nativeA, RepoPrefix: "r"},
 		{ID: nativeB, Kind: graph.KindFile, Name: "b.go", FilePath: nativeB, RepoPrefix: "r"},
+		{ID: nativeFix, Kind: graph.KindFile, Name: "x.json", FilePath: nativeFix, RepoPrefix: "r"},
+		{ID: nativeMod, Kind: graph.KindFile, Name: "go.mod", FilePath: nativeMod, RepoPrefix: "r"},
 		// Native todo: must survive.
 		{ID: nativeTodo, Kind: graph.KindTodo, Name: "todo:5", FilePath: nativeA, RepoPrefix: "r"},
 		// Legacy per-file artifacts: must be purged.
@@ -454,6 +460,67 @@ func TestLegacyPathPredicateAcrossRepoScopes(t *testing.T) {
 		require.True(t, none.empty())
 		require.Equal(t, "0", none.legacyPathPredicate("file_path"))
 	})
+}
+
+// TestOpenPurgesOnlyRowsWhoseNativeTwinExists is the strongest of the
+// safety properties, and the one that makes a wrong repository verdict
+// harmless rather than merely unlikely.
+//
+// A legacy row is by definition a RE-spelling of a file the indexer also
+// recorded natively, so the natively spelled twin is in the store. A file
+// that was simply indexed on POSIX has no twin, because its own spelling
+// IS the native one. Requiring the twin therefore removes exactly the
+// duplicates and never a live row - including a fixture node, which
+// reuses its file node's ID and so cannot be told apart any other way.
+//
+// The store here is judged Windows-written (the stale `r/old\thing.go`
+// row sets the verdict) and every path below is slash-spelled, so only
+// the twin requirement separates them.
+func TestOpenPurgesOnlyRowsWhoseNativeTwinExists(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.sqlite")
+
+	const (
+		staleWin = `r/old\thing.go`
+
+		twinned     = `r/src\a.go`
+		twinnedSlur = `r/src/a.go`
+		twinnedTodo = `r/src/a.go::todo:4`
+
+		lonelyFix  = `r/testdata/golden.json` // POSIX-indexed, no twin
+		lonelyTodo = `r/pkg/only.go::todo:9`  // its file was deleted
+	)
+
+	s, err := Open(path)
+	require.NoError(t, err)
+	s.AddBatch([]*graph.Node{
+		{ID: staleWin, Kind: graph.KindFile, Name: "thing.go", FilePath: staleWin, RepoPrefix: "r"},
+		{ID: twinned, Kind: graph.KindFile, Name: "a.go", FilePath: twinned, RepoPrefix: "r"},
+		{ID: twinnedTodo, Kind: graph.KindTodo, Name: "todo:4", FilePath: twinnedSlur, RepoPrefix: "r"},
+		{ID: lonelyFix, Kind: graph.KindFixture, Name: "golden.json", FilePath: lonelyFix, RepoPrefix: "r"},
+		{ID: lonelyTodo, Kind: graph.KindTodo, Name: "todo:9", FilePath: `r/pkg/only.go`, RepoPrefix: "r"},
+	}, []*graph.Edge{
+		{From: twinnedSlur, To: twinnedTodo, Kind: graph.EdgeAnnotated, FilePath: twinnedSlur, Line: 4},
+		{From: `r/pkg/only.go`, To: lonelyTodo, Kind: graph.EdgeAnnotated, FilePath: `r/pkg/only.go`, Line: 9},
+	})
+	require.NoError(t, s.Close())
+
+	withRawDB(t, path, func(db *sql.DB) {
+		_, err := db.Exec(`PRAGMA user_version = 12`)
+		require.NoError(t, err, "reset to the pre-purge version")
+	})
+
+	s2, err := Open(path)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s2.Close() })
+
+	require.Nil(t, s2.GetNode(twinnedTodo),
+		"a row whose native twin is present is a duplicate and heals")
+	require.NotNil(t, s2.GetNode(lonelyFix),
+		"a fixture with no native twin was indexed on POSIX and must survive")
+	require.NotNil(t, s2.GetNode(lonelyTodo),
+		"a row with no twin is unreachable residue, not a duplicate: left alone rather than risked")
+	require.Len(t, s2.GetOutEdges(`r/pkg/only.go`), 1,
+		"and its edge stays with it")
 }
 
 // TestCoverageNodeSidecarTablesCoverSchema keeps the sidecar list from

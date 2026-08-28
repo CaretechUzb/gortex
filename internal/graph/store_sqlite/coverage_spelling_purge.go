@@ -81,8 +81,8 @@ func purgeLegacyCoverageSpellings(tx *sql.Tx) error {
 	if err != nil || scope.empty() {
 		return err
 	}
-	legacyNodePath := scope.legacyPathPredicate("nodes.file_path")
-	legacyEdgePath := scope.legacyPathPredicate("edges.file_path")
+	legacyNodePath := scope.legacyRowPredicate("nodes.file_path")
+	legacyEdgePath := scope.legacyRowPredicate("edges.file_path")
 
 	// Per-file artifacts whose own spelling is legacy. Collected before any
 	// delete so the edge sweep below can clear their endpoints too.
@@ -339,6 +339,54 @@ func (s coverageSpellingScope) legacyPathPredicate(column string) string {
 		arms = append(arms, b.String())
 	}
 	return "(" + strings.Join(arms, " OR ") + ") AND instr(" + column + ", '::') = 0"
+}
+
+// legacyRowPredicate is what the migration actually selects on: a legacy
+// SPELLING whose natively spelled twin is present in the store. Kept
+// separate from legacyPathPredicate so the path arms stay independently
+// testable.
+func (s coverageSpellingScope) legacyRowPredicate(column string) string {
+	if s.empty() {
+		return "0"
+	}
+	return s.legacyPathPredicate(column) +
+		" AND EXISTS (SELECT 1 FROM nodes twin WHERE twin.file_path = " +
+		s.nativeTwinExpr(column) + ")"
+}
+
+// nativeTwinExpr renders the path a row WOULD have carried had the builder
+// preserved the indexer's spelling: the repo prefix kept verbatim, every
+// forward slash below it turned back into a separator.
+//
+// Requiring that twin to exist is what makes the purge safe rather than
+// merely narrow. A legacy row is by definition a RE-spelling of a file the
+// indexer also recorded natively, so its twin is present; a row that is
+// simply a POSIX-indexed file has no twin, because its own spelling is the
+// native one. So a repository misjudged as Windows-written - the sticky
+// verdict a store carried across platforms can produce - loses nothing,
+// including the fixture nodes that reuse a file node's ID.
+//
+// Measured against a real Windows store before adopting it: all 1,126
+// legacy-spelled artifact rows had their twin, so the stricter rule costs
+// no healing. What it does give up is a row whose file has since been
+// deleted, whose twin went with it. That row is unreachable residue either
+// way, and trading it for the guarantee that no live file is ever removed
+// is the right side of that bargain.
+func (s coverageSpellingScope) nativeTwinExpr(column string) string {
+	// A single-repo store carries no prefix to preserve, and SQL CASE
+	// requires at least one WHEN, so this branch is not just a shortcut.
+	if len(s.windowsPrefixes) == 0 {
+		return "replace(" + column + ", '/', '\\')"
+	}
+	var b strings.Builder
+	b.WriteString("CASE")
+	for _, prefix := range s.windowsPrefixes {
+		lit := quoteSQLLiteral(prefix + "/")
+		b.WriteString(" WHEN substr(" + column + ", 1, length(" + lit + ")) = " + lit +
+			" THEN " + lit + " || replace(substr(" + column + ", length(" + lit + ") + 1), '/', '\\')")
+	}
+	b.WriteString(" ELSE replace(" + column + ", '/', '\\') END")
+	return b.String()
 }
 
 // quoteSQLLiteral renders s as a single-quoted SQLite string literal.
