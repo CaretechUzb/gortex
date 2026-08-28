@@ -27,7 +27,8 @@ import (
 //     (`<: Living` → EdgeExtends), plus struct fields (KindField),
 //     including the `x::T = default` form `Base.@kwdef` requires
 //   - `module` / `baremodule` — KindType node whose Meta carries the
-//     module's `export` list; definitions inside get EdgeMemberOf
+//     module's `export` list; definitions, constants and nested modules
+//     inside get EdgeMemberOf
 //   - `const X = ...` constants (KindVariable)
 //
 // Node ids stay flat (`<file>::<Name>`, `<file>::<Owner>.<member>`) as in
@@ -330,6 +331,15 @@ func (e *JuliaExtractor) handleModule(n *sitter.Node, src []byte, scope juliaSco
 				From: st.fileNode.ID, To: id, Kind: graph.EdgeDefines,
 				FilePath: st.filePath, Line: line,
 			})
+			// A nested module belongs to its parent just as any other
+			// resident does; without the edge, a traversal from Outer
+			// stops at functions and types and never reaches Inner.
+			if scope.moduleID != "" {
+				st.result.Edges = append(st.result.Edges, &graph.Edge{
+					From: id, To: scope.moduleID, Kind: graph.EdgeMemberOf,
+					FilePath: st.filePath, Line: line,
+				})
+			}
 		}
 		inner.moduleID = id
 		inner.modulePath = name
@@ -772,6 +782,15 @@ func (e *JuliaExtractor) handleAssignment(n *sitter.Node, src []byte, scope juli
 				From: st.fileNode.ID, To: id, Kind: graph.EdgeDefines,
 				FilePath: st.filePath, Line: line,
 			})
+			// A constant inside a module belongs to it the same way a
+			// function does — the edge is what a traversal from the
+			// module reaches; scope_mod on Meta is not traversable.
+			if scope.moduleID != "" {
+				st.result.Edges = append(st.result.Edges, &graph.Edge{
+					From: id, To: scope.moduleID, Kind: graph.EdgeMemberOf,
+					FilePath: st.filePath, Line: line,
+				})
+			}
 		}
 	}
 

@@ -1070,6 +1070,53 @@ end
 	assert.True(t, plainGot, "the undocumented form is unchanged")
 }
 
+// Functions, types and fields inside a module carry a member_of edge to
+// it, but a constant and a nested module carried only scope_mod on
+// Meta — recorded, yet unreachable from a traversal of the module. A
+// constant belongs to its module and a nested module to its parent
+// through the same edge every other resident uses; at the top level
+// (no enclosing module) neither gets one.
+func TestJuliaExtractor_ConstAndNestedModuleContainment(t *testing.T) {
+	src := []byte(`module Outer
+const X = 1
+module Inner
+const Y = 2
+f() = 1
+end
+end
+
+const TOP = 3
+`)
+	res, err := NewJuliaExtractor().Extract("own.jl", src)
+	require.NoError(t, err)
+
+	nodes := map[string]*graph.Node{}
+	for _, n := range res.Nodes {
+		nodes[n.ID] = n
+	}
+	require.NotNil(t, nodes["own.jl::Outer"])
+	require.NotNil(t, nodes["own.jl::X"])
+	inner := nodes["own.jl::Inner"]
+	require.NotNil(t, inner)
+	assert.Equal(t, "Outer", inner.Meta["scope_mod"], "scope_mod keeps recording the lexical path")
+	require.NotNil(t, nodes["own.jl::Y"])
+	require.NotNil(t, nodes["own.jl::TOP"], "a top-level constant still mints its variable node")
+
+	owners := juliaOwners(res.Edges)
+	assert.True(t, owners["own.jl::X"]["own.jl::Outer"],
+		"a module-level constant belongs to its module")
+	assert.True(t, owners["own.jl::Inner"]["own.jl::Outer"],
+		"a nested module belongs to its parent")
+	assert.True(t, owners["own.jl::Y"]["own.jl::Inner"],
+		"a constant in the inner module belongs to the inner module")
+	assert.True(t, owners["own.jl::f"]["own.jl::Inner"],
+		"the pre-existing function containment is unchanged")
+	assert.Empty(t, owners["own.jl::TOP"],
+		"a top-level constant has no enclosing module to belong to")
+	assert.Empty(t, owners["own.jl::Outer"],
+		"a top-level module has no enclosing module to belong to")
+}
+
 func TestJuliaExtractor_ConstAndDocstrings(t *testing.T) {
 	src := []byte(`"""
 Circle radius helpers.
