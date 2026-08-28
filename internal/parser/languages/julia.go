@@ -84,6 +84,9 @@ type juliaScope struct {
 	functionID   string
 	functionName string
 	functionRecv string
+	// functionIsCtor marks the enclosing definition as a constructor, so
+	// the direct-recursion guard does not eat its delegation calls.
+	functionIsCtor bool
 }
 
 type juliaWalkState struct {
@@ -780,6 +783,7 @@ func (e *JuliaExtractor) emitCallable(
 	inner.functionID = id
 	inner.functionName = name
 	inner.functionRecv = receiver
+	inner.functionIsCtor = ownerID != "" && strings.HasSuffix(id, ".<init>")
 	return inner
 }
 
@@ -1029,8 +1033,13 @@ func (e *JuliaExtractor) handleCall(n *sitter.Node, src []byte, scope juliaScope
 	if scope.functionID == "" {
 		return
 	}
-	if scope.functionName == name && scope.functionRecv == receiver {
-		return // direct recursion
+	// Direct recursion carries no information, so it is dropped — except
+	// from a constructor, where a call to the type's own name is
+	// delegation to a DIFFERENT method (`Box() = Box(0)`), which is the
+	// single most idiomatic constructor body Julia has. A constructor
+	// that genuinely recursed into itself would not terminate.
+	if !scope.functionIsCtor && scope.functionName == name && scope.functionRecv == receiver {
+		return
 	}
 	target := name
 	if receiver != "" {

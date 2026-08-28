@@ -462,6 +462,26 @@ end
 	}
 	assert.Equal(t, 2, ctors, "the constructor above the struct counts too")
 
+	// Delegation to another method of the same constructor is the most
+	// idiomatic constructor body Julia has, and it is NOT recursion —
+	// multiple dispatch sends it to a different method.
+	deleg, err := NewJuliaExtractor().Extract("dg.jl", []byte(`struct Box
+    x::Int
+    Box(x) = new(check(x))
+end
+
+Box() = Box(0)
+`))
+	require.NoError(t, err)
+	var delegated bool
+	for _, ed := range deleg.Edges {
+		if ed.Kind == graph.EdgeCalls && strings.HasPrefix(ed.From, "dg.jl::Box.<init>") &&
+			ed.To == "unresolved::Box" {
+			delegated = true
+		}
+	}
+	assert.True(t, delegated, "a delegating constructor must keep its call edge")
+
 	// The macro is a macro, not Tag's constructor.
 	_, tagCtor := nodes["fw.jl::Tag.<init>"]
 	assert.False(t, tagCtor, "a macro must never be read as a constructor")
