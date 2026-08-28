@@ -164,6 +164,14 @@ func ExtractorVersionStaleLangs(storedJSON string) []string {
 // A language present in stored but absent from current is dropped: its
 // extension is no longer version-tracked, so there is nothing to compare.
 func staleLangsBetween(stored, current map[string]int) []string {
+	// No baseline at all is "we do not know what produced this graph",
+	// not "everything is behind". Guarding here as well as at the JSON
+	// layer keeps the helper fail-inert on its own terms, so a future
+	// caller that decodes the snapshot itself cannot turn an absent row
+	// into a whole-repository restage.
+	if len(stored) == 0 {
+		return nil
+	}
 	var stale []string
 	for lang, cur := range current {
 		storedV, recorded := stored[lang]

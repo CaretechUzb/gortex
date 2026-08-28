@@ -48,6 +48,26 @@ func TestStaleLangsDetection(t *testing.T) {
 		}
 	})
 
+	t.Run("no_baseline_reports_nothing", func(t *testing.T) {
+		// Absent provenance means "unknown", not "everything is behind".
+		if got := staleLangsBetween(nil, extractorVersionsSnapshot()); got != nil {
+			t.Errorf("nil baseline = %v, want nil", got)
+		}
+		if got := staleLangsBetween(map[string]int{}, extractorVersionsSnapshot()); got != nil {
+			t.Errorf("empty baseline = %v, want nil", got)
+		}
+	})
+
+	t.Run("retired_language_is_not_compared", func(t *testing.T) {
+		// A language the salt map no longer tracks has no current
+		// version to compare against, so it is dropped rather than
+		// flagged forever.
+		stored := map[string]int{"go": 3, "retired": 9}
+		if got := staleLangsBetween(stored, map[string]int{"go": 3}); got != nil {
+			t.Errorf("retired language = %v, want nil", got)
+		}
+	})
+
 	t.Run("newly_tracked_language_is_stale", func(t *testing.T) {
 		// A language whose extension mapping ships in the SAME change that
 		// raises its version cannot appear in the previous release's
@@ -126,6 +146,12 @@ func TestStaleLangsDetection(t *testing.T) {
 		}
 		if got := merkleSaltFor("include/widget.hxx"); got != "cpp@2" {
 			t.Errorf("C++ extractor salt for .hxx = %q, want cpp@2", got)
+		}
+		// The Merkle half of the Julia bump: without the .jl → julia
+		// mapping the leaf salt stays empty and Merkle mode misses the
+		// bump the same way the mtime path did.
+		if got := merkleSaltFor("src/model.jl"); got != "julia@2" {
+			t.Errorf("Julia extractor salt = %q, want julia@2", got)
 		}
 	})
 
