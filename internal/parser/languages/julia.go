@@ -24,7 +24,8 @@ import (
 //   - `macro m(...) ... end`
 //   - `struct` / `mutable struct` / `abstract type` / `primitive type`
 //     with parametric names (`struct Pair{T,S}`) and supertypes
-//     (`<: Living` → EdgeExtends), plus struct fields (KindField)
+//     (`<: Living` → EdgeExtends), plus struct fields (KindField),
+//     including the `x::T = default` form `Base.@kwdef` requires
 //   - `module` / `baremodule` — KindType node whose Meta carries the
 //     module's `export` list; definitions inside get EdgeMemberOf
 //   - `const X = ...` constants (KindVariable)
@@ -326,6 +327,37 @@ func juliaNameAndParams(n *sitter.Node, src []byte) (string, []string) {
 	return "", nil
 }
 
+// juliaFieldName returns the field a direct struct member declares, or ""
+// when the member is not a field. Three shapes reach it:
+//
+//	x::T        typed_expression
+//	x           identifier
+//	x::T = 1    assignment — the shape `Base.@kwdef` requires, and the
+//	            shape every field of a @kwdef struct therefore has
+//
+// The assignment case is deliberately narrow: an INNER CONSTRUCTOR is a
+// direct struct child and an assignment too (`Guard(v) = new(v)`), but its
+// left-hand side is a call, so it falls through and is left to the
+// definition handling.
+func juliaFieldName(c *sitter.Node, src []byte) string {
+	n := c
+	if n.Type() == "assignment" {
+		n = n.NamedChild(0)
+	}
+	if n == nil {
+		return ""
+	}
+	switch n.Type() {
+	case "typed_expression":
+		if id := n.NamedChild(0); id != nil && id.Type() == "identifier" {
+			return id.Content(src)
+		}
+	case "identifier":
+		return n.Content(src)
+	}
+	return ""
+}
+
 // handleType covers struct / mutable struct / abstract type /
 // primitive type: KindType node, EdgeExtends for the supertype (bare
 // name target + full path in Meta, matching the python extractor
@@ -396,8 +428,7 @@ func (e *JuliaExtractor) handleType(n *sitter.Node, src []byte, scope juliaScope
 		})
 	}
 
-	// Struct fields: typed_expression (`x::T`) or bare identifier
-	// members at the top level of the struct body. This runs only for a
+	// Struct fields at the top level of the struct body. This runs only for a
 	// struct THIS call minted, so a struct whose name collides with an
 	// earlier declaration cannot hang its fields off that other node.
 	if n.Type() == "struct_definition" {
@@ -405,15 +436,7 @@ func (e *JuliaExtractor) handleType(n *sitter.Node, src []byte, scope juliaScope
 			if c.Type() == "type_head" {
 				continue
 			}
-			var fieldName string
-			switch c.Type() {
-			case "typed_expression":
-				if lhs := c.NamedChild(0); lhs != nil && lhs.Type() == "identifier" {
-					fieldName = lhs.Content(src)
-				}
-			case "identifier":
-				fieldName = c.Content(src)
-			}
+			fieldName := juliaFieldName(c, src)
 			if fieldName == "" {
 				continue
 			}

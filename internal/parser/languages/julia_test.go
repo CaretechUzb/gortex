@@ -470,6 +470,56 @@ end
 		"it must NOT bind to the same-named type in the nested module")
 }
 
+// `Base.@kwdef` is the idiomatic way to give struct fields defaults, and
+// it makes every field an `assignment` node whose left-hand side is the
+// declaration. A field scanner that recognised only `x::T` and `x` saw a
+// @kwdef struct as having no fields at all.
+func TestJuliaExtractor_KwdefStructFields(t *testing.T) {
+	src := []byte(`Base.@kwdef struct Config
+    host::String = "localhost"
+    port::Int = 8080
+    debug = false
+end
+
+@kwdef struct Bare
+    n::Int = 1
+end
+
+struct Guarded
+    v::Int = 0
+    Guarded(v) = new(check(v))
+end
+`)
+	res, err := NewJuliaExtractor().Extract("kw.jl", src)
+	require.NoError(t, err)
+
+	nodes := map[string]*graph.Node{}
+	for _, n := range res.Nodes {
+		nodes[n.ID] = n
+	}
+	owners := juliaOwners(res.Edges)
+
+	for _, fid := range []string{
+		"kw.jl::Config.host", "kw.jl::Config.port", "kw.jl::Config.debug",
+		"kw.jl::Bare.n", "kw.jl::Guarded.v",
+	} {
+		n, ok := nodes[fid]
+		require.True(t, ok, "missing field %s", fid)
+		assert.Equal(t, graph.KindField, n.Kind)
+	}
+	assert.True(t, owners["kw.jl::Config.host"]["kw.jl::Config"])
+	assert.True(t, owners["kw.jl::Bare.n"]["kw.jl::Bare"],
+		"the bare @kwdef form must work too, not just Base.@kwdef")
+
+	// An inner constructor is an assignment child of the struct as well,
+	// but it is a definition, not a field.
+	ctor, ok := nodes["kw.jl::Guarded.<init>"]
+	require.True(t, ok, "an inner constructor must stay a constructor")
+	assert.Equal(t, graph.KindMethod, ctor.Kind)
+	_, isField := nodes["kw.jl::Guarded.Guarded"]
+	assert.False(t, isField, "an inner constructor must not be read as a field")
+}
+
 func TestJuliaExtractor_Imports(t *testing.T) {
 	src := []byte(`module M
 using LinearAlgebra
