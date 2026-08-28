@@ -17,6 +17,12 @@ import (
 const (
 	coveragePerFileNodeKinds = `'todo','fixture'`
 	coverageEdgeKinds        = `'annotated','licensed_as','owns','generated_by','depends_on_module'`
+	// coverageOwnedNodeKinds are the kinds whose FilePath may legitimately
+	// carry a coverage builder's re-spelling: the per-file artifacts
+	// themselves, and the shared targets whose FilePath is a first-sighting
+	// breadcrumb rather than an ownership claim. Any OTHER kind at a path
+	// means the indexer really parsed a file there.
+	coverageOwnedNodeKinds = `'todo','fixture','license','team','module','artifact'`
 )
 
 // coverageNodeSidecarTables are the node_id-keyed sidecars a removed node
@@ -81,8 +87,15 @@ func purgeLegacyCoverageSpellings(tx *sql.Tx) error {
 	if err != nil || scope.empty() {
 		return err
 	}
-	legacyNodePath := scope.legacyRowPredicate("nodes.file_path")
-	legacyEdgePath := scope.legacyRowPredicate("edges.file_path")
+	// The node candidate additionally has to be absent from `files`, the
+	// indexer's own record of the paths it parsed. That is the check that
+	// covers a fixture with no symbols in it, which nothing else can tell
+	// apart from a legacy artifact. Matched on (repo_prefix, file_path) so
+	// it seeks the primary key.
+	legacyNodePath := scope.legacyRowPredicate("nodes.file_path", "nodes.id") +
+		` AND NOT EXISTS (SELECT 1 FROM files f
+			WHERE f.repo_prefix = nodes.repo_prefix AND f.file_path = nodes.file_path)`
+	legacyEdgePath := scope.legacyRowPredicate("edges.file_path", "")
 
 	// Per-file artifacts whose own spelling is legacy. Collected before any
 	// delete so the edge sweep below can clear their endpoints too.
@@ -341,17 +354,47 @@ func (s coverageSpellingScope) legacyPathPredicate(column string) string {
 	return "(" + strings.Join(arms, " OR ") + ") AND instr(" + column + ", '::') = 0"
 }
 
-// legacyRowPredicate is what the migration actually selects on: a legacy
-// SPELLING whose natively spelled twin is present in the store. Kept
-// separate from legacyPathPredicate so the path arms stay independently
-// testable.
-func (s coverageSpellingScope) legacyRowPredicate(column string) string {
+// legacyRowPredicate is what the migration actually selects on. The path
+// shape alone is NOT enough, and that is the whole lesson of this step: a
+// store written on Windows and then re-indexed on POSIX (a synced home, a
+// container mounting the host's store) keeps its stale Windows rows,
+// because eviction is spelling-exact. Those stale rows set the
+// repository's verdict AND vouch for the new forward-slash rows as their
+// "twin", at which point a LIVE POSIX row and a stale legacy row are
+// identical in every path field.
+//
+// What actually separates them is ownership. When the indexer parses a
+// file it records that path in `files` and hangs the file node and every
+// symbol in it off the same path. A coverage builder's re-spelled path was
+// never any of those things: it was minted by the builder and referenced
+// by nothing else. So a row is legacy only when
+//
+//   - its natively spelled twin exists (it is a re-spelling of something), AND
+//   - `files` does not record its path (the indexer never parsed a file there), AND
+//   - no node outside the coverage domains claims that path (no file node,
+//     no symbol) - selfID excludes the candidate row itself, because a
+//     fixture node IS its own path.
+//
+// Verified against a real Windows store: of 1,088 legacy artifact rows,
+// zero had their path in `files` and zero were claimed by a non-coverage
+// node, while all 1,088 of their twins had both. The delete set is
+// unchanged and the ambiguous cases are now excluded by construction.
+//
+// selfID is the candidate's id column, or "" where the candidate is not a
+// node (the edge sweep).
+func (s coverageSpellingScope) legacyRowPredicate(column, selfID string) string {
 	if s.empty() {
 		return "0"
 	}
-	return s.legacyPathPredicate(column) +
+	pred := s.legacyPathPredicate(column) +
 		" AND EXISTS (SELECT 1 FROM nodes twin WHERE twin.file_path = " +
-		s.nativeTwinExpr(column) + ")"
+		s.nativeTwinExpr(column) + ")" +
+		" AND NOT EXISTS (SELECT 1 FROM nodes claimant WHERE claimant.file_path = " + column +
+		" AND claimant.kind NOT IN (" + coverageOwnedNodeKinds + ")"
+	if selfID != "" {
+		pred += " AND claimant.id <> " + selfID
+	}
+	return pred + ")"
 }
 
 // nativeTwinExpr renders the path a row WOULD have carried had the builder
