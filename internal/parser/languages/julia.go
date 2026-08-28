@@ -97,6 +97,11 @@ type juliaWalkState struct {
 	// constructor and attributed to the RIGHT type when one file declares
 	// two same-named types in different modules.
 	types map[string]string
+	// declaredTypes holds the same keys for every type declared ANYWHERE
+	// in the file, filled by the pre-pass. The emitting walk is a single
+	// forward pass, and Julia routinely puts outer constructors above the
+	// struct they build.
+	declaredTypes map[string]bool
 	// importAliases maps a module scope + local alias to the module it
 	// renames (`import Foo as F` inside `module A` → A/F→Foo), so a
 	// qualified call can name the module the resolver can find rather
@@ -131,12 +136,10 @@ func (e *JuliaExtractor) Extract(filePath string, src []byte) (*parser.Extractio
 		seen:          make(map[string]bool),
 		nodes:         map[string]*graph.Node{filePath: fileNode},
 		types:         map[string]string{},
+		declaredTypes: map[string]bool{},
 		importAliases: map[string]string{},
 	}
-	// Aliases are collected up front: the emitting walk is a single
-	// forward pass, and Julia does not require `import ... as ...` to
-	// precede the code that uses the alias.
-	juliaCollectImportAliases(root, src, "", st.importAliases)
+	juliaPrescan(root, src, "", st)
 	e.walk(root, src, juliaScope{}, st)
 	return result, nil
 }
@@ -693,10 +696,24 @@ func (e *JuliaExtractor) emitCallable(
 
 	default:
 		typeID, typeName := "", ""
-		if scope.typeName == name && scope.typeID != "" {
+		// A macro name lives in a disjoint namespace — `macro Tag`
+		// defines `@Tag`, which has nothing to do with a type `Tag` — so
+		// a macro can never be a constructor.
+		switch {
+		case isMacro:
+		case scope.typeName == name && scope.typeID != "":
 			typeID, typeName = scope.typeID, scope.typeName // inner constructor
-		} else if id, declared, ok := st.lookupType(scope.modulePath, name); ok {
-			typeID, typeName = id, declared // outer constructor
+		default:
+			if id, declared, ok := st.lookupType(scope.modulePath, name); ok {
+				typeID, typeName = id, declared // outer constructor
+			} else if st.declaredTypes[juliaTypeKey(scope.modulePath, name)] &&
+				!st.seen[st.filePath+"::"+name] {
+				// The struct is declared further down the file. Predict
+				// the id it will take rather than taking it here — but
+				// only while that id is still free, so a same-named type
+				// in another module cannot be adopted by mistake.
+				typeID, typeName = st.filePath+"::"+name, name
+			}
 		}
 		if typeID != "" {
 			baseID = typeID + ".<init>"
@@ -807,17 +824,24 @@ func juliaAliasParts(n *sitter.Node, src []byte) (orig, alias string) {
 	return orig, alias
 }
 
-// juliaCollectImportAliases records every `import M as A` / `using M as A`
-// module rename in the file, keyed by the module the statement appears in,
-// so handleCall can rewrite a qualified callee onto the module it actually
-// names. The pre-pass exists because the emitting walk is a single forward
-// pass and Julia does not require the import to precede its use.
+// juliaPrescan walks the file once before extraction, collecting the two
+// facts the emitting pass needs BEFORE it reaches the declarations that
+// establish them — it is a single forward pass, and Julia orders neither.
 //
-// Only MODULE aliases are collected: a renamed binding inside a selected
-// list (`import Foo: bar as baz`) renames a function, and rewriting a bare
-// call through it would fight any local shadowing the extractor cannot
-// see.
-func juliaCollectImportAliases(n *sitter.Node, src []byte, modulePath string, out map[string]string) {
+// Module renames (`import M as A`) are keyed by the module the statement
+// appears in, so handleCall can rewrite a qualified callee onto the module
+// it actually names. Only MODULE aliases are collected: a renamed binding
+// inside a selected list (`import Foo: bar as baz`) renames a function,
+// and rewriting a bare call through it would fight any local shadowing the
+// extractor cannot see.
+//
+// Declared type names are keyed the same way, because a callable named
+// after a type is that type's constructor and outer constructors are
+// routinely written ABOVE the struct they build. Without knowing that up
+// front, such a constructor was minted as a plain function on the type's
+// own canonical id, and the struct that followed was demoted to a
+// line-suffixed one.
+func juliaPrescan(n *sitter.Node, src []byte, modulePath string, st *juliaWalkState) {
 	switch n.Type() {
 	case "using_statement", "import_statement":
 		for c := range n.NamedChildren() {
@@ -825,10 +849,20 @@ func juliaCollectImportAliases(n *sitter.Node, src []byte, modulePath string, ou
 				continue
 			}
 			if module, alias := juliaAliasParts(c, src); module != "" && alias != "" && alias != module {
-				out[juliaTypeKey(modulePath, alias)] = module
+				st.importAliases[juliaTypeKey(modulePath, alias)] = module
 			}
 		}
 		return
+	case "struct_definition", "abstract_definition", "primitive_definition":
+		for c := range n.NamedChildren() {
+			if c.Type() != "type_head" {
+				continue
+			}
+			if name, _ := juliaTypeHeadInfo(c, src); name != "" {
+				st.declaredTypes[juliaTypeKey(modulePath, name)] = true
+			}
+			break
+		}
 	case "module_definition":
 		if nn := n.ChildByFieldName("name"); nn != nil && nn.Content(src) != "" {
 			if modulePath == "" {
@@ -839,7 +873,7 @@ func juliaCollectImportAliases(n *sitter.Node, src []byte, modulePath string, ou
 		}
 	}
 	for c := range n.NamedChildren() {
-		juliaCollectImportAliases(c, src, modulePath, out)
+		juliaPrescan(c, src, modulePath, st)
 	}
 }
 

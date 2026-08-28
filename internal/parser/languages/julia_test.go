@@ -417,6 +417,65 @@ end
 	}
 }
 
+// Julia does not require a struct to precede the constructors that build
+// it, and a macro sharing a type's name is not a constructor at all —
+// `macro Tag` defines `@Tag`, a name in a disjoint namespace.
+func TestJuliaExtractor_ConstructorRecognitionEdges(t *testing.T) {
+	src := []byte(`Box(x) = make_box(x)
+
+struct Box
+    x::Int
+end
+
+Box(x, y) = make_box2(x, y)
+
+struct Tag
+    v::Int
+end
+
+macro Tag(x)
+    x
+end
+`)
+	res, err := NewJuliaExtractor().Extract("fw.jl", src)
+	require.NoError(t, err)
+
+	nodes := map[string]*graph.Node{}
+	for _, n := range res.Nodes {
+		nodes[n.ID] = n
+	}
+	owners := juliaOwners(res.Edges)
+
+	// The TYPE keeps the canonical id even though a constructor was
+	// written above it.
+	box := nodes["fw.jl::Box"]
+	require.NotNil(t, box, "the struct must keep the canonical id")
+	assert.Equal(t, graph.KindType, box.Kind)
+	require.NotNil(t, nodes["fw.jl::Box.x"], "and so must its field")
+
+	var ctors int
+	for _, n := range res.Nodes {
+		if n.Kind == graph.KindMethod && strings.HasPrefix(n.ID, "fw.jl::Box.<init>") {
+			ctors++
+			assert.True(t, owners[n.ID]["fw.jl::Box"], "%s must belong to Box", n.ID)
+		}
+	}
+	assert.Equal(t, 2, ctors, "the constructor above the struct counts too")
+
+	// The macro is a macro, not Tag's constructor.
+	_, tagCtor := nodes["fw.jl::Tag.<init>"]
+	assert.False(t, tagCtor, "a macro must never be read as a constructor")
+	var macroNode *graph.Node
+	for _, n := range res.Nodes {
+		if n.Name == "Tag" && n.Meta["macro"] == true {
+			macroNode = n
+		}
+	}
+	require.NotNil(t, macroNode, "the macro must survive as its own node")
+	assert.Equal(t, graph.KindFunction, macroNode.Kind)
+	assert.False(t, owners[macroNode.ID]["fw.jl::Tag"])
+}
+
 // A nested module contributes its full dotted path, and a constructor
 // binds to the type declared in its own module rather than to a
 // same-named type in a sibling one.
