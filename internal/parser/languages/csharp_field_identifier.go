@@ -87,7 +87,8 @@ func emitCSharpFieldIdentifierUses(
 	calls []csharpDeferredCall, accesses []csharpDeferredAccess,
 	fieldAssigns []csharpDeferredFieldAssign,
 	src []byte, filePath string, funcRanges *csharpFuncLookup,
-	paramsByOwner, localNamesByOwner map[string]map[string]bool,
+	paramsByOwner map[string]map[string]bool,
+	localScopes csharpLocalScopes,
 	builtinsByOwner map[string]map[string]string,
 	result *parser.ExtractionResult,
 ) {
@@ -107,7 +108,11 @@ func emitCSharpFieldIdentifierUses(
 		if ownerType == "" || !fieldsByType[ownerType][name] {
 			return "", "", false
 		}
-		if paramsByOwner[owner][name] || localNamesByOwner[owner][name] ||
+		// This emitter's three input buffers do not all carry a byte
+		// offset, so it asks the function-wide question. That is the
+		// pre-extent behavior and stays conservative: it can only
+		// withhold a read edge, never invent one.
+		if paramsByOwner[owner][name] || localScopes.shadowsAnywhere(owner, name) ||
 			builtinsByOwner[owner][name] != "" {
 			return "", "", false
 		}

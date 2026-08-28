@@ -186,6 +186,11 @@ type csharpDeferredCall struct {
 	// keyword itself never appears in any tenv.
 	recvType string
 	line     int
+	// offset is the call expression's start byte. A line number cannot
+	// say which side of a block boundary a call falls on, and cannot
+	// separate two sites that share one physical line; a scope test
+	// needs a coordinate that can.
+	offset int
 	isMember bool
 	// returnUsage is how the call site consumes the return value
 	// (graph.ReturnUsage* label), classified at capture time and
@@ -207,6 +212,9 @@ type csharpDeferredCall struct {
 func withCSharpCallArity(c csharpDeferredCall, inv *sitter.Node) csharpDeferredCall {
 	c.argCount, c.argKnown = csharpCallArgCount(inv)
 	c.typeArgCount, c.typeArgKnown = csharpCallTypeArgCount(inv)
+	if inv != nil {
+		c.offset = int(inv.StartByte())
+	}
 	return c
 }
 
@@ -219,6 +227,53 @@ type csharpDeferredLocal struct {
 	name    string
 	rawType string
 	defNode *sitter.Node
+}
+
+// csharpLocalScope is one local declaration's binding extent: the byte
+// range of the block that declares it. A local shadows a same-named
+// field only inside that range — a name declared in a nested block that
+// has already closed binds nothing at a later call site, and refusing
+// evidence there costs the site its receiver spelling for no reason.
+type csharpLocalScope struct {
+	start, end int
+}
+
+// csharpLocalScopes indexes each function's declared local names by the
+// extents that declare them. It replaces a flat name set: the set could
+// only answer "declared somewhere in this function", which is not the
+// question a shadow test asks.
+type csharpLocalScopes map[string]map[string][]csharpLocalScope
+
+// shadows reports whether a local declared in owner and named name is in
+// scope at offset.
+func (s csharpLocalScopes) shadows(owner, name string, offset int) bool {
+	for _, sc := range s[owner][name] {
+		if offset >= sc.start && offset < sc.end {
+			return true
+		}
+	}
+	return false
+}
+
+// shadowsAnywhere is the function-wide question, for consumers whose
+// sites carry no byte offset. It is the pre-extent behavior, kept
+// deliberately: answering a narrower question without a real coordinate
+// would open a hole rather than close one.
+func (s csharpLocalScopes) shadowsAnywhere(owner, name string) bool {
+	return len(s[owner][name]) > 0
+}
+
+// csharpLocalScopeOf returns the extent of the block declaring a local.
+// A declaration with no enclosing block gets an unbounded extent, which
+// keeps its refusal function-wide — exactly what every local had before
+// extents existed, so an unrecognized shape can never lose a refusal.
+func csharpLocalScopeOf(n *sitter.Node) csharpLocalScope {
+	for cur := n; cur != nil; cur = cur.Parent() {
+		if cur.Type() == "block" {
+			return csharpLocalScope{start: int(cur.StartByte()), end: int(cur.EndByte())}
+		}
+	}
+	return csharpLocalScope{start: 0, end: math.MaxInt}
 }
 
 // csharpTypeUse buffers a type referenced only in a local-variable
@@ -678,21 +733,22 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 	// honor its contract ("a receiver no local, param or builtin
 	// explains"): a bare receiver naming a declared parameter or local is
 	// that value — never the enclosing type's same-named field, never a
-	// static class. Locals ride the tenv only when typed; the name sets
-	// cover every declaration. The field-identifier emitter reuses both.
+	// static class. Locals ride the tenv only when typed; the scope index
+	// covers every declaration, and covers it where it actually binds.
+	// The field-identifier emitter reuses both.
 	paramsByOwner := csharpParamNamesByOwner(result)
-	localNamesByOwner := map[string]map[string]bool{}
+	localScopes := csharpLocalScopes{}
 	for _, l := range locals {
 		owner := localOwner(l)
 		if owner == "" {
 			continue
 		}
-		m := localNamesByOwner[owner]
+		m := localScopes[owner]
 		if m == nil {
-			m = map[string]bool{}
-			localNamesByOwner[owner] = m
+			m = map[string][]csharpLocalScope{}
+			localScopes[owner] = m
 		}
-		m[l.name] = true
+		m[l.name] = append(m[l.name], csharpLocalScopeOf(l.defNode))
 	}
 
 	for _, c := range calls {
@@ -743,7 +799,7 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 				}
 			} else if c.receiver != "" &&
 				!paramsByOwner[callerID][c.receiver] &&
-				!localNamesByOwner[callerID][c.receiver] {
+				!localScopes.shadows(callerID, c.receiver, c.offset) {
 				// A bare receiver nothing above could type, and no
 				// parameter or local declares its name. Its spelling is
 				// still evidence: a receiver that names a static class is
@@ -820,7 +876,7 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 	// alone holds only the typed ones), parameters, and builtin-typed
 	// locals.
 	emitCSharpFieldIdentifierUses(calls, accesses, fieldAssigns, src,
-		filePath, funcRanges, paramsByOwner, localNamesByOwner, builtinsByOwner, result)
+		filePath, funcRanges, paramsByOwner, localScopes, builtinsByOwner, result)
 
 	// .NET surfaces a symbol walk misses: DI registrations + COM
 	// interop. Stamped onto the file node.
