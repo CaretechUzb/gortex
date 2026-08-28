@@ -474,6 +474,73 @@ end
 // it makes every field an `assignment` node whose left-hand side is the
 // declaration. A field scanner that recognised only `x::T` and `x` saw a
 // @kwdef struct as having no fields at all.
+// `import X as A` binds in the module it appears in. One file routinely
+// gives the same short nickname to different packages in different
+// modules, so a file-global alias map lets the last one win and rewrites
+// the earlier module's calls to a package they never touch. And a
+// submodule does NOT inherit its parent's bindings, so a definition
+// inside it that happens to share a name with an outer type is an
+// independent function, not that type's constructor.
+func TestJuliaExtractor_ModuleScopedAliasesAndTypes(t *testing.T) {
+	src := []byte(`module Plotting
+import Plots as P
+render(x) = P.plot(x)
+end
+
+module Reporting
+import PrettyTables as P
+show_it(x) = P.pretty_table(x)
+end
+
+module Outer
+
+struct Thing
+    v::Int
+end
+
+module Inner
+function Thing(x)
+    build(x)
+end
+end
+
+end
+`)
+	res, err := NewJuliaExtractor().Extract("sc.jl", src)
+	require.NoError(t, err)
+
+	calls := map[string]string{}
+	for _, ed := range res.Edges {
+		if ed.Kind == graph.EdgeCalls {
+			calls[ed.From] = ed.To
+		}
+	}
+	assert.Equal(t, "unresolved::Plots.plot", calls["sc.jl::render"],
+		"an alias declared in another module must not rewrite this call")
+	assert.Equal(t, "unresolved::PrettyTables.pretty_table", calls["sc.jl::show_it"])
+
+	nodes := map[string]*graph.Node{}
+	for _, n := range res.Nodes {
+		nodes[n.ID] = n
+	}
+	require.NotNil(t, nodes["sc.jl::Thing"], "the outer struct keeps its id")
+	_, isCtor := nodes["sc.jl::Thing.<init>"]
+	assert.False(t, isCtor,
+		"a submodule does not inherit the parent's types, so this is not a constructor")
+
+	var inner *graph.Node
+	for _, n := range res.Nodes {
+		if n.Name == "Thing" && n.Kind == graph.KindFunction {
+			inner = n
+		}
+	}
+	require.NotNil(t, inner, "the submodule definition must survive as a plain function")
+	assert.Equal(t, "Outer.Inner", inner.Meta["scope_mod"])
+	owners := juliaOwners(res.Edges)
+	assert.False(t, owners[inner.ID]["sc.jl::Thing"],
+		"it must not claim membership of the outer type")
+}
+
 func TestJuliaExtractor_KwdefStructFields(t *testing.T) {
 	src := []byte(`Base.@kwdef struct Config
     host::String = "localhost"

@@ -97,9 +97,13 @@ type juliaWalkState struct {
 	// constructor and attributed to the RIGHT type when one file declares
 	// two same-named types in different modules.
 	types map[string]string
-	// importAliases maps a local module alias to the module it renames
-	// (`import Foo as F` → F→Foo), so a qualified call can name the
-	// module the resolver can find rather than a file-local nickname.
+	// importAliases maps a module scope + local alias to the module it
+	// renames (`import Foo as F` inside `module A` → A/F→Foo), so a
+	// qualified call can name the module the resolver can find rather
+	// than a file-local nickname. Keyed by scope because `import ... as`
+	// binds in the module it appears in, and one file routinely holds
+	// several modules giving the same short nickname to different
+	// packages.
 	importAliases map[string]string
 }
 
@@ -132,7 +136,7 @@ func (e *JuliaExtractor) Extract(filePath string, src []byte) (*parser.Extractio
 	// Aliases are collected up front: the emitting walk is a single
 	// forward pass, and Julia does not require `import ... as ...` to
 	// precede the code that uses the alias.
-	juliaCollectImportAliases(root, src, st.importAliases)
+	juliaCollectImportAliases(root, src, "", st.importAliases)
 	e.walk(root, src, juliaScope{}, st)
 	return result, nil
 }
@@ -281,23 +285,18 @@ func (e *JuliaExtractor) handleModule(n *sitter.Node, src []byte, scope juliaSco
 // a same-named type in a sibling module of the same file.
 func juliaTypeKey(modulePath, name string) string { return modulePath + "\x00" + name }
 
-// lookupType finds the type a definition name would construct, searching
-// the current module then each enclosing one out to file scope — Julia's
-// own lexical lookup order.
+// lookupType finds the type a definition name would construct, in the
+// SAME module only. A Julia submodule does not inherit its parent's
+// bindings — each module starts with the implicit `using Base` and
+// nothing else — so `Outer.Inner.Thing` is an independent generic
+// function, not a constructor for `Outer.Thing`, unless it was imported
+// explicitly. Searching outward would fabricate a member_of edge into a
+// type the definition has no relationship with.
 func (st *juliaWalkState) lookupType(modulePath, name string) (id, declared string, ok bool) {
-	for path := modulePath; ; {
-		if id, hit := st.types[juliaTypeKey(path, name)]; hit {
-			return id, name, true
-		}
-		if path == "" {
-			return "", "", false
-		}
-		if i := strings.LastIndex(path, "."); i >= 0 {
-			path = path[:i]
-		} else {
-			path = ""
-		}
+	if id, hit := st.types[juliaTypeKey(modulePath, name)]; hit {
+		return id, name, true
 	}
+	return "", "", false
 }
 
 // juliaTypeHeadInfo decodes a `type_head` child: the declared name
@@ -773,25 +772,38 @@ func juliaAliasParts(n *sitter.Node, src []byte) (orig, alias string) {
 }
 
 // juliaCollectImportAliases records every `import M as A` / `using M as A`
-// module rename in the file, so handleCall can rewrite a qualified callee
-// onto the module it actually names. Only MODULE aliases are collected: a
-// renamed binding inside a selected list (`import Foo: bar as baz`)
-// renames a function, and rewriting a bare call through it would fight
-// any local shadowing the extractor cannot see.
-func juliaCollectImportAliases(n *sitter.Node, src []byte, out map[string]string) {
-	if n.Type() == "using_statement" || n.Type() == "import_statement" {
+// module rename in the file, keyed by the module the statement appears in,
+// so handleCall can rewrite a qualified callee onto the module it actually
+// names. The pre-pass exists because the emitting walk is a single forward
+// pass and Julia does not require the import to precede its use.
+//
+// Only MODULE aliases are collected: a renamed binding inside a selected
+// list (`import Foo: bar as baz`) renames a function, and rewriting a bare
+// call through it would fight any local shadowing the extractor cannot
+// see.
+func juliaCollectImportAliases(n *sitter.Node, src []byte, modulePath string, out map[string]string) {
+	switch n.Type() {
+	case "using_statement", "import_statement":
 		for c := range n.NamedChildren() {
 			if c.Type() != "import_alias" {
 				continue
 			}
 			if module, alias := juliaAliasParts(c, src); module != "" && alias != "" && alias != module {
-				out[alias] = module
+				out[juliaTypeKey(modulePath, alias)] = module
 			}
 		}
 		return
+	case "module_definition":
+		if nn := n.ChildByFieldName("name"); nn != nil && nn.Content(src) != "" {
+			if modulePath == "" {
+				modulePath = nn.Content(src)
+			} else {
+				modulePath += "." + nn.Content(src)
+			}
+		}
 	}
 	for c := range n.NamedChildren() {
-		juliaCollectImportAliases(c, src, out)
+		juliaCollectImportAliases(c, src, modulePath, out)
 	}
 }
 
@@ -953,8 +965,11 @@ func (e *JuliaExtractor) handleCall(n *sitter.Node, src []byte, scope juliaScope
 	if receiver != "" {
 		// `import Foo as F` then `F.process(x)`: name the module, not
 		// the file-local nickname, so the call target is something
-		// another file's `module Foo` can be matched against.
-		if module, ok := st.importAliases[receiver]; ok {
+		// another file's `module Foo` can be matched against. The alias
+		// is looked up in the module that declared it — a sibling module
+		// binding the same nickname to a different package must not
+		// rewrite this call.
+		if module, ok := st.importAliases[juliaTypeKey(scope.modulePath, receiver)]; ok {
 			receiver = module
 		}
 		target = receiver + "." + name
