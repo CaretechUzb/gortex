@@ -796,6 +796,30 @@ import Base: + as plus, -
 		"and the selected names are still recorded on it")
 }
 
+// An export list can export a macro (`export @m`) and an operator
+// (`export ⊗`) — a macro_identifier node and an operator node, the same
+// distinction import selections already decode — so an identifier-only
+// scan dropped them from the module's recorded public surface.
+func TestJuliaExtractor_MacroAndOperatorExports(t *testing.T) {
+	src := []byte(`module Ops
+export apply, @m, ⊗
+end
+`)
+	res, err := NewJuliaExtractor().Extract("exports.jl", src)
+	require.NoError(t, err)
+
+	mod := map[string]*graph.Node{}
+	for _, n := range res.Nodes {
+		mod[n.ID] = n
+	}
+	m := mod["exports.jl::Ops"]
+	require.NotNil(t, m)
+	exports, ok := m.Meta["exports"].([]string)
+	require.True(t, ok, "module Meta exports missing")
+	assert.ElementsMatch(t, []string{"apply", "@m", "⊗"}, exports,
+		"a module's exported macros and operators are part of its public surface")
+}
+
 func TestJuliaExtractor_Calls(t *testing.T) {
 	src := []byte(`module Calls
 

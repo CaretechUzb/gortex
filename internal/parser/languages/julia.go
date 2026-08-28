@@ -1145,7 +1145,14 @@ func (e *JuliaExtractor) handleExport(n *sitter.Node, src []byte, scope juliaSco
 	}
 	names := []string{}
 	for c := range n.NamedChildren() {
-		if c.Type() == "identifier" {
+		// `export apply, @m, ⊗` exports a function, a macro and an
+		// operator: a macro name is a macro_identifier node and an
+		// operator an operator node — the same distinction import
+		// lists already decode (`using Base: @time, +`). Record them
+		// verbatim (@m, ⊗) so the module's public surface keeps its
+		// macro and operator names.
+		switch c.Type() {
+		case "identifier", "operator", "macro_identifier":
 			names = append(names, c.Content(src))
 		}
 	}
