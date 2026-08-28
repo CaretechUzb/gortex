@@ -1,6 +1,7 @@
 package languages
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -269,6 +270,204 @@ end
 	exports, ok := mod.Meta["exports"].([]string)
 	require.True(t, ok, "module Meta exports missing")
 	assert.ElementsMatch(t, []string{"area", "Circle"}, exports)
+}
+
+// juliaOwners maps each node to the set of member_of targets it carries.
+// A method or constructor inside a module has TWO owners — its type and
+// its module — so a last-write-wins map would silently pick one.
+func juliaOwners(edges []*graph.Edge) map[string]map[string]bool {
+	out := map[string]map[string]bool{}
+	for _, ed := range edges {
+		if ed.Kind != graph.EdgeMemberOf {
+			continue
+		}
+		if out[ed.From] == nil {
+			out[ed.From] = map[string]bool{}
+		}
+		out[ed.From][ed.To] = true
+	}
+	return out
+}
+
+// One file, two modules, one name. Node ids stay flat (the house
+// convention — folding the module in would break the owner derivation
+// that cuts a method id at its last dot), so both definitions have to
+// separate through the shared line-suffix helper and carry their module
+// on Meta["scope_mod"]. Before this, the second definition was dropped
+// AND its body's calls were re-parented onto the first, so the surviving
+// node reported calls it does not make.
+func TestJuliaExtractor_SameNameAcrossModulesBothSurvive(t *testing.T) {
+	src := []byte(`module A
+f() = from_a()
+
+struct S
+    a::Int
+end
+end
+
+module B
+f() = from_b()
+
+struct S
+    b::Int
+end
+end
+`)
+	res, err := NewJuliaExtractor().Extract("dup.jl", src)
+	require.NoError(t, err)
+
+	nodes := map[string]*graph.Node{}
+	for _, n := range res.Nodes {
+		nodes[n.ID] = n
+	}
+
+	first, second := nodes["dup.jl::f"], nodes["dup.jl::f_L10"]
+	require.NotNil(t, first, "the first f must keep the clean id")
+	require.NotNil(t, second, "the second f must survive under a disambiguated id")
+	assert.Equal(t, "A", first.Meta["scope_mod"])
+	assert.Equal(t, "B", second.Meta["scope_mod"])
+
+	calls := map[string]string{}
+	for _, ed := range res.Edges {
+		if ed.Kind == graph.EdgeCalls {
+			calls[ed.To] = ed.From
+		}
+	}
+	owners := juliaOwners(res.Edges)
+	assert.Equal(t, "dup.jl::f", calls["unresolved::from_a"])
+	assert.Equal(t, "dup.jl::f_L10", calls["unresolved::from_b"],
+		"each definition must own the calls in its own body")
+	assert.True(t, owners["dup.jl::f"]["dup.jl::A"])
+	assert.True(t, owners["dup.jl::f_L10"]["dup.jl::B"])
+
+	// Same for the two structs, and each field must point at its own.
+	require.NotNil(t, nodes["dup.jl::S"])
+	require.NotNil(t, nodes["dup.jl::S_L12"])
+	require.NotNil(t, nodes["dup.jl::S.a"])
+	require.NotNil(t, nodes["dup.jl::S_L12.b"])
+	assert.True(t, owners["dup.jl::S.a"]["dup.jl::S"])
+	assert.True(t, owners["dup.jl::S_L12.b"]["dup.jl::S_L12"],
+		"a field must belong to its own struct, not to whichever came first")
+}
+
+// Julia has no constructor keyword: a callable named after a type IS that
+// type's constructor. Sharing the type's id meant the type node swallowed
+// every constructor and — worse — adopted the calls in their bodies, so
+// `struct Box` reported calling `make_box`. Constructors take the
+// cross-language `<Type>.<init>` spelling instead.
+func TestJuliaExtractor_ConstructorsAreDistinctFromTheirType(t *testing.T) {
+	src := []byte(`struct Box
+    x::Int
+    Box(x) = new(check(x))
+    function Box()
+        new(0)
+    end
+end
+
+Box(x, y) = make_box(x, y)
+
+function Box(x, y, z)
+    make_box3(x, y, z)
+end
+`)
+	res, err := NewJuliaExtractor().Extract("ctor.jl", src)
+	require.NoError(t, err)
+
+	nodes := map[string]*graph.Node{}
+	for _, n := range res.Nodes {
+		nodes[n.ID] = n
+	}
+	boxType := nodes["ctor.jl::Box"]
+	require.NotNil(t, boxType, "the struct itself must still be a type node")
+	assert.Equal(t, graph.KindType, boxType.Kind)
+
+	// Four constructors: inner short, inner long, outer short, outer long.
+	var ctors []*graph.Node
+	for _, n := range res.Nodes {
+		if n.Kind == graph.KindMethod && strings.HasPrefix(n.ID, "ctor.jl::Box.<init>") {
+			ctors = append(ctors, n)
+		}
+	}
+	require.Len(t, ctors, 4, "every constructor form needs its own node")
+	for _, n := range ctors {
+		assert.Equal(t, "Box.<init>", n.Name)
+		assert.Equal(t, "Box", n.Meta["receiver"])
+	}
+
+	owners := juliaOwners(res.Edges)
+	callers := map[string]string{}
+	for _, ed := range res.Edges {
+		if ed.Kind == graph.EdgeCalls {
+			callers[ed.To] = ed.From
+		}
+	}
+	for _, n := range ctors {
+		assert.True(t, owners[n.ID]["ctor.jl::Box"], "%s must belong to Box", n.ID)
+	}
+
+	// Constructor bodies must attribute to the constructor, never to the
+	// type node.
+	for _, target := range []string{"unresolved::check", "unresolved::make_box", "unresolved::make_box3"} {
+		from := callers[target]
+		require.NotEmpty(t, from, "missing call to %s", target)
+		assert.NotEqual(t, "ctor.jl::Box", from,
+			"a constructor body's calls must not be attributed to the type node")
+		assert.True(t, strings.HasPrefix(from, "ctor.jl::Box.<init>"),
+			"%s should be called by a constructor, got %s", target, from)
+	}
+}
+
+// A nested module contributes its full dotted path, and a constructor
+// binds to the type declared in its own module rather than to a
+// same-named type in a sibling one.
+func TestJuliaExtractor_NestedModuleScope(t *testing.T) {
+	src := []byte(`module Outer
+
+module Inner
+struct Node
+    v::Int
+end
+Node(v) = build_inner(v)
+end
+
+struct Node
+    w::Int
+end
+Node(w) = build_outer(w)
+
+end
+`)
+	res, err := NewJuliaExtractor().Extract("nest.jl", src)
+	require.NoError(t, err)
+
+	nodes := map[string]*graph.Node{}
+	for _, n := range res.Nodes {
+		nodes[n.ID] = n
+	}
+	require.NotNil(t, nodes["nest.jl::Inner"])
+	assert.Equal(t, "Outer", nodes["nest.jl::Inner"].Meta["scope_mod"])
+	require.NotNil(t, nodes["nest.jl::Node"])
+	assert.Equal(t, "Outer.Inner", nodes["nest.jl::Node"].Meta["scope_mod"])
+	require.NotNil(t, nodes["nest.jl::Node_L10"])
+	assert.Equal(t, "Outer", nodes["nest.jl::Node_L10"].Meta["scope_mod"])
+
+	owners := juliaOwners(res.Edges)
+	callers := map[string]string{}
+	for _, ed := range res.Edges {
+		if ed.Kind == graph.EdgeCalls {
+			callers[ed.To] = ed.From
+		}
+	}
+	inner := callers["unresolved::build_inner"]
+	outer := callers["unresolved::build_outer"]
+	require.NotEmpty(t, inner)
+	require.NotEmpty(t, outer)
+	assert.True(t, owners[inner]["nest.jl::Node"],
+		"the inner module's constructor must belong to the inner module's type")
+	assert.True(t, owners[outer]["nest.jl::Node_L10"],
+		"the outer module's constructor must belong to the outer module's type")
+	assert.False(t, owners[outer]["nest.jl::Node"],
+		"it must NOT bind to the same-named type in the nested module")
 }
 
 func TestJuliaExtractor_Imports(t *testing.T) {

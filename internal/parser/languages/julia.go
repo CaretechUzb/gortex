@@ -29,6 +29,13 @@ import (
 //     module's `export` list; definitions inside get EdgeMemberOf
 //   - `const X = ...` constants (KindVariable)
 //
+// Node ids stay flat (`<file>::<Name>`, `<file>::<Owner>.<member>`) as in
+// every other extractor; the enclosing module rides on
+// Meta["scope_mod"], and two definitions that would share an id separate
+// through the shared line-suffix helper. A callable named after a type is
+// that type's constructor and takes the cross-language `<Type>.<init>`
+// spelling.
+//
 // Imports: `using M`, `using M: a, b`, `import M`, `import M as Alias`,
 // dotted and relative import paths (`A.B`, `.Local`, `..Up`), and
 // `include("file.jl")` — all as EdgeImports to
@@ -62,7 +69,16 @@ func (e *JuliaExtractor) Extensions() []string { return []string{".jl"} }
 // module (for EdgeMemberOf and export attachment) and the innermost
 // function-like definition (for call attribution).
 type juliaScope struct {
-	moduleID     string
+	moduleID string
+	// modulePath is the dotted lexical module path (`Outer.Inner`). Node
+	// ids stay flat — see emitCallable — and the path rides on
+	// Meta["scope_mod"], the convention the Rust extractor established
+	// for exactly this shape.
+	modulePath string
+	// typeID / typeName name the struct whose body is being walked, so an
+	// inner constructor can be attributed to it.
+	typeID       string
+	typeName     string
 	functionID   string
 	functionName string
 	functionRecv string
@@ -74,6 +90,11 @@ type juliaWalkState struct {
 	result   *parser.ExtractionResult
 	seen     map[string]bool
 	nodes    map[string]*graph.Node
+	// types maps a lexical scope + declared type name to the minted type
+	// id, so a definition that shares a type's name is recognised as its
+	// constructor and attributed to the RIGHT type when one file declares
+	// two same-named types in different modules.
+	types map[string]string
 	// importAliases maps a local module alias to the module it renames
 	// (`import Foo as F` → F→Foo), so a qualified call can name the
 	// module the resolver can find rather than a file-local nickname.
@@ -103,6 +124,7 @@ func (e *JuliaExtractor) Extract(filePath string, src []byte) (*parser.Extractio
 		result:        result,
 		seen:          make(map[string]bool),
 		nodes:         map[string]*graph.Node{filePath: fileNode},
+		types:         map[string]string{},
 		importAliases: map[string]string{},
 	}
 	// Aliases are collected up front: the emitting walk is a single
@@ -182,29 +204,67 @@ func (e *JuliaExtractor) handleModule(n *sitter.Node, src []byte, scope juliaSco
 	}
 	inner := scope
 	if name != "" {
-		id := st.filePath + "::" + name
-		if !st.seen[id] {
-			st.seen[id] = true
+		line := int(n.StartPoint().Row) + 1
+		id, minted := disambiguateID(st.seen, st.filePath+"::"+name, line)
+		if minted {
 			node := &graph.Node{
 				ID: id, Kind: graph.KindType, Name: name,
 				FilePath:  st.filePath,
-				StartLine: int(n.StartPoint().Row) + 1,
+				StartLine: line,
 				EndLine:   int(n.EndPoint().Row) + 1,
 				Language:  "julia",
 			}
+			meta := map[string]any{}
 			if doc != "" {
-				node.Meta = map[string]any{"doc": doc}
+				meta["doc"] = doc
+			}
+			if scope.modulePath != "" {
+				meta["scope_mod"] = scope.modulePath
+			}
+			if len(meta) > 0 {
+				node.Meta = meta
 			}
 			st.result.Nodes = append(st.result.Nodes, node)
 			st.nodes[id] = node
 			st.result.Edges = append(st.result.Edges, &graph.Edge{
 				From: st.fileNode.ID, To: id, Kind: graph.EdgeDefines,
-				FilePath: st.filePath, Line: int(n.StartPoint().Row) + 1,
+				FilePath: st.filePath, Line: line,
 			})
 		}
 		inner.moduleID = id
+		inner.modulePath = name
+		if scope.modulePath != "" {
+			inner.modulePath = scope.modulePath + "." + name
+		}
+		// A module body opens a fresh type scope: a struct declared
+		// outside it does not own a constructor declared inside.
+		inner.typeID, inner.typeName = "", ""
 	}
 	e.walk(n, src, inner, st)
+}
+
+// juliaTypeKey keys the file's type table by lexical module path, so a
+// constructor binds to the type declared in its own module rather than to
+// a same-named type in a sibling module of the same file.
+func juliaTypeKey(modulePath, name string) string { return modulePath + "\x00" + name }
+
+// lookupType finds the type a definition name would construct, searching
+// the current module then each enclosing one out to file scope — Julia's
+// own lexical lookup order.
+func (st *juliaWalkState) lookupType(modulePath, name string) (id, declared string, ok bool) {
+	for path := modulePath; ; {
+		if id, hit := st.types[juliaTypeKey(path, name)]; hit {
+			return id, name, true
+		}
+		if path == "" {
+			return "", "", false
+		}
+		if i := strings.LastIndex(path, "."); i >= 0 {
+			path = path[:i]
+		} else {
+			path = ""
+		}
+	}
 }
 
 // juliaTypeHeadInfo decodes a `type_head` child: the declared name
@@ -285,49 +345,61 @@ func (e *JuliaExtractor) handleType(n *sitter.Node, src []byte, scope juliaScope
 		return
 	}
 
-	id := st.filePath + "::" + name
-	if !st.seen[id] {
-		st.seen[id] = true
-		node := &graph.Node{
-			ID: id, Kind: graph.KindType, Name: name,
-			FilePath:  st.filePath,
-			StartLine: int(n.StartPoint().Row) + 1,
-			EndLine:   int(n.EndPoint().Row) + 1,
-			Language:  "julia",
+	line := int(n.StartPoint().Row) + 1
+	id, minted := disambiguateID(st.seen, st.filePath+"::"+name, line)
+	if !minted {
+		e.walk(n, src, scope, st)
+		return
+	}
+	node := &graph.Node{
+		ID: id, Kind: graph.KindType, Name: name,
+		FilePath:  st.filePath,
+		StartLine: line,
+		EndLine:   int(n.EndPoint().Row) + 1,
+		Language:  "julia",
+	}
+	meta := map[string]any{}
+	if doc != "" {
+		meta["doc"] = doc
+	}
+	if scope.modulePath != "" {
+		meta["scope_mod"] = scope.modulePath
+	}
+	if len(meta) > 0 {
+		node.Meta = meta
+	}
+	st.result.Nodes = append(st.result.Nodes, node)
+	st.nodes[id] = node
+	st.types[juliaTypeKey(scope.modulePath, name)] = id
+	st.result.Edges = append(st.result.Edges, &graph.Edge{
+		From: st.fileNode.ID, To: id, Kind: graph.EdgeDefines,
+		FilePath: st.filePath, Line: line,
+	})
+	if super != "" {
+		bare := super
+		if idx := strings.IndexAny(bare, "{"); idx > 0 {
+			bare = bare[:idx]
 		}
-		if doc != "" {
-			node.Meta = map[string]any{"doc": doc}
+		edge := &graph.Edge{
+			From: id, To: "unresolved::" + bare, Kind: graph.EdgeExtends,
+			FilePath: st.filePath, Line: line,
 		}
-		st.result.Nodes = append(st.result.Nodes, node)
-		st.nodes[id] = node
+		if super != bare {
+			edge.Meta = map[string]any{"base_path": super}
+		}
+		st.result.Edges = append(st.result.Edges, edge)
+	}
+	if scope.moduleID != "" {
 		st.result.Edges = append(st.result.Edges, &graph.Edge{
-			From: st.fileNode.ID, To: id, Kind: graph.EdgeDefines,
-			FilePath: st.filePath, Line: int(n.StartPoint().Row) + 1,
+			From: id, To: scope.moduleID, Kind: graph.EdgeMemberOf,
+			FilePath: st.filePath, Line: line,
 		})
-		if super != "" {
-			bare := super
-			if idx := strings.IndexAny(bare, "{"); idx > 0 {
-				bare = bare[:idx]
-			}
-			edge := &graph.Edge{
-				From: id, To: "unresolved::" + bare, Kind: graph.EdgeExtends,
-				FilePath: st.filePath, Line: int(n.StartPoint().Row) + 1,
-			}
-			if super != bare {
-				edge.Meta = map[string]any{"base_path": super}
-			}
-			st.result.Edges = append(st.result.Edges, edge)
-		}
-		if scope.moduleID != "" {
-			st.result.Edges = append(st.result.Edges, &graph.Edge{
-				From: id, To: scope.moduleID, Kind: graph.EdgeMemberOf,
-				FilePath: st.filePath, Line: int(n.StartPoint().Row) + 1,
-			})
-		}
 	}
 
 	// Struct fields: typed_expression (`x::T`) or bare identifier
-	// members at the top level of the struct body.
+	// members at the top level of the struct body. This runs only for a
+	// struct THIS call minted, so a struct whose name collides with an
+	// earlier declaration cannot hang its fields off that other node.
 	if n.Type() == "struct_definition" {
 		for c := range n.NamedChildren() {
 			if c.Type() == "type_head" {
@@ -345,26 +417,28 @@ func (e *JuliaExtractor) handleType(n *sitter.Node, src []byte, scope juliaScope
 			if fieldName == "" {
 				continue
 			}
-			fid := id + "." + fieldName
-			if st.seen[fid] {
+			fieldLine := int(c.StartPoint().Row) + 1
+			fid, fieldMinted := disambiguateID(st.seen, id+"."+fieldName, fieldLine)
+			if !fieldMinted {
 				continue
 			}
-			st.seen[fid] = true
 			st.result.Nodes = append(st.result.Nodes, &graph.Node{
 				ID: fid, Kind: graph.KindField, Name: fieldName,
 				FilePath:  st.filePath,
-				StartLine: int(c.StartPoint().Row) + 1,
+				StartLine: fieldLine,
 				EndLine:   int(c.EndPoint().Row) + 1,
 				Language:  "julia",
 			})
 			st.result.Edges = append(st.result.Edges, &graph.Edge{
 				From: fid, To: id, Kind: graph.EdgeMemberOf,
-				FilePath: st.filePath, Line: int(c.StartPoint().Row) + 1,
+				FilePath: st.filePath, Line: fieldLine,
 			})
 		}
 	}
 
-	e.walk(n, src, scope, st)
+	inner := scope
+	inner.typeID, inner.typeName = id, name
+	e.walk(n, src, inner, st)
 }
 
 // juliaCalleeName decodes a call callee: bare identifier or qualified
@@ -438,56 +512,7 @@ func (e *JuliaExtractor) handleFunction(n *sitter.Node, src []byte, scope juliaS
 
 	inner := scope
 	if name != "" {
-		kind := graph.KindFunction
-		id := st.filePath + "::" + name
-		if receiver != "" {
-			kind = graph.KindMethod
-			id = st.filePath + "::" + receiver + "." + name
-		}
-		if !st.seen[id] {
-			st.seen[id] = true
-			node := &graph.Node{
-				ID: id, Kind: kind, Name: name,
-				FilePath:  st.filePath,
-				StartLine: int(n.StartPoint().Row) + 1,
-				EndLine:   int(n.EndPoint().Row) + 1,
-				Language:  "julia",
-			}
-			meta := map[string]any{}
-			if receiver != "" {
-				meta["receiver"] = receiver
-			}
-			if n.Type() == "macro_definition" {
-				meta["macro"] = true
-			}
-			if doc != "" {
-				meta["doc"] = doc
-			}
-			if len(meta) > 0 {
-				node.Meta = meta
-			}
-			st.result.Nodes = append(st.result.Nodes, node)
-			st.nodes[id] = node
-			st.result.Edges = append(st.result.Edges, &graph.Edge{
-				From: st.fileNode.ID, To: id, Kind: graph.EdgeDefines,
-				FilePath: st.filePath, Line: int(n.StartPoint().Row) + 1,
-			})
-			if receiver != "" {
-				st.result.Edges = append(st.result.Edges, &graph.Edge{
-					From: id, To: st.filePath + "::" + receiver, Kind: graph.EdgeMemberOf,
-					FilePath: st.filePath, Line: int(n.StartPoint().Row) + 1,
-				})
-			}
-			if scope.moduleID != "" {
-				st.result.Edges = append(st.result.Edges, &graph.Edge{
-					From: id, To: scope.moduleID, Kind: graph.EdgeMemberOf,
-					FilePath: st.filePath, Line: int(n.StartPoint().Row) + 1,
-				})
-			}
-		}
-		inner.functionID = id
-		inner.functionName = name
-		inner.functionRecv = receiver
+		inner = e.emitCallable(n, name, receiver, doc, n.Type() == "macro_definition", scope, st)
 	}
 	// Body docstring: first body statement that is a string literal.
 	bodyDoc := ""
@@ -524,19 +549,23 @@ func (e *JuliaExtractor) handleAssignment(n *sitter.Node, src []byte, scope juli
 
 	if isConst && lhs != nil && lhs.Type() == "identifier" {
 		name := lhs.Content(src)
-		id := st.filePath + "::" + name
-		if !st.seen[id] {
-			st.seen[id] = true
-			st.result.Nodes = append(st.result.Nodes, &graph.Node{
+		line := int(n.StartPoint().Row) + 1
+		if id, minted := disambiguateID(st.seen, st.filePath+"::"+name, line); minted {
+			node := &graph.Node{
 				ID: id, Kind: graph.KindVariable, Name: name,
 				FilePath:  st.filePath,
-				StartLine: int(n.StartPoint().Row) + 1,
+				StartLine: line,
 				EndLine:   int(n.EndPoint().Row) + 1,
 				Language:  "julia",
-			})
+			}
+			if scope.modulePath != "" {
+				node.Meta = map[string]any{"scope_mod": scope.modulePath}
+			}
+			st.result.Nodes = append(st.result.Nodes, node)
+			st.nodes[id] = node
 			st.result.Edges = append(st.result.Edges, &graph.Edge{
 				From: st.fileNode.ID, To: id, Kind: graph.EdgeDefines,
-				FilePath: st.filePath, Line: int(n.StartPoint().Row) + 1,
+				FilePath: st.filePath, Line: line,
 			})
 		}
 	}
@@ -545,48 +574,120 @@ func (e *JuliaExtractor) handleAssignment(n *sitter.Node, src []byte, scope juli
 }
 
 func (e *JuliaExtractor) emitShortFunction(n, sig *sitter.Node, name, receiver string, src []byte, scope juliaScope, st *juliaWalkState) {
-	kind := graph.KindFunction
-	id := st.filePath + "::" + name
-	if receiver != "" {
-		kind = graph.KindMethod
-		id = st.filePath + "::" + receiver + "." + name
+	inner := e.emitCallable(n, name, receiver, "", false, scope, st)
+	e.walk(n, src, inner, st)
+}
+
+// emitCallable mints one function / method / constructor node and returns
+// the scope its body should walk under.
+//
+// Node ids stay FLAT — `<file>::<Name>`, `<file>::<Owner>.<member>` — as
+// every other extractor mints them; the enclosing module rides on
+// Meta["scope_mod"] instead (the Rust `mod` precedent). Folding the module
+// into the id would break graph.EnclosingFromID, which recovers a
+// method's or field's owner by cutting at the LAST dot. Two definitions
+// that would collide on one id — `f` in module A and `f` in module B —
+// separate through the shared line-suffix helper, so both survive as
+// navigable nodes instead of one silently swallowing the other's call
+// edges.
+//
+// A callable whose name is a type's name is that type's CONSTRUCTOR:
+// Julia has no separate keyword, so `Box(x) = …` beside `struct Box` and
+// `function Box() … end` inside it are both constructors. They take the
+// cross-language `<Type>.<init>` spelling that Java, C# and Swift already
+// emit, so constructor-aware consumers need no Julia special case — and,
+// critically, they no longer collide with the type node itself, which
+// used to swallow the constructor and adopt its body's call edges.
+func (e *JuliaExtractor) emitCallable(
+	n *sitter.Node, name, receiver, doc string, isMacro bool,
+	scope juliaScope, st *juliaWalkState,
+) juliaScope {
+	line := int(n.StartPoint().Row) + 1
+	kind := graph.KindMethod
+	nodeName := name
+	var baseID, ownerID, ownerName string
+
+	switch {
+	case receiver != "":
+		ownerID, ownerName = st.filePath+"::"+receiver, receiver
+		if id, _, ok := st.lookupType(scope.modulePath, receiver); ok {
+			ownerID = id
+		}
+		baseID = ownerID + "." + name
+
+	default:
+		typeID, typeName := "", ""
+		if scope.typeName == name && scope.typeID != "" {
+			typeID, typeName = scope.typeID, scope.typeName // inner constructor
+		} else if id, declared, ok := st.lookupType(scope.modulePath, name); ok {
+			typeID, typeName = id, declared // outer constructor
+		}
+		if typeID != "" {
+			baseID = typeID + ".<init>"
+			ownerID, ownerName = typeID, typeName
+			nodeName = typeName + ".<init>"
+		} else {
+			kind = graph.KindFunction
+			baseID = st.filePath + "::" + name
+		}
 	}
-	if !st.seen[id] {
-		st.seen[id] = true
-		node := &graph.Node{
-			ID: id, Kind: kind, Name: name,
-			FilePath:  st.filePath,
-			StartLine: int(n.StartPoint().Row) + 1,
-			EndLine:   int(n.EndPoint().Row) + 1,
-			Language:  "julia",
-		}
-		if receiver != "" {
-			node.Meta = map[string]any{"receiver": receiver}
-		}
-		st.result.Nodes = append(st.result.Nodes, node)
-		st.nodes[id] = node
+
+	id, minted := disambiguateID(st.seen, baseID, line)
+	if !minted {
+		// The same declaration reached twice. Leaving the scope
+		// untouched is deliberate: adopting the existing id here is
+		// what used to re-parent a shadowed definition's calls onto
+		// whichever twin was emitted first.
+		return scope
+	}
+
+	node := &graph.Node{
+		ID: id, Kind: kind, Name: nodeName,
+		FilePath:  st.filePath,
+		StartLine: line,
+		EndLine:   int(n.EndPoint().Row) + 1,
+		Language:  "julia",
+	}
+	meta := map[string]any{}
+	if ownerName != "" {
+		meta["receiver"] = ownerName
+	}
+	if isMacro {
+		meta["macro"] = true
+	}
+	if doc != "" {
+		meta["doc"] = doc
+	}
+	if scope.modulePath != "" {
+		meta["scope_mod"] = scope.modulePath
+	}
+	if len(meta) > 0 {
+		node.Meta = meta
+	}
+	st.result.Nodes = append(st.result.Nodes, node)
+	st.nodes[id] = node
+	st.result.Edges = append(st.result.Edges, &graph.Edge{
+		From: st.fileNode.ID, To: id, Kind: graph.EdgeDefines,
+		FilePath: st.filePath, Line: line,
+	})
+	if ownerID != "" {
 		st.result.Edges = append(st.result.Edges, &graph.Edge{
-			From: st.fileNode.ID, To: id, Kind: graph.EdgeDefines,
-			FilePath: st.filePath, Line: int(n.StartPoint().Row) + 1,
+			From: id, To: ownerID, Kind: graph.EdgeMemberOf,
+			FilePath: st.filePath, Line: line,
 		})
-		if receiver != "" {
-			st.result.Edges = append(st.result.Edges, &graph.Edge{
-				From: id, To: st.filePath + "::" + receiver, Kind: graph.EdgeMemberOf,
-				FilePath: st.filePath, Line: int(n.StartPoint().Row) + 1,
-			})
-		}
-		if scope.moduleID != "" {
-			st.result.Edges = append(st.result.Edges, &graph.Edge{
-				From: id, To: scope.moduleID, Kind: graph.EdgeMemberOf,
-				FilePath: st.filePath, Line: int(n.StartPoint().Row) + 1,
-			})
-		}
 	}
+	if scope.moduleID != "" {
+		st.result.Edges = append(st.result.Edges, &graph.Edge{
+			From: id, To: scope.moduleID, Kind: graph.EdgeMemberOf,
+			FilePath: st.filePath, Line: line,
+		})
+	}
+
 	inner := scope
 	inner.functionID = id
 	inner.functionName = name
 	inner.functionRecv = receiver
-	e.walk(n, src, inner, st)
+	return inner
 }
 
 // juliaImportModule returns the module a `selected_import` /

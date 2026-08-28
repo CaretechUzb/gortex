@@ -114,10 +114,16 @@ Recent extraction refinements (each covered by a per-feature CI golden): Java `@
 `module` / `baremodule` index as `KindType` nodes (the graph's `KindModule`
 is reserved for ecosystem packages) and carry the module's `export` list in
 `Meta["exports"]`; definitions inside a module get `member_of` edges to it.
-Qualified method definitions (`function Base.show(...)`, `function Base.:+`)
-become `KindMethod` with `Meta["receiver"]`, mirroring the Lua `M.func`
-convention. Struct fields are `KindField` nodes with `member_of` into the
-struct; supertypes (`struct X <: Y`) emit `extends` edges with the full
+Node ids stay flat — the enclosing module rides on `Meta["scope_mod"]`, the
+Rust `mod` convention — and two definitions that would collide on one id
+(`f` in module `A` and `f` in module `B`) separate through the shared
+line-suffix helper. Qualified method definitions (`function Base.show(...)`,
+`function Base.:+`) become `KindMethod` with `Meta["receiver"]`, mirroring
+the Lua `M.func` convention. Julia has no constructor keyword, so a callable
+named after a type is that type's constructor and takes the cross-language
+`<Type>.<init>` spelling Java, C# and Swift already emit — outer, short and
+inner forms alike. Struct fields are `KindField` nodes with `member_of` into
+the struct; supertypes (`struct X <: Y`) emit `extends` edges with the full
 right-hand path in `Meta["base_path"]` (python extractor convention).
 
 `using M: a, b` / `import M as Alias` keep the module as the import target,
