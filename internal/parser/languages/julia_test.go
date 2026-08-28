@@ -931,6 +931,35 @@ plain(a, b) = (==)(a, b)
 		"a bare parenthesised operator callee decodes too")
 }
 
+// Constructing a parametric type is one of the most common calls in real
+// Julia, and its callee is a parametrized_type_expression, not an
+// identifier — a decoder with no case for it dropped the edge, so
+// `Vector{Int}(xs)` vanished from the call graph. The edge names the
+// constructor the way Julia prints it, parameters included, and a
+// qualified head keeps its module.
+func TestJuliaExtractor_ParametrizedConstructorCallee(t *testing.T) {
+	src := []byte(`build(xs) = Vector{Int}(xs)
+qualified(xs) = Base.Vector{Int}(xs)
+table(xs) = Dict{String,Int}(xs)
+`)
+	res, err := NewJuliaExtractor().Extract("param.jl", src)
+	require.NoError(t, err)
+
+	calls := map[string]bool{}
+	for _, ed := range res.Edges {
+		if ed.Kind == graph.EdgeCalls {
+			calls[ed.From+" -> "+ed.To] = true
+		}
+		require.NotContains(t, ed.To, "\n", "a target must never carry a line break")
+	}
+	require.True(t, calls["param.jl::build -> unresolved::Vector{Int}"],
+		"a parametric constructor call is a call edge")
+	require.True(t, calls["param.jl::qualified -> unresolved::Base.Vector{Int}"],
+		"a qualified parametric head keeps its module")
+	require.True(t, calls["param.jl::table -> unresolved::Dict{String,Int}"],
+		"multi-parameter constructors carry their parameters")
+}
+
 func TestJuliaExtractor_ConstAndDocstrings(t *testing.T) {
 	src := []byte(`"""
 Circle radius helpers.

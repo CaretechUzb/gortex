@@ -559,14 +559,15 @@ func juliaUnwrappedName(n *sitter.Node, src []byte) string {
 }
 
 // juliaCalleeName decodes a call callee: bare identifiers, qualified
-// field_expressions (`Base.show`, `A.B.c`), and quoted operators (`:+`,
-// `:(==)`). The field_expression is decoded from its base and property
-// CHILDREN, never from source text: text split on the last dot dragged a
-// chained callee's arguments (`get(cfg).run`) and even a line break
-// inside a multi-line chain into the call target. A base that is not
-// itself a dotted name leaves only the property decodable, so the callee
-// degrades to its bare method name — the only part a resolver could ever
-// match. Returns name, receiver.
+// field_expressions (`Base.show`, `A.B.c`), quoted operators (`:+`,
+// `:(==)`), and parametrized constructors (`Vector{Int}`). The
+// field_expression is decoded from its base and property CHILDREN, never
+// from source text: text split on the last dot dragged a chained
+// callee's arguments (`get(cfg).run`) and even a line break inside a
+// multi-line chain into the call target. A base that is not itself a
+// dotted name leaves only the property decodable, so the callee degrades
+// to its bare method name — the only part a resolver could ever match.
+// Returns name, receiver.
 func juliaCalleeName(n *sitter.Node, src []byte) (name, receiver string) {
 	if n == nil {
 		return "", ""
@@ -576,6 +577,8 @@ func juliaCalleeName(n *sitter.Node, src []byte) (name, receiver string) {
 		return n.Content(src), ""
 	case "quote_expression", "parenthesized_expression": // bare `:+` / `(==)` callee
 		return juliaUnwrappedName(n, src), ""
+	case "parametrized_type_expression": // `Vector{Int}(xs)`
+		return juliaParametrizedCallee(n, src)
 	case "field_expression":
 		count := int(n.NamedChildCount())
 		if count < 2 {
@@ -604,6 +607,45 @@ func juliaCalleeName(n *sitter.Node, src []byte) (name, receiver string) {
 		}
 	}
 	return "", ""
+}
+
+// juliaParametrizedCallee decodes a `Vector{Int}(xs)`-style constructor
+// callee: the head name — possibly qualified, as `Base.Vector{Int}` —
+// followed by the literal type parameters, which are part of the
+// constructor's name the way Julia prints it. The curly list is rebuilt
+// from its children so a parameter list broken across lines cannot leak
+// a newline into the target.
+func juliaParametrizedCallee(n *sitter.Node, src []byte) (name, receiver string) {
+	head := n.NamedChild(0)
+	if head == nil {
+		return "", ""
+	}
+	switch head.Type() {
+	case "identifier":
+		name = head.Content(src)
+	case "field_expression":
+		inner, recv := juliaCalleeName(head, src)
+		if inner == "" {
+			return "", ""
+		}
+		name, receiver = inner, recv
+	default:
+		return "", ""
+	}
+	var params []string
+	for i, count := 1, int(n.NamedChildCount()); i < count; i++ {
+		if c := n.NamedChild(i); c != nil && c.Type() == "curly_expression" {
+			for j, jcount := 0, int(c.NamedChildCount()); j < jcount; j++ {
+				if p := c.NamedChild(j); p != nil {
+					params = append(params, p.Content(src))
+				}
+			}
+		}
+	}
+	if len(params) > 0 {
+		name += "{" + strings.Join(params, ",") + "}"
+	}
+	return name, receiver
 }
 
 // juliaSignatureCall peels the wrappers a definition head can carry until
