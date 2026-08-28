@@ -1,24 +1,71 @@
 package indexer
 
 import (
+	"encoding/json"
 	"reflect"
 	"testing"
 )
 
+// snapshotJSON renders the shape a real previous release persisted — the FULL
+// per-language snapshot extractorVersionsSnapshot() writes — with the given
+// overrides applied and the named languages removed. A stored row is never
+// partial in production (persistRepoIndexState marshals the whole map and
+// persistExtractorVersion only adds to it), so a test that feeds a two-key map
+// is testing a shape the field never produces.
+func snapshotJSON(t *testing.T, overrides map[string]int, drop ...string) string {
+	t.Helper()
+	m := extractorVersionsSnapshot()
+	for _, lang := range drop {
+		delete(m, lang)
+	}
+	for lang, v := range overrides {
+		m[lang] = v
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal snapshot: %v", err)
+	}
+	return string(b)
+}
+
 // TestStaleLangsDetection proves the per-language extractor-staleness signal:
 // only languages whose stored version is behind the current one are flagged
 // (so the advisory names the exact languages to reindex — a scoped reindex
-// rather than a full cold rebuild), a language the snapshot never recorded is
-// never spuriously flagged, and an empty baseline reports nothing.
+// rather than a full cold rebuild), a language the snapshot recorded at the
+// current version is left alone, and an empty baseline reports nothing.
 func TestStaleLangsDetection(t *testing.T) {
 	t.Run("only_behind_langs", func(t *testing.T) {
 		stored := map[string]int{"go": 1, "python": 2, "ruby": 1}
-		current := map[string]int{"go": 2, "python": 2, "ruby": 1, "rust": 3}
+		current := map[string]int{"go": 2, "python": 2, "ruby": 1, "rust": 3, "lua": 1}
 		got := staleLangsBetween(stored, current)
-		// go is behind (1<2); python/ruby are current; rust is absent from
-		// stored (no baseline) so it is NOT flagged.
-		if want := []string{"go"}; !reflect.DeepEqual(got, want) {
+		// go is behind (1<2); python/ruby are current. rust is absent from
+		// stored, which means the snapshot's binary tracked no version for
+		// it — the implicit baseline 1 — so a current version of 3 IS a
+		// bump and must be flagged. lua is absent too but sits at the
+		// baseline itself, so there is nothing to re-extract.
+		if want := []string{"go", "rust"}; !reflect.DeepEqual(got, want) {
 			t.Errorf("staleLangsBetween = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("newly_tracked_language_is_stale", func(t *testing.T) {
+		// A language whose extension mapping ships in the SAME change that
+		// raises its version cannot appear in the previous release's
+		// snapshot. Comparing only the keys the snapshot happens to carry
+		// would leave every already-indexed repository on the old
+		// extraction forever, because no content change re-triggers it.
+		previous := extractorVersionsSnapshot()
+		delete(previous, "julia")
+
+		stale := staleLangsBetween(previous, extractorVersionsSnapshot())
+		var found bool
+		for _, lang := range stale {
+			if lang == "julia" {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("staleLangsBetween = %v, want it to contain julia", stale)
 		}
 	})
 
@@ -39,28 +86,35 @@ func TestStaleLangsDetection(t *testing.T) {
 		if got := ExtractorVersionStaleLangs("not json"); got != nil {
 			t.Errorf("bad json = %v, want nil", got)
 		}
-		// Against the live extractor versions, an unchanged baseline language
-		// is not stale. Java is the exemplar because its extractor has never
-		// been bumped — a language whose version this suite also asserts
-		// would make the check tautological.
-		if got := ExtractorVersionStaleLangs(`{"java":1}`); len(got) != 0 {
+		// A snapshot written by THIS binary is current in every language.
+		if got := ExtractorVersionStaleLangs(snapshotJSON(t, nil)); len(got) != 0 {
 			t.Errorf("stored at current = %v, want empty", got)
 		}
-		if got := ExtractorVersionStaleLangs(`{"java":1,"php":1}`); !reflect.DeepEqual(got, []string{"php"}) {
+		if got := ExtractorVersionStaleLangs(
+			snapshotJSON(t, map[string]int{"php": 1})); !reflect.DeepEqual(got, []string{"php"}) {
 			t.Errorf("stored PHP structural-edge version = %v, want [php]", got)
 		}
 		// A store extracted before the generic-call fix must re-extract:
 		// until then, every call spelling explicit type arguments is missing
 		// from its graph entirely, and no content change will trigger it.
-		if got := ExtractorVersionStaleLangs(`{"go":1,"scala":1,"cpp":1,"swift":1}`); !reflect.DeepEqual(
-			got, []string{"cpp", "go", "scala", "swift"}) {
+		if got := ExtractorVersionStaleLangs(snapshotJSON(t, map[string]int{
+			"go": 1, "scala": 1, "cpp": 1, "swift": 1,
+		})); !reflect.DeepEqual(got, []string{"cpp", "go", "scala", "swift"}) {
 			t.Errorf("stored pre-generic-call version = %v, want all four", got)
 		}
 		// A store extracted before the C# params-shape fix must re-extract
 		// unchanged .cs, .razor, and .cshtml files. Without the bump, their
 		// persisted graph keeps the old arity and parameter evidence.
-		if got := ExtractorVersionStaleLangs(`{"csharp":10}`); !reflect.DeepEqual(got, []string{"csharp"}) {
+		if got := ExtractorVersionStaleLangs(
+			snapshotJSON(t, map[string]int{"csharp": 10})); !reflect.DeepEqual(got, []string{"csharp"}) {
 			t.Errorf("stored pre-params C# version = %v, want [csharp]", got)
+		}
+		// The Julia tree-sitter extractor shipped `.jl` into the salt map
+		// for the first time, so a previous release's snapshot has no julia
+		// key at all — the shape that must still restage.
+		if got := ExtractorVersionStaleLangs(
+			snapshotJSON(t, nil, "julia")); !reflect.DeepEqual(got, []string{"julia"}) {
+			t.Errorf("previous-release snapshot without julia = %v, want [julia]", got)
 		}
 		for _, path := range []string{"src/Handler.cs", "Views/Page.razor", "Views/Page.cshtml"} {
 			if got := merkleSaltFor(path); got != "csharp@12" {

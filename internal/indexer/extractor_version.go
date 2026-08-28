@@ -148,12 +148,35 @@ func ExtractorVersionStaleLangs(storedJSON string) []string {
 }
 
 // staleLangsBetween returns the languages whose stored version is behind the
-// current version — only languages present in BOTH maps are compared, so a
-// language the stored snapshot never recorded is not spuriously flagged.
+// current version. Iteration is over CURRENT, not stored: a language the
+// stored snapshot never recorded is compared against the implicit baseline
+// version 1 that every untracked language carries, and flagged only when the
+// running binary has raised it above that baseline.
+//
+// Iterating stored instead would make a language that gains its FIRST tracked
+// version after the snapshot was written permanently invisible here — the
+// snapshot cannot name a language whose extension the older binary did not map
+// yet, so `julia@2` (shipped together with the `.jl` mapping) would never be
+// reported stale and every already-indexed repository would keep serving the
+// graph the previous Julia extractor produced. The Merkle path catches such a
+// bump through the changed leaf salt, but Merkle is not the default.
+//
+// A language present in stored but absent from current is dropped: its
+// extension is no longer version-tracked, so there is nothing to compare.
 func staleLangsBetween(stored, current map[string]int) []string {
 	var stale []string
-	for lang, storedV := range stored {
-		if cur, ok := current[lang]; ok && storedV < cur {
+	for lang, cur := range current {
+		storedV, recorded := stored[lang]
+		if !recorded {
+			// Never recorded: the snapshot's binary tracked no version
+			// for this language, which is the baseline 1. Only a
+			// deliberate raise above the baseline is a bump.
+			if cur > 1 {
+				stale = append(stale, lang)
+			}
+			continue
+		}
+		if storedV < cur {
 			stale = append(stale, lang)
 		}
 	}
