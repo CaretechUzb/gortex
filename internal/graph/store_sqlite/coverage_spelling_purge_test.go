@@ -387,8 +387,8 @@ func TestOpenLeavesUnprefixedSyntheticPathsUntouched(t *testing.T) {
 // beside them, a prefix that is a prefix of another) is covered.
 func TestLegacyPathPredicateAcrossRepoScopes(t *testing.T) {
 	scope := coverageSpellingScope{
-		windowsPrefixes: []string{"win", "gortex"},
-		knownPrefixes:   []string{"win", "gortex", "gortexish", "nix"},
+		windowsPrefixes: []string{"win", "gortex", "nest"},
+		knownPrefixes:   []string{"win", "gortex", "gortexish", "nix", "nest", "nest/inner"},
 	}
 
 	cases := []struct {
@@ -405,6 +405,9 @@ func TestLegacyPathPredicateAcrossRepoScopes(t *testing.T) {
 		{`nix/testdata/golden.json`, false, "including its fixture, which IS its file node"},
 		{`win/external::go:github.com/pkg/errors`, false, "synthetic namespace, not a path"},
 		{`unknown/src/c.go`, false, "no matching Windows prefix and the unprefixed arm is off"},
+		{`nest/inner/pkg\a.go`, false,
+			"a nested repo's native path is not judged by its parent repo's arm"},
+		{`nest/pkg/a.go`, true, "the parent repo itself is still judged normally"},
 	}
 
 	path := filepath.Join(t.TempDir(), "store.sqlite")
@@ -451,6 +454,108 @@ func TestLegacyPathPredicateAcrossRepoScopes(t *testing.T) {
 		require.True(t, none.empty())
 		require.Equal(t, "0", none.legacyPathPredicate("file_path"))
 	})
+}
+
+// TestCoverageNodeSidecarTablesCoverSchema keeps the sidecar list from
+// drifting: any table whose primary key is node_id must be cleaned when a
+// node is purged, so a newly added one has to appear in the list. Derived
+// from the live schema rather than from a second hand-written list.
+func TestCoverageNodeSidecarTablesCoverSchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.sqlite")
+	s, err := Open(path)
+	require.NoError(t, err)
+	require.NoError(t, s.Close())
+
+	listed := make(map[string]bool, len(coverageNodeSidecarTables))
+	for _, table := range coverageNodeSidecarTables {
+		listed[table] = true
+	}
+	// Cleaned by name elsewhere in the purge rather than through the list.
+	handled := map[string]bool{"symbol_fts_rowid": true, "nodes": true}
+
+	withRawDB(t, path, func(db *sql.DB) {
+		rows, err := db.Query(`SELECT name FROM sqlite_master WHERE type = 'table'`)
+		require.NoError(t, err)
+		defer rows.Close() //nolint:errcheck // read-only cursor
+		var tables []string
+		for rows.Next() {
+			var name string
+			require.NoError(t, rows.Scan(&name))
+			tables = append(tables, name)
+		}
+		require.NoError(t, rows.Err())
+
+		for _, table := range tables {
+			if listed[table] || handled[table] {
+				continue
+			}
+			info, err := db.Query(`SELECT name, pk FROM pragma_table_info(?)`, table)
+			require.NoError(t, err)
+			keyedByNodeID := false
+			for info.Next() {
+				var name string
+				var pk int
+				require.NoError(t, info.Scan(&name, &pk))
+				if name == "node_id" && pk > 0 {
+					keyedByNodeID = true
+				}
+			}
+			require.NoError(t, info.Err())
+			require.NoError(t, info.Close())
+			require.False(t, keyedByNodeID,
+				"table %q is keyed by node_id but is not in coverageNodeSidecarTables: "+
+					"a purged node would leave a dangling row there", table)
+		}
+	})
+}
+
+// TestOpenNeverPurgesANodeThatDefinesSymbols is the fail-safe for a wrong
+// repository verdict. A repository's Windows classification is drawn from
+// rows eviction never removes, so a repository re-indexed on POSIX inside
+// a store that still holds its old Windows rows keeps being judged by the
+// Windows rule. Since a `fixture` node reuses the file node's ID, that
+// would delete a live file and orphan its symbols. A legacy artifact node
+// defines nothing, so excluding nodes that do costs nothing and bounds the
+// damage of a misclassification to zero.
+func TestOpenNeverPurgesANodeThatDefinesSymbols(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.sqlite")
+
+	const (
+		staleWin  = `r/src\old.go` // leftover Windows row: sets the verdict
+		liveFix   = `r/testdata/golden.json`
+		liveSym   = `r/testdata/golden.json::Root`
+		liveTodo  = `r/src/b.go::todo:2`
+		liveFileB = `r/src/b.go`
+	)
+
+	s, err := Open(path)
+	require.NoError(t, err)
+	s.AddBatch([]*graph.Node{
+		{ID: staleWin, Kind: graph.KindFile, Name: "old.go", FilePath: staleWin, RepoPrefix: "r"},
+		// Re-indexed on POSIX: this fixture node IS the file node.
+		{ID: liveFix, Kind: graph.KindFixture, Name: "golden.json", FilePath: liveFix, RepoPrefix: "r"},
+		{ID: liveSym, Kind: graph.KindVariable, Name: "Root", FilePath: liveFix, RepoPrefix: "r"},
+		{ID: liveFileB, Kind: graph.KindFile, Name: "b.go", FilePath: liveFileB, RepoPrefix: "r"},
+		{ID: liveTodo, Kind: graph.KindTodo, Name: "todo:2", FilePath: liveFileB, RepoPrefix: "r"},
+	}, []*graph.Edge{
+		{From: liveFix, To: liveSym, Kind: graph.EdgeDefines, FilePath: liveFix, Line: 1},
+		{From: liveFileB, To: liveTodo, Kind: graph.EdgeAnnotated, FilePath: liveFileB, Line: 2},
+	})
+	require.NoError(t, s.Close())
+
+	withRawDB(t, path, func(db *sql.DB) {
+		_, err := db.Exec(`PRAGMA user_version = 12`)
+		require.NoError(t, err, "reset to the pre-purge version")
+	})
+
+	s2, err := Open(path)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s2.Close() })
+
+	require.NotNil(t, s2.GetNode(liveFix),
+		"a node that defines symbols is never purged, whatever the path verdict")
+	require.Len(t, s2.GetOutEdges(liveFix), 1, "its defines edge must survive with it")
+	require.NotNil(t, s2.GetNode(liveSym), "the defined symbol keeps its parent")
 }
 
 // TestPurgeLegacyCoverageSpellingsIsIdempotent runs the step twice on

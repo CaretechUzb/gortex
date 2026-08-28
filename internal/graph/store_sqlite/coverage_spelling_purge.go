@@ -24,8 +24,12 @@ const (
 // callers (deleteEnrichmentByNodeIDs, the constant-value writer, the vector
 // store); a migration has no such caller, so it deletes them inline — the
 // same reasoning purgeUnprefixedRepoRows applies to vectors.
+// It must list every node_id-keyed table in schemaSQL;
+// TestCoverageNodeSidecarTablesCoverSchema fails when a new one appears,
+// so the list cannot drift the way a hand-maintained list usually does.
 var coverageNodeSidecarTables = []string{
 	"vectors",
+	"clone_shingles",
 	"constant_values",
 	"churn_enrichment",
 	"coverage_enrichment",
@@ -81,22 +85,37 @@ func purgeLegacyCoverageSpellings(tx *sql.Tx) error {
 	legacyEdgePath := scope.legacyPathPredicate("edges.file_path")
 
 	// Per-file artifacts whose own spelling is legacy. Collected before any
-	// delete so the edge sweep below can clear their endpoints too. The
-	// DROPs make the step re-entrant on a connection that carried a temp
-	// table over from an earlier attempt.
-	if _, err := tx.Exec(`DROP TABLE IF EXISTS covdom_doomed_nodes`); err != nil {
+	// delete so the edge sweep below can clear their endpoints too.
+	//
+	// The `defines` exclusion is the last line of defence against deleting
+	// a live file. A `fixture` node reuses the file node's ID, and a
+	// repository's Windows verdict is drawn from rows that eviction never
+	// removes, so a repository re-indexed on POSIX inside a store that
+	// still holds its old Windows rows would keep being judged by the
+	// Windows rule. A legacy artifact node defines nothing; a file node
+	// with symbols in it always does. Cheap, and it fails safe in exactly
+	// the case where the classification is wrong.
+	//
+	// The DROPs make the step re-entrant on a connection that carried a
+	// temp table over from an earlier attempt; they name `temp.` so they
+	// can never reach a same-named table in the main schema. Their
+	// deferred errors are dropped deliberately: nothing else consults
+	// these names, and the leading DROP makes a survivor harmless.
+	if _, err := tx.Exec(`DROP TABLE IF EXISTS temp.covdom_doomed_nodes`); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`CREATE TEMP TABLE covdom_doomed_nodes AS
 		SELECT id FROM nodes
-		WHERE kind IN (` + coveragePerFileNodeKinds + `) AND ` + legacyNodePath); err != nil {
+		WHERE kind IN (` + coveragePerFileNodeKinds + `) AND ` + legacyNodePath + `
+		  AND NOT EXISTS (SELECT 1 FROM edges e
+		                  WHERE e.from_id = nodes.id AND e.kind = 'defines')`); err != nil {
 		return err
 	}
-	defer func() { _, _ = tx.Exec(`DROP TABLE IF EXISTS covdom_doomed_nodes`) }()
+	defer func() { _, _ = tx.Exec(`DROP TABLE IF EXISTS temp.covdom_doomed_nodes`) }()
 
 	// Shared targets the legacy edges point at. Snapshotted BEFORE the edge
 	// delete, because afterwards nothing links them to this purge.
-	if _, err := tx.Exec(`DROP TABLE IF EXISTS covdom_shared_targets`); err != nil {
+	if _, err := tx.Exec(`DROP TABLE IF EXISTS temp.covdom_shared_targets`); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`CREATE TEMP TABLE covdom_shared_targets AS
@@ -107,13 +126,18 @@ func purgeLegacyCoverageSpellings(tx *sql.Tx) error {
 		WHERE kind = 'owns' AND ` + legacyEdgePath); err != nil {
 		return err
 	}
-	defer func() { _, _ = tx.Exec(`DROP TABLE IF EXISTS covdom_shared_targets`) }()
+	defer func() { _, _ = tx.Exec(`DROP TABLE IF EXISTS temp.covdom_shared_targets`) }()
 
 	// Legacy coverage edges, selected by kind AND their own FilePath
 	// spelling — never by touching an evicted endpoint, which would take
 	// a shared target's other, still-valid edges with it.
-	if _, err := tx.Exec(`DELETE FROM edges
-		WHERE kind IN (` + coverageEdgeKinds + `) AND ` + legacyEdgePath); err != nil {
+	result, err := tx.Exec(`DELETE FROM edges
+		WHERE kind IN (` + coverageEdgeKinds + `) AND ` + legacyEdgePath)
+	if err != nil {
+		return err
+	}
+	removedEdges, err := result.RowsAffected()
+	if err != nil {
 		return err
 	}
 	// Any remaining edge on a doomed per-file artifact: its node is going,
@@ -138,6 +162,24 @@ func purgeLegacyCoverageSpellings(tx *sql.Tx) error {
 		  AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.from_id = t.id)
 		  AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.to_id = t.id)`); err != nil {
 		return err
+	}
+
+	// Everything below is keyed by the doomed node ids, so an empty set
+	// makes all of it a no-op. Skipping it outright matters because this
+	// step runs before healPlannerStats: on a store with no sqlite_stat1
+	// the ref_facts deletes plan as full scans of a table that holds one
+	// row per resolved reference edge.
+	var doomed int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM covdom_doomed_nodes`).Scan(&doomed); err != nil {
+		return err
+	}
+	if doomed == 0 {
+		if removedEdges == 0 {
+			// The store held nothing legacy: leave the persisted analysis
+			// generation alone rather than forcing a needless recompute.
+			return nil
+		}
+		return invalidateAnalysisGenerationIfPresent(tx)
 	}
 
 	// Symbol FTS rows outlive their node unless deleted explicitly (see
@@ -212,15 +254,18 @@ func (s coverageSpellingScope) empty() bool {
 	return len(s.windowsPrefixes) == 0 && !s.unprefixedIsWindows
 }
 
-// windowsWrittenScope groups the store's nodes by repository and reports
-// which ones were written by an indexer whose separator is not '/'. One
-// pass: the predicate is not indexable, so grouping beats a probe per
-// repository.
+// windowsWrittenScope groups the store's FILE nodes by repository and
+// reports which ones were written by an indexer whose separator is not
+// '/'. One pass rather than a probe per repository, and restricted to
+// kind='file' for two reasons: only file-backed nodes evidence the
+// indexer's separator at all, and the restriction lets the scan ride the
+// covering nodes_repo_files index instead of fetching every row in a
+// table whose payload includes the meta blob.
 func windowsWrittenScope(tx *sql.Tx) (coverageSpellingScope, error) {
 	var scope coverageSpellingScope
 	rows, err := tx.Query(`SELECT repo_prefix,
 		MAX(CASE WHEN instr(file_path, '\') > 0 THEN 1 ELSE 0 END)
-		FROM nodes GROUP BY repo_prefix`)
+		FROM nodes WHERE kind = 'file' GROUP BY repo_prefix`)
 	if err != nil {
 		return scope, err
 	}
@@ -268,8 +313,20 @@ func (s coverageSpellingScope) legacyPathPredicate(column string) string {
 	var arms []string
 	for _, prefix := range s.windowsPrefixes {
 		lit := quoteSQLLiteral(prefix + "/")
-		arms = append(arms, "(substr("+column+", 1, length("+lit+")) = "+lit+
-			" AND instr(substr("+column+", length("+lit+") + 1), '/') > 0)")
+		arm := "substr(" + column + ", 1, length(" + lit + ")) = " + lit
+		// A repo prefix may itself contain a separator, so one prefix can
+		// be a leading substring of another ("foo" and "foo/bar"). Without
+		// this exclusion the shorter repo's arm would judge the longer
+		// repo's paths and read its prefix separator as a legacy spelling.
+		for _, nested := range s.knownPrefixes {
+			if nested == prefix || !strings.HasPrefix(nested, prefix+"/") {
+				continue
+			}
+			nestedLit := quoteSQLLiteral(nested + "/")
+			arm += " AND substr(" + column + ", 1, length(" + nestedLit + ")) <> " + nestedLit
+		}
+		arm += " AND instr(substr(" + column + ", length(" + lit + ") + 1), '/') > 0"
+		arms = append(arms, "("+arm+")")
 	}
 	if s.unprefixedIsWindows {
 		var b strings.Builder
