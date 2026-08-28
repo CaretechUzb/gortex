@@ -30,9 +30,10 @@ import (
 //   - `const X = ...` constants (KindVariable)
 //
 // Imports: `using M`, `using M: a, b` (selected names in edge Meta),
-// `import M`, `import M as Alias` (alias in edge Meta), dotted import
-// paths, and `include("file.jl")` — all as EdgeImports to
-// `unresolved::import::<path>`.
+// `import M`, `import M as Alias` (alias in edge Meta), dotted and
+// relative import paths (`A.B`, `.Local`, `..Up`), and
+// `include("file.jl")` — all as EdgeImports to
+// `unresolved::import::<module>`, never to a selected name.
 //
 // Calls: call_expression / broadcast_call_expression / macrocall
 // callees (identifier or qualified field_expression) attribute to the
@@ -575,13 +576,54 @@ func (e *JuliaExtractor) emitShortFunction(n, sig *sitter.Node, name, receiver s
 	e.walk(n, src, inner, st)
 }
 
+// juliaImportModule returns the module a `selected_import` /
+// `import_alias` names, plus the index of the first child after it. A
+// dotted or relative path (`A.B`, `.Local`, `..Up`) is an `import_path`
+// node; a single-segment module is a bare `identifier`. Everything after
+// it is the selected bindings or the alias.
+func juliaImportModule(n *sitter.Node, src []byte) (module string, next int) {
+	first := n.NamedChild(0)
+	if first == nil {
+		return "", 0
+	}
+	switch first.Type() {
+	case "import_path", "identifier":
+		return first.Content(src), 1
+	}
+	return "", 0
+}
+
+// juliaAliasParts decodes an `import_alias` — `Foo as F`, `C.D as CD` at
+// statement level, `bar as baz` inside a selected list — into the
+// upstream name and the local alias.
+func juliaAliasParts(n *sitter.Node, src []byte) (orig, alias string) {
+	orig, next := juliaImportModule(n, src)
+	if orig == "" {
+		return "", ""
+	}
+	for i, count := next, int(n.NamedChildCount()); i < count; i++ {
+		s := n.NamedChild(i)
+		if s == nil {
+			continue
+		}
+		if s.Type() == "identifier" || s.Type() == "operator" {
+			alias = s.Content(src)
+		}
+	}
+	return orig, alias
+}
+
 // handleImport covers `using M`, `using M: a, b`, `import M`,
-// `import M as Alias`, and dotted import paths. Selected names and
-// aliases ride on the edge Meta for the resolver to consume.
+// `import M as Alias`, and dotted / relative import paths. The import
+// target is always the MODULE; selected names and aliases ride on the
+// edge Meta.
 func (e *JuliaExtractor) handleImport(n *sitter.Node, src []byte, st *juliaWalkState) {
 	emit := func(target string, meta map[string]any) {
 		if target == "" {
 			return
+		}
+		if len(meta) == 0 {
+			meta = nil
 		}
 		st.result.Edges = append(st.result.Edges, &graph.Edge{
 			From: st.fileNode.ID, To: "unresolved::import::" + target,
@@ -592,18 +634,29 @@ func (e *JuliaExtractor) handleImport(n *sitter.Node, src []byte, st *juliaWalkS
 	}
 	for c := range n.NamedChildren() {
 		switch c.Type() {
-		case "identifier":
-			emit(c.Content(src), nil)
-		case "import_path":
+		case "identifier", "import_path":
 			emit(c.Content(src), nil)
 		case "selected_import":
-			module, names := "", []string{}
-			for s := range c.NamedChildren() {
-				if s.Type() == "identifier" {
-					if module == "" {
-						module = s.Content(src)
-					} else {
-						names = append(names, s.Content(src))
+			// `using A.B: x, y` — the module is the FIRST child and is
+			// an import_path whenever the path is dotted or relative.
+			// Scanning for identifiers instead skipped it and promoted
+			// the first selected name to the import target.
+			module, next := juliaImportModule(c, src)
+			var names []string
+			for i, count := next, int(c.NamedChildCount()); i < count; i++ {
+				s := c.NamedChild(i)
+				if s == nil {
+					continue
+				}
+				switch s.Type() {
+				case "identifier", "operator":
+					// `using Base: +, -` selects operators, which are
+					// `operator` nodes rather than identifiers.
+					names = append(names, s.Content(src))
+				case "import_alias":
+					// `import Foo: bar as baz` renames one binding.
+					if orig, _ := juliaAliasParts(s, src); orig != "" {
+						names = append(names, orig)
 					}
 				}
 			}
@@ -613,17 +666,7 @@ func (e *JuliaExtractor) handleImport(n *sitter.Node, src []byte, st *juliaWalkS
 			}
 			emit(module, meta)
 		case "import_alias":
-			path, alias := "", ""
-			for a := range c.NamedChildren() {
-				if a.Type() != "identifier" {
-					continue
-				}
-				if path == "" {
-					path = a.Content(src)
-				} else {
-					alias = a.Content(src)
-				}
-			}
+			path, alias := juliaAliasParts(c, src)
 			meta := map[string]any{}
 			if alias != "" {
 				meta["alias"] = alias

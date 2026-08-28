@@ -314,6 +314,78 @@ end
 	require.Contains(t, targets, "unresolved::import::A.B.C")
 }
 
+// The cross-product the isolated per-feature tests missed: a dotted or
+// relative module path COMBINED with a selective list or an alias. In
+// those shapes the module is an `import_path` child, so the
+// identifier-only scan skipped it and promoted the first selected name
+// (or the alias) to the import target — `using A.B: x, y` imported "x".
+// The regex extractor this replaced still recorded `A.B`.
+func TestJuliaExtractor_CombinedImportPaths(t *testing.T) {
+	src := []byte(`using A.B: x, y
+import C.D as CD
+using .Local: z
+import .Local as L
+import ..Up: q
+using Base: +, -
+import Foo: bar as baz
+`)
+	res, err := NewJuliaExtractor().Extract("imp.jl", src)
+	require.NoError(t, err)
+
+	type imp struct {
+		names []string
+		alias string
+	}
+	byTarget := map[string][]imp{}
+	for _, ed := range res.Edges {
+		if ed.Kind != graph.EdgeImports {
+			continue
+		}
+		var got imp
+		if v, ok := ed.Meta["names"].([]string); ok {
+			got.names = v
+		}
+		if v, ok := ed.Meta["alias"].(string); ok {
+			got.alias = v
+		}
+		byTarget[ed.To] = append(byTarget[ed.To], got)
+	}
+
+	require.Contains(t, byTarget, "unresolved::import::A.B", "dotted + selective must keep the module")
+	assert.ElementsMatch(t, []string{"x", "y"}, byTarget["unresolved::import::A.B"][0].names)
+
+	require.Contains(t, byTarget, "unresolved::import::C.D", "dotted + alias must keep the module")
+	assert.Equal(t, "CD", byTarget["unresolved::import::C.D"][0].alias)
+
+	require.Contains(t, byTarget, "unresolved::import::..Up", "a relative path keeps its leading dots")
+	assert.ElementsMatch(t, []string{"q"}, byTarget["unresolved::import::..Up"][0].names)
+
+	// One relative module reached both ways in the same file.
+	local := byTarget["unresolved::import::.Local"]
+	require.Len(t, local, 2, "relative + selective and relative + alias are two imports of .Local")
+	var sawNames, sawAlias bool
+	for _, got := range local {
+		if len(got.names) == 1 && got.names[0] == "z" {
+			sawNames = true
+		}
+		if got.alias == "L" {
+			sawAlias = true
+		}
+	}
+	assert.True(t, sawNames, "relative + selective must record the selected name")
+	assert.True(t, sawAlias, "relative + alias must record the alias")
+
+	// Operators are `operator` nodes, not identifiers, so an
+	// identifier-only scan recorded an empty selection for them.
+	require.Contains(t, byTarget, "unresolved::import::Base")
+	assert.ElementsMatch(t, []string{"+", "-"}, byTarget["unresolved::import::Base"][0].names)
+
+	// A renamed binding inside a selected list still selects the
+	// UPSTREAM name.
+	require.Contains(t, byTarget, "unresolved::import::Foo")
+	assert.ElementsMatch(t, []string{"bar"}, byTarget["unresolved::import::Foo"][0].names)
+}
+
 func TestJuliaExtractor_Calls(t *testing.T) {
 	src := []byte(`module Calls
 
