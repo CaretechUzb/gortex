@@ -846,6 +846,7 @@ func (e *CSharpExtractor) emitContainer(m parser.QueryResult, kind string, nodeK
 	// IEntityTypeConfiguration<T> carries facts the resolver joins to
 	// the entity class later — the entity lives in another file.
 	if kind == "class" || kind == "record" {
+		stampCSharpEFAttribute(def.Node, src, meta)
 		stampCSharpEFConfig(def.Node, src, meta)
 	}
 	result.Nodes = append(result.Nodes, &graph.Node{

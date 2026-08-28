@@ -948,7 +948,7 @@ func defaultFrameworkSynthesizers() []FrameworkSynthesizer {
 		// into the models_table layer. Position-independent: it reads
 		// only its own stamps and models_table itself, and no other
 		// pass consumes models_table during synthesis.
-		synthFunc{name: SynthCSharpEFCoreModels, fn: ResolveCSharpEFCoreModels},
+		synthFunc{name: SynthCSharpEFCoreModels, fn: ResolveCSharpEFCoreModels, scopedFn: ResolveCSharpEFCoreModelsScoped},
 		// Sidekiq job dispatch: Worker.perform_async(...) → the worker's
 		// perform, namespace-aware. Include-gated, typed tier.
 		synthFunc{name: SynthSidekiq, fn: ResolveSidekiqCalls},

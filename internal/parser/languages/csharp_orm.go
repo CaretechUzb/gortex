@@ -1,9 +1,9 @@
 package languages
 
 import (
-	"regexp"
-	"strconv"
 	"strings"
+	"unicode/utf16"
+	"unicode/utf8"
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/parser"
@@ -20,25 +20,100 @@ import (
 // fluent ToTable(...) configuration — live in files other than the
 // entity's, so they are joined by a resolver pass over stamped facts,
 // not here. A class with no [Table] attribute emits nothing.
+func csharpEFAttributeArguments(list *sitter.Node, src []byte) ([]csharpEFArgument, bool) {
+	if list == nil || list.Type() != "attribute_argument_list" {
+		return nil, false
+	}
+	args := make([]csharpEFArgument, 0, list.NamedChildCount())
+	for i, count := 0, int(list.NamedChildCount()); i < count; i++ {
+		argument := list.NamedChild(i)
+		if argument == nil || argument.Type() != "attribute_argument" || argument.NamedChildCount() == 0 {
+			return nil, false
+		}
+		name := ""
+		if nameNode := argument.ChildByFieldName("name"); nameNode != nil {
+			if argument.NamedChildCount() < 2 {
+				return nil, false
+			}
+			name = strings.TrimPrefix(strings.TrimSpace(nameNode.Content(src)), "@")
+			if name == "" {
+				return nil, false
+			}
+		}
+		args = append(args, csharpEFArgument{
+			name:  name,
+			value: argument.NamedChild(int(argument.NamedChildCount()) - 1),
+		})
+	}
+	return args, len(args) != 0
+}
+
+func csharpEFTableAttribute(decl *sitter.Node, src []byte) (table, schema string, ok bool) {
+	if decl == nil {
+		return "", "", false
+	}
+	for i, count := 0, int(decl.NamedChildCount()); i < count; i++ {
+		list := decl.NamedChild(i)
+		if list == nil || list.Type() != "attribute_list" {
+			continue
+		}
+		for j, attrCount := 0, int(list.NamedChildCount()); j < attrCount; j++ {
+			attribute := list.NamedChild(j)
+			if attribute == nil || attribute.Type() != "attribute" {
+				continue
+			}
+			nameNode := attribute.ChildByFieldName("name")
+			if nameNode == nil || !csharpIsTableAttr(nameNode.Content(src)) {
+				continue
+			}
+			arguments, valid := csharpEFAttributeArguments(
+				csharpDirectChildOfType(attribute, "attribute_argument_list"),
+				src,
+			)
+			if !valid {
+				continue
+			}
+			tableValue := ""
+			schemaValue := ""
+			tableSet := false
+			schemaSet := false
+			for index, argument := range arguments {
+				key := argument.name
+				if key == "" && index == 0 {
+					key = "name"
+				}
+				value, literal := csharpDecodeStringLiteral(argument.value.Content(src))
+				switch key {
+				case "name":
+					if tableSet || !literal || value == "" {
+						valid = false
+					} else {
+						tableValue, tableSet = value, true
+					}
+				case "Schema":
+					if schemaSet || !literal {
+						valid = false
+					} else {
+						schemaValue, schemaSet = value, true
+					}
+				default:
+					valid = false
+				}
+				if !valid {
+					break
+				}
+			}
+			if valid && tableSet {
+				return tableValue, schemaValue, true
+			}
+		}
+	}
+	return "", "", false
+}
+
 func detectCSharpORMModel(classNode *sitter.Node, src []byte, classID, filePath string) []*graph.Edge {
-	if classNode == nil {
-		return nil
-	}
-	tableName := ""
-	schema := ""
-	for _, ann := range csharpCollectAttributes(classNode, src) {
-		if !csharpIsTableAttr(ann.name) {
-			continue
-		}
-		name := csharpAttrPositionalString(ann.args)
-		if name == "" {
-			continue
-		}
-		tableName = name
-		schema = javaAnnotationStringArg(ann.args, "Schema")
-		break
-	}
-	if tableName == "" {
+	tableName, schema, ok := csharpEFTableAttribute(classNode, src)
+	if !ok {
 		return nil
 	}
 	qualified := tableName
@@ -68,6 +143,17 @@ func detectCSharpORMModel(classNode *sitter.Node, src []byte, classID, filePath 
 	}
 }
 
+func stampCSharpEFAttribute(decl *sitter.Node, src []byte, meta map[string]any) {
+	table, schema, ok := csharpEFTableAttribute(decl, src)
+	if !ok {
+		return
+	}
+	meta["ef_attribute_table"] = table
+	if schema != "" {
+		meta["ef_attribute_schema"] = schema
+	}
+}
+
 // csharpIsTableAttr reports whether an attribute name denotes [Table].
 // C# lets the attribute appear qualified (Schema.Table, or the full
 // namespace path) and with the explicit Attribute suffix, so compare
@@ -79,85 +165,396 @@ func csharpIsTableAttr(name string) bool {
 	return name == "Table" || name == "TableAttribute"
 }
 
-// csharpAttrPositionalStringArg matches a leading (optionally
-// verbatim) string literal — [Table("name", ...)]'s table name is the
-// attribute's first positional argument, unlike JPA's key=value form.
-// Known limits, accepted for the fixed-cost regex: an escaped quote
-// truncates the name (`"a\"b"` → `a\` — table names with quotes do
-// not survive real databases either), and a C#11 raw string literal
-// ("""...""") matches its empty prefix and is skipped as unnamed.
-var csharpAttrPositionalStringArg = regexp.MustCompile(`^\s*@?"([^"]*)"`)
-
-// csharpAttrPositionalString extracts the first positional string
-// literal from an attribute's verbatim argument text. Non-literal
-// firsts (nameof(...), constants) return "" — fail-open, no guess.
+// csharpAttrPositionalString extracts and decodes the first positional
+// string literal from an attribute's verbatim argument text. Only C#
+// regular and verbatim literals are accepted; constants, interpolated
+// strings, raw strings, UTF-8 literals, and malformed escapes fail open.
 func csharpAttrPositionalString(args string) string {
-	m := csharpAttrPositionalStringArg.FindStringSubmatch(args)
-	if len(m) < 2 {
+	text := strings.TrimSpace(args)
+	value, consumed, ok := csharpDecodeStringLiteralPrefix(text)
+	if !ok {
 		return ""
 	}
-	return strings.TrimSpace(m[1])
+	rest := strings.TrimSpace(text[consumed:])
+	if rest != "" && rest[0] != ',' {
+		return ""
+	}
+	return value
 }
 
-// csharpEFConfigIfaceArg pulls the single type argument out of an
-// IEntityTypeConfiguration<T> base-list entry. Text-level on purpose:
-// the base list is one short line, and the extractor needs only T's
-// name — qualification is stripped after the match.
-var csharpEFConfigIfaceArg = regexp.MustCompile(`IEntityTypeConfiguration\s*<\s*([^<>,]+?)\s*>`)
-
-// stampCSharpEFConfig detects an EF Core entity-configuration class —
-// one implementing IEntityTypeConfiguration<T> — and stamps the facts
-// a resolver pass needs to join fluent table mapping to the entity:
-//
-//	ef_config_entity    T's final name segment (always, when detected)
-//	ef_config_table     first ToTable/ToView string arg (when present)
-//	ef_config_relation  "table" or "view" (with ef_config_table)
-//	ef_config_schema    second string arg (when present)
-//
-// The entity class, the config class, and the DbContext registration
-// live in different files, so the extractor only records what this
-// file proves; the cross-file join happens at resolve time.
-func stampCSharpEFConfig(decl *sitter.Node, src []byte, meta map[string]any) {
-	if decl == nil {
-		return
+// csharpDecodeStringLiteral decodes one complete C# regular or verbatim
+// string literal. It intentionally rejects newer raw/interpolated/UTF-8
+// spellings: accepting a prefix of one of those would manufacture a table
+// name that the source does not state as a runtime System.String value.
+func csharpDecodeStringLiteral(text string) (string, bool) {
+	text = strings.TrimSpace(text)
+	value, consumed, ok := csharpDecodeStringLiteralPrefix(text)
+	if !ok || strings.TrimSpace(text[consumed:]) != "" {
+		return "", false
 	}
-	var baseList *sitter.Node
-	for i, _nc := 0, int(decl.ChildCount()); i < _nc; i++ {
-		if c := decl.Child(i); c != nil && c.Type() == "base_list" {
-			baseList = c
+	return value, true
+}
+
+func csharpDecodeStringLiteralPrefix(text string) (string, int, bool) {
+	if strings.HasPrefix(text, `@"`) {
+		return csharpDecodeVerbatimStringPrefix(text)
+	}
+	if len(text) < 2 || text[0] != '"' || strings.HasPrefix(text, `"""`) {
+		return "", 0, false
+	}
+
+	decoded := make([]rune, 0, len(text))
+	for i := 1; i < len(text); {
+		switch text[i] {
+		case '"':
+			consumed := i + 1
+			if strings.HasPrefix(text[consumed:], "u8") {
+				return "", 0, false
+			}
+			value, ok := csharpNormalizeStringRunes(decoded)
+			return value, consumed, ok
+		case '\r', '\n':
+			return "", 0, false
+		case '\\':
+			i++
+			if i >= len(text) {
+				return "", 0, false
+			}
+			switch text[i] {
+			case '\'', '"', '\\':
+				decoded = append(decoded, rune(text[i]))
+				i++
+			case '0':
+				decoded = append(decoded, 0)
+				i++
+			case 'a':
+				decoded = append(decoded, '\a')
+				i++
+			case 'b':
+				decoded = append(decoded, '\b')
+				i++
+			case 'e':
+				decoded = append(decoded, 0x1b)
+				i++
+			case 'f':
+				decoded = append(decoded, '\f')
+				i++
+			case 'n':
+				decoded = append(decoded, '\n')
+				i++
+			case 'r':
+				decoded = append(decoded, '\r')
+				i++
+			case 't':
+				decoded = append(decoded, '\t')
+				i++
+			case 'v':
+				decoded = append(decoded, '\v')
+				i++
+			case 'x':
+				value, next, ok := csharpReadHexEscape(text, i+1, 1, 4)
+				if !ok {
+					return "", 0, false
+				}
+				decoded = append(decoded, rune(value))
+				i = next
+			case 'u':
+				value, next, ok := csharpReadHexEscape(text, i+1, 4, 4)
+				if !ok {
+					return "", 0, false
+				}
+				decoded = append(decoded, rune(value))
+				i = next
+			case 'U':
+				value, next, ok := csharpReadHexEscape(text, i+1, 8, 8)
+				if !ok || value > utf8.MaxRune || value >= 0xd800 && value <= 0xdfff {
+					return "", 0, false
+				}
+				decoded = append(decoded, rune(value))
+				i = next
+			default:
+				return "", 0, false
+			}
+		default:
+			r, size := utf8.DecodeRuneInString(text[i:])
+			if r == utf8.RuneError && size == 1 || csharpIsRegularStringNewline(r) {
+				return "", 0, false
+			}
+			decoded = append(decoded, r)
+			i += size
+		}
+	}
+	return "", 0, false
+}
+
+func csharpDecodeVerbatimStringPrefix(text string) (string, int, bool) {
+	decoded := make([]rune, 0, len(text))
+	for i := 2; i < len(text); {
+		if text[i] == '"' {
+			if i+1 < len(text) && text[i+1] == '"' {
+				decoded = append(decoded, '"')
+				i += 2
+				continue
+			}
+			consumed := i + 1
+			if strings.HasPrefix(text[consumed:], "u8") {
+				return "", 0, false
+			}
+			value, ok := csharpNormalizeStringRunes(decoded)
+			return value, consumed, ok
+		}
+		r, size := utf8.DecodeRuneInString(text[i:])
+		if r == utf8.RuneError && size == 1 {
+			return "", 0, false
+		}
+		decoded = append(decoded, r)
+		i += size
+	}
+	return "", 0, false
+}
+
+func csharpReadHexEscape(text string, start, minDigits, maxDigits int) (uint32, int, bool) {
+	var value uint32
+	i := start
+	for i < len(text) && i-start < maxDigits {
+		digit, ok := csharpHexDigit(text[i])
+		if !ok {
 			break
 		}
+		value = value*16 + uint32(digit)
+		i++
 	}
-	if baseList == nil {
-		return
+	if i-start < minDigits {
+		return 0, start, false
 	}
-	// A class may implement IEntityTypeConfiguration<A> AND <B> (legal,
-	// two Configure overloads). A single-entity stamp cannot say whose
-	// ToTable the body scan found, so more than one distinct T refuses.
-	matches := csharpEFConfigIfaceArg.FindAllStringSubmatch(baseList.Content(src), -1)
-	if len(matches) == 0 {
-		return
+	return value, i, true
+}
+
+func csharpHexDigit(b byte) (byte, bool) {
+	switch {
+	case b >= '0' && b <= '9':
+		return b - '0', true
+	case b >= 'a' && b <= 'f':
+		return b - 'a' + 10, true
+	case b >= 'A' && b <= 'F':
+		return b - 'A' + 10, true
+	default:
+		return 0, false
 	}
-	entity := ""
-	for _, m := range matches {
-		cand := strings.TrimSpace(m[1])
-		if i := strings.LastIndexByte(cand, '.'); i >= 0 {
-			cand = cand[i+1:]
+}
+
+func csharpNormalizeStringRunes(decoded []rune) (string, bool) {
+	out := make([]rune, 0, len(decoded))
+	for i := 0; i < len(decoded); i++ {
+		r := decoded[i]
+		switch {
+		case r >= 0xd800 && r <= 0xdbff:
+			if i+1 >= len(decoded) || decoded[i+1] < 0xdc00 || decoded[i+1] > 0xdfff {
+				return "", false
+			}
+			out = append(out, utf16.DecodeRune(r, decoded[i+1]))
+			i++
+		case r >= 0xdc00 && r <= 0xdfff, !utf8.ValidRune(r):
+			return "", false
+		default:
+			out = append(out, r)
 		}
-		cand = strings.TrimPrefix(cand, "@")
-		if cand == "" {
+	}
+	return string(out), true
+}
+
+func csharpIsRegularStringNewline(r rune) bool {
+	return r == '\r' || r == '\n' || r == '\u0085' || r == '\u2028' || r == '\u2029'
+}
+
+// csharpEFConfigEntity validates a direct base-list entry whose terminal
+// type is exactly IEntityTypeConfiguration<T>. Nested occurrences such as
+// Wrapper<IEntityTypeConfiguration<T>> are deliberately not configuration
+// facts. Multiple distinct entity arguments are ambiguous and fail open.
+func csharpEFConfigEntity(decl *sitter.Node, src []byte) (entity, identity string, ok bool) {
+	baseList := csharpDirectChildOfType(decl, "base_list")
+	if baseList == nil {
+		return "", "", false
+	}
+	for i, count := 0, int(baseList.NamedChildCount()); i < count; i++ {
+		arg, matched := csharpEFGenericTypeArgument(baseList.NamedChild(i), src, "IEntityTypeConfiguration")
+		if !matched {
 			continue
 		}
-		if entity != "" && cand != entity {
-			return
+		candidateIdentity, candidateEntity, named := csharpEFNamedType(arg, src)
+		if !named {
+			return "", "", false
 		}
-		entity = cand
+		if identity != "" && candidateIdentity != identity {
+			return "", "", false
+		}
+		identity, entity = candidateIdentity, candidateEntity
 	}
-	if entity == "" {
+	return entity, identity, identity != ""
+}
+
+func csharpEFGenericTypeArgument(typeNode *sitter.Node, src []byte, expected string) (*sitter.Node, bool) {
+	terminal := csharpEFTerminalTypeNode(typeNode)
+	if terminal == nil || terminal.Type() != "generic_name" {
+		return nil, false
+	}
+	name := terminal.ChildByFieldName("name")
+	if name == nil && terminal.NamedChildCount() != 0 {
+		name = terminal.NamedChild(0)
+	}
+	if name == nil || strings.TrimPrefix(name.Content(src), "@") != expected {
+		return nil, false
+	}
+	typeArgs := terminal.ChildByFieldName("type_arguments")
+	if typeArgs == nil {
+		typeArgs = csharpDirectChildOfType(terminal, "type_argument_list")
+	}
+	if typeArgs == nil || typeArgs.NamedChildCount() != 1 {
+		return nil, false
+	}
+	return typeArgs.NamedChild(0), true
+}
+
+func csharpEFTerminalTypeNode(typeNode *sitter.Node) *sitter.Node {
+	for typeNode != nil {
+		switch typeNode.Type() {
+		case "simple_base_type":
+			if typeNode.NamedChildCount() != 1 {
+				return typeNode
+			}
+			typeNode = typeNode.NamedChild(0)
+		case "qualified_name", "alias_qualified_name":
+			next := typeNode.ChildByFieldName("name")
+			if next == nil && typeNode.NamedChildCount() != 0 {
+				next = typeNode.NamedChild(int(typeNode.NamedChildCount()) - 1)
+			}
+			typeNode = next
+		default:
+			return typeNode
+		}
+	}
+	return nil
+}
+
+func csharpEFNamedType(typeNode *sitter.Node, src []byte) (identity, terminal string, ok bool) {
+	last := csharpEFTerminalTypeNode(typeNode)
+	if last == nil || last.Type() != "identifier" {
+		return "", "", false
+	}
+	terminal = strings.TrimPrefix(last.Content(src), "@")
+	if terminal == "" {
+		return "", "", false
+	}
+	identity = csharpCompactTypeIdentity(typeNode.Content(src))
+	return identity, terminal, identity != ""
+}
+
+func csharpCompactTypeIdentity(text string) string {
+	text = strings.NewReplacer(" ", "", "\t", "", "\r", "", "\n", "").Replace(text)
+	parts := strings.Split(text, ".")
+	for i := range parts {
+		parts[i] = strings.TrimPrefix(parts[i], "@")
+	}
+	return strings.Join(parts, ".")
+}
+
+func csharpDirectChildOfType(node *sitter.Node, kind string) *sitter.Node {
+	if node == nil {
+		return nil
+	}
+	for i, count := 0, int(node.NamedChildCount()); i < count; i++ {
+		child := node.NamedChild(i)
+		if child != nil && child.Type() == kind {
+			return child
+		}
+	}
+	return nil
+}
+
+// csharpEFConfigureMethod accepts only the direct, unambiguous Configure
+// implementation for the same T named by IEntityTypeConfiguration<T>:
+// void Configure(EntityTypeBuilder<T> receiver) with a block body.
+func csharpEFConfigureMethod(decl *sitter.Node, src []byte, entityIdentity string) (*sitter.Node, string, bool) {
+	body := decl.ChildByFieldName("body")
+	if body == nil {
+		body = csharpDirectChildOfType(decl, "declaration_list")
+	}
+	if body == nil {
+		return nil, "", false
+	}
+	var method *sitter.Node
+	receiver := ""
+	for i, count := 0, int(body.NamedChildCount()); i < count; i++ {
+		candidate := body.NamedChild(i)
+		if candidate == nil || candidate.Type() != "method_declaration" {
+			continue
+		}
+		candidateIdentity, candidateReceiver, valid := csharpEFConfigureSignature(candidate, src)
+		if !valid || candidateIdentity != entityIdentity {
+			continue
+		}
+		if method != nil {
+			return nil, "", false
+		}
+		method, receiver = candidate, candidateReceiver
+	}
+	return method, receiver, method != nil
+}
+
+func csharpEFConfigureSignature(method *sitter.Node, src []byte) (entityIdentity, receiver string, ok bool) {
+	name := method.ChildByFieldName("name")
+	if name == nil || name.Content(src) != "Configure" {
+		return "", "", false
+	}
+	returns := method.ChildByFieldName("returns")
+	if returns == nil {
+		returns = method.ChildByFieldName("type")
+	}
+	if returns == nil || returns.Content(src) != "void" {
+		return "", "", false
+	}
+	parameters := method.ChildByFieldName("parameters")
+	if parameters == nil || parameters.NamedChildCount() != 1 {
+		return "", "", false
+	}
+	parameter := parameters.NamedChild(0)
+	if parameter == nil || parameter.Type() != "parameter" {
+		return "", "", false
+	}
+	parameterType := parameter.ChildByFieldName("type")
+	arg, matched := csharpEFGenericTypeArgument(parameterType, src, "EntityTypeBuilder")
+	if !matched {
+		return "", "", false
+	}
+	identity, _, named := csharpEFNamedType(arg, src)
+	if !named {
+		return "", "", false
+	}
+	parameterName := parameter.ChildByFieldName("name")
+	if parameterName == nil || parameterName.Type() != "identifier" {
+		return "", "", false
+	}
+	block := method.ChildByFieldName("body")
+	if block == nil || block.Type() != "block" {
+		return "", "", false
+	}
+	return identity, strings.TrimPrefix(parameterName.Content(src), "@"), true
+}
+
+// stampCSharpEFConfig records only a mapping proved by an exact
+// IEntityTypeConfiguration<T> implementation and its matching Configure
+// method. Scalar keys remain for the resolver compatibility contract.
+func stampCSharpEFConfig(decl *sitter.Node, src []byte, meta map[string]any) {
+	entity, identity, ok := csharpEFConfigEntity(decl, src)
+	if !ok {
+		return
+	}
+	configure, _, ok := csharpEFConfigureMethod(decl, src, identity)
+	if !ok {
 		return
 	}
 	meta["ef_config_entity"] = entity
-	table, schema, relation := csharpEFConfigTableCall(decl, src)
+	table, schema, relation := csharpEFConfigTableCall(configure, src)
 	if table == "" {
 		return
 	}
@@ -168,91 +565,164 @@ func stampCSharpEFConfig(decl *sitter.Node, src []byte, meta map[string]any) {
 	}
 }
 
-// csharpEFConfigTableCall finds the first ToTable(...) / ToView(...)
-// invocation in the declaration's subtree whose receiver is a PLAIN
-// IDENTIFIER outside any lambda, and returns its literal name/schema
-// arguments. Both restrictions are misattribution guards, not
-// conveniences: a ToTable inside a lambda is an owned-type mapping
-// (`builder.OwnsOne(c => c.Slot, s => s.ToTable(...))`) naming the
-// OWNED type's table, and a ToTable chained onto another call
-// (`builder.OwnsOne(...).ToTable(...)`) hangs off a builder for a
-// different entity. Refusing those loses the rare
-// `builder.HasAnnotation(...).ToTable(...)` chain — a miss, never a
-// wrong edge.
+// csharpEFConfigTableCall scans only the validated Configure body and
+// credits direct calls on its EntityTypeBuilder<T> parameter. Calls are
+// visited in source order and the last valid mapping wins, matching EF.
 func csharpEFConfigTableCall(decl *sitter.Node, src []byte) (table, schema, relation string) {
-	var walk func(n *sitter.Node, inLambda bool) bool
-	walk = func(n *sitter.Node, inLambda bool) bool {
-		if n == nil {
-			return true
-		}
-		switch n.Type() {
-		case "lambda_expression", "anonymous_method_expression":
-			inLambda = true
-		case "invocation_expression":
-			if !inLambda {
-				if t, s, r, ok := csharpEFTableViewArgs(n, src); ok {
-					if fn := n.ChildByFieldName("function"); fn != nil {
-						if recv := fn.ChildByFieldName("expression"); recv != nil && recv.Type() == "identifier" {
-							table, schema, relation = t, s, r
-							return false
-						}
-					}
-				}
-			}
-		}
-		for i, _nc := 0, int(n.NamedChildCount()); i < _nc; i++ {
-			if !walk(n.NamedChild(i), inLambda) {
-				return false
-			}
-		}
-		return true
+	method := decl
+	if method == nil {
+		return "", "", ""
 	}
-	walk(decl, false)
+	if method.Type() != "method_declaration" {
+		_, identity, valid := csharpEFConfigEntity(method, src)
+		if !valid {
+			return "", "", ""
+		}
+		method, _, valid = csharpEFConfigureMethod(method, src, identity)
+		if !valid {
+			return "", "", ""
+		}
+	}
+	_, receiver, valid := csharpEFConfigureSignature(method, src)
+	if !valid {
+		return "", "", ""
+	}
+	body := method.ChildByFieldName("body")
+	csharpWalkEFInvocations(body, func(inv *sitter.Node) {
+		t, s, r, matched := csharpEFTableViewArgs(inv, src)
+		if !matched {
+			return
+		}
+		fn := inv.ChildByFieldName("function")
+		if !csharpEFDirectReceiver(fn, src, receiver) {
+			return
+		}
+		table, schema, relation = t, s, r
+	})
 	return table, schema, relation
 }
 
-// csharpEFTableViewArgs recognises an invocation node as a
-// ToTable/ToView call with a literal name and returns its arguments.
-// The first argument must itself be a string literal — the
-// lambda-only overloads configure without naming, so a non-literal
-// first argument is not a table fact.
-func csharpEFTableViewArgs(n *sitter.Node, src []byte) (table, schema, relation string, ok bool) {
-	if n.Type() != "invocation_expression" {
-		return "", "", "", false
+type csharpEFArgument struct {
+	name  string
+	value *sitter.Node
+}
+
+func csharpEFArguments(inv *sitter.Node, src []byte) ([]csharpEFArgument, bool) {
+	if inv == nil {
+		return nil, false
 	}
-	fn := n.ChildByFieldName("function")
-	if fn == nil || fn.Type() != "member_access_expression" {
-		return "", "", "", false
+	list := inv.ChildByFieldName("arguments")
+	if list == nil {
+		return nil, false
 	}
-	name := ""
-	if nm := fn.ChildByFieldName("name"); nm != nil {
-		name = nm.Content(src)
-	}
-	if name != "ToTable" && name != "ToView" {
-		return "", "", "", false
-	}
-	args := n.ChildByFieldName("arguments")
-	if args == nil {
-		return "", "", "", false
-	}
-	var lits []string
-	for i, _nc := 0, int(args.NamedChildCount()); i < _nc; i++ {
-		a := args.NamedChild(i)
-		if a == nil {
+	args := make([]csharpEFArgument, 0, list.NamedChildCount())
+	for i, count := 0, int(list.NamedChildCount()); i < count; i++ {
+		node := list.NamedChild(i)
+		if node == nil {
+			return nil, false
+		}
+		if node.Type() != "argument" {
+			args = append(args, csharpEFArgument{value: node})
 			continue
 		}
-		lit := csharpAttrPositionalString(a.Content(src))
-		if i == 0 && lit == "" {
-			return "", "", "", false
+		name := ""
+		nameNode := node.ChildByFieldName("name")
+		for j, children := 0, int(node.NamedChildCount()); j < children; j++ {
+			child := node.NamedChild(j)
+			if child != nil && child.Type() == "name_colon" {
+				nameNode = child
+			}
 		}
-		lits = append(lits, lit)
+		if nameNode != nil {
+			name = csharpEFNameColon(nameNode, src)
+			if name == "" {
+				return nil, false
+			}
+		}
+		value := node.ChildByFieldName("value")
+		if value == nil {
+			value = node.ChildByFieldName("expression")
+		}
+		if value == nil && node.NamedChildCount() != 0 {
+			value = node.NamedChild(int(node.NamedChildCount()) - 1)
+		}
+		if value == nil || nameNode != nil && value.Equal(nameNode) {
+			return nil, false
+		}
+		args = append(args, csharpEFArgument{name: name, value: value})
 	}
-	if len(lits) == 0 || lits[0] == "" {
+	return args, true
+}
+
+func csharpEFNameColon(node *sitter.Node, src []byte) string {
+	if node == nil {
+		return ""
+	}
+	if name := node.ChildByFieldName("name"); name != nil {
+		return strings.TrimPrefix(name.Content(src), "@")
+	}
+	if node.NamedChildCount() != 0 {
+		return strings.TrimPrefix(node.NamedChild(0).Content(src), "@")
+	}
+	return strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(node.Content(src)), ":"), "@")
+}
+
+// csharpEFTableViewArgs recognises literal ToTable/ToView name and schema
+// arguments, including C# name:/schema: argument syntax. A dynamic schema
+// is refused because treating it as the default schema would be wrong.
+func csharpEFTableViewArgs(inv *sitter.Node, src []byte) (table, schema, relation string, ok bool) {
+	fn, name, valid := csharpEFMemberCall(inv, src)
+	if !valid || name != "ToTable" && name != "ToView" {
 		return "", "", "", false
 	}
-	table = lits[0]
-	if len(lits) > 1 {
-		schema = lits[1]
+	_ = fn
+	args, valid := csharpEFArguments(inv, src)
+	if !valid {
+		return "", "", "", false
+	}
+	var tableNode, schemaNode *sitter.Node
+	tableSet, schemaSet := false, false
+	position := 0
+	for _, arg := range args {
+		switch arg.name {
+		case "":
+			switch position {
+			case 0:
+				tableNode, tableSet = arg.value, true
+			case 1:
+				schemaNode, schemaSet = arg.value, true
+			default:
+				return "", "", "", false
+			}
+			position++
+		case "name":
+			if tableSet {
+				return "", "", "", false
+			}
+			tableNode, tableSet = arg.value, true
+		case "schema":
+			if schemaSet {
+				return "", "", "", false
+			}
+			schemaNode, schemaSet = arg.value, true
+		default:
+			return "", "", "", false
+		}
+	}
+	if !tableSet || tableNode == nil {
+		return "", "", "", false
+	}
+	table, valid = csharpDecodeStringLiteral(tableNode.Content(src))
+	if !valid || table == "" {
+		return "", "", "", false
+	}
+	if schemaSet {
+		if !csharpEFStaticNull(schemaNode, src) {
+			schema, valid = csharpDecodeStringLiteral(schemaNode.Content(src))
+			if !valid {
+				return "", "", "", false
+			}
+		}
 	}
 	relation = "table"
 	if name == "ToView" {
@@ -261,14 +731,6 @@ func csharpEFTableViewArgs(n *sitter.Node, src []byte) (table, schema, relation 
 	return table, schema, relation, true
 }
 
-// csharpEFEntityGenericArg matches the Entity<T> generic-name link of
-// a modelBuilder fluent chain.
-var csharpEFEntityGenericArg = regexp.MustCompile(`^Entity\s*<\s*([^<>,]+?)\s*>$`)
-
-// csharpEFSubjectChangers are the fluent links that return a builder
-// for a DIFFERENT entity (owned types, navigations): a ToTable past
-// one of these names that other entity's table, so the chain walk
-// refuses rather than crediting T.
 var csharpEFSubjectChangers = map[string]bool{
 	"OwnsOne": true, "OwnsMany": true,
 	"HasOne": true, "HasMany": true,
@@ -276,96 +738,352 @@ var csharpEFSubjectChangers = map[string]bool{
 	"Navigation": true, "ComplexProperty": true,
 }
 
-// csharpEFEntityFromChain walks a ToTable/ToView call's receiver
-// chain (`modelBuilder.Entity<T>().HasKey(...).ToTable(...)`) down to
-// the Entity<T> link and returns T's final name segment, or "" when
-// the chain never names an entity — or passes through a
-// subject-changing link (`Entity<T>().OwnsOne(...).ToTable(...)` is
-// the owned type's table-splitting spelling, not T's table).
+// csharpEFEntityFromChain retains the existing helper contract; context
+// extraction uses the rooted variant so only the ModelBuilder parameter
+// can establish Entity<T>.
 func csharpEFEntityFromChain(fn *sitter.Node, src []byte) string {
+	return csharpEFEntityFromChainRoot(fn, src, "")
+}
+
+func csharpEFEntityFromChainRoot(fn *sitter.Node, src []byte, root string) string {
+	if fn == nil || fn.Type() != "member_access_expression" {
+		return ""
+	}
 	expr := fn.ChildByFieldName("expression")
-	for expr != nil {
-		switch expr.Type() {
-		case "invocation_expression":
-			expr = expr.ChildByFieldName("function")
-		case "member_access_expression":
-			if nm := expr.ChildByFieldName("name"); nm != nil {
-				txt := nm.Content(src)
-				if nm.Type() == "generic_name" {
-					if m := csharpEFEntityGenericArg.FindStringSubmatch(txt); len(m) >= 2 {
-						entity := strings.TrimSpace(m[1])
-						if i := strings.LastIndexByte(entity, '.'); i >= 0 {
-							entity = entity[i+1:]
-						}
-						return strings.TrimPrefix(entity, "@")
-					}
-					// OwnsOne<Address>(...) spells the subject change as a
-					// generic name — strip the argument list before the check.
-					if i := strings.IndexByte(txt, '<'); i >= 0 {
-						txt = strings.TrimSpace(txt[:i])
-					}
-				}
-				if csharpEFSubjectChangers[txt] {
-					return ""
-				}
-			}
-			expr = expr.ChildByFieldName("expression")
-		default:
+	for expr != nil && expr.Type() == "invocation_expression" {
+		callFn := expr.ChildByFieldName("function")
+		if callFn == nil || callFn.Type() != "member_access_expression" {
 			return ""
 		}
+		nameNode := callFn.ChildByFieldName("name")
+		if nameNode == nil {
+			return ""
+		}
+		name := csharpEFMemberName(nameNode, src)
+		if arg, entityCall := csharpEFGenericTypeArgument(nameNode, src, "Entity"); entityCall {
+			arguments := expr.ChildByFieldName("arguments")
+			if arguments == nil || arguments.NamedChildCount() != 0 {
+				return ""
+			}
+			base := callFn.ChildByFieldName("expression")
+			if base == nil || base.Type() != "identifier" {
+				return ""
+			}
+			baseName := strings.TrimPrefix(base.Content(src), "@")
+			if root != "" && baseName != root {
+				return ""
+			}
+			_, entity, named := csharpEFNamedType(arg, src)
+			if !named {
+				return ""
+			}
+			return entity
+		}
+		if csharpEFSubjectChangers[name] {
+			return ""
+		}
+		expr = callFn.ChildByFieldName("expression")
 	}
 	return ""
 }
 
-// stampCSharpEFFluent records the OnModelCreating inline fluent
-// mapping facts on the file node as Meta["ef_fluent"], one
-// "entity|table|schema|relation|line" entry per Entity<T> chain that
-// ends in a literal ToTable/ToView — line is the call's own line, so
-// the resolver's edge evidence points at the mapping statement rather
-// than the file top. Only OnModelCreating bodies are
-// scanned: that is where EF looks, and a helper method reached from
-// there is a cross-file/cross-method chase the extractor stays out
-// of. The resolver joins entries to entity class nodes by name, same
-// as the config-class stamps.
-func stampCSharpEFFluent(root *sitter.Node, src []byte, fileNode *graph.Node) {
-	var entries []string
-	seen := map[string]bool{}
-	walkNodes(root, func(n *sitter.Node) {
-		if n.Type() != "method_declaration" {
+func csharpEFMemberName(node *sitter.Node, src []byte) string {
+	if node == nil {
+		return ""
+	}
+	if node.Type() == "generic_name" {
+		name := node.ChildByFieldName("name")
+		if name == nil && node.NamedChildCount() != 0 {
+			name = node.NamedChild(0)
+		}
+		if name != nil && name.Type() == "identifier" {
+			return strings.TrimPrefix(name.Content(src), "@")
+		}
+		return ""
+	}
+	if node.Type() != "identifier" {
+		return ""
+	}
+	return strings.TrimPrefix(node.Content(src), "@")
+}
+
+func csharpEFMemberCall(inv *sitter.Node, src []byte) (*sitter.Node, string, bool) {
+	if inv == nil || inv.Type() != "invocation_expression" {
+		return nil, "", false
+	}
+	fn := inv.ChildByFieldName("function")
+	if fn == nil || fn.Type() != "member_access_expression" {
+		return nil, "", false
+	}
+	name := csharpEFMemberName(fn.ChildByFieldName("name"), src)
+	return fn, name, name != ""
+}
+
+func csharpEFDirectReceiver(fn *sitter.Node, src []byte, expected string) bool {
+	if fn == nil || fn.Type() != "member_access_expression" {
+		return false
+	}
+	receiver := fn.ChildByFieldName("expression")
+	return receiver != nil && receiver.Type() == "identifier" &&
+		strings.TrimPrefix(receiver.Content(src), "@") == expected
+}
+
+func csharpWalkEFInvocations(root *sitter.Node, visit func(*sitter.Node)) {
+	var walk func(*sitter.Node)
+	walk = func(node *sitter.Node) {
+		if node == nil {
 			return
 		}
-		if nm := n.ChildByFieldName("name"); nm == nil || nm.Content(src) != "OnModelCreating" {
-			return
+		if node != root {
+			switch node.Type() {
+			case "lambda_expression", "anonymous_method_expression", "local_function_statement", "method_declaration":
+				return
+			}
 		}
-		body := n.ChildByFieldName("body")
-		if body == nil {
-			return
+		if node.Type() == "invocation_expression" {
+			visit(node)
 		}
-		walkAST(body, func(inv *sitter.Node) bool {
-			table, schema, relation, ok := csharpEFTableViewArgs(inv, src)
-			if !ok {
-				return true
-			}
-			entity := csharpEFEntityFromChain(inv.ChildByFieldName("function"), src)
-			if entity == "" {
-				return true
-			}
-			entry := entity + "|" + table + "|" + schema + "|" + relation +
-				"|" + strconv.Itoa(int(inv.StartPoint().Row)+1)
-			if !seen[entry] {
-				seen[entry] = true
-				entries = append(entries, entry)
-			}
+		for i, count := 0, int(node.NamedChildCount()); i < count; i++ {
+			walk(node.NamedChild(i))
+		}
+	}
+	walk(root)
+}
+
+func csharpEFDbContextClass(decl *sitter.Node, src []byte) (string, bool) {
+	if decl == nil || decl.Type() != "class_declaration" {
+		return "", false
+	}
+	baseList := csharpDirectChildOfType(decl, "base_list")
+	if baseList == nil {
+		return "", false
+	}
+	isContext := false
+	for i, count := 0, int(baseList.NamedChildCount()); i < count; i++ {
+		identity, terminal, named := csharpEFNamedType(baseList.NamedChild(i), src)
+		if !named || terminal != "DbContext" {
+			continue
+		}
+		if identity == "DbContext" || identity == "Microsoft.EntityFrameworkCore.DbContext" ||
+			identity == "global::Microsoft.EntityFrameworkCore.DbContext" {
+			isContext = true
+		}
+	}
+	name := decl.ChildByFieldName("name")
+	if !isContext || name == nil || name.Type() != "identifier" {
+		return "", false
+	}
+	return strings.TrimPrefix(name.Content(src), "@"), true
+}
+
+func csharpEFOnModelCreating(decl *sitter.Node, src []byte) (*sitter.Node, string, bool) {
+	body := decl.ChildByFieldName("body")
+	if body == nil {
+		body = csharpDirectChildOfType(decl, "declaration_list")
+	}
+	if body == nil {
+		return nil, "", false
+	}
+	var found *sitter.Node
+	receiver := ""
+	for i, count := 0, int(body.NamedChildCount()); i < count; i++ {
+		method := body.NamedChild(i)
+		candidateReceiver, valid := csharpEFOnModelCreatingSignature(method, src)
+		if !valid {
+			continue
+		}
+		if found != nil {
+			return nil, "", false
+		}
+		found, receiver = method, candidateReceiver
+	}
+	return found, receiver, found != nil
+}
+
+func csharpEFOnModelCreatingSignature(method *sitter.Node, src []byte) (string, bool) {
+	if method == nil || method.Type() != "method_declaration" {
+		return "", false
+	}
+	name := method.ChildByFieldName("name")
+	if name == nil || name.Type() != "identifier" || name.Content(src) != "OnModelCreating" {
+		return "", false
+	}
+	returns := method.ChildByFieldName("returns")
+	if returns == nil {
+		returns = method.ChildByFieldName("type")
+	}
+	if returns == nil || returns.Content(src) != "void" || !csharpEFHasDirectToken(method, src, "override") {
+		return "", false
+	}
+	parameters := method.ChildByFieldName("parameters")
+	if parameters == nil || parameters.NamedChildCount() != 1 {
+		return "", false
+	}
+	parameter := parameters.NamedChild(0)
+	if parameter == nil || parameter.Type() != "parameter" {
+		return "", false
+	}
+	identity, terminal, named := csharpEFNamedType(parameter.ChildByFieldName("type"), src)
+	if !named || terminal != "ModelBuilder" || identity != "ModelBuilder" && identity != "Microsoft.EntityFrameworkCore.ModelBuilder" && identity != "global::Microsoft.EntityFrameworkCore.ModelBuilder" {
+		return "", false
+	}
+	parameterName := parameter.ChildByFieldName("name")
+	body := method.ChildByFieldName("body")
+	if parameterName == nil || parameterName.Type() != "identifier" || body == nil || body.Type() != "block" {
+		return "", false
+	}
+	return strings.TrimPrefix(parameterName.Content(src), "@"), true
+}
+
+func csharpEFHasDirectToken(node *sitter.Node, src []byte, token string) bool {
+	for i, count := 0, int(node.ChildCount()); i < count; i++ {
+		child := node.Child(i)
+		if child != nil && child.Content(src) == token {
 			return true
+		}
+	}
+	return false
+}
+
+func csharpEFApplyConfiguration(inv *sitter.Node, src []byte, receiver string) (string, bool) {
+	fn, name, valid := csharpEFMemberCall(inv, src)
+	if !valid || name != "ApplyConfiguration" || !csharpEFDirectReceiver(fn, src, receiver) {
+		return "", false
+	}
+	args, valid := csharpEFArguments(inv, src)
+	if !valid || len(args) != 1 || args[0].name != "" && args[0].name != "configuration" {
+		return "", false
+	}
+	creation := args[0].value
+	if creation == nil || creation.Type() != "object_creation_expression" {
+		return "", false
+	}
+	_, config, named := csharpEFNamedType(creation.ChildByFieldName("type"), src)
+	return config, named
+}
+
+func csharpEFApplyAssembly(inv *sitter.Node, src []byte, receiver, context string) bool {
+	fn, name, valid := csharpEFMemberCall(inv, src)
+	if !valid || name != "ApplyConfigurationsFromAssembly" || !csharpEFDirectReceiver(fn, src, receiver) {
+		return false
+	}
+	args, valid := csharpEFArguments(inv, src)
+	if !valid {
+		return false
+	}
+	var assembly, predicate *sitter.Node
+	assemblySet, predicateSet, position := false, false, 0
+	for _, arg := range args {
+		switch arg.name {
+		case "":
+			if position == 0 {
+				assembly, assemblySet = arg.value, true
+			} else if position == 1 {
+				predicate, predicateSet = arg.value, true
+			} else {
+				return false
+			}
+			position++
+		case "assembly":
+			if assemblySet {
+				return false
+			}
+			assembly, assemblySet = arg.value, true
+		case "predicate":
+			if predicateSet {
+				return false
+			}
+			predicate, predicateSet = arg.value, true
+		default:
+			return false
+		}
+	}
+	if !assemblySet || predicateSet && !csharpEFStaticNull(predicate, src) {
+		return false
+	}
+	return csharpEFCurrentAssembly(assembly, src, context)
+}
+
+func csharpEFCurrentAssembly(expr *sitter.Node, src []byte, context string) bool {
+	if expr == nil || expr.Type() != "member_access_expression" {
+		return false
+	}
+	name := expr.ChildByFieldName("name")
+	typeof := expr.ChildByFieldName("expression")
+	if name == nil || name.Type() != "identifier" || name.Content(src) != "Assembly" || typeof == nil || typeof.Type() != "typeof_expression" {
+		return false
+	}
+	typeNode := typeof.ChildByFieldName("type")
+	if typeNode == nil && typeof.NamedChildCount() == 1 {
+		typeNode = typeof.NamedChild(0)
+	}
+	identity, _, named := csharpEFNamedType(typeNode, src)
+	return named && identity == context
+}
+
+func csharpEFStaticNull(node *sitter.Node, src []byte) bool {
+	return node != nil && node.Type() == "null_literal" && strings.TrimSpace(node.Content(src)) == "null"
+}
+
+// stampCSharpEFFluent records lexical EF actions in source order. Each
+// map uses the persisted structured contract: context/kind/line/ordinal,
+// plus mapping or configuration fields appropriate to the action kind.
+func stampCSharpEFFluent(root *sitter.Node, src []byte, fileNode *graph.Node) {
+	actions := make([]map[string]any, 0)
+	walkNodes(root, func(decl *sitter.Node) {
+		context, valid := csharpEFDbContextClass(decl, src)
+		if !valid {
+			return
+		}
+		method, receiver, valid := csharpEFOnModelCreating(decl, src)
+		if !valid {
+			return
+		}
+		body := method.ChildByFieldName("body")
+		csharpWalkEFInvocations(body, func(inv *sitter.Node) {
+			if table, schema, relation, matched := csharpEFTableViewArgs(inv, src); matched {
+				entity := csharpEFEntityFromChainRoot(inv.ChildByFieldName("function"), src, receiver)
+				if entity != "" {
+					actions = append(actions, map[string]any{
+						"context":  context,
+						"kind":     "mapping",
+						"line":     int(inv.StartPoint().Row) + 1,
+						"ordinal":  len(actions),
+						"entity":   entity,
+						"table":    table,
+						"schema":   schema,
+						"relation": relation,
+					})
+					return
+				}
+			}
+			if config, matched := csharpEFApplyConfiguration(inv, src, receiver); matched {
+				actions = append(actions, map[string]any{
+					"context": context,
+					"kind":    "apply_configuration",
+					"line":    int(inv.StartPoint().Row) + 1,
+					"ordinal": len(actions),
+					"config":  config,
+				})
+				return
+			}
+			if csharpEFApplyAssembly(inv, src, receiver, context) {
+				actions = append(actions, map[string]any{
+					"context": context,
+					"kind":    "apply_assembly",
+					"line":    int(inv.StartPoint().Row) + 1,
+					"ordinal": len(actions),
+				})
+			}
 		})
 	})
-	if len(entries) == 0 {
+	if len(actions) == 0 {
 		return
 	}
 	if fileNode.Meta == nil {
 		fileNode.Meta = map[string]any{}
 	}
-	fileNode.Meta["ef_fluent"] = entries
+	fileNode.Meta["ef_fluent"] = actions
 }
 
 // emitCSharpORMEdges materialises the KindTable node + EdgeModelsTable

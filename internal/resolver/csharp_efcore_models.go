@@ -1,6 +1,7 @@
 package resolver
 
 import (
+	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
@@ -9,59 +10,51 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 )
 
-// ResolveCSharpEFCoreModels joins the EF Core mapping facts the C#
-// extractor stamps into models_table edges. The extractor decides only
-// the in-file form — a [Table] attribute on the entity itself; the two
-// cross-file forms land here:
-//
-//   - DbSet<T> convention: EF names the table after the DbSet PROPERTY
-//     (verbatim — not a pluralization of the class name), and the
-//     property lives on the DbContext, not the entity.
-//
-//   - Fluent configuration: an IEntityTypeConfiguration<T> class's
-//     ToTable/ToView (stamped as ef_config_* class meta) or an
-//     OnModelCreating Entity<T>() chain (stamped as ef_fluent file
-//     meta) names the table from yet another file.
-//
-// Precedence is fluent > attribute > dbset: a fluent fact REWIRES an
-// existing attribute edge in place (go_orm's override model) rather
-// than adding a second edge, and an entity a fluent fact claimed never
-// falls through to the DbSet convention. Within the fluent tier an
-// inline OnModelCreating entry beats a config class (EF applies
-// OnModelCreating statements after ApplyConfiguration); two facts in
-// the WINNING tier that disagree drop the entity entirely.
-//
-// Facts join to entity classes by unique class name within the same
-// boundary — an ambiguous name (two classes called Widget) skips
-// rather than guesses. An entity that already carries a models_table
-// edge at its final target is left alone, which is also what makes
-// the pass idempotent.
-//
-// Scoped (incremental) invocations run through frameworkScopedStore
-// with no bespoke scopedFn: the pass only sees nodes in the changed
-// frontier, so a cross-file join whose other half did not change joins
-// nothing — fail-open, never wrong. The one transient window: a fluent
-// fact whose file is out of scope cannot shadow the DbSet convention,
-// so an incremental run may land the convention name until the next
-// full settle rewires it. Full resolves see everything.
-//
-// Returns the number of edges synthesized or rewired.
+const (
+	csharpEFActionMapping            = "mapping"
+	csharpEFActionApplyConfiguration = "apply_configuration"
+	csharpEFActionApplyAssembly      = "apply_assembly"
+)
+
+type csharpEFDecisionState uint8
+
+const (
+	csharpEFUnclaimed csharpEFDecisionState = iota
+	csharpEFWinner
+	csharpEFRejected
+)
+
+// ResolveCSharpEFCoreModels is the full/cold entry point. Incremental callers
+// use ResolveCSharpEFCoreModelsScoped so a configuration-only edit reconciles
+// the complete projection for every entity in the changed repository.
 func ResolveCSharpEFCoreModels(g graph.Store) int {
+	return ResolveCSharpEFCoreModelsScoped(g, nil)
+}
+
+// ResolveCSharpEFCoreModelsScoped joins ordered EF Core OnModelCreating actions
+// with configuration definitions, entity attributes, and DbSet conventions.
+// A non-nil scope is repository-bounded but still reads every current
+// models_table sibling for each affected entity, enabling deletion, reversion,
+// and duplicate coalescing.
+func ResolveCSharpEFCoreModelsScoped(g graph.Store, scope map[string]bool) int {
 	if g == nil {
 		return 0
 	}
-	classesByName := map[string][]*graph.Node{}
+
+	nodes := csharpEFNodesForScope(g, scope)
+	classesByKey := map[string][]*graph.Node{}
+	configsByKey := map[string][]csharpEFConfigFact{}
+	configsByBoundary := map[string][]csharpEFConfigFact{}
+	entitiesByID := map[string]*graph.Node{}
+	var actions []csharpEFAction
 	var dbsets []csharpDbSetFact
-	var fluents []csharpEFFluentFact
-	for _, n := range nodesByKindsOrAll(g, graph.KindType, graph.KindField, graph.KindFile) {
+
+	for _, n := range nodes {
 		if n == nil {
 			continue
 		}
-		// File nodes skip the language gate deliberately: they carry no
-		// Language, and only the C# extractor mints ef_fluent — key
-		// presence is the filter.
 		if n.Kind == graph.KindFile {
-			fluents = append(fluents, csharpEFInlineFactsFromFile(n)...)
+			actions = append(actions, csharpEFActionsFromFile(n)...)
 			continue
 		}
 		if !strings.EqualFold(n.Language, "csharp") {
@@ -69,270 +62,738 @@ func ResolveCSharpEFCoreModels(g graph.Store) int {
 		}
 		switch n.Kind {
 		case graph.KindType:
-			classesByName[n.Name] = append(classesByName[n.Name], n)
-			if f, ok := csharpEFConfigFactFromNode(n); ok {
-				fluents = append(fluents, f)
+			entitiesByID[n.ID] = n
+			nameKey := csharpEFNameKey(n.RepoPrefix, n.WorkspaceID, n.Name)
+			classesByKey[nameKey] = append(classesByKey[nameKey], n)
+			if cfg, ok := csharpEFConfigFactFromNode(n); ok {
+				key := csharpEFNameKey(cfg.repoPrefix, cfg.workspaceID, cfg.name)
+				configsByKey[key] = append(configsByKey[key], cfg)
+				boundary := csharpEFBoundaryKey(cfg.repoPrefix, cfg.workspaceID)
+				configsByBoundary[boundary] = append(configsByBoundary[boundary], cfg)
 			}
 		case graph.KindField:
-			if f, ok := csharpDbSetFactFromNode(n); ok {
-				dbsets = append(dbsets, f)
+			if fact, ok := csharpDbSetFactFromNode(n); ok {
+				dbsets = append(dbsets, fact)
 			}
 		}
 	}
-	if len(dbsets) == 0 && len(fluents) == 0 {
+
+	for key := range configsByKey {
+		sort.Slice(configsByKey[key], func(i, j int) bool {
+			return configsByKey[key][i].siteID < configsByKey[key][j].siteID
+		})
+	}
+	for key := range configsByBoundary {
+		sort.Slice(configsByBoundary[key], func(i, j int) bool {
+			return configsByBoundary[key][i].siteID < configsByBoundary[key][j].siteID
+		})
+	}
+
+	decisions := csharpEFReduceActions(actions, classesByKey, configsByKey, configsByBoundary)
+	dbsetsByEntity := csharpEFResolveDbSets(dbsets, classesByKey)
+
+	entityIDs := make([]string, 0, len(entitiesByID))
+	for id := range entitiesByID {
+		entityIDs = append(entityIDs, id)
+	}
+	sort.Strings(entityIDs)
+	outgoing := g.GetOutEdgesByNodeIDs(entityIDs)
+	currentByEntity := map[string][]*graph.Edge{}
+	affected := map[string]bool{}
+	for _, id := range entityIDs {
+		entity := entitiesByID[id]
+		if _, ok := csharpEFAttributeMapping(entity); ok {
+			affected[id] = true
+		}
+		for _, edge := range outgoing[id] {
+			if csharpEFOwnsModelsTableEdge(edge) {
+				currentByEntity[id] = append(currentByEntity[id], edge)
+				affected[id] = true
+			}
+		}
+	}
+	for id := range decisions {
+		affected[id] = true
+	}
+	for id := range dbsetsByEntity {
+		affected[id] = true
+	}
+
+	var removeEdges []*graph.Edge
+	addEdges := map[graph.EdgeIdentity]*graph.Edge{}
+	addNodes := map[string]*graph.Node{}
+	changed := 0
+	orderedAffected := make([]string, 0, len(affected))
+	for id := range affected {
+		orderedAffected = append(orderedAffected, id)
+	}
+	sort.Strings(orderedAffected)
+
+	for _, entityID := range orderedAffected {
+		entity := entitiesByID[entityID]
+		if entity == nil {
+			continue
+		}
+		current := currentByEntity[entityID]
+		sort.Slice(current, func(i, j int) bool {
+			return csharpEFEdgeOrderKey(current[i]) < csharpEFEdgeOrderKey(current[j])
+		})
+		desired := csharpEFDesiredProjection(entity, decisions[entityID], dbsetsByEntity[entityID], current)
+		if len(current) == 1 && desired != nil && csharpEFEdgesEqual(current[0], desired) {
+			continue
+		}
+		if len(current) == 0 && desired == nil {
+			continue
+		}
+		removeEdges = append(removeEdges, current...)
+		if desired != nil {
+			addEdges[graph.EdgeIdentityFor(desired)] = desired
+			if g.GetNode(desired.To) == nil {
+				if table := csharpEFTableNodeForEdge(entity, desired); table != nil {
+					addNodes[table.ID] = table
+				}
+			}
+		}
+		changed++
+	}
+
+	if changed == 0 {
 		return 0
 	}
-	// Node scans are map-ordered; sort every fact list before first-wins
-	// logic so edge content and evidence sites are deterministic across
-	// runs (the mediatr/gin sibling idiom).
-	sort.Slice(dbsets, func(i, j int) bool {
-		if dbsets[i].entity != dbsets[j].entity {
-			return dbsets[i].entity < dbsets[j].entity
-		}
-		return dbsets[i].siteID < dbsets[j].siteID
+	nodeBatch := make([]*graph.Node, 0, len(addNodes))
+	for _, node := range addNodes {
+		nodeBatch = append(nodeBatch, node)
+	}
+	sort.Slice(nodeBatch, func(i, j int) bool { return nodeBatch[i].ID < nodeBatch[j].ID })
+	edgeBatch := make([]*graph.Edge, 0, len(addEdges))
+	for _, edge := range addEdges {
+		edgeBatch = append(edgeBatch, edge)
+	}
+	sort.Slice(edgeBatch, func(i, j int) bool {
+		return csharpEFEdgeOrderKey(edgeBatch[i]) < csharpEFEdgeOrderKey(edgeBatch[j])
 	})
 
-	// Entities that already model a table: the attribute binding was
-	// decided at extraction, and a prior run of this pass already
-	// landed. Fluent facts may rewire these; the DbSet leg never
-	// touches them.
-	mapped := map[string]bool{}
-	edgesByFrom := map[string][]*graph.Edge{}
-	for e := range g.EdgesByKind(graph.EdgeModelsTable) {
-		if e != nil {
-			mapped[e.From] = true
-			edgesByFrom[e.From] = append(edgesByFrom[e.From], e)
+	// Full framework runs wrap legacy functions in frameworkEdgeBatchStore.
+	// This resolver performs one replacement and has no staged AddEdge writes;
+	// unwrap the facade so Graph/SQLite retain exact, atomic replacement.
+	replacementStore := g
+	if batch, ok := g.(*frameworkEdgeBatchStore); ok {
+		batch.flush()
+		if batch.readCache != nil && len(nodeBatch) > 0 {
+			batch.readCache.invalidateNodes()
 		}
+		replacementStore = batch.Store
 	}
-
-	resolved := 0
-
-	// Fluent tier first, so its claims shadow the DbSet convention.
-	var reindex []graph.EdgeReindex
-	for _, f := range csharpEFMergeFluentFacts(fluents) {
-		cands := sameBoundaryCandidates(g, f.siteID, classesByName[f.entity])
-		if len(cands) != 1 {
-			continue
-		}
-		cls := cands[0]
-		tableID := csharpEFTableNodeID(cls.RepoPrefix, f.table, f.schema)
-		meta := map[string]any{
-			"orm":        "efcore",
-			"binding":    "fluent",
-			"table_name": f.table,
-			"derivation": "override",
-		}
-		if f.schema != "" {
-			meta["schema"] = f.schema
-		}
-		if f.relation != "" {
-			meta["relation"] = f.relation
-		}
-		if es := edgesByFrom[cls.ID]; len(es) > 0 {
-			// Rewire in place. The edge keeps its FilePath/Line (the
-			// entity's own file): the edge's From side is the model, and
-			// anchoring evidence there survives re-extraction of the
-			// fact file. The superseded attribute's table node is
-			// deliberately left behind even if nothing points at it any
-			// more — same call go_orm's override rewire makes; a table
-			// node is cheap and another entity may share it.
-			e := es[0]
-			if e.To == tableID {
-				continue
-			}
-			csharpEFEnsureTableNode(g, tableID, f.table, f.schema, f.filePath, cls.RepoPrefix)
-			oldTo := e.To
-			e.To = tableID
-			e.Origin = graph.OriginASTInferred
-			e.Confidence = ConfidenceTyped
-			e.ConfidenceLabel = graph.ConfidenceLabelFor(graph.EdgeModelsTable, ConfidenceTyped)
-			e.Meta = meta
-			StampSynthesizedTyped(e, SynthCSharpEFCoreModels)
-			reindex = append(reindex, graph.EdgeReindex{Edge: e, OldTo: oldTo})
-			resolved++
-			continue
-		}
-		if mapped[cls.ID] {
-			continue
-		}
-		mapped[cls.ID] = true
-		csharpEFEnsureTableNode(g, tableID, f.table, f.schema, f.filePath, cls.RepoPrefix)
-		e := &graph.Edge{
-			From: cls.ID, To: tableID, Kind: graph.EdgeModelsTable,
-			FilePath:        f.filePath,
-			Line:            f.line,
-			Origin:          graph.OriginASTInferred,
-			Confidence:      ConfidenceTyped,
-			ConfidenceLabel: graph.ConfidenceLabelFor(graph.EdgeModelsTable, ConfidenceTyped),
-			Meta:            meta,
-		}
-		StampSynthesizedTyped(e, SynthCSharpEFCoreModels)
-		g.AddEdge(e)
-		resolved++
+	_, err := graph.ReplaceDerivedContracts(replacementStore, graph.DerivedContractReplacement{
+		RemoveEdges: removeEdges,
+		Nodes:       nodeBatch,
+		Edges:       edgeBatch,
+	})
+	if err != nil {
+		return 0
 	}
-	if len(reindex) > 0 {
-		g.ReindexEdges(reindex)
-	}
-
-	for _, f := range dbsets {
-		cands := sameBoundaryCandidates(g, f.siteID, classesByName[f.entity])
-		if len(cands) != 1 {
-			continue
-		}
-		cls := cands[0]
-		if mapped[cls.ID] {
-			continue
-		}
-		mapped[cls.ID] = true
-		tableID := csharpEFTableNodeID(cls.RepoPrefix, f.table, "")
-		csharpEFEnsureTableNode(g, tableID, f.table, "", f.filePath, cls.RepoPrefix)
-		e := &graph.Edge{
-			From: cls.ID, To: tableID, Kind: graph.EdgeModelsTable,
-			FilePath:        f.filePath,
-			Line:            f.line,
-			Origin:          graph.OriginASTInferred,
-			Confidence:      ConfidenceTyped,
-			ConfidenceLabel: graph.ConfidenceLabelFor(graph.EdgeModelsTable, ConfidenceTyped),
-			Meta: map[string]any{
-				"orm":        "efcore",
-				"binding":    "dbset",
-				"table_name": f.table,
-				"derivation": "convention",
-			},
-		}
-		StampSynthesizedTyped(e, SynthCSharpEFCoreModels)
-		g.AddEdge(e)
-		resolved++
-	}
-	return resolved
+	return changed
 }
 
-// csharpEFFluentFact is one fluent table naming: from a config class
-// (inline=false) or an OnModelCreating entry (inline=true).
-type csharpEFFluentFact struct {
-	entity   string
-	table    string
-	schema   string
-	relation string
-	inline   bool
-	siteID   string
-	filePath string
-	line     int
-}
-
-// csharpEFMergeFluentFacts reduces the fluent facts to at most one per
-// entity name. Two-phase so the verdict never depends on arrival order
-// (facts come off a map-ordered node scan): the inline OnModelCreating
-// tier wins outright when present — a disagreement in the config tier
-// below it is irrelevant — and only the WINNING tier's facts are
-// checked for conflicts; two of those that disagree on the mapping
-// drop the entity, refusing over guessing. Agreeing duplicates keep
-// the lowest-siteID fact, so the retained evidence site is
-// deterministic too.
-func csharpEFMergeFluentFacts(fluents []csharpEFFluentFact) []csharpEFFluentFact {
-	byEntity := map[string][]csharpEFFluentFact{}
-	var order []string
-	for _, f := range fluents {
-		if _, ok := byEntity[f.entity]; !ok {
-			order = append(order, f.entity)
-		}
-		byEntity[f.entity] = append(byEntity[f.entity], f)
+func csharpEFNodesForScope(g graph.Store, scope map[string]bool) []*graph.Node {
+	if scope == nil {
+		return nodesByKindsOrAll(g, graph.KindType, graph.KindField, graph.KindFile)
 	}
-	sort.Strings(order)
-	var out []csharpEFFluentFact
-	for _, entity := range order {
-		facts := byEntity[entity]
-		// Winning tier: inline when any inline fact exists.
-		tier := facts[:0:0]
-		for _, f := range facts {
-			if f.inline {
-				tier = append(tier, f)
-			}
-		}
-		if len(tier) == 0 {
-			tier = facts
-		}
-		sort.Slice(tier, func(i, j int) bool { return tier[i].siteID < tier[j].siteID })
-		winner := tier[0]
-		conflict := false
-		for _, f := range tier[1:] {
-			if f.table != winner.table || f.schema != winner.schema || f.relation != winner.relation {
-				conflict = true
-				break
-			}
-		}
-		if !conflict {
-			out = append(out, winner)
+	prefixes := frameworkScopePrefixes(scope)
+	var out []*graph.Node
+	for node := range graph.NodesInScopeSeq(g, prefixes, nil, graph.KindType, graph.KindField, graph.KindFile) {
+		if node != nil {
+			out = append(out, node)
 		}
 	}
 	return out
 }
 
-// csharpEFConfigFactFromNode reads the ef_config_* stamps off an
-// IEntityTypeConfiguration<T> class node. A config class without a
-// literal ToTable/ToView carries no table fact.
-func csharpEFConfigFactFromNode(n *graph.Node) (csharpEFFluentFact, bool) {
-	if n.Meta == nil {
-		return csharpEFFluentFact{}, false
+type csharpEFMapping struct {
+	entity      string
+	table       string
+	schema      string
+	relation    string
+	context     string
+	siteID      string
+	filePath    string
+	line        int
+	repoPrefix  string
+	workspaceID string
+	sources     []string
+	contexts    []string
+}
+
+type csharpEFAction struct {
+	kind        string
+	context     string
+	config      string
+	ordinal     int
+	line        int
+	siteID      string
+	filePath    string
+	repoPrefix  string
+	workspaceID string
+	mapping     csharpEFMapping
+}
+
+type csharpEFConfigFact struct {
+	name        string
+	siteID      string
+	repoPrefix  string
+	workspaceID string
+	mapping     csharpEFMapping
+}
+
+type csharpEFDecision struct {
+	state   csharpEFDecisionState
+	mapping csharpEFMapping
+}
+
+func csharpEFReduceActions(
+	actions []csharpEFAction,
+	classesByKey map[string][]*graph.Node,
+	configsByKey map[string][]csharpEFConfigFact,
+	configsByBoundary map[string][]csharpEFConfigFact,
+) map[string]csharpEFDecision {
+	byContext := map[string][]csharpEFAction{}
+	for _, action := range actions {
+		key := csharpEFBoundaryKey(action.repoPrefix, action.workspaceID) + "\x00" + action.context
+		byContext[key] = append(byContext[key], action)
+	}
+	contextKeys := make([]string, 0, len(byContext))
+	for key := range byContext {
+		contextKeys = append(contextKeys, key)
+	}
+	sort.Strings(contextKeys)
+
+	perEntity := map[string][]csharpEFDecision{}
+	for _, contextKey := range contextKeys {
+		stream := byContext[contextKey]
+		sort.SliceStable(stream, func(i, j int) bool {
+			if stream[i].ordinal != stream[j].ordinal {
+				return stream[i].ordinal < stream[j].ordinal
+			}
+			if stream[i].line != stream[j].line {
+				return stream[i].line < stream[j].line
+			}
+			return stream[i].kind < stream[j].kind
+		})
+		current := map[string]csharpEFDecision{}
+		for _, action := range stream {
+			switch action.kind {
+			case csharpEFActionMapping:
+				if id, mapping, ok := csharpEFResolveMapping(action.mapping, classesByKey); ok {
+					current[id] = csharpEFDecision{state: csharpEFWinner, mapping: mapping}
+				}
+			case csharpEFActionApplyConfiguration:
+				key := csharpEFNameKey(action.repoPrefix, action.workspaceID, action.config)
+				configs := configsByKey[key]
+				if len(configs) != 1 {
+					continue
+				}
+				mapping := csharpEFActivateConfig(configs[0], action)
+				if id, resolved, ok := csharpEFResolveMapping(mapping, classesByKey); ok {
+					current[id] = csharpEFDecision{state: csharpEFWinner, mapping: resolved}
+				}
+			case csharpEFActionApplyAssembly:
+				boundary := csharpEFBoundaryKey(action.repoPrefix, action.workspaceID)
+				atEvent := map[string][]csharpEFMapping{}
+				for _, config := range configsByBoundary[boundary] {
+					mapping := csharpEFActivateConfig(config, action)
+					if id, resolved, ok := csharpEFResolveMapping(mapping, classesByKey); ok {
+						atEvent[id] = append(atEvent[id], resolved)
+					}
+				}
+				for entityID, mappings := range atEvent {
+					current[entityID] = csharpEFMergeMappings(mappings)
+				}
+			}
+		}
+		for entityID, decision := range current {
+			perEntity[entityID] = append(perEntity[entityID], decision)
+		}
+	}
+
+	out := map[string]csharpEFDecision{}
+	for entityID, decisions := range perEntity {
+		if len(decisions) == 0 {
+			continue
+		}
+		merged := decisions[0]
+		for _, decision := range decisions[1:] {
+			if merged.state == csharpEFRejected || decision.state == csharpEFRejected ||
+				!csharpEFMappingEqual(merged.mapping, decision.mapping) {
+				merged = csharpEFDecision{state: csharpEFRejected}
+				continue
+			}
+			merged.mapping = csharpEFCombineMappingEvidence(merged.mapping, decision.mapping)
+		}
+		out[entityID] = merged
+	}
+	return out
+}
+
+func csharpEFMergeMappings(mappings []csharpEFMapping) csharpEFDecision {
+	if len(mappings) == 0 {
+		return csharpEFDecision{state: csharpEFUnclaimed}
+	}
+	sort.Slice(mappings, func(i, j int) bool {
+		return csharpEFMappingEvidenceKey(mappings[i]) < csharpEFMappingEvidenceKey(mappings[j])
+	})
+	winner := mappings[0]
+	for _, mapping := range mappings[1:] {
+		if !csharpEFMappingEqual(winner, mapping) {
+			return csharpEFDecision{state: csharpEFRejected}
+		}
+		winner = csharpEFCombineMappingEvidence(winner, mapping)
+	}
+	return csharpEFDecision{state: csharpEFWinner, mapping: winner}
+}
+
+func csharpEFResolveMapping(
+	mapping csharpEFMapping,
+	classesByKey map[string][]*graph.Node,
+) (string, csharpEFMapping, bool) {
+	key := csharpEFNameKey(mapping.repoPrefix, mapping.workspaceID, mapping.entity)
+	candidates := classesByKey[key]
+	if len(candidates) != 1 {
+		return "", csharpEFMapping{}, false
+	}
+	entity := candidates[0]
+	mapping.entity = entity.Name
+	return entity.ID, mapping, true
+}
+
+func csharpEFActivateConfig(config csharpEFConfigFact, action csharpEFAction) csharpEFMapping {
+	mapping := config.mapping
+	mapping.context = action.context
+	mapping.contexts = []string{action.context}
+	mapping.siteID = action.siteID
+	mapping.filePath = action.filePath
+	mapping.line = action.line
+	mapping.repoPrefix = action.repoPrefix
+	mapping.workspaceID = action.workspaceID
+	mapping.sources = csharpEFUniqueStrings([]string{config.siteID, csharpEFActionSource(action)})
+	return mapping
+}
+
+func csharpEFResolveDbSets(
+	facts []csharpDbSetFact,
+	classesByKey map[string][]*graph.Node,
+) map[string][]csharpDbSetFact {
+	out := map[string][]csharpDbSetFact{}
+	sort.Slice(facts, func(i, j int) bool { return facts[i].siteID < facts[j].siteID })
+	for _, fact := range facts {
+		key := csharpEFNameKey(fact.repoPrefix, fact.workspaceID, fact.entity)
+		candidates := classesByKey[key]
+		if len(candidates) != 1 {
+			continue
+		}
+		out[candidates[0].ID] = append(out[candidates[0].ID], fact)
+	}
+	return out
+}
+
+func csharpEFDesiredProjection(
+	entity *graph.Node,
+	decision csharpEFDecision,
+	dbsets []csharpDbSetFact,
+	current []*graph.Edge,
+) *graph.Edge {
+	attribute, hasAttribute := csharpEFAttributeMapping(entity)
+	switch decision.state {
+	case csharpEFWinner:
+		return csharpEFProjectionEdge(entity, decision.mapping, "fluent", "override")
+	case csharpEFRejected:
+		// An activated same-boundary conflict claims the entity but has no
+		// defensible target. Drop the projection entirely; do not expose the
+		// lower-precedence attribute or DbSet as if it were the runtime winner.
+		return nil
+	default:
+		if hasAttribute {
+			return csharpEFAttributeEdge(entity, attribute, current)
+		}
+		mapping, ok := csharpEFDbSetMapping(dbsets)
+		if !ok {
+			return nil
+		}
+		return csharpEFProjectionEdge(entity, mapping, "dbset", "convention")
+	}
+}
+
+func csharpEFDbSetMapping(facts []csharpDbSetFact) (csharpEFMapping, bool) {
+	if len(facts) == 0 {
+		return csharpEFMapping{}, false
+	}
+	sort.Slice(facts, func(i, j int) bool { return facts[i].siteID < facts[j].siteID })
+	first := facts[0]
+	for _, fact := range facts[1:] {
+		if fact.table != first.table {
+			return csharpEFMapping{}, false
+		}
+	}
+	sources := make([]string, 0, len(facts))
+	for _, fact := range facts {
+		sources = append(sources, fact.siteID)
+	}
+	return csharpEFMapping{
+		entity: first.entity, table: first.table,
+		siteID: first.siteID, filePath: first.filePath, line: first.line,
+		repoPrefix: first.repoPrefix, workspaceID: first.workspaceID,
+		sources: csharpEFUniqueStrings(sources),
+	}, true
+}
+
+func csharpEFProjectionEdge(entity *graph.Node, mapping csharpEFMapping, binding, derivation string) *graph.Edge {
+	tableID := csharpEFTableNodeID(entity.RepoPrefix, mapping.table, mapping.schema)
+	meta := map[string]any{
+		"orm":        "efcore",
+		"binding":    binding,
+		"table_name": mapping.table,
+		"derivation": derivation,
+	}
+	if mapping.schema != "" {
+		meta["schema"] = mapping.schema
+	}
+	if mapping.relation != "" {
+		meta["relation"] = mapping.relation
+	}
+	if sources := csharpEFUniqueStrings(mapping.sources); len(sources) > 0 {
+		meta["ef_sources"] = strings.Join(sources, "\x1f")
+	}
+	if contexts := csharpEFUniqueStrings(mapping.contexts); len(contexts) > 0 {
+		meta["ef_contexts"] = strings.Join(contexts, "\x1f")
+	}
+	filePath := mapping.filePath
+	line := mapping.line
+	if filePath == "" {
+		filePath = entity.FilePath
+	}
+	if line < 1 {
+		line = entity.StartLine
+	}
+	edge := &graph.Edge{
+		From: entity.ID, To: tableID, Kind: graph.EdgeModelsTable,
+		FilePath:        filePath,
+		Line:            line,
+		Origin:          graph.OriginASTInferred,
+		Confidence:      ConfidenceTyped,
+		ConfidenceLabel: graph.ConfidenceLabelFor(graph.EdgeModelsTable, ConfidenceTyped),
+		Meta:            meta,
+	}
+	StampSynthesizedTyped(edge, SynthCSharpEFCoreModels)
+	return edge
+}
+
+func csharpEFAttributeMapping(entity *graph.Node) (csharpEFMapping, bool) {
+	if entity == nil || entity.Meta == nil {
+		return csharpEFMapping{}, false
+	}
+	table, _ := entity.Meta["ef_attribute_table"].(string)
+	if table == "" {
+		return csharpEFMapping{}, false
+	}
+	schema, _ := entity.Meta["ef_attribute_schema"].(string)
+	return csharpEFMapping{
+		entity: entity.Name, table: table, schema: schema,
+		siteID: entity.ID, filePath: entity.FilePath, line: entity.StartLine,
+		repoPrefix: entity.RepoPrefix, workspaceID: entity.WorkspaceID,
+	}, true
+}
+
+func csharpEFAttributeEdge(entity *graph.Node, mapping csharpEFMapping, current []*graph.Edge) *graph.Edge {
+	tableID := csharpEFTableNodeID(entity.RepoPrefix, mapping.table, mapping.schema)
+	for _, edge := range current {
+		if edge == nil || edge.To != tableID || edge.Meta == nil {
+			continue
+		}
+		binding, _ := edge.Meta["binding"].(string)
+		if binding == "attribute" {
+			return cloneFrameworkEdge(edge)
+		}
+	}
+	meta := map[string]any{
+		"orm":        "efcore",
+		"binding":    "attribute",
+		"table_name": mapping.table,
+		"derivation": "override",
+	}
+	if mapping.schema != "" {
+		meta["schema"] = mapping.schema
+	}
+	return &graph.Edge{
+		From: entity.ID, To: tableID, Kind: graph.EdgeModelsTable,
+		FilePath:        entity.FilePath,
+		Line:            entity.StartLine,
+		Origin:          graph.OriginASTInferred,
+		Confidence:      ConfidenceTyped,
+		ConfidenceLabel: graph.ConfidenceLabelFor(graph.EdgeModelsTable, ConfidenceTyped),
+		Meta:            meta,
+	}
+}
+
+func csharpEFTableNodeForEdge(entity *graph.Node, edge *graph.Edge) *graph.Node {
+	if entity == nil || edge == nil || edge.Meta == nil {
+		return nil
+	}
+	table, _ := edge.Meta["table_name"].(string)
+	if table == "" {
+		return nil
+	}
+	schema, _ := edge.Meta["schema"].(string)
+	return &graph.Node{
+		ID:          edge.To,
+		Kind:        graph.KindTable,
+		Name:        table,
+		FilePath:    edge.FilePath,
+		Language:    "csharp",
+		RepoPrefix:  entity.RepoPrefix,
+		WorkspaceID: entity.WorkspaceID,
+		Meta: map[string]any{
+			"dialect": "orm",
+			"schema":  schema,
+			"source":  "csharp-orm",
+		},
+	}
+}
+
+func csharpEFOwnsModelsTableEdge(edge *graph.Edge) bool {
+	if edge == nil || edge.Kind != graph.EdgeModelsTable || edge.Meta == nil {
+		return false
+	}
+	orm, _ := edge.Meta["orm"].(string)
+	synth, _ := edge.Meta[MetaSynthesizedBy].(string)
+	return orm == "efcore" || synth == SynthCSharpEFCoreModels
+}
+
+func csharpEFEdgesEqual(a, b *graph.Edge) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.From == b.From && a.To == b.To && a.Kind == b.Kind &&
+		a.FilePath == b.FilePath && a.Line == b.Line && a.Origin == b.Origin &&
+		a.Confidence == b.Confidence && a.ConfidenceLabel == b.ConfidenceLabel &&
+		reflect.DeepEqual(a.Meta, b.Meta)
+}
+
+func csharpEFMappingEqual(a, b csharpEFMapping) bool {
+	return a.table == b.table && a.schema == b.schema && a.relation == b.relation
+}
+
+func csharpEFCombineMappingEvidence(a, b csharpEFMapping) csharpEFMapping {
+	if csharpEFMappingEvidenceKey(b) < csharpEFMappingEvidenceKey(a) {
+		a, b = b, a
+	}
+	a.sources = csharpEFUniqueStrings(append(append([]string(nil), a.sources...), b.sources...))
+	a.contexts = csharpEFUniqueStrings(append(append([]string(nil), a.contexts...), b.contexts...))
+	return a
+}
+
+func csharpEFMappingEvidenceKey(mapping csharpEFMapping) string {
+	return mapping.filePath + "\x00" + strconv.Itoa(mapping.line) + "\x00" + mapping.siteID
+}
+
+func csharpEFEdgeOrderKey(edge *graph.Edge) string {
+	if edge == nil {
+		return ""
+	}
+	return edge.From + "\x00" + edge.To + "\x00" + string(edge.Kind) + "\x00" + edge.FilePath + "\x00" + strconv.Itoa(edge.Line)
+}
+
+func csharpEFBoundaryKey(repoPrefix, workspaceID string) string {
+	return repoPrefix + "\x00" + workspaceID
+}
+
+func csharpEFNameKey(repoPrefix, workspaceID, name string) string {
+	return csharpEFBoundaryKey(repoPrefix, workspaceID) + "\x00" + csharpEFBareName(name)
+}
+
+func csharpEFBareName(name string) string {
+	name = strings.TrimSpace(strings.TrimPrefix(name, "global::"))
+	if i := strings.LastIndexByte(name, '.'); i >= 0 {
+		name = name[i+1:]
+	}
+	return strings.TrimPrefix(name, "@")
+}
+
+func csharpEFUniqueStrings(values []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func csharpEFActionSource(action csharpEFAction) string {
+	return action.siteID + "#" + action.context + "#" + strconv.Itoa(action.ordinal)
+}
+
+func csharpEFConfigFactFromNode(n *graph.Node) (csharpEFConfigFact, bool) {
+	if n == nil || n.Meta == nil {
+		return csharpEFConfigFact{}, false
 	}
 	entity, _ := n.Meta["ef_config_entity"].(string)
 	table, _ := n.Meta["ef_config_table"].(string)
 	if entity == "" || table == "" {
-		return csharpEFFluentFact{}, false
+		return csharpEFConfigFact{}, false
 	}
 	schema, _ := n.Meta["ef_config_schema"].(string)
 	relation, _ := n.Meta["ef_config_relation"].(string)
-	return csharpEFFluentFact{
-		entity: entity, table: table, schema: schema, relation: relation,
+	mapping := csharpEFMapping{
+		entity: csharpEFBareName(entity), table: table, schema: schema, relation: relation,
 		siteID: n.ID, filePath: n.FilePath, line: n.StartLine,
+		repoPrefix: n.RepoPrefix, workspaceID: n.WorkspaceID,
+		sources: []string{n.ID},
+	}
+	return csharpEFConfigFact{
+		name: csharpEFBareName(n.Name), siteID: n.ID,
+		repoPrefix: n.RepoPrefix, workspaceID: n.WorkspaceID,
+		mapping: mapping,
 	}, true
 }
 
-// csharpEFInlineFactsFromFile parses the ef_fluent
-// "entity|table|schema|relation|line" entries off a file node. Meta
-// lists round-trip through persistence as []any, so both shapes
-// decode.
-func csharpEFInlineFactsFromFile(n *graph.Node) []csharpEFFluentFact {
-	if n.Meta == nil {
+func csharpEFActionsFromFile(n *graph.Node) []csharpEFAction {
+	if n == nil || n.Meta == nil {
 		return nil
 	}
-	var entries []string
-	switch v := n.Meta["ef_fluent"].(type) {
-	case []string:
-		entries = v
-	case []any:
-		for _, x := range v {
-			if s, ok := x.(string); ok {
-				entries = append(entries, s)
-			}
+	value := n.Meta["ef_fluent"]
+	var out []csharpEFAction
+	appendMap := func(index int, raw map[string]any) {
+		kind, _ := raw["kind"].(string)
+		kind = strings.ToLower(strings.TrimSpace(kind))
+		context, _ := raw["context"].(string)
+		if context == "" {
+			context = n.ID
 		}
-	}
-	var out []csharpEFFluentFact
-	for _, entry := range entries {
-		parts := strings.SplitN(entry, "|", 5)
-		if len(parts) != 5 || parts[0] == "" || parts[1] == "" {
-			continue
-		}
-		line, err := strconv.Atoi(parts[4])
-		if err != nil || line < 1 {
+		line, ok := csharpEFMetaInt(raw["line"])
+		if !ok || line < 1 {
 			line = 1
 		}
-		out = append(out, csharpEFFluentFact{
-			entity: parts[0], table: parts[1], schema: parts[2], relation: parts[3],
-			inline: true,
-			siteID: n.ID, filePath: n.FilePath, line: line,
-		})
+		ordinal, ok := csharpEFMetaInt(raw["ordinal"])
+		if !ok {
+			ordinal = index
+		}
+		action := csharpEFAction{
+			kind: kind, context: context, ordinal: ordinal, line: line,
+			siteID: n.ID, filePath: n.FilePath,
+			repoPrefix: n.RepoPrefix, workspaceID: n.WorkspaceID,
+		}
+		switch kind {
+		case csharpEFActionMapping:
+			action.mapping = csharpEFMapping{
+				entity:   csharpEFBareName(csharpEFString(raw["entity"])),
+				table:    csharpEFString(raw["table"]),
+				schema:   csharpEFString(raw["schema"]),
+				relation: csharpEFString(raw["relation"]),
+				context:  context, contexts: []string{context},
+				siteID: n.ID, filePath: n.FilePath, line: line,
+				repoPrefix: n.RepoPrefix, workspaceID: n.WorkspaceID,
+				sources: []string{csharpEFActionSource(action)},
+			}
+			if action.mapping.entity == "" || action.mapping.table == "" {
+				return
+			}
+		case csharpEFActionApplyConfiguration:
+			action.config = csharpEFBareName(csharpEFString(raw["config"]))
+			if action.config == "" {
+				return
+			}
+		case csharpEFActionApplyAssembly:
+		default:
+			return
+		}
+		out = append(out, action)
+	}
+
+	switch entries := value.(type) {
+	case []map[string]any:
+		for i, entry := range entries {
+			appendMap(i, entry)
+		}
+	case []any:
+		for i, entry := range entries {
+			if raw, ok := entry.(map[string]any); ok {
+				appendMap(i, raw)
+				continue
+			}
+			if legacy, ok := entry.(string); ok {
+				if action, ok := csharpEFLegacyAction(n, legacy, i); ok {
+					out = append(out, action)
+				}
+			}
+		}
+	case []string:
+		for i, entry := range entries {
+			if action, ok := csharpEFLegacyAction(n, entry, i); ok {
+				out = append(out, action)
+			}
+		}
 	}
 	return out
 }
 
-// csharpEFTableNodeID mirrors the db::<dialect>::<schema>.<table>
-// convention the other ORM passes share. In a workspace store, ingest
-// prefixes every extraction ID with the repo — the extractor-minted
-// db::orm:: nodes included — so resolver-minted IDs carry the joined
-// entity's RepoPrefix to keep one logical table one identity
-// regardless of which binding path named it. RepoPrefix is empty in a
-// single-repo store and the ID stays bare, same as extraction.
+// csharpEFInlineFactsFromFile is retained as the narrow decoder entry point
+// used by focused tests; actions now include mapping and activation sites.
+func csharpEFInlineFactsFromFile(n *graph.Node) []csharpEFAction {
+	return csharpEFActionsFromFile(n)
+}
+
+func csharpEFLegacyAction(n *graph.Node, entry string, ordinal int) (csharpEFAction, bool) {
+	parts := strings.SplitN(entry, "|", 5)
+	if len(parts) != 5 || parts[0] == "" || parts[1] == "" {
+		return csharpEFAction{}, false
+	}
+	line, err := strconv.Atoi(parts[4])
+	if err != nil || line < 1 {
+		line = 1
+	}
+	action := csharpEFAction{
+		kind: csharpEFActionMapping, context: n.ID, ordinal: ordinal, line: line,
+		siteID: n.ID, filePath: n.FilePath,
+		repoPrefix: n.RepoPrefix, workspaceID: n.WorkspaceID,
+	}
+	action.mapping = csharpEFMapping{
+		entity: csharpEFBareName(parts[0]), table: parts[1], schema: parts[2], relation: parts[3],
+		context: action.context, contexts: []string{action.context},
+		siteID: n.ID, filePath: n.FilePath, line: line,
+		repoPrefix: n.RepoPrefix, workspaceID: n.WorkspaceID,
+		sources: []string{csharpEFActionSource(action)},
+	}
+	return action, true
+}
+
+func csharpEFMetaInt(value any) (int, bool) {
+	switch v := value.(type) {
+	case int:
+		return v, true
+	case int32:
+		return int(v), true
+	case int64:
+		return int(v), true
+	case float32:
+		return int(v), true
+	case float64:
+		return int(v), true
+	case string:
+		n, err := strconv.Atoi(v)
+		return n, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func csharpEFString(value any) string {
+	text, _ := value.(string)
+	return strings.TrimSpace(text)
+}
+
 func csharpEFTableNodeID(repoPrefix, table, schema string) string {
 	id := "db::orm::" + table
 	if schema != "" {
@@ -344,73 +805,54 @@ func csharpEFTableNodeID(repoPrefix, table, schema string) string {
 	return id
 }
 
-// csharpEFEnsureTableNode mints the KindTable node when the store does
-// not already hold it.
+// csharpEFEnsureTableNode remains for sibling tests and callers that construct
+// one table eagerly; the reconciler itself batches table nodes atomically.
 func csharpEFEnsureTableNode(g graph.Store, tableID, table, schema, filePath, repoPrefix string) {
 	if g.GetNode(tableID) != nil {
 		return
 	}
 	g.AddNode(&graph.Node{
-		ID:         tableID,
-		Kind:       graph.KindTable,
-		Name:       table,
-		FilePath:   filePath,
-		Language:   "csharp",
-		RepoPrefix: repoPrefix,
-		Meta: map[string]any{
-			"dialect": "orm",
-			"schema":  schema,
-			"source":  "csharp-orm",
-		},
+		ID: tableID, Kind: graph.KindTable, Name: table,
+		FilePath: filePath, Language: "csharp", RepoPrefix: repoPrefix,
+		Meta: map[string]any{"dialect": "orm", "schema": schema, "source": "csharp-orm"},
 	})
 }
 
-// csharpDbSetFact is one DbSet<T> property: the entity it names, the
-// table EF derives (the property name, verbatim), and the property's
-// site as edge evidence.
 type csharpDbSetFact struct {
-	entity   string
-	table    string
-	siteID   string
-	filePath string
-	line     int
+	entity      string
+	table       string
+	siteID      string
+	filePath    string
+	line        int
+	repoPrefix  string
+	workspaceID string
 }
 
-// csharpDbSetType matches a (possibly qualified) DbSet<T> property
-// type and captures T.
 var csharpDbSetType = regexp.MustCompile(`^(?:[A-Za-z_][\w.]*\.)?DbSet<(.+)>\??$`)
 
-// csharpDbSetFactFromNode recognises a C# property node whose type is
-// DbSet<T>. A nested-generic argument (DbSet<Pair<A,B>>) is not an
-// entity registration and returns no fact.
 func csharpDbSetFactFromNode(n *graph.Node) (csharpDbSetFact, bool) {
-	if n.Meta == nil {
+	if n == nil || n.Meta == nil {
 		return csharpDbSetFact{}, false
 	}
-	if k, _ := n.Meta["kind"].(string); k != "property" {
+	if kind, _ := n.Meta["kind"].(string); kind != "property" {
 		return csharpDbSetFact{}, false
 	}
-	ft, _ := n.Meta["field_type"].(string)
-	m := csharpDbSetType.FindStringSubmatch(strings.TrimSpace(ft))
-	if len(m) < 2 {
+	fieldType, _ := n.Meta["field_type"].(string)
+	match := csharpDbSetType.FindStringSubmatch(strings.TrimSpace(fieldType))
+	if len(match) < 2 {
 		return csharpDbSetFact{}, false
 	}
-	entity := strings.TrimSpace(m[1])
+	entity := strings.TrimSpace(match[1])
 	if strings.ContainsAny(entity, "<>,") {
 		return csharpDbSetFact{}, false
 	}
-	if i := strings.LastIndexByte(entity, '.'); i >= 0 {
-		entity = entity[i+1:]
-	}
-	entity = strings.TrimPrefix(entity, "@")
+	entity = csharpEFBareName(entity)
 	if entity == "" || n.Name == "" {
 		return csharpDbSetFact{}, false
 	}
 	return csharpDbSetFact{
-		entity:   entity,
-		table:    n.Name,
-		siteID:   n.ID,
-		filePath: n.FilePath,
-		line:     n.StartLine,
+		entity: entity, table: n.Name,
+		siteID: n.ID, filePath: n.FilePath, line: n.StartLine,
+		repoPrefix: n.RepoPrefix, workspaceID: n.WorkspaceID,
 	}, true
 }

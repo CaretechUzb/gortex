@@ -12,6 +12,14 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 )
 
+const (
+	// postExtractionPolicySnapshotKey is a reserved RepoIndexState extractor-
+	// version key. It versions admission rules that run after every language
+	// extractor, so it must never be returned as a language to re-stage.
+	postExtractionPolicySnapshotKey = "_post_extraction_policy"
+	postExtractionPolicyVersion     = 2
+)
+
 // extractorVersions records the logic version of each language's
 // extractor. Bump a language's entry when its extraction logic changes
 // in a way that should re-extract already-indexed files whose content
@@ -106,21 +114,21 @@ func extractorVersionForLang(lang string) int {
 	return 1
 }
 
-// merkleSaltFor returns the Merkle leaf salt for a repo-relative path:
-// "" when the file's language extractor is at the baseline version 1
-// (so the leaf equals the content hash and nothing changes), or
-// "lang@N" once a language's extractor version is bumped, so its files
-// re-extract on the next reconcile even when their content is unchanged.
+// merkleSaltFor returns the Merkle leaf salt for a repo-relative path. Every
+// mapped source language carries the global post-extraction policy epoch; a
+// bumped language additionally carries its extractor version. An unmapped
+// extension remains content-only and therefore has no salt.
 func merkleSaltFor(rel string) string {
 	lang := extractorSaltExtLang[strings.ToLower(filepath.Ext(rel))]
 	if lang == "" {
 		return ""
 	}
+	policySalt := postExtractionPolicySnapshotKey + "@" + strconv.Itoa(postExtractionPolicyVersion)
 	v := extractorVersionForLang(lang)
 	if v <= 1 {
-		return ""
+		return policySalt
 	}
-	return lang + "@" + strconv.Itoa(v)
+	return policySalt + "|" + lang + "@" + strconv.Itoa(v)
 }
 
 // ExtractorVersionStaleLangs reports which languages' extractors have been
@@ -146,14 +154,32 @@ func ExtractorVersionStaleLangs(storedJSON string) []string {
 }
 
 // staleLangsBetween returns the languages whose stored version is behind the
-// current version — only languages present in BOTH maps are compared, so a
-// language the stored snapshot never recorded is not spuriously flagged.
+// current version. Per-language entries are compared only when present in both
+// maps. The reserved post-extraction policy epoch is global: when current tracks
+// it and stored is missing or behind, every real current language is stale.
 func staleLangsBetween(stored, current map[string]int) []string {
-	var stale []string
-	for lang, storedV := range stored {
-		if cur, ok := current[lang]; ok && storedV < cur {
-			stale = append(stale, lang)
+	staleSet := make(map[string]struct{})
+	if currentPolicy, tracked := current[postExtractionPolicySnapshotKey]; tracked {
+		storedPolicy, found := stored[postExtractionPolicySnapshotKey]
+		if !found || storedPolicy < currentPolicy {
+			for lang := range current {
+				if lang != postExtractionPolicySnapshotKey {
+					staleSet[lang] = struct{}{}
+				}
+			}
 		}
+	}
+	for lang, storedV := range stored {
+		if lang == postExtractionPolicySnapshotKey {
+			continue
+		}
+		if cur, ok := current[lang]; ok && storedV < cur {
+			staleSet[lang] = struct{}{}
+		}
+	}
+	stale := make([]string, 0, len(staleSet))
+	for lang := range staleSet {
+		stale = append(stale, lang)
 	}
 	sort.Strings(stale)
 	return stale
@@ -201,11 +227,11 @@ func extractorLangStale(set map[string]struct{}, rel string) bool {
 	return ok
 }
 
-// extractorVersionsSnapshot returns a copy of the current per-language
-// extractor versions for persistence in repo_index_state, so a future
-// reconcile can tell which extractor produced the stored graph.
+// extractorVersionsSnapshot returns the current per-language extractor versions
+// plus the reserved global post-extraction policy epoch for persistence in
+// repo_index_state.
 func extractorVersionsSnapshot() map[string]int {
-	out := make(map[string]int, len(extractorSaltExtLang))
+	out := make(map[string]int, len(extractorSaltExtLang)+1)
 	seen := map[string]bool{}
 	for _, lang := range extractorSaltExtLang {
 		if seen[lang] {
@@ -214,5 +240,6 @@ func extractorVersionsSnapshot() map[string]int {
 		seen[lang] = true
 		out[lang] = extractorVersionForLang(lang)
 	}
+	out[postExtractionPolicySnapshotKey] = postExtractionPolicyVersion
 	return out
 }

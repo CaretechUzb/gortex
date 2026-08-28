@@ -236,7 +236,16 @@ public class ShipContext : DbContext
 	fix := runCSharpExtractFixtureORM(t, "Data/ShipContext.cs", src)
 	fileNode := fix.nodesByID["Data/ShipContext.cs"]
 	require.NotNil(t, fileNode)
-	assert.Equal(t, []string{"Parcel|parcels_main||table|8"}, fileNode.Meta["ef_fluent"],
+	assert.Equal(t, []map[string]any{{
+		"context":  "ShipContext",
+		"kind":     "mapping",
+		"line":     8,
+		"ordinal":  0,
+		"entity":   "Parcel",
+		"table":    "parcels_main",
+		"schema":   "",
+		"relation": "table",
+	}}, fileNode.Meta["ef_fluent"],
 		"the OwnsOne chain's ToTable names the OWNED type's table — the walk must stop at subject-changing links")
 }
 
@@ -261,11 +270,29 @@ public class ProbeContext : DbContext
 	fix := runCSharpExtractFixtureORM(t, "Data/ProbeContext.cs", src)
 	fileNode := fix.nodesByID["Data/ProbeContext.cs"]
 	require.NotNil(t, fileNode)
-	assert.Equal(t, []string{
-		"Widget|widget_master|core|table|11",
-		"Gadget|gadget_view||view|13",
+	assert.Equal(t, []map[string]any{
+		{
+			"context":  "ProbeContext",
+			"kind":     "mapping",
+			"line":     11,
+			"ordinal":  0,
+			"entity":   "Widget",
+			"table":    "widget_master",
+			"schema":   "core",
+			"relation": "table",
+		},
+		{
+			"context":  "ProbeContext",
+			"kind":     "mapping",
+			"line":     13,
+			"ordinal":  1,
+			"entity":   "Gadget",
+			"table":    "gadget_view",
+			"schema":   "",
+			"relation": "view",
+		},
 	}, fileNode.Meta["ef_fluent"],
-		"one entry per Entity<T> chain ending in a literal ToTable/ToView, line-stamped; chains without one stamp nothing")
+		"one structured action per Entity<T> chain ending in a literal ToTable/ToView")
 }
 
 func TestCSharpORM_FluentOutsideOnModelCreatingNotStamped(t *testing.T) {
@@ -317,6 +344,156 @@ public class VaultRow
 	models := fix.edgesByKind[graph.EdgeModelsTable]
 	require.Len(t, models, 1, "the explicit Attribute suffix and a verbatim string are both ordinary spellings")
 	assert.Equal(t, "db::orm::vault_rows", models[0].To)
+}
+
+func TestCSharpORM_AttributeMetadataDecodesSupportedLiterals(t *testing.T) {
+	src := `using System.ComponentModel.DataAnnotations.Schema;
+
+[Table("order\u005frows", Schema = @"audit")]
+public class Order
+{
+    public int Id { get; set; }
+}
+`
+	fix := runCSharpExtractFixtureORM(t, "Models/Order.cs", src)
+	entity := fix.nodesByID["Models/Order.cs::Order"]
+	require.NotNil(t, entity)
+	assert.Equal(t, "order_rows", entity.Meta["ef_attribute_table"])
+	assert.Equal(t, "audit", entity.Meta["ef_attribute_schema"])
+}
+
+func TestCSharpORM_ConfigNamedArgumentsLastCallWins(t *testing.T) {
+	src := `public class WidgetConfig : IEntityTypeConfiguration<Widget>
+{
+    public void Configure(EntityTypeBuilder<Widget> builder)
+    {
+        builder.ToTable(name: "first_widgets", schema: "archive");
+        builder.ToView(schema: null, name: @"final_widgets");
+    }
+}
+`
+	fix := runCSharpExtractFixtureORM(t, "Config/WidgetConfig.cs", src)
+	cfg := fix.nodesByID["Config/WidgetConfig.cs::WidgetConfig"]
+	require.NotNil(t, cfg)
+	assert.Equal(t, "Widget", cfg.Meta["ef_config_entity"])
+	assert.Equal(t, "final_widgets", cfg.Meta["ef_config_table"])
+	assert.Equal(t, "view", cfg.Meta["ef_config_relation"])
+	_, hasSchema := cfg.Meta["ef_config_schema"]
+	assert.False(t, hasSchema)
+}
+
+func TestCSharpORM_ConfigRequiresExactInterfaceAndMatchingConfigure(t *testing.T) {
+	src := `public class LookalikeConfig : AlmostIEntityTypeConfiguration<Widget>
+{
+    public void Configure(EntityTypeBuilder<Widget> builder)
+    {
+        builder.ToTable("wrong_one");
+    }
+}
+
+public class MismatchedConfig : IEntityTypeConfiguration<Widget>
+{
+    public void Configure(EntityTypeBuilder<Gadget> builder)
+    {
+        builder.ToTable("wrong_two");
+    }
+}
+`
+	fix := runCSharpExtractFixtureORM(t, "Config/InvalidConfigs.cs", src)
+	for _, id := range []string{"Config/InvalidConfigs.cs::LookalikeConfig", "Config/InvalidConfigs.cs::MismatchedConfig"} {
+		cfg := fix.nodesByID[id]
+		require.NotNil(t, cfg)
+		_, stamped := cfg.Meta["ef_config_entity"]
+		assert.False(t, stamped, id)
+	}
+}
+
+func TestCSharpORM_OnModelCreatingRequiresExactContextSignatureAndReceiver(t *testing.T) {
+	src := `public class NotAContext : DbContextish
+{
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<Widget>().ToTable("wrong_base");
+    }
+}
+
+public class MissingOverrideContext : DbContext
+{
+    protected void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<Widget>().ToTable("wrong_signature");
+    }
+}
+
+public class ExactContext : DbContext
+{
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        otherBuilder.Entity<Widget>().ToTable("wrong_receiver");
+        modelBuilder.Entity<Widget>().ToTable("widgets");
+    }
+}
+`
+	fix := runCSharpExtractFixtureORM(t, "Data/ExactContext.cs", src)
+	fileNode := fix.nodesByID["Data/ExactContext.cs"]
+	require.NotNil(t, fileNode)
+	actions, ok := fileNode.Meta["ef_fluent"].([]map[string]any)
+	require.True(t, ok)
+	require.Len(t, actions, 1)
+	assert.Equal(t, "ExactContext", actions[0]["context"])
+	assert.Equal(t, "Widget", actions[0]["entity"])
+	assert.Equal(t, "widgets", actions[0]["table"])
+}
+
+func TestCSharpORM_ApplyConfigurationActionsPreserveOrder(t *testing.T) {
+	src := `public class ApplyContext : DbContext
+{
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<Widget>().ToTable("widgets");
+        modelBuilder.ApplyConfiguration(configuration: new WidgetConfig());
+        modelBuilder.Entity<Widget>().ToView("widget_view");
+    }
+}
+`
+	fix := runCSharpExtractFixtureORM(t, "Data/ApplyContext.cs", src)
+	fileNode := fix.nodesByID["Data/ApplyContext.cs"]
+	require.NotNil(t, fileNode)
+	actions, ok := fileNode.Meta["ef_fluent"].([]map[string]any)
+	require.True(t, ok)
+	require.Len(t, actions, 3)
+	assert.Equal(t, "mapping", actions[0]["kind"])
+	assert.Equal(t, 0, actions[0]["ordinal"])
+	assert.Equal(t, "apply_configuration", actions[1]["kind"])
+	assert.Equal(t, "WidgetConfig", actions[1]["config"])
+	assert.Equal(t, 1, actions[1]["ordinal"])
+	assert.Equal(t, "mapping", actions[2]["kind"])
+	assert.Equal(t, 2, actions[2]["ordinal"])
+}
+
+func TestCSharpORM_ApplyAssemblyRequiresCurrentContextAndNullPredicate(t *testing.T) {
+	src := `public class ScanContext : DbContext
+{
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        modelBuilder.ApplyConfigurationsFromAssembly(typeof(ScanContext).Assembly);
+        modelBuilder.ApplyConfigurationsFromAssembly(assembly: typeof(ScanContext).Assembly, predicate: null);
+        modelBuilder.ApplyConfigurationsFromAssembly(typeof(OtherContext).Assembly);
+        modelBuilder.ApplyConfigurationsFromAssembly(typeof(ScanContext).Assembly, type => true);
+    }
+}
+`
+	fix := runCSharpExtractFixtureORM(t, "Data/ScanContext.cs", src)
+	fileNode := fix.nodesByID["Data/ScanContext.cs"]
+	require.NotNil(t, fileNode)
+	actions, ok := fileNode.Meta["ef_fluent"].([]map[string]any)
+	require.True(t, ok)
+	require.Len(t, actions, 2)
+	for ordinal, action := range actions {
+		assert.Equal(t, "ScanContext", action["context"])
+		assert.Equal(t, "apply_assembly", action["kind"])
+		assert.Equal(t, ordinal, action["ordinal"])
+	}
 }
 
 func TestCSharpORM_PlainClassIgnored(t *testing.T) {
