@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -246,28 +247,58 @@ func TestFindFiles_GlobstarComposesWithTrailingSubtree(t *testing.T) {
 // the whole scan rather than costing one call. The handler therefore has to
 // refuse an oversized pattern before it walks anything — a bound that only
 // existed inside the matcher would still have paid for the walk.
+//
+// The counts are taken off the NORMALISED pattern. Reading them off the raw
+// string was a bypass: on Windows a native-separator glob counts as one
+// segment before filepath.ToSlash and as many after it, so a 130-byte
+// pattern was admitted and then expanded to 65 segments at match time.
 func TestFindFiles_GlobOversizedIsRejectedBeforeScanning(t *testing.T) {
 	srv := setupFindFilesServer(t)
 
-	tooManySegments := strings.Repeat("segment/", maxGlobSegments+10) + "*"
-	tooManyBytes := strings.Repeat("a", maxGlobBytes+1)
-
-	for name, glob := range map[string]string{
-		"segments": tooManySegments,
-		"bytes":    tooManyBytes,
-	} {
-		t.Run(name, func(t *testing.T) {
-			res := callTool(t, srv, "find_files", map[string]any{"glob": glob})
-			require.True(t, res.IsError, "an oversized glob must be refused")
-			text := res.Content[0].(mcplib.TextContent).Text
-			require.Contains(t, text, "too large")
-		})
+	refused := func(t *testing.T, glob string) {
+		t.Helper()
+		res := callTool(t, srv, "find_files", map[string]any{"glob": glob})
+		require.True(t, res.IsError, "an oversized glob must be refused")
+		require.Contains(t, res.Content[0].(mcplib.TextContent).Text, "too large")
+	}
+	served := func(t *testing.T, glob string) {
+		t.Helper()
+		res := callTool(t, srv, "find_files", map[string]any{"glob": glob})
+		require.False(t, res.IsError, "a glob inside the bound must still be served")
 	}
 
-	// A glob at the limit still works, so the bound is not merely "reject
-	// anything long".
-	atLimit := strings.Repeat("x/", maxGlobSegments-2) + "**"
-	require.False(t, globTooComplex(atLimit))
-	res := callTool(t, srv, "find_files", map[string]any{"glob": atLimit})
-	require.False(t, res.IsError, "a glob inside the bound must still be served")
+	// Exactly at each limit is served; one past it is refused. The
+	// previous fixture built 63 segments and never touched the boundary.
+	atSegmentLimit := strings.Repeat("x/", maxGlobSegments-1) + "**"
+	require.Equal(t, maxGlobSegments, strings.Count(atSegmentLimit, "/")+1)
+	served(t, atSegmentLimit)
+	refused(t, strings.Repeat("x/", maxGlobSegments)+"**")
+
+	atByteLimit := strings.Repeat("a", maxGlobBytes)
+	require.Len(t, atByteLimit, maxGlobBytes)
+	served(t, atByteLimit)
+	refused(t, strings.Repeat("a", maxGlobBytes+1))
+
+	// Native and mixed separators are counted after normalisation, which
+	// is the only reading that agrees with the matcher.
+	t.Run("native separators", func(t *testing.T) {
+		glob := strings.Repeat(`x\`, maxGlobSegments) + `**`
+		require.Equal(t, 1, strings.Count(glob, "/")+1,
+			"the fixture must look small before normalisation, or it proves nothing")
+		require.Greater(t, strings.Count(filepath.ToSlash(glob), "/")+1, maxGlobSegments)
+		if runtime.GOOS == "windows" {
+			refused(t, glob)
+		} else {
+			// filepath.ToSlash is a no-op on POSIX, where a backslash is an
+			// ordinary filename byte; there is nothing to normalise and
+			// nothing to bypass.
+			served(t, glob)
+		}
+	})
+	t.Run("mixed separators", func(t *testing.T) {
+		glob := strings.Repeat(`a/b\`, maxGlobSegments) + `**`
+		if runtime.GOOS == "windows" {
+			refused(t, glob)
+		}
+	})
 }

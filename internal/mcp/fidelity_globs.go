@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"fmt"
 	"path"
 	"path/filepath"
 	"strings"
@@ -11,24 +12,50 @@ import (
 // fidelityGlobsParamDescription documents the fidelity_globs param for
 // read_file / get_editing_context. Kept as a constant so both tool
 // registrations share one source of truth.
-const fidelityGlobsParamDescription = "Per-glob fidelity tiers, applied when compress_bodies is set: a comma-separated, ordered list of `glob:fidelity` rules where fidelity is one of full | compress | omit (e.g. \"internal/**:full,*_test.go:omit,vendor/**:compress\"). The first rule whose glob matches the file's repo-relative path wins; a file matching no rule falls back to the compress_bodies boolean (compress). Glob semantics: `*` matches within a single path segment (never across `/`), basenames are matched too (so `*_test.go` works without a `**/` prefix), a trailing `/**` matches the directory and everything beneath it, a leading `**/` matches any directory depth, and a bare directory prefix (`internal`) matches everything under it, as does a trailing `/*` (`internal/*` is a prefix, not a segment glob). The per-symbol `keep` predicate still composes: a kept symbol stays full even when its file's rule says compress or omit."
+const fidelityGlobsParamDescription = "Per-glob fidelity tiers, applied when compress_bodies is set: a comma-separated, ordered list of `glob:fidelity` rules where fidelity is one of full | compress | omit (e.g. \"internal/**:full,*_test.go:omit,vendor/**:compress\"). The first rule whose glob matches the file's repo-relative path wins; a file matching no rule falls back to the compress_bodies boolean (compress). Glob semantics: `*` stays within one path segment, basenames are matched too (so `*_test.go` works without a `**/` prefix), a trailing `/**`, a bare prefix (`internal`) and a trailing `/*` each match a directory and everything below it; a leading `**/` matches at any depth. An over-size rule, or more than 64 rules, is an error, not a silent drop — a first-match policy is never quietly weakened. The per-symbol `keep` predicate still composes: a kept symbol stays full even when its file's rule says compress or omit."
 
 // fidelityRule is one parsed `glob:fidelity` clause. Rules are matched
 // in declaration order; the first matching glob wins.
 type fidelityRule struct {
 	glob     string
+	compiled compiledGlob
 	fidelity elide.Fidelity
 }
 
+// Admission bounds for a whole fidelity_globs value. The rules are an
+// ordered list scanned per file, so both the total size and the count are
+// per-request multipliers on a per-file loop: 1.3 MB of spec parsed into
+// 100,001 rules before these existed.
+const (
+	maxFidelitySpecBytes = 8192
+	maxFidelityRules     = 64
+)
+
 // parseFidelityGlobs parses the fidelity_globs param value into an
-// ordered rule list. Unrecognised or malformed clauses are skipped
-// (fail-soft — a typo never aborts the read). Returns nil when the
-// value yields no usable rule, so the caller falls back to the plain
-// compress_bodies boolean.
-func parseFidelityGlobs(spec string) []fidelityRule {
+// ordered rule list.
+//
+// Two failure modes, deliberately different:
+//
+//   - A malformed clause is skipped. A typo has never aborted a read and
+//     still does not.
+//   - A clause that breaks an admission bound returns an error, and the
+//     caller must refuse the request. Dropping it would silently rewrite
+//     the caller's policy: the rules are first-match, so an over-budget
+//     `omit` disappearing lets a later `full` win and the content the
+//     request asked to hide comes back instead. That is not a typo the
+//     user can see in the output — it looks like a successful read.
+//
+// Returns nil rules when the value yields none, so the caller falls back
+// to the plain compress_bodies boolean.
+func parseFidelityGlobs(spec string) ([]fidelityRule, error) {
 	spec = strings.TrimSpace(spec)
 	if spec == "" {
-		return nil
+		return nil, nil
+	}
+	if len(spec) > maxFidelitySpecBytes {
+		return nil, fmt.Errorf(
+			"fidelity_globs is too large (%d bytes); the limit is %d",
+			len(spec), maxFidelitySpecBytes)
 	}
 	var rules []fidelityRule
 	for _, clause := range strings.Split(spec, ",") {
@@ -45,14 +72,24 @@ func parseFidelityGlobs(spec string) []fidelityRule {
 		}
 		glob := strings.TrimSpace(clause[:idx])
 		fid, ok := parseFidelity(clause[idx+1:])
-		// Same bound as find_files, dropped rather than reported: this
-		// parser is fail-soft by contract, and the rules run per file.
-		if glob == "" || !ok || globTooComplex(glob) {
+		if glob == "" || !ok {
 			continue
 		}
-		rules = append(rules, fidelityRule{glob: glob, fidelity: fid})
+		compiled := compileGlob(glob)
+		if compiled.tooComplex() {
+			return nil, fmt.Errorf(
+				"fidelity_globs rule %q is too large (%d bytes, %d segments); "+
+					"the limits are %d bytes and %d segments",
+				glob, len(compiled.pattern), compiled.segmentCount(),
+				maxGlobBytes, maxGlobSegments)
+		}
+		if len(rules) == maxFidelityRules {
+			return nil, fmt.Errorf(
+				"fidelity_globs has more than %d rules", maxFidelityRules)
+		}
+		rules = append(rules, fidelityRule{glob: glob, compiled: compiled, fidelity: fid})
 	}
-	return rules
+	return rules, nil
 }
 
 // parseFidelity maps a fidelity token to the elide enum.
@@ -81,7 +118,9 @@ func fidelityDecideForPath(rules []fidelityRule, relPath string) func(elide.Decl
 	}
 	rel := filepath.ToSlash(relPath)
 	for _, r := range rules {
-		if matchFidelityGlob(r.glob, rel) {
+		// The compiled form was built once at parse time; matching here
+		// per file must not re-normalise or re-split the pattern.
+		if r.compiled.match(rel) {
 			fid := r.fidelity
 			return func(elide.Decl) elide.Fidelity { return fid }
 		}
@@ -98,7 +137,49 @@ func fidelityDecideForPath(rules []fidelityRule, relPath string) func(elide.Decl
 // directory-prefix rule that is not glob matching at all, and a trailing
 // `/*` goes through it. See matchSegmentGlob.
 func matchFidelityGlob(pattern, rel string) bool {
-	pattern = filepath.ToSlash(pattern)
+	return compileGlob(pattern).match(rel)
+}
+
+// compiledGlob is a pattern normalised and split once, so a request pays
+// for that work per request rather than per candidate file, and so the
+// size bound can only ever be read off the same representation the matcher
+// uses. Counting separators in the raw string was a bypass: on Windows a
+// native-separator pattern counts as one segment before ToSlash and as
+// many after it, which admitted a 130-byte glob that expands to 65
+// segments at match time.
+type compiledGlob struct {
+	pattern  string   // '/'-spelled
+	segments []string // nil unless a whole-segment `**` makes the walk relevant
+}
+
+// compileGlob normalises, then bounds, then splits. The order matters:
+// an over-budget pattern must not pay for the split, and nothing outside
+// this function should see the un-normalised form.
+func compileGlob(pattern string) compiledGlob {
+	g := compiledGlob{pattern: filepath.ToSlash(pattern)}
+	if g.tooComplex() {
+		return g
+	}
+	if patternHasGlobstarSegment(g.pattern) {
+		g.segments = globPatternSegments(g.pattern)
+	}
+	return g
+}
+
+// tooComplex reports whether the normalised pattern exceeds the admission
+// bounds. It is a method so that the only way to ask is to hold a
+// compiledGlob, which is by construction already normalised.
+func (g compiledGlob) tooComplex() bool {
+	return len(g.pattern) > maxGlobBytes ||
+		strings.Count(g.pattern, "/")+1 > maxGlobSegments
+}
+
+// segmentCount reports the normalised segment count, for error messages
+// that have to agree with the check that rejected the pattern.
+func (g compiledGlob) segmentCount() int { return strings.Count(g.pattern, "/") + 1 }
+
+func (g compiledGlob) match(rel string) bool {
+	pattern := g.pattern
 	rel = filepath.ToSlash(rel)
 
 	// `**` in any position, matching zero or more whole segments. The
@@ -119,8 +200,8 @@ func matchFidelityGlob(pattern, rel string) bool {
 	// candidate before applying the limit, so that overhead was
 	// user-controlled: a 999-segment `segment/.../*` measured 99 kB per
 	// call with no `**` in it at all.
-	if patternHasGlobstarSegment(pattern) &&
-		matchGlobstarSegments(globPatternSegments(pattern), strings.Split(rel, "/")) {
+	if g.segments != nil &&
+		matchGlobstarSegments(g.segments, strings.Split(rel, "/")) {
 		return true
 	}
 
@@ -142,9 +223,17 @@ func matchFidelityGlob(pattern, rel string) bool {
 		}
 		// Try the suffix against every trailing path component so
 		// `**/foo/*.go` matches `a/b/foo/x.go`.
-		segs := strings.Split(rel, "/")
-		for i := range segs {
-			if matchSegmentGlob(suffix, strings.Join(segs[i:], "/")) {
+		//
+		// Walk the separator offsets and slice `rel` instead of rebuilding
+		// each suffix: a substring shares the original bytes, while
+		// splitting and re-joining allocated every suffix in turn. That was
+		// quadratic in path depth for a nonmatch — 17 MB for a single
+		// 2000-segment candidate, paid once per candidate file.
+		for i := 0; i < len(rel); i++ {
+			if rel[i] != '/' {
+				continue
+			}
+			if matchSegmentGlob(suffix, rel[i+1:]) {
 				return true
 			}
 		}
@@ -220,13 +309,6 @@ const (
 	maxGlobBytes    = 1024
 	maxGlobSegments = 64
 )
-
-// globTooComplex reports whether a glob exceeds the bounds above. It counts
-// separators rather than splitting, so it allocates nothing.
-func globTooComplex(pattern string) bool {
-	return len(pattern) > maxGlobBytes ||
-		strings.Count(pattern, "/")+1 > maxGlobSegments
-}
 
 // matchGlobstarSegments matches a segment-split pattern against a
 // segment-split path, giving `**` its usual meaning: zero or more whole

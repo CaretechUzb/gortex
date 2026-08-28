@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	mcplib "github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -13,7 +14,8 @@ import (
 )
 
 func TestParseFidelityGlobs(t *testing.T) {
-	rules := parseFidelityGlobs("internal/**:full,*_test.go:omit,vendor/**:compress")
+	rules, err := parseFidelityGlobs("internal/**:full,*_test.go:omit,vendor/**:compress")
+	require.NoError(t, err)
 	require.Len(t, rules, 3)
 	assert.Equal(t, "internal/**", rules[0].glob)
 	assert.Equal(t, elide.FidelityFull, rules[0].fidelity)
@@ -23,11 +25,13 @@ func TestParseFidelityGlobs(t *testing.T) {
 	assert.Equal(t, elide.FidelityCompress, rules[2].fidelity)
 
 	// Malformed clauses are skipped, not fatal.
-	assert.Empty(t, parseFidelityGlobs(""))
-	assert.Empty(t, parseFidelityGlobs("nofidelity"))
-	assert.Empty(t, parseFidelityGlobs("glob:bogus"))
-	assert.Empty(t, parseFidelityGlobs(":full"))
-	mixed := parseFidelityGlobs("good/**:full, ,bad, *.go:omit")
+	for _, spec := range []string{"", "nofidelity", "glob:bogus", ":full"} {
+		got, err := parseFidelityGlobs(spec)
+		assert.NoErrorf(t, err, "a malformed clause stays fail-soft: %q", spec)
+		assert.Emptyf(t, got, "%q yields no usable rule", spec)
+	}
+	mixed, err := parseFidelityGlobs("good/**:full, ,bad, *.go:omit")
+	require.NoError(t, err)
 	require.Len(t, mixed, 2, "only the two well-formed clauses survive")
 }
 
@@ -101,7 +105,8 @@ func TestMatchFidelityGlob_DirStarStaysRecursive(t *testing.T) {
 }
 
 func TestFidelityDecideForPath(t *testing.T) {
-	rules := parseFidelityGlobs("internal/**:full,*_test.go:omit")
+	rules, err := parseFidelityGlobs("internal/**:full,*_test.go:omit")
+	require.NoError(t, err)
 	// First matching rule wins (order matters).
 	dFull := fidelityDecideForPath(rules, "internal/mcp/server.go")
 	require.NotNil(t, dFull)
@@ -301,7 +306,8 @@ func TestMatchFidelityGlob_TerminalStarKeepsItsRequiredSegment(t *testing.T) {
 // widening cannot reach users' files while only the matcher test is
 // watched.
 func TestFidelityGlobTerminalStarDepthAtTheConsumer(t *testing.T) {
-	rules := parseFidelityGlobs("*/*:omit")
+	rules, err := parseFidelityGlobs("*/*:omit")
+	require.NoError(t, err)
 
 	assert.Nil(t, fidelityDecideForPath(rules, "top.go"),
 		"a root file must not be caught by `*/*`")
@@ -344,7 +350,8 @@ func TestMatchFidelityGlob_GlobstarComposesWithTrailingSubtree(t *testing.T) {
 // the contract is pinned at the level users configure rather than only at
 // the matcher.
 func TestFidelityGlobDecideForPath_SubtreeComposition(t *testing.T) {
-	rules := parseFidelityGlobs("src/**/internal/*:full,**:omit")
+	rules, err := parseFidelityGlobs("src/**/internal/*:full,**:omit")
+	require.NoError(t, err)
 
 	for _, rel := range []string{
 		"src/a/internal/x.go",
@@ -424,15 +431,41 @@ func TestMatchFidelityGlob_GlobstarGateIgnoresNonSegmentStars(t *testing.T) {
 	assert.False(t, matchFidelityGlob("a**b", "a/x/b"))
 }
 
-// TestParseFidelityGlobs_DropsOversizedClause holds the fidelity parser to
-// the same bound as find_files. It is fail-soft by contract, so the clause
-// is dropped rather than reported — but it must not reach the matcher,
-// because fidelity rules run once per file.
-func TestParseFidelityGlobs_DropsOversizedClause(t *testing.T) {
+// TestParseFidelityGlobs_RejectsOversizedClause holds the parser to the
+// distinction the contract now draws. A malformed clause is still skipped
+// — a typo has never aborted a read. An over-budget clause is refused,
+// because dropping it rewrites the caller's policy: the rules are
+// first-match, so an oversized `omit` disappearing lets a later `full`
+// win and the content the request asked to hide comes back in a read that
+// looks like it succeeded.
+func TestParseFidelityGlobs_RejectsOversizedClause(t *testing.T) {
 	huge := strings.Repeat("segment/", maxGlobSegments+10) + "**"
-	rules := parseFidelityGlobs("internal/**:full," + huge + ":omit")
-	require.Len(t, rules, 1, "only the well-formed clause survives")
-	assert.Equal(t, "internal/**", rules[0].glob)
+
+	rules, err := parseFidelityGlobs("internal/**:full," + huge + ":omit")
+	require.Error(t, err, "an over-budget rule must not be silently dropped")
+	assert.Nil(t, rules)
+	assert.Contains(t, err.Error(), "too large")
+
+	// The ordered-policy consequence, stated directly: this is the shape
+	// that used to turn a requested `omit` into `full`.
+	deep := strings.Repeat("x/", maxGlobSegments) + "**"
+	_, err = parseFidelityGlobs(deep + ":omit,**:full")
+	require.Error(t, err, "an oversized first-match omit must refuse, not defer to the later rule")
+
+	// Total spec size and rule count are bounded too; both are per-request
+	// multipliers on a per-file scan.
+	_, err = parseFidelityGlobs(strings.Repeat("a", maxFidelitySpecBytes+1) + ":omit")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "too large")
+
+	_, err = parseFidelityGlobs(strings.Repeat("never-*:omit,", maxFidelityRules+1) + "**:full")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "more than")
+
+	// Exactly at the rule cap is still served.
+	atCap, err := parseFidelityGlobs(strings.Repeat("never-*:omit,", maxFidelityRules-1) + "**:full")
+	require.NoError(t, err)
+	assert.Len(t, atCap, maxFidelityRules)
 }
 
 // TestMatchFidelityGlob_NonGlobstarPatternDoesNotEnterTheWalk binds what
@@ -473,4 +506,69 @@ func TestMatchFidelityGlob_NonGlobstarPatternDoesNotEnterTheWalk(t *testing.T) {
 		"matchFidelityGlob allocated %d B/op for a pattern with no globstar; "+
 			"find_files runs this per candidate file ahead of `limit`, so this "+
 			"is user-controlled memory pressure", perOp)
+}
+
+// TestFidelityGlobsOversizedRuleCannotWeakenThePolicy_Endpoints is the
+// consumer-side proof for the ordered-policy hazard. Dropping an
+// over-budget rule is not a cosmetic difference: the rules are
+// first-match, so an oversized `omit` disappearing let a later `full` win
+// and the file the request asked to hide came back in full, in a response
+// that looked like a normal successful read.
+//
+// Both endpoints that accept fidelity_globs are covered, because the
+// parser is reached separately from each.
+func TestFidelityGlobsOversizedRuleCannotWeakenThePolicy_Endpoints(t *testing.T) {
+	srv, _ := setupCompressTestServer(t)
+
+	// An oversized first-match `omit` followed by a catch-all `full` —
+	// exactly the pair that used to resolve to `full`.
+	oversized := strings.Repeat("x/", maxGlobSegments) + "**"
+	spec := oversized + ":omit,**:full"
+
+	for _, tool := range []string{"read_file", "get_editing_context"} {
+		t.Run(tool, func(t *testing.T) {
+			args := map[string]any{
+				"compress_bodies": true,
+				"fidelity_globs":  spec,
+			}
+			args["path"] = "service.go"
+			res := callTool(t, srv, tool, args)
+			require.Truef(t, res.IsError,
+				"%s must refuse the request rather than serve it under a weakened policy", tool)
+			text := res.Content[0].(mcplib.TextContent).Text
+			require.Contains(t, text, "too large")
+			require.NotContains(t, text, `strings.Split(t, ".")`,
+				"no file body may be returned when the policy was rejected")
+		})
+	}
+}
+
+// TestMatchFidelityGlob_LeadingGlobstarNonmatchStaysLinear pins the
+// allocation of the legacy leading-`**/` fallback.
+//
+// After the linear walk declines, that branch tries the suffix glob at
+// every depth. It used to split the path and re-join every tail, which
+// rebuilt the whole remainder once per segment — quadratic in path depth,
+// and paid per candidate file: 17 MB for one 2000-segment nonmatch.
+// Slicing the original string shares its bytes instead.
+//
+// The ceiling sits far below the old figure and far above the new one, so
+// allocator noise cannot trip it and the re-join cannot pass it.
+func TestMatchFidelityGlob_LeadingGlobstarNonmatchStaysLinear(t *testing.T) {
+	rel := strings.Repeat("segment/", 2000) + "leaf.go"
+	require.False(t, matchFidelityGlob("**/never", rel))
+
+	const runs = 20
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	for i := 0; i < runs; i++ {
+		_ = matchFidelityGlob("**/never", rel)
+	}
+	runtime.ReadMemStats(&after)
+
+	perOp := (after.TotalAlloc - before.TotalAlloc) / runs
+	assert.Lessf(t, perOp, uint64(1<<20),
+		"a leading-globstar nonmatch allocated %d B for one candidate; "+
+			"the suffix scan must not rebuild the path", perOp)
 }

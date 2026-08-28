@@ -63,13 +63,17 @@ func (s *Server) handleFindFiles(ctx context.Context, req mcp.CallToolRequest) (
 	if query == "" && glob == "" {
 		return mcp.NewToolResultError("find_files: pass `query` (a filename/path substring) and/or `glob` (a path glob)"), nil
 	}
-	// Bound the glob before anything walks the file set: the matcher runs
-	// per candidate, ahead of `limit`, so pattern size is a multiplier on
-	// the whole scan rather than on one call.
-	if globTooComplex(glob) {
+	// Compile and bound the glob before anything walks the file set: the
+	// matcher runs per candidate, ahead of `limit`, so pattern size is a
+	// multiplier on the whole scan rather than on one call. The counts come
+	// off the normalised pattern, because that is what the matcher sees —
+	// reading them off the raw string let a native-separator glob count as
+	// one segment here and expand to many at match time.
+	compiledGlob := compileGlob(glob)
+	if compiledGlob.tooComplex() {
 		return mcp.NewToolResultError(fmt.Sprintf(
 			"find_files: `glob` is too large (%d bytes, %d segments); the limits are %d bytes and %d segments",
-			len(glob), strings.Count(glob, "/")+1, maxGlobBytes, maxGlobSegments)), nil
+			len(compiledGlob.pattern), compiledGlob.segmentCount(), maxGlobBytes, maxGlobSegments)), nil
 	}
 	fuzzy := req.GetBool("fuzzy", false)
 	resolved, errResult := s.resolveScope(ctx, req, IntentLocate)
@@ -109,7 +113,7 @@ func (s *Server) handleFindFiles(ctx context.Context, req mcp.CallToolRequest) (
 
 		score := 0
 		if glob != "" {
-			if !matchFidelityGlob(glob, rel) {
+			if !compiledGlob.match(rel) {
 				continue
 			}
 			score += 5
