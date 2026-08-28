@@ -159,6 +159,12 @@ func (e *JuliaExtractor) Extract(filePath string, src []byte) (*parser.Extractio
 // adjacent and detached parses are structurally identical — so the line
 // numbers are the only discriminator.
 func (e *JuliaExtractor) walk(n *sitter.Node, src []byte, scope juliaScope, st *juliaWalkState) {
+	e.walkFrom(n, src, scope, st, 0)
+}
+
+// walkFrom is walk starting at the given named-child index, so a
+// definition can skip its own signature and dispatch only its body.
+func (e *JuliaExtractor) walkFrom(n *sitter.Node, src []byte, scope juliaScope, st *juliaWalkState, start int) {
 	// Only a few blocks can hold documentation: the file, a module body,
 	// and a begin / quote block outside any definition. A string standing
 	// in a FUNCTION body is ordinary executable code — Julia parses a
@@ -188,7 +194,11 @@ func (e *JuliaExtractor) walk(n *sitter.Node, src []byte, scope juliaScope, st *
 		}
 		return pendingDoc
 	}
-	for c := range n.NamedChildren() {
+	for i, count := start, int(n.NamedChildCount()); i < count; i++ {
+		c := n.NamedChild(i)
+		if c == nil {
+			continue
+		}
 		switch c.Type() {
 		case "string_literal":
 			if docContext {
@@ -601,7 +611,21 @@ func (e *JuliaExtractor) handleFunction(n *sitter.Node, src []byte, scope juliaS
 	if name != "" {
 		inner = e.emitCallable(n, name, receiver, doc, n.Type() == "macro_definition", scope, st)
 	}
-	e.walk(n, src, inner, st)
+	e.walkDefinitionBody(n, juliaSignatureCall(head), src, inner, st)
+}
+
+// walkDefinitionBody dispatches a definition's body, treating its own
+// signature as a declaration rather than a call site. The signature IS a
+// call_expression in this grammar, so walking the definition whole made
+// every definition appear to call itself — masked until now by the
+// direct-recursion guard, which a constructor no longer applies. Its
+// children are still walked, so a call inside a default argument value
+// is not lost with it.
+func (e *JuliaExtractor) walkDefinitionBody(n, sig *sitter.Node, src []byte, scope juliaScope, st *juliaWalkState) {
+	if sig != nil {
+		e.walk(sig, src, scope, st)
+	}
+	e.walkFrom(n, src, scope, st, 1)
 }
 
 // handleAssignment: `f(x) = body` (and `f(x) where T = body`) are
@@ -617,7 +641,7 @@ func (e *JuliaExtractor) handleAssignment(n *sitter.Node, src []byte, scope juli
 	// instead of unwrapping one fixed level.
 	if sig := juliaSignatureCall(lhs); sig != nil {
 		if name, receiver := juliaCalleeName(sig.NamedChild(0), src); name != "" {
-			e.emitShortFunction(n, name, receiver, doc, src, scope, st)
+			e.emitShortFunction(n, sig, name, receiver, doc, src, scope, st)
 			return
 		}
 	}
@@ -655,9 +679,9 @@ func (e *JuliaExtractor) handleAssignment(n *sitter.Node, src []byte, scope juli
 	e.walk(n, src, scope, st)
 }
 
-func (e *JuliaExtractor) emitShortFunction(n *sitter.Node, name, receiver, doc string, src []byte, scope juliaScope, st *juliaWalkState) {
+func (e *JuliaExtractor) emitShortFunction(n, sig *sitter.Node, name, receiver, doc string, src []byte, scope juliaScope, st *juliaWalkState) {
 	inner := e.emitCallable(n, name, receiver, doc, false, scope, st)
-	e.walk(n, src, inner, st)
+	e.walkDefinitionBody(n, sig, src, inner, st)
 }
 
 // emitCallable mints one function / method / constructor node and returns
@@ -687,6 +711,7 @@ func (e *JuliaExtractor) emitCallable(
 	line := int(n.StartPoint().Row) + 1
 	kind := graph.KindMethod
 	nodeName := name
+	isCtor := false
 	var baseID, ownerID, ownerName string
 
 	switch {
@@ -722,6 +747,7 @@ func (e *JuliaExtractor) emitCallable(
 			baseID = typeID + ".<init>"
 			ownerID, ownerName = typeID, typeName
 			nodeName = typeName + ".<init>"
+			isCtor = true
 		} else {
 			kind = graph.KindFunction
 			baseID = st.filePath + "::" + name
@@ -742,6 +768,7 @@ func (e *JuliaExtractor) emitCallable(
 		inner.functionID = id
 		inner.functionName = name
 		inner.functionRecv = receiver
+		inner.functionIsCtor = isCtor
 		return inner
 	}
 
@@ -791,7 +818,7 @@ func (e *JuliaExtractor) emitCallable(
 	inner.functionID = id
 	inner.functionName = name
 	inner.functionRecv = receiver
-	inner.functionIsCtor = ownerID != "" && strings.HasSuffix(id, ".<init>")
+	inner.functionIsCtor = isCtor
 	return inner
 }
 

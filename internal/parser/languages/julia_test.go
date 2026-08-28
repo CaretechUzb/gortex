@@ -498,6 +498,41 @@ Box() = Box(0)
 	}
 	assert.True(t, delegated, "a delegating constructor must keep its call edge")
 
+	// Exactly one: a definition's own signature is a call_expression in
+	// this grammar, and counting it as a call site would make every
+	// definition appear to call itself — invisible while the recursion
+	// guard swallowed it, visible the moment a constructor stops
+	// applying that guard. A call in a DEFAULT ARGUMENT is still a call
+	// and must survive.
+	sig, err := NewJuliaExtractor().Extract("sig.jl", []byte(`struct Rep
+    n::Int
+    tag::Bool
+end
+
+Rep(n) = Rep(n, false)
+
+function build(x = fallback())
+    use(x)
+end
+`))
+	require.NoError(t, err)
+	var selfCalls int
+	sigCalls := map[string]bool{}
+	for _, ed := range sig.Edges {
+		if ed.Kind != graph.EdgeCalls {
+			continue
+		}
+		sigCalls[ed.From+" -> "+ed.To] = true
+		if ed.To == "unresolved::Rep" {
+			selfCalls++
+		}
+	}
+	assert.Equal(t, 1, selfCalls,
+		"the delegation is one call; the signature is not a second one")
+	assert.True(t, sigCalls["sig.jl::build -> unresolved::fallback"],
+		"a call in a default argument value must still be recorded")
+	assert.True(t, sigCalls["sig.jl::build -> unresolved::use"])
+
 	// The macro is a macro, not Tag's constructor.
 	_, tagCtor := nodes["fw.jl::Tag.<init>"]
 	assert.False(t, tagCtor, "a macro must never be read as a constructor")
