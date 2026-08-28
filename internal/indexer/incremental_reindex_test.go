@@ -14,6 +14,7 @@ import (
 
 	"github.com/zzet/gortex/internal/excludes"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 )
 
 // TestIncrementalReindex_EvictsExcludedFiles is the regression for #321:
@@ -204,105 +205,71 @@ func TestIncrementalReindex_FailedFileSurfacedAndRetried(t *testing.T) {
 	assert.NotEmpty(t, g.FindNodesByName("Bad"))
 }
 
-// seedSlashSpelledTodoRow plants the coverage-domain rows a pre-fix
-// store holds on Windows: the builders re-spelled the extractor's
-// relPath with forward slashes, so a subdirectory file's todo node and
-// annotated edge were keyed by a spelling native eviction never sweeps.
-// Returns the stale node ID.
-func seedSlashSpelledTodoRow(g *graph.Graph, nativeRel string) string {
-	slashRel := filepath.ToSlash(nativeRel)
-	staleID := slashRel + "::todo:99"
-	g.AddNode(&graph.Node{
-		ID:        staleID,
-		Kind:      graph.KindTodo,
-		Name:      "todo:99",
-		FilePath:  slashRel,
-		StartLine: 99,
-		EndLine:   99,
-		Language:  "go",
-		Meta:      map[string]any{"tag": "NOTE", "text": "stale spelling"},
-	})
-	g.AddEdge(&graph.Edge{
-		From:     slashRel,
-		To:       staleID,
-		Kind:     graph.EdgeAnnotated,
-		FilePath: slashRel,
-		Line:     99,
-		Origin:   graph.OriginASTResolved,
-	})
-	return staleID
-}
-
-// edgesTouching returns the graph's edges whose From or To equals id.
-func edgesTouching(g graph.Store, id string) []*graph.Edge {
-	var out []*graph.Edge
-	for _, e := range g.AllEdges() {
-		if e != nil && (e.From == id || e.To == id) {
-			out = append(out, e)
-		}
+// TestEvictFilesBatched_EvictsOnlyTheCallerSpelling pins the eviction
+// contract both storage backends must honour: a file's eviction touches
+// that file's own spelling and nothing else.
+//
+// The shape is the one a Windows store written by a pre-fix binary has:
+// native `src\a.go` and `src\b.go` both hold a licensed_as edge into the
+// SHARED `license::MIT` node, and a legacy `src/a.go` edge lingers beside
+// them. Sweeping a's forward-slash twin through file eviction would
+// delete every edge touching whichever node that sweep evicts — so with
+// the shared node anchored to the legacy path it takes b's valid edge
+// down with it, and with it anchored elsewhere the legacy edge survives
+// anyway. Legacy rows are healed once by schema migration v13
+// (purgeLegacyCoverageSpellings), which deletes by edge kind + FilePath
+// and drops a shared target only when nothing references it.
+func TestEvictFilesBatched_EvictsOnlyTheCallerSpelling(t *testing.T) {
+	const (
+		nativeA = `src\a.go`
+		nativeB = `src\b.go`
+		legacyA = `src/a.go`
+		license = "license::MIT"
+	)
+	nodes := []*graph.Node{
+		{ID: nativeA, Kind: graph.KindFile, Name: "a.go", FilePath: nativeA},
+		{ID: nativeB, Kind: graph.KindFile, Name: "b.go", FilePath: nativeB},
+		// Anchored to the legacy spelling — the first-sighting FilePath
+		// of a shared coverage target is a breadcrumb, not ownership.
+		{ID: license, Kind: graph.KindLicense, Name: "MIT", FilePath: legacyA},
 	}
-	return out
-}
+	edges := []*graph.Edge{
+		{From: nativeA, To: license, Kind: graph.EdgeLicensedAs, FilePath: nativeA},
+		{From: nativeB, To: license, Kind: graph.EdgeLicensedAs, FilePath: nativeB},
+		{From: legacyA, To: license, Kind: graph.EdgeLicensedAs, FilePath: legacyA},
+	}
 
-// TestIncrementalReindex_SweepsSlashSpelledCoverageRows: stores written
-// before the coverage-domain builders preserved the extractor's path
-// spelling hold todo rows keyed by the forward-slash spelling of
-// subdirectory files. Replacing the file must sweep that twin spelling
-// too, or the stale row shadows the file forever on Windows.
-func TestIncrementalReindex_SweepsSlashSpelledCoverageRows(t *testing.T) {
-	dir := t.TempDir()
-	require.NoError(t, os.MkdirAll(filepath.Join(dir, "pkg"), 0o755))
-	rel := filepath.Join("pkg", "util.go")
-	writeFile(t, filepath.Join(dir, rel),
-		"package pkg\n\n// TODO: original marker\nfunc Util() {}\n")
+	for _, backend := range []struct {
+		name string
+		open func(t *testing.T) graph.Store
+	}{
+		{"graph", func(t *testing.T) graph.Store { return graph.New() }},
+		{"sqlite", func(t *testing.T) graph.Store {
+			s, err := store_sqlite.Open(filepath.Join(t.TempDir(), "store.sqlite"))
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = s.Close() })
+			return s
+		}},
+	} {
+		t.Run(backend.name, func(t *testing.T) {
+			g := backend.open(t)
+			g.AddBatch(nodes, edges)
 
-	g := graph.New()
-	idx := newTestIndexer(g)
-	_, err := idx.Index(dir)
-	require.NoError(t, err)
+			evictFilesBatched(g, []string{nativeA})
 
-	staleID := seedSlashSpelledTodoRow(g, rel)
-	require.NotNil(t, g.GetNode(staleID))
-
-	bumpMtime(t, filepath.Join(dir, rel),
-		"package pkg\n\n// TODO: edited marker\nfunc Util() {}\n")
-	_, err = idx.IncrementalReindexPaths(dir, nil)
-	require.NoError(t, err)
-
-	assert.Nil(t, g.GetNode(staleID),
-		"the slash-spelled stale todo node must be swept on replacement")
-	assert.Empty(t, edgesTouching(g, staleID),
-		"the stale annotated edge must be swept with its node")
-	assert.NotNil(t, g.GetNode(rel+"::todo:3"),
-		"the fresh extraction's todo node rides the native spelling")
-}
-
-// TestIncrementalReindex_SweepsSlashSpelledCoverageRowsOnDelete is the
-// delete-lane sibling: removing the file from disk must also sweep the
-// twin-spelled stale rows.
-func TestIncrementalReindex_SweepsSlashSpelledCoverageRowsOnDelete(t *testing.T) {
-	dir := t.TempDir()
-	require.NoError(t, os.MkdirAll(filepath.Join(dir, "pkg"), 0o755))
-	rel := filepath.Join("pkg", "util.go")
-	writeFile(t, filepath.Join(dir, rel),
-		"package pkg\n\n// TODO: original marker\nfunc Util() {}\n")
-
-	g := graph.New()
-	idx := newTestIndexer(g)
-	_, err := idx.Index(dir)
-	require.NoError(t, err)
-
-	staleID := seedSlashSpelledTodoRow(g, rel)
-	require.NotNil(t, g.GetNode(staleID))
-
-	require.NoError(t, os.Remove(filepath.Join(dir, rel)))
-	_, err = idx.IncrementalReindexPaths(dir, nil)
-	require.NoError(t, err)
-
-	assert.Nil(t, g.GetNode(staleID),
-		"the slash-spelled stale todo node must be swept on deletion")
-	assert.Empty(t, edgesTouching(g, staleID),
-		"the stale annotated edge must be swept with its node")
+			var froms []string
+			for _, e := range g.GetInEdges(license) {
+				if e != nil {
+					froms = append(froms, e.From)
+				}
+			}
+			assert.ElementsMatch(t, []string{nativeB, legacyA}, froms,
+				"only a's own spelling is evicted: b keeps its valid edge, "+
+					"and the legacy row is the migration's business")
+			assert.NotNil(t, g.GetNode(license),
+				"the shared license node outlives one of its files")
+		})
+	}
 }
 
 // TestIncrementalReindex_MerkleMode exercises the BLAKE3 Merkle change
