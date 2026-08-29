@@ -240,6 +240,9 @@ func (e *JuliaExtractor) walkFrom(n *sitter.Node, src []byte, scope juliaScope, 
 		case "export_statement":
 			e.handleExport(c, src, scope, st)
 
+		case "public_statement":
+			e.handlePublic(c, src, scope, st)
+
 		case "call_expression", "broadcast_call_expression":
 			e.handleCall(c, src, scope, st)
 			e.walk(c, src, scope, st)
@@ -1219,6 +1222,19 @@ func (e *JuliaExtractor) handleImport(n *sitter.Node, src []byte, st *juliaWalkS
 // module node's Meta (Julia export lists are only meaningful inside
 // modules).
 func (e *JuliaExtractor) handleExport(n *sitter.Node, src []byte, scope juliaScope, st *juliaWalkState) {
+	e.recordModuleNames(n, src, scope, st, "exports")
+}
+
+// handlePublic records a Julia 1.11 `public` list the same way. Public
+// names are visible API WITHOUT being re-exported, so they ride on their
+// own Meta key next to the export list.
+func (e *JuliaExtractor) handlePublic(n *sitter.Node, src []byte, scope juliaScope, st *juliaWalkState) {
+	e.recordModuleNames(n, src, scope, st, "public")
+}
+
+// recordModuleNames collects the names named by an export or public
+// statement onto the enclosing module node's Meta under key.
+func (e *JuliaExtractor) recordModuleNames(n *sitter.Node, src []byte, scope juliaScope, st *juliaWalkState, key string) {
 	if scope.moduleID == "" {
 		return
 	}
@@ -1245,8 +1261,8 @@ func (e *JuliaExtractor) handleExport(n *sitter.Node, src []byte, scope juliaSco
 	if node.Meta == nil {
 		node.Meta = map[string]any{}
 	}
-	prev, _ := node.Meta["exports"].([]string)
-	node.Meta["exports"] = append(prev, names...)
+	prev, _ := node.Meta[key].([]string)
+	node.Meta[key] = append(prev, names...)
 }
 
 // handleCall emits EdgeCalls from the enclosing function to the callee

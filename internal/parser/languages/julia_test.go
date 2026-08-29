@@ -1233,6 +1233,36 @@ end
 	assert.False(t, orphan, "an @doc with no object must not mint a phantom node")
 }
 
+// Julia 1.11 `public` names API that is visible WITHOUT being
+// re-exported — a different contract from `export`, so it rides on its
+// own Meta key next to the export list. The statement's children are the
+// same node kinds exports accept, operators included (`public +`).
+func TestJuliaExtractor_PublicStatementRecorded(t *testing.T) {
+	src := []byte(`module Pubbed
+export kept
+public shown, also_shown, +
+
+kept() = 1
+shown() = 2
+end
+`)
+	res, err := NewJuliaExtractor().Extract("public.jl", src)
+	require.NoError(t, err)
+
+	mod := map[string]*graph.Node{}
+	for _, n := range res.Nodes {
+		mod[n.ID] = n
+	}
+	m := mod["public.jl::Pubbed"]
+	require.NotNil(t, m)
+	exports, ok := m.Meta["exports"].([]string)
+	require.True(t, ok, "exports stay recorded")
+	assert.ElementsMatch(t, []string{"kept"}, exports)
+	public, ok := m.Meta["public"].([]string)
+	require.True(t, ok, "public names missing")
+	assert.ElementsMatch(t, []string{"shown", "also_shown", "+"}, public)
+}
+
 func TestJuliaExtractor_ConstAndDocstrings(t *testing.T) {
 	src := []byte(`"""
 Circle radius helpers.
