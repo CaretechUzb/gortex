@@ -308,6 +308,51 @@ func csharpLocalScopeOf(n *sitter.Node) csharpLocalScope {
 	return csharpLocalScope{start: 0, end: math.MaxInt}
 }
 
+// csharpTypedBinding is one typed local declaration's evidence record:
+// the annotated (or inferred) type, the builtin keyword form, the
+// canonical shape, and the declaring scope's extent. The tenv/builtin/
+// shape maps answer the function-wide question; these records answer it
+// AT AN OFFSET, so an explicitly-typed local dies with its block exactly
+// like the scope index already lets a var local die - a
+// `{ int X = 1; }` must not type a later X receiver as int (round-5
+// finding 2).
+type csharpTypedBinding struct {
+	typ, builtin, shape string
+	scope               csharpLocalScope
+}
+
+// Verdicts of csharpTypedLocalAt. Absent keeps the caller on its
+// function-wide fallback (a name the records never saw); Expired means
+// records exist but none covers the offset - the local is dead there,
+// and falling back would resurrect the function-wide bug.
+const (
+	csharpTypedAbsent = iota
+	csharpTypedFound
+	csharpTypedExpired
+)
+
+// csharpTypedLocalAt returns the innermost typed-local record covering
+// offset, or the Absent/Expired verdict.
+func csharpTypedLocalAt(m map[string]map[string][]*csharpTypedBinding, owner, name string, offset int) (*csharpTypedBinding, int) {
+	recs := m[owner][name]
+	if len(recs) == 0 {
+		return nil, csharpTypedAbsent
+	}
+	var best *csharpTypedBinding
+	for _, b := range recs {
+		if offset < b.scope.start || offset >= b.scope.end {
+			continue
+		}
+		if best == nil || (b.scope.end-b.scope.start) < (best.scope.end-best.scope.start) {
+			best = b
+		}
+	}
+	if best == nil {
+		return nil, csharpTypedExpired
+	}
+	return best, csharpTypedFound
+}
+
 // csharpTypeUse buffers a type referenced only in a local-variable
 // annotation (`HttpResponse resp = Get();`) so the post-pass can emit an
 // EdgeTypedAs from the enclosing function once funcRanges are built.
@@ -576,13 +621,40 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 		return funcRanges.enclosing(int(l.defNode.StartPoint().Row) + 1)
 	}
 	tenvByOwner := map[string]typeEnv{}
-	setLocalType := func(owner, name, typeName string) {
+	// The offset-aware mirror of the tenv/shape/builtin maps: one
+	// evidence record per typed local declaration, merged across the
+	// passes below by declaring extent, consulted by the call-receiver
+	// chain at the call's own byte offset.
+	typedLocalsByOwner := map[string]map[string][]*csharpTypedBinding{}
+	typedRecord := func(owner string, l csharpDeferredLocal) *csharpTypedBinding {
+		if l.defNode == nil {
+			return nil
+		}
+		sc := csharpLocalScopeOf(l.defNode)
+		m := typedLocalsByOwner[owner]
+		if m == nil {
+			m = map[string][]*csharpTypedBinding{}
+			typedLocalsByOwner[owner] = m
+		}
+		for _, b := range m[l.name] {
+			if b.scope == sc {
+				return b
+			}
+		}
+		b := &csharpTypedBinding{scope: sc}
+		m[l.name] = append(m[l.name], b)
+		return b
+	}
+	setLocalType := func(owner string, l csharpDeferredLocal, typeName string) {
 		env := tenvByOwner[owner]
 		if env == nil {
 			env = make(typeEnv)
 			tenvByOwner[owner] = env
 		}
-		env[name] = typeName
+		env[l.name] = typeName
+		if b := typedRecord(owner, l); b != nil && b.typ == "" {
+			b.typ = typeName
+		}
 	}
 	for _, l := range locals {
 		owner := localOwner(l)
@@ -591,7 +663,7 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 		}
 		typeName := normalizeCSharpTypeName(l.rawType)
 		if typeName != "" && typeName != "var" {
-			setLocalType(owner, l.name, typeName)
+			setLocalType(owner, l, typeName)
 		}
 	}
 	for _, l := range locals {
@@ -610,7 +682,7 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 			if !done && n.Type() == "object_creation_expression" {
 				typeName := inferTypeFromCSharpNew(n, src)
 				if typeName != "" {
-					setLocalType(owner, l.name, typeName)
+					setLocalType(owner, l, typeName)
 					done = true
 				}
 			}
@@ -653,7 +725,7 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 				return
 			}
 			if t := csharpAwaitedCallType(inner.Content(src), csharpOwnerTypeName(owner), tenvByOwner[owner], result); t != "" {
-				setLocalType(owner, l.name, t)
+				setLocalType(owner, l, t)
 			}
 		})
 	}
@@ -663,13 +735,16 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 	// array/nullable suffixes and generic arguments — which are part of
 	// applicability — survive in a receiver_shape stamp.
 	shapesByOwner := map[string]map[string]string{}
-	setLocalShape := func(owner, name, shape string) {
+	setLocalShape := func(owner string, l csharpDeferredLocal, shape string) {
 		m := shapesByOwner[owner]
 		if m == nil {
 			m = map[string]string{}
 			shapesByOwner[owner] = m
 		}
-		m[name] = shape
+		m[l.name] = shape
+		if b := typedRecord(owner, l); b != nil && b.shape == "" {
+			b.shape = shape
+		}
 	}
 	for _, l := range locals {
 		owner := localOwner(l)
@@ -680,7 +755,7 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 			continue
 		}
 		if shape := csharpCanonTypeShape(l.rawType); shape != "" {
-			setLocalShape(owner, l.name, shape)
+			setLocalShape(owner, l, shape)
 		} else if l.rawType == "var" && l.defNode != nil {
 			// Same first-creation rule as the type walk above — the
 			// two stamps must describe the same creation expression.
@@ -689,7 +764,7 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 				if !done && n.Type() == "object_creation_expression" {
 					if tn := n.ChildByFieldName("type"); tn != nil {
 						if s := csharpCanonTypeShape(tn.Content(src)); s != "" {
-							setLocalShape(owner, l.name, s)
+							setLocalShape(owner, l, s)
 							done = true
 						}
 					}
@@ -721,6 +796,9 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 			builtinsByOwner[owner] = m
 		}
 		m[l.name] = bt
+		if b := typedRecord(owner, l); b != nil && b.builtin == "" {
+			b.builtin = bt
+		}
 	}
 
 	// Local-variable type annotations → EdgeTypedAs from the enclosing
@@ -807,20 +885,38 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 				From: callerID, To: "unresolved::*." + c.name,
 				Kind: graph.EdgeCalls, FilePath: filePath, Line: c.line,
 			}
+			// The receiver's typed-local evidence is asked AT THE CALL'S
+			// OFFSET: a typed or builtin local whose block has closed
+			// before this site types nothing here (round-5 finding 2) —
+			// the chain then falls through to the awaited/chain/spelling
+			// branches exactly as if the local never existed. The
+			// function-wide maps stay as the fallback for names the
+			// records never saw.
+			typedLocal, typedState := csharpTypedLocalAt(typedLocalsByOwner, callerID, c.receiver, c.offset)
 			if c.recvType != "" {
 				// this./base.-qualified: the receiver type came from the
 				// enclosing declaration, not from any variable lookup.
 				edge.Meta = map[string]any{"receiver_type": c.recvType}
-			} else if recvType, ok := tenvByOwner[callerID][c.receiver]; ok {
-				edge.Meta = map[string]any{"receiver_type": recvType}
-				if shape := shapesByOwner[callerID][c.receiver]; shape != "" && shape != recvType {
-					edge.Meta["receiver_shape"] = shape
+			} else if typedState == csharpTypedFound && typedLocal.typ != "" {
+				edge.Meta = map[string]any{"receiver_type": typedLocal.typ}
+				if typedLocal.shape != "" && typedLocal.shape != typedLocal.typ {
+					edge.Meta["receiver_shape"] = typedLocal.shape
 				}
-			} else if bt := builtinsByOwner[callerID][c.receiver]; bt != "" {
+			} else if typedState == csharpTypedFound && typedLocal.builtin != "" {
 				// Builtins stay out of receiver_type (the receiver-gate
 				// passes key on user types); extension eligibility still
 				// needs them — `n.Foo()` on an int must match
 				// `Foo(this int)` and refuse `Foo(this string)`.
+				edge.Meta = map[string]any{"receiver_builtin": typedLocal.builtin}
+				if typedLocal.shape != "" && typedLocal.shape != typedLocal.builtin {
+					edge.Meta["receiver_shape"] = typedLocal.shape
+				}
+			} else if recvType, ok := tenvByOwner[callerID][c.receiver]; ok && typedState == csharpTypedAbsent {
+				edge.Meta = map[string]any{"receiver_type": recvType}
+				if shape := shapesByOwner[callerID][c.receiver]; shape != "" && shape != recvType {
+					edge.Meta["receiver_shape"] = shape
+				}
+			} else if bt := builtinsByOwner[callerID][c.receiver]; bt != "" && typedState == csharpTypedAbsent {
 				edge.Meta = map[string]any{"receiver_builtin": bt}
 				if shape := shapesByOwner[callerID][c.receiver]; shape != "" && shape != bt {
 					edge.Meta["receiver_shape"] = shape
