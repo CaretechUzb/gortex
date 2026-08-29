@@ -8,34 +8,40 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 )
 
-// The durable per-repo mutation anchor.
+// The durable per-repo counters. Two of them, and the difference decides every
+// readiness verdict -- see the repo_graph_gen block in schema.go for the full
+// argument.
 //
-// Readiness asks "has every stage caught up with the graph as it is now?", so
-// it needs a value that moves whenever the graph moves. repo_index_state's
-// indexed_at cannot serve: it has exactly two writers (a full reindex, and the
-// git watcher on a HEAD transition), so the most common mutation of all -- an
-// incremental single-file reindex -- leaves it untouched. A stage compared
-// against it would read "current" forever after an ordinary edit.
+//	gen          any committed mutation of this repo's graph, whoever caused it
+//	content_gen  only the indexer recording that it parsed or dropped a file
 //
-//	  write path                       repo_graph_gen         derive_state
-//	  ----------                       --------------         ------------
-//	  derive runs; its own edges land  bump ->  41                    0
-//	  derive completes, stamps                  41    read -> derived_gen 41
-//	  file saved, batch commits        bump ->  42                   41
-//	  readiness compares                        42       41 <  42 -> PARTIAL
-//	  derive re-runs and completes     bump ->  43    read -> derived_gen 43
-//	  readiness compares                        43       43 == 43 -> READY
+// Readiness compares stage stamps against content_gen, never against gen. Both
+// the derived passes and the semantic providers are graph writers, so a stamp
+// compared against gen is compared against a number its own successors keep
+// pushing away: the derive would read "partial" the moment enrichment
+// finished, permanently, on a perfectly healthy repo. gen remains the honest
+// "the graph moved" signal and the provenance readiness reports alongside its
+// verdict.
 //
-// Note which end of the derive is stamped. The passes are graph writers
-// themselves, so they advance the anchor as they run; a stamp taken at derive
-// START would be behind the moment the derive ended, and no later derive would
-// close the gap, because a re-derive over unchanged content inserts nothing and
-// so moves nothing. StampDeriveState therefore reads the anchor at completion,
-// in the transaction that writes the row.
+// repo_index_state's indexed_at can serve as neither: it has exactly two
+// writers (a full reindex, and the git watcher on a HEAD transition), so the
+// most common mutation of all -- an incremental single-file reindex -- leaves
+// it untouched. A stage compared against it would read "current" forever after
+// an ordinary edit.
 //
-// Two properties make this the anchor rather than a timestamp: it advances on
-// every committed mutation regardless of which writer caused it, and two
-// distinct integers cannot collide the way two same-second timestamps can.
+//	  write path                    gen   content_gen   derive_state
+//	  ----------                    ---   -----------   ------------
+//	  files indexed                  10             3             --
+//	  derive runs; its edges land    25             3   stamp -> 3
+//	  enrich runs; its edges land    40             3             3
+//	  readiness: 3 >= 3                                       READY
+//	  file saved; mtime written      41             4             3
+//	  readiness: 3 <  4                                     PARTIAL
+//	  derive re-runs                 46             4   stamp -> 4  READY
+//
+// Two properties make content_gen the anchor rather than a timestamp: only the
+// indexer's own file bookkeeping advances it, and two distinct integers cannot
+// collide the way two same-second timestamps can.
 //
 // The bump is written INSIDE the mutating transaction (see
 // commitGraphMutation), never after it. Bumping after the commit would leave a
@@ -57,6 +63,30 @@ func bumpRepoGensTx(tx *sql.Tx, prefixes []string) error {
 		}
 	}
 	return nil
+}
+
+// bumpContentGenTx advances the CONTENT counter for one repo inside the
+// caller's transaction. Its only callers are the four file_mtimes writers --
+// which is the point. A file mtime is written exactly when the indexer has
+// parsed a file or dropped one, and by nothing else in the system: no derived
+// pass and no semantic provider has any reason to touch that table. So a stage
+// stamp taken against content_gen is immune to the stage's own output, and to
+// every stage that runs after it, by construction rather than by every future
+// pass author remembering a rule.
+//
+// changed is the caller's verdict that a row genuinely moved. Re-writing an
+// identical mtime set -- which a warm restart's authoritative persist does on
+// every start -- must NOT advance the counter: a derive that legitimately
+// short-circuited on an unchanged workspace fingerprint would otherwise read
+// stale immediately afterwards, and the column would cry wolf on every daemon
+// restart.
+func bumpContentGenTx(tx *sql.Tx, changed bool, prefix string) error {
+	if !changed || prefix == "" {
+		return nil
+	}
+	_, err := tx.Exec(`INSERT INTO repo_graph_gen (repo_prefix, gen, content_gen) VALUES (?, 0, 1)
+		ON CONFLICT(repo_prefix) DO UPDATE SET content_gen = repo_graph_gen.content_gen + 1`, prefix)
+	return err
 }
 
 // bumpAllRepoGensTx is the conservative fallback for a mutation whose blast

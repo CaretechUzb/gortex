@@ -7,30 +7,37 @@ import (
 )
 
 // StampDeriveState records that the global derived passes completed for each
-// named repo, against that repo's graph generation as it stands right now.
+// named repo, against that repo's counters as they stand right now.
 //
-// The generation is read here, in the same transaction as the write, and is
-// never accepted from the caller. That is the whole design:
+// Both counters are read here, in the same transaction as the write, and
+// neither is ever accepted from the caller. derived_content_gen is the one
+// readiness compares; derived_gen rides along as provenance.
 //
-//	derive reads the graph at gen 41
-//	derive's own passes emit edges          -> repo_graph_gen.gen = 44
-//	derive completes, stamps                -> derive_state.derived_gen = 44
-//	someone saves a file, batch commits     -> repo_graph_gen.gen = 45
-//	readiness: 44 < 45                      -> PARTIAL
+//	write path                    gen   content_gen   derived_content_gen
+//	----------                    ---   -----------   -------------------
+//	files indexed                  10             3                    --
+//	derive's own edges land        25             3                    --
+//	derive completes, stamps       25             3                     3
+//	enrichment's edges land        40             3                     3
+//	readiness: 3 >= 3                                              READY
+//	file saved, mtime written      41             4                     3
+//	readiness: 3 <  4                                            PARTIAL
 //
-// Stamping the generation observed at derive START instead -- 41 above -- would
-// leave every repo permanently behind after its very first derive, because the
-// passes themselves are graph writers and advance the anchor as they run. No
-// later derive would repair it: a second derive over unchanged content inserts
-// no new edges, so it moves nothing and the gap never closes.
+// Stamping against gen instead of content_gen is the trap this shape exists to
+// avoid: the derive's own edges, and every enrichment pass that follows it,
+// advance gen, so a gen-stamped row is behind the moment the pipeline finishes
+// and no later derive closes the gap -- a re-derive over unchanged content
+// inserts nothing, so it moves nothing. Every repo would read "partial"
+// forever after its very first successful pipeline.
 //
-// Reading at completion is exact rather than a concession. A derive holds the
-// batch-mutation write gate for its entire run, so no content write can
-// interleave; the generations between start and completion are its own, and
-// the content it read at the start is the content it stamps against here.
+// Reading content_gen at COMPLETION is exact rather than a concession. A
+// derive holds the batch-mutation write gate for its entire run, so no content
+// write can interleave and content_gen cannot move between start and
+// completion. If that gate is ever weakened this read must move to derive
+// START: stamping a completion value the passes never saw is fail-OPEN.
 //
 // This table is provenance, not graph: the write deliberately does NOT advance
-// any anchor and does NOT invalidate the analysis generation. A stamp that
+// either counter and does NOT invalidate the analysis generation. A stamp that
 // bumped the value it was stamping could never converge.
 func (s *Store) StampDeriveState(completions []graph.DeriveCompletion, derivedAt int64) error {
 	if len(completions) == 0 {
@@ -52,20 +59,23 @@ func (s *Store) StampDeriveState(completions []graph.DeriveCompletion, derivedAt
 		// mutation moves the anchor to 1 and reports partial.
 		if _, err := tx.Exec(`
 INSERT INTO derive_state
-  (repo_prefix, derived_gen, derived_sha, derived_at, pass_version, config_hash, scoped, legacy)
+  (repo_prefix, derived_gen, derived_content_gen, derived_sha, derived_at,
+   pass_version, config_hash, scoped, legacy)
 VALUES (
   ?,
-  COALESCE((SELECT gen FROM repo_graph_gen WHERE repo_prefix = ?), 0),
+  COALESCE((SELECT gen         FROM repo_graph_gen WHERE repo_prefix = ?), 0),
+  COALESCE((SELECT content_gen FROM repo_graph_gen WHERE repo_prefix = ?), 0),
   ?, ?, ?, ?, ?, 0)
 ON CONFLICT(repo_prefix) DO UPDATE SET
-  derived_gen  = excluded.derived_gen,
-  derived_sha  = excluded.derived_sha,
-  derived_at   = excluded.derived_at,
-  pass_version = excluded.pass_version,
-  config_hash  = excluded.config_hash,
-  scoped       = excluded.scoped,
-  legacy       = 0`,
-			c.RepoPrefix, c.RepoPrefix, c.DerivedSHA, derivedAt,
+  derived_gen         = excluded.derived_gen,
+  derived_content_gen = excluded.derived_content_gen,
+  derived_sha         = excluded.derived_sha,
+  derived_at          = excluded.derived_at,
+  pass_version        = excluded.pass_version,
+  config_hash         = excluded.config_hash,
+  scoped              = excluded.scoped,
+  legacy              = 0`,
+			c.RepoPrefix, c.RepoPrefix, c.RepoPrefix, c.DerivedSHA, derivedAt,
 			c.PassVersion, c.ConfigHash, boolToInt(c.Scoped)); err != nil {
 			_ = tx.Rollback()
 			return err
@@ -81,11 +91,12 @@ ON CONFLICT(repo_prefix) DO UPDATE SET
 // all, permanently, and until this row existed nothing could say so.
 func (s *Store) GetDeriveState(repoPrefix string) (graph.DeriveState, bool, error) {
 	row := s.db.QueryRow(`
-SELECT derived_gen, derived_sha, derived_at, pass_version, config_hash, scoped, legacy
+SELECT derived_gen, derived_content_gen, derived_sha, derived_at,
+       pass_version, config_hash, scoped, legacy
   FROM derive_state WHERE repo_prefix = ?`, repoPrefix)
 	st := graph.DeriveState{RepoPrefix: repoPrefix}
 	var scoped, legacy int
-	err := row.Scan(&st.DerivedGen, &st.DerivedSHA, &st.DerivedAt,
+	err := row.Scan(&st.DerivedGen, &st.DerivedContentGen, &st.DerivedSHA, &st.DerivedAt,
 		&st.PassVersion, &st.ConfigHash, &scoped, &legacy)
 	if err == sql.ErrNoRows {
 		return graph.DeriveState{RepoPrefix: repoPrefix}, false, nil
@@ -98,18 +109,22 @@ SELECT derived_gen, derived_sha, derived_at, pass_version, config_hash, scoped, 
 	return st, true, nil
 }
 
-// GetRepoGraphGen returns a repo's current mutation anchor. Zero with a false
+// GetRepoGraphGen returns a repo's two counters: gen (any graph mutation) and
+// content_gen (only the indexer parsing or dropping a file). Zero with a false
 // bool means no row: nothing has ever committed a change for that prefix.
-func (s *Store) GetRepoGraphGen(repoPrefix string) (int64, bool, error) {
-	var gen int64
-	err := s.db.QueryRow(`SELECT gen FROM repo_graph_gen WHERE repo_prefix = ?`, repoPrefix).Scan(&gen)
+//
+// Readiness compares stage stamps against contentGen. gen is provenance.
+func (s *Store) GetRepoGraphGen(repoPrefix string) (gen, contentGen int64, found bool, err error) {
+	err = s.db.QueryRow(
+		`SELECT gen, content_gen FROM repo_graph_gen WHERE repo_prefix = ?`, repoPrefix,
+	).Scan(&gen, &contentGen)
 	if err == sql.ErrNoRows {
-		return 0, false, nil
+		return 0, 0, false, nil
 	}
 	if err != nil {
-		return 0, false, err
+		return 0, 0, false, err
 	}
-	return gen, true, nil
+	return gen, contentGen, true, nil
 }
 
 func boolToInt(b bool) int {
@@ -155,9 +170,10 @@ func (s *Store) RefreshDeriveState(prefixes []string, derivedAt int64) (int, err
 		}
 		res, err := tx.Exec(`
 UPDATE derive_state
-   SET derived_gen = COALESCE((SELECT gen FROM repo_graph_gen WHERE repo_prefix = ?), 0),
-       derived_at  = ?
- WHERE repo_prefix = ? AND legacy = 0`, prefix, derivedAt, prefix)
+   SET derived_gen         = COALESCE((SELECT gen         FROM repo_graph_gen WHERE repo_prefix = ?), 0),
+       derived_content_gen = COALESCE((SELECT content_gen FROM repo_graph_gen WHERE repo_prefix = ?), 0),
+       derived_at          = ?
+ WHERE repo_prefix = ? AND legacy = 0`, prefix, prefix, derivedAt, prefix)
 		if err != nil {
 			_ = tx.Rollback()
 			return 0, err

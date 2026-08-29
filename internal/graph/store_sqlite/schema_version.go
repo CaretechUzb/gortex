@@ -99,34 +99,53 @@ var schemaMigrations = []schemaMigration{
 // real derive overwrites them.
 func createReadinessStateTables(tx *sql.Tx) error {
 	if _, err := tx.Exec(`CREATE TABLE IF NOT EXISTS repo_graph_gen (
-		repo_prefix TEXT PRIMARY KEY,
-		gen         INTEGER NOT NULL DEFAULT 0
+		repo_prefix TEXT    PRIMARY KEY,
+		gen         INTEGER NOT NULL DEFAULT 0,
+		content_gen INTEGER NOT NULL DEFAULT 0
 	) WITHOUT ROWID`); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`CREATE TABLE IF NOT EXISTS derive_state (
-		repo_prefix  TEXT PRIMARY KEY,
-		derived_gen  INTEGER NOT NULL DEFAULT 0,
-		derived_sha  TEXT    NOT NULL DEFAULT '',
-		derived_at   INTEGER NOT NULL DEFAULT 0,
-		pass_version INTEGER NOT NULL DEFAULT 0,
-		config_hash  TEXT    NOT NULL DEFAULT '',
-		scoped       INTEGER NOT NULL DEFAULT 0,
-		legacy       INTEGER NOT NULL DEFAULT 0
+		repo_prefix         TEXT PRIMARY KEY,
+		derived_gen         INTEGER NOT NULL DEFAULT 0,
+		derived_content_gen INTEGER NOT NULL DEFAULT 0,
+		derived_sha         TEXT    NOT NULL DEFAULT '',
+		derived_at          INTEGER NOT NULL DEFAULT 0,
+		pass_version        INTEGER NOT NULL DEFAULT 0,
+		config_hash         TEXT    NOT NULL DEFAULT '',
+		scoped              INTEGER NOT NULL DEFAULT 0,
+		legacy              INTEGER NOT NULL DEFAULT 0
 	) WITHOUT ROWID`); err != nil {
 		return err
 	}
 	// SQLite has no ADD COLUMN IF NOT EXISTS, and a duplicate ADD is a hard
 	// error that would roll the entire migration transaction back on a re-run.
-	var hasGen int
-	if err := tx.QueryRow(
-		`SELECT COUNT(*) FROM pragma_table_info('enrichment_state') WHERE name = 'gen'`,
-	).Scan(&hasGen); err != nil {
-		return err
-	}
-	if hasGen == 0 {
+	//
+	// The three content_gen columns are added here rather than in a v14 for a
+	// specific reason: they correct v13's own anchor before v13 has shipped, so
+	// the only stores carrying the earlier shape are development builds of this
+	// branch. Those are already stamped user_version 13 and would never see a
+	// v13 step re-run -- which is exactly why each ADD is guarded individually
+	// and why schemaSQL's CREATE TABLE IF NOT EXISTS cannot be relied on to
+	// deliver them. Stacking a migration onto an unreleased version would buy
+	// nothing and cost a second test matrix.
+	for _, col := range []struct{ table, name, ddl string }{
+		{"enrichment_state", "gen", "gen INTEGER NOT NULL DEFAULT 0"},
+		{"enrichment_state", "content_gen", "content_gen INTEGER NOT NULL DEFAULT 0"},
+		{"repo_graph_gen", "content_gen", "content_gen INTEGER NOT NULL DEFAULT 0"},
+		{"derive_state", "derived_content_gen", "derived_content_gen INTEGER NOT NULL DEFAULT 0"},
+	} {
+		var present int
+		if err := tx.QueryRow(
+			`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, col.table, col.name,
+		).Scan(&present); err != nil {
+			return err
+		}
+		if present > 0 {
+			continue
+		}
 		if _, err := tx.Exec(
-			`ALTER TABLE enrichment_state ADD COLUMN gen INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE ` + col.table + ` ADD COLUMN ` + col.ddl,
 		); err != nil {
 			return err
 		}

@@ -215,9 +215,9 @@ func TestV13MigrationAddsEnrichmentGenExactlyOnce(t *testing.T) {
 func TestRepoGraphGenIsMaintainedAcrossMutationFamilies(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
-		name    string
-		mutate  func(t *testing.T, s *Store, a, b *graph.Node, e *graph.Edge)
-		wantB   bool // does repoB legitimately change too?
+		name   string
+		mutate func(t *testing.T, s *Store, a, b *graph.Node, e *graph.Edge)
+		wantB  bool // does repoB legitimately change too?
 	}{
 		{
 			name: "RemoveEdgesExact",

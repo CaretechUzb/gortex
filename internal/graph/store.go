@@ -1390,14 +1390,17 @@ type EnrichmentStateStore interface {
 // unknowable, so it renders "unknown" rather than claiming a completion that
 // was never recorded.
 type DeriveState struct {
-	RepoPrefix  string
-	DerivedGen  int64
-	DerivedSHA  string
-	DerivedAt   int64 // unix seconds
-	PassVersion int64
-	ConfigHash  string
-	Scoped      bool
-	Legacy      bool
+	RepoPrefix string
+	DerivedGen int64
+	// DerivedContentGen is the comparand: the content_gen this derive covered.
+	// DerivedGen is the graph-wide counter at the same moment, provenance only.
+	DerivedContentGen int64
+	DerivedSHA        string
+	DerivedAt         int64 // unix seconds
+	PassVersion       int64
+	ConfigHash        string
+	Scoped            bool
+	Legacy            bool
 }
 
 // DeriveCompletion is one repo's half of a derive that finished successfully.

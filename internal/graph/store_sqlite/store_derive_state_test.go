@@ -196,10 +196,11 @@ func TestStampDeriveStateHandlesARepoWithNoAnchorRow(t *testing.T) {
 	require.True(t, found)
 	require.Zero(t, st.DerivedGen)
 
-	gen, found, err := store.GetRepoGraphGen("unseen")
+	gen, contentGen, found, err := store.GetRepoGraphGen("unseen")
 	require.NoError(t, err)
 	require.False(t, found)
 	require.Zero(t, gen)
+	require.Zero(t, contentGen)
 
 	store.AddBatch([]*graph.Node{genNode("unseen", "A")}, nil)
 	require.Greater(t, readGen(t, store, "unseen"), st.DerivedGen)
