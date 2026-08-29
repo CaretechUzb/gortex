@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
 )
@@ -216,7 +217,7 @@ func queryTolerantOfMissingTablePresence(
 ) (bool, error) {
 	rows, err := db.Query(query, args...)
 	if err != nil {
-		if isMissingTableErr(err) {
+		if isMissingTableErr(err) || isMissingColumnErr(err) {
 			return false, nil
 		}
 		return false, fmt.Errorf("read readiness state from %q: %w", path, err)
@@ -238,4 +239,24 @@ func queryTolerantOfMissingTable(
 ) error {
 	_, err := queryTolerantOfMissingTablePresence(db, path, query, scan, args...)
 	return err
+}
+
+// isMissingColumnErr reports whether err is SQLite refusing a query because a
+// column does not exist.
+//
+// A missing column is the same window as a missing table, one migration
+// narrower: this binary is ahead of the store it is reading. It arises when a
+// schema version gains a column after some store was already stamped at that
+// version — which is exactly what happened to v13 while this feature was being
+// built, and which the guarded ADD COLUMN steps in createReadinessStateTables
+// repair only on a store that has not yet reached v13.
+//
+// Tolerated ONLY here, in the readiness reader, and only to the same effect a
+// missing table has: the stage reads "unknown". The alternative is that
+// `gortex repos` fails outright and reports nothing about any repo, which is a
+// far worse answer than "I cannot tell yet" — a status command's whole job is
+// to degrade rather than refuse. A genuinely mistyped column would be caught
+// immediately by the tests, which run against a freshly migrated store.
+func isMissingColumnErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "no such column")
 }

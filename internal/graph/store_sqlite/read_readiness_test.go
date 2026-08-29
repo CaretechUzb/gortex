@@ -163,3 +163,27 @@ func dropReadinessTable(t *testing.T, path, table string) {
 	_, err = db.Exec("DROP TABLE IF EXISTS " + table)
 	require.NoError(t, err)
 }
+
+// A store stamped at the current schema version but missing a column this
+// binary expects — the window a version gains a column after some store was
+// already stamped at it. It must read like a missing table (unknown), not fail
+// the whole command: a status tool that refuses to answer about ANY repo
+// because one column is absent is strictly worse than one that says it cannot
+// tell yet.
+func TestReadReadinessStatesToleratesAColumnThisBinaryIsAheadOf(t *testing.T) {
+	t.Parallel()
+	path := seedReadinessStore(t)
+
+	db, err := sql.Open("sqlite", path)
+	require.NoError(t, err)
+	_, err = db.Exec(`ALTER TABLE derive_state DROP COLUMN derived_content_gen`)
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+
+	states, err := ReadReadinessStates(path)
+	require.NoError(t, err, "a column this binary is ahead of must not fail the command")
+	require.False(t, states.DeriveTable)
+	require.True(t, states.EnrichTable, "the other stages still answer")
+	require.Contains(t, states.Index, "repoA")
+	require.Equal(t, int64(1), states.Repos["repoA"].ContentGen)
+}
