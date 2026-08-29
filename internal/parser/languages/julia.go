@@ -892,7 +892,6 @@ func (e *JuliaExtractor) emitCallable(
 	switch {
 	case receiver != "":
 		ownerID, ownerName = st.filePath+"::"+receiver, receiver
-		ownerTarget = ownerID
 		if id, _, ok := st.lookupType(scope.modulePath, receiver); ok {
 			ownerID = id
 			ownerTarget = id
