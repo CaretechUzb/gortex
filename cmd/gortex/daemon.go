@@ -495,6 +495,13 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 	if err := daemon.WriteRuntimeState(daemon.RuntimeState{BackendPath: state.backendPath}); err != nil {
 		logger.Warn("daemon: could not record runtime state", zap.Error(err))
 	}
+	// Keep publishing into that record as long-running work opens and closes.
+	// A derive or an enrichment pass IS the work readiness waits on, so a
+	// reader that can name it in flight reports "deriving…" instead of holding
+	// the repo at "never derived" for the length of the pass.
+	if state.multiIndexer != nil {
+		state.multiIndexer.SetRuntimeMarker(runtimeStateMarker{logger: logger})
+	}
 	fmt.Fprintf(cmd.ErrOrStderr(),
 		"[gortex daemon] listening on %s (pid %d)\n",
 		daemon.SocketPath(), os.Getpid())

@@ -111,6 +111,11 @@ type Manager struct {
 	// failed) so index_health can surface an un-enriched graph instead
 	// of reporting green. Keyed by repo + "\x00" + provider name.
 	enrichStatus map[string]*EnrichmentStatus
+	// activityHook, when installed, is fired with the set of repos holding a
+	// running pass every time that set could have changed. The daemon uses it
+	// to publish "enriching…" to an out-of-band reader that cannot see this
+	// process. Nil for every other caller.
+	activityHook func(repos []string)
 
 	// lifecycleCtx is cancelled before providers are closed. activePasses
 	// covers the whole manager-owned pass (including terminal marker writes),
@@ -754,7 +759,47 @@ func (m *Manager) setEnrichStatus(repo, provider, lang, state string, deadline t
 		st.StartedAt = prev.StartedAt
 	}
 	m.enrichStatus[key] = st
+	// Snapshot under the lock, notify outside it. This fires on every
+	// (repo, provider) transition and the daemon's hook writes a file; holding
+	// m.mu across that would put disk I/O on the enrichment status path, which
+	// every provider walks several times per repo.
+	hook := m.activityHook
+	var active []string
+	if hook != nil {
+		active = m.activeEnrichReposLocked()
+	}
 	m.mu.Unlock()
+	if hook != nil {
+		hook(active)
+	}
+}
+
+// SetActivityHook installs a callback fired with the repos holding a running
+// enrichment pass, whenever that set could have changed. Installed by the
+// daemon so an out-of-band reader can render "enriching…" instead of reporting
+// a repo not-ready for the length of a pass that is doing exactly the work
+// readiness is waiting on.
+func (m *Manager) SetActivityHook(fn func(repos []string)) {
+	m.mu.Lock()
+	m.activityHook = fn
+	m.mu.Unlock()
+}
+
+// activeEnrichReposLocked lists the repos with a pass in flight, using the same
+// definition of "in flight" as EnrichmentActive. m.mu must be held.
+func (m *Manager) activeEnrichReposLocked() []string {
+	seen := make(map[string]struct{})
+	for _, st := range m.enrichStatus {
+		if st.State == EnrichStateRunning || st.State == EnrichStateDraining {
+			seen[st.Repo] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for repo := range seen {
+		out = append(out, repo)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // enrichBoundReason classifies why the add-phase stopped: a cut pass is

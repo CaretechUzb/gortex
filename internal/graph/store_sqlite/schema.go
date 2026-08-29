@@ -630,9 +630,10 @@ CREATE TABLE IF NOT EXISTS contract_state (
 -- read "current" forever after the most common way a repo goes stale. Two
 -- integers also cannot collide the way two same-second timestamps can.
 --
---   derive starts, repo gen = 41  ->  derive_state.derived_gen = 41
---   file saved, batch commits     ->  repo_graph_gen.gen       = 42
---   verdict: 41 < 42              ->  PARTIAL (correct)
+--   derive runs, its own edges land  ->  repo_graph_gen.gen       = 41
+--   derive completes, stamps 41      ->  derive_state.derived_gen = 41
+--   file saved, batch commits        ->  repo_graph_gen.gen       = 42
+--   verdict: 41 < 42                 ->  PARTIAL (correct)
 --
 -- One row per repo_prefix; WITHOUT ROWID -- the PK index IS the table, like
 -- file_mtimes / repo_index_state.
@@ -649,9 +650,22 @@ CREATE TABLE IF NOT EXISTS repo_graph_gen (
 -- daemon warmup could silently never be derived while every query against it
 -- returned a subset with no signal that anything was missing.
 --
--- derived_gen is the repo_graph_gen value observed at derive START, so a repo
--- mutated mid-derive reads stale rather than falsely current. derived_sha and
--- derived_at are provenance for humans and are never compared. pass_version
+-- derived_gen is the repo_graph_gen value read at derive COMPLETION, inside the
+-- same transaction that writes this row. NOT at derive start: the passes emit
+-- edges themselves, so every one of their own writes advances the anchor, and
+-- a start-stamped row would already be behind the moment the derive finished --
+-- leaving every repo permanently stale after its very first derive.
+--
+-- Completion-stamping is exact here rather than a concession, because a derive
+-- holds the batch-mutation write gate for its whole run (EndBatch,
+-- runWorkspaceRederive and RunIncrementalDerivedPasses all take it; the cold
+-- multi-repo index holds a per-repo mutation lane for every repo it stamps).
+-- No content write can interleave, so the only generations between start and
+-- completion are the derive's own, and the content it read at start is the
+-- content it is stamping against at the end.
+--
+-- derived_sha and derived_at are provenance for humans and are never compared.
+-- pass_version
 -- invalidates a store derived by a build whose synthesis has since changed
 -- semantics; config_hash does the same for derive-relevant CONFIG changes
 -- (the framework allow-list), which alter derived output with no code change.

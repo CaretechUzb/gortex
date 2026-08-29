@@ -1376,6 +1376,57 @@ type EnrichmentStateStore interface {
 	SetEnrichmentState(state EnrichmentState) error
 }
 
+// DeriveState is the per-repo completion marker for the derived-pass tier:
+// implements/overrides inference, test edges, entry-point hierarchy,
+// capability edges, framework-dispatch synthesis, external-call placeholders
+// and cross-repo edges. Before this row existed those passes emitted log lines
+// and nothing else, so a repo the daemon never derived was indistinguishable
+// from one it derived a second ago -- and every query against it silently
+// returned a subset.
+//
+// DerivedGen is the anchor; DerivedSHA and DerivedAt are provenance for
+// humans and are never compared. Legacy marks a row planted by the v13
+// migration for a repo derived before the table existed: its true state is
+// unknowable, so it renders "unknown" rather than claiming a completion that
+// was never recorded.
+type DeriveState struct {
+	RepoPrefix  string
+	DerivedGen  int64
+	DerivedSHA  string
+	DerivedAt   int64 // unix seconds
+	PassVersion int64
+	ConfigHash  string
+	Scoped      bool
+	Legacy      bool
+}
+
+// DeriveCompletion is one repo's half of a derive that finished successfully.
+//
+// It deliberately carries no generation. A caller cannot supply one correctly:
+// the derived passes emit edges themselves, so their own writes advance the
+// repo's generation while they run, and any value read before the last pass
+// committed is already behind. StampDeriveState reads each repo's current
+// generation inside the transaction that writes the row, which is the only
+// place the two can be observed together.
+type DeriveCompletion struct {
+	RepoPrefix  string
+	DerivedSHA  string
+	PassVersion int64
+	ConfigHash  string
+	Scoped      bool
+}
+
+// DeriveStateStore is an optional capability backends MAY implement to persist
+// and read back per-repo derived-pass completion. GetDeriveState's bool is
+// false when no row has been recorded yet -- a repo tracked since the feature
+// landed that has genuinely never been derived, which readiness must report
+// rather than excuse.
+type DeriveStateStore interface {
+	GetDeriveState(repoPrefix string) (DeriveState, bool, error)
+	StampDeriveState(completions []DeriveCompletion, derivedAt int64) error
+	RefreshDeriveState(prefixes []string, derivedAt int64) (int, error)
+}
+
 // ContractState is the per-repo completion marker for the contract tier: the
 // git revision the whole-repo contract pass last committed at, when it
 // finished, and how many contracts it wrote.

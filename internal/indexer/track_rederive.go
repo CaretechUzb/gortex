@@ -327,17 +327,25 @@ func (mi *MultiIndexer) runWorkspaceRederive(ctx context.Context, frontier map[s
 	// running them first would derive from a half-bound graph.
 	mi.RunGlobalResolve()
 
+	var covered []string
+	var passErr error
 	if ctx.Err() == nil {
 		mi.batchMutationGate.Lock()
-		mi.runGlobalGraphPasses(ctx, scope, false)
+		covered, passErr = mi.runGlobalGraphPasses(ctx, scope, false)
 		mi.batchMutationGate.Unlock()
 	}
+	// A preempted run leaves passErr non-nil and stamps nothing, so the repos
+	// keep reading partial until the scheduler's re-run completes. The gate
+	// above is held for the whole pass, which is what lets the stamp record the
+	// generation the passes themselves left the graph at.
+	mi.completeDerive(covered, scope != nil, passErr)
 
 	if mi.logger != nil {
 		mi.logger.Info("workspace derivation complete (post-track)",
 			zap.String("triggered_by", reason),
 			zap.Bool("scoped", scope != nil),
 			zap.Bool("preempted", ctx.Err() != nil),
+			zap.Int("derived_repos", len(covered)),
 			zap.Duration("elapsed", time.Since(start)))
 	}
 }

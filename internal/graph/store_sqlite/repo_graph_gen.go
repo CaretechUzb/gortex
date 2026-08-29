@@ -17,13 +17,21 @@ import (
 // incremental single-file reindex -- leaves it untouched. A stage compared
 // against it would read "current" forever after an ordinary edit.
 //
-//	   write path                      repo_graph_gen        derive_state
-//	   ----------                      --------------        ------------
-//	   derive starts                        41          read -> derived_gen 41
-//	   file saved, batch commits   bump ->  42                    41
-//	   readiness compares                   42          <         41  -> PARTIAL
-//	   derive re-runs, completes            42          read -> derived_gen 42
-//	   readiness compares                   42          ==        42  -> READY
+//	  write path                       repo_graph_gen         derive_state
+//	  ----------                       --------------         ------------
+//	  derive runs; its own edges land  bump ->  41                    0
+//	  derive completes, stamps                  41    read -> derived_gen 41
+//	  file saved, batch commits        bump ->  42                   41
+//	  readiness compares                        42       41 <  42 -> PARTIAL
+//	  derive re-runs and completes     bump ->  43    read -> derived_gen 43
+//	  readiness compares                        43       43 == 43 -> READY
+//
+// Note which end of the derive is stamped. The passes are graph writers
+// themselves, so they advance the anchor as they run; a stamp taken at derive
+// START would be behind the moment the derive ended, and no later derive would
+// close the gap, because a re-derive over unchanged content inserts nothing and
+// so moves nothing. StampDeriveState therefore reads the anchor at completion,
+// in the transaction that writes the row.
 //
 // Two properties make this the anchor rather than a timestamp: it advances on
 // every committed mutation regardless of which writer caused it, and two

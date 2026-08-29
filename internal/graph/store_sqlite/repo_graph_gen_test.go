@@ -41,6 +41,7 @@ func genNode(prefix, name string) *graph.Node {
 // Without the second half every repo would decay to "partial" on idle writes;
 // without the first, a mutated repo would keep reading "ready".
 func TestRepoGraphGenAdvancesOnlyForReposAnEffectiveBatchTouched(t *testing.T) {
+	t.Parallel()
 	store := openGenTestStore(t)
 
 	a, b := genNode("repoA", "A"), genNode("repoB", "B")
@@ -64,6 +65,7 @@ func TestRepoGraphGenAdvancesOnlyForReposAnEffectiveBatchTouched(t *testing.T) {
 // A cross-repo edge is a change to the graph at BOTH ends: "who uses this"
 // answers differently for each side, so each side's anchor must move.
 func TestRepoGraphGenAdvancesBothEndsOfACrossRepoEdge(t *testing.T) {
+	t.Parallel()
 	store := openGenTestStore(t)
 	from, to := genNode("repoA", "A"), genNode("repoB", "B")
 	store.AddBatch([]*graph.Node{from, to}, nil)
@@ -82,6 +84,7 @@ func TestRepoGraphGenAdvancesBothEndsOfACrossRepoEdge(t *testing.T) {
 // sitting at the old anchor -- and every stage stamped there would read
 // "ready" against a graph it no longer describes.
 func TestRepoGraphGenBumpRollsBackWithItsTransaction(t *testing.T) {
+	t.Parallel()
 	store := openGenTestStore(t)
 	store.AddBatch([]*graph.Node{genNode("repoA", "A")}, nil)
 	before := readGen(t, store, "repoA")
@@ -102,6 +105,7 @@ func TestRepoGraphGenBumpRollsBackWithItsTransaction(t *testing.T) {
 // advance it once, or the anchor would inflate with batch size rather than
 // with the number of times the repo actually changed.
 func TestRepoGraphGenBumpsOncePerRepoPerTransaction(t *testing.T) {
+	t.Parallel()
 	store := openGenTestStore(t)
 	store.writeMu.Lock()
 	defer store.writeMu.Unlock()
@@ -121,6 +125,7 @@ func TestRepoGraphGenBumpsOncePerRepoPerTransaction(t *testing.T) {
 // rows but no repo_index_state row yet, which happens because the index
 // stamps that row only at the END of a run.
 func TestBumpAllRepoGensCoversIndexedAndNotYetIndexedRepos(t *testing.T) {
+	t.Parallel()
 	store := openGenTestStore(t)
 	store.writeMu.Lock()
 	defer store.writeMu.Unlock()
@@ -143,6 +148,7 @@ func TestBumpAllRepoGensCoversIndexedAndNotYetIndexedRepos(t *testing.T) {
 // whole transaction back on any error, and the user_version stamp is a
 // SEPARATE statement, so a crash between the two replays every step.
 func TestCreateReadinessStateTablesIsIdempotentAndSeedsLegacyRows(t *testing.T) {
+	t.Parallel()
 	store := openGenTestStore(t)
 	_, err := store.writerDB.Exec(`INSERT INTO repo_index_state (repo_prefix) VALUES ('alpha'), ('beta')`)
 	require.NoError(t, err)
@@ -165,6 +171,7 @@ func TestCreateReadinessStateTablesIsIdempotentAndSeedsLegacyRows(t *testing.T) 
 // recorded. The migration marks it legacy so readiness can say "unknown"
 // rather than inventing a verdict.
 func TestV13MigrationNeverClaimsAnUnrecordedDerive(t *testing.T) {
+	t.Parallel()
 	store := openGenTestStore(t)
 	_, err := store.writerDB.Exec(`INSERT INTO repo_index_state (repo_prefix) VALUES ('legacyrepo')`)
 	require.NoError(t, err)
@@ -186,6 +193,7 @@ func TestV13MigrationNeverClaimsAnUnrecordedDerive(t *testing.T) {
 // enrichment_state.gen must exist after the migration on a store that predates
 // it, and the guarded ALTER must tolerate a second run.
 func TestV13MigrationAddsEnrichmentGenExactlyOnce(t *testing.T) {
+	t.Parallel()
 	store := openGenTestStore(t)
 	for run := 1; run <= 2; run++ {
 		tx, err := store.writerDB.Begin()
@@ -205,6 +213,7 @@ func TestV13MigrationAddsEnrichmentGenExactlyOnce(t *testing.T) {
 // through during ordinary operation; each must advance the anchor of the repo
 // it touched, and none may advance a bystander's.
 func TestRepoGraphGenIsMaintainedAcrossMutationFamilies(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name    string
 		mutate  func(t *testing.T, s *Store, a, b *graph.Node, e *graph.Edge)
@@ -274,6 +283,7 @@ func TestRepoGraphGenIsMaintainedAcrossMutationFamilies(t *testing.T) {
 // repos those edges came FROM have genuinely changed and must advance -- while
 // the purged repo's own anchor row goes away with the rest of its state.
 func TestPurgeRepoAdvancesSurvivorsAndDropsItsOwnAnchor(t *testing.T) {
+	t.Parallel()
 	store := openGenTestStore(t)
 	a, b := genNode("repoA", "A"), genNode("repoB", "B")
 	store.AddBatch([]*graph.Node{a, b}, []*graph.Edge{{
@@ -296,6 +306,7 @@ func TestPurgeRepoAdvancesSurvivorsAndDropsItsOwnAnchor(t *testing.T) {
 // generated to_repo column. Restating it means it can drift, so pin the two
 // together the way TestEdgeScopeColumnsMirrorGoHelpers pins from_repo.
 func TestToRepoExprMirrorsRepoPrefixOfID(t *testing.T) {
+	t.Parallel()
 	store := openGenTestStore(t)
 	for _, id := range []string{
 		"repoA/a.go::A",
