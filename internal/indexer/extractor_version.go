@@ -45,7 +45,7 @@ var extractorVersions = map[string]int{
 	"go":     3,                                      // generic instantiations are marked so indexing a func value cannot bind (was: generic calls emit call edges)
 	"cpp":    2,                                      // templated and namespace-qualified calls emit call edges
 	"swift":  2,                                      // generic calls and ordinary member calls emit call edges
-	"julia":  2,                                      // bespoke tree-sitter extractor replaces the regex extractor (fields, exports, qualified methods, broadcast/macro calls)
+	"julia":  3,                                      // callee and macro decoding from CST children (chained/parametric callees, Base.@time, Base.:(==)), macro/operator exports, member_of for module consts and nested modules, @doc and public metadata (was: bespoke tree-sitter extractor replaced the regex extractor)
 }
 
 // extractorSaltExtLang maps a lower-case file extension to the language
