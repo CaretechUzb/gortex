@@ -117,6 +117,13 @@ type juliaWalkState struct {
 	// several modules giving the same short nickname to different
 	// packages.
 	importAliases map[string]string
+	// modules maps a lexical scope + module name to the minted module
+	// id, so `module M … end; function M.f() … end` binds the qualified
+	// method to the real module node instead of an invented
+	// unresolved::M. Keyed like the type and alias tables — modules are
+	// KindType nodes, indistinguishable from structs by kind, so a
+	// receiver that is a module needs its own table to resolve through.
+	modules map[string]string
 }
 
 func (e *JuliaExtractor) Extract(filePath string, src []byte) (*parser.ExtractionResult, error) {
@@ -145,6 +152,7 @@ func (e *JuliaExtractor) Extract(filePath string, src []byte) (*parser.Extractio
 		types:         map[string]string{},
 		declaredTypes: map[string]bool{},
 		importAliases: map[string]string{},
+		modules:       map[string]string{},
 	}
 	juliaPrescan(root, src, "", st)
 	e.walk(root, src, juliaScope{}, st)
@@ -384,6 +392,10 @@ func (e *JuliaExtractor) handleModule(n *sitter.Node, src []byte, scope juliaSco
 			}
 			st.result.Nodes = append(st.result.Nodes, node)
 			st.nodes[id] = node
+			// Record the module by lexical scope so a later qualified
+			// method (`function M.f()`) in the same file resolves it as
+			// the receiver's owner rather than inventing unresolved::M.
+			st.modules[juliaTypeKey(scope.modulePath, name)] = id
 			st.result.Edges = append(st.result.Edges, &graph.Edge{
 				From: st.fileNode.ID, To: id, Kind: graph.EdgeDefines,
 				FilePath: st.filePath, Line: line,
@@ -891,10 +903,14 @@ func (e *JuliaExtractor) emitCallable(
 
 	switch {
 	case receiver != "":
-		ownerID, ownerName = st.filePath+"::"+receiver, receiver
+		ownerName = receiver
 		if id, _, ok := st.lookupType(scope.modulePath, receiver); ok {
-			ownerID = id
-			ownerTarget = id
+			ownerID, ownerTarget = id, id
+		} else if id, ok := st.modules[juliaTypeKey(scope.modulePath, receiver)]; ok {
+			// `module M … end; function M.f() … end` — the receiver names
+			// a module this file declares, so member_of reaches the real
+			// module node instead of an invented unresolved::M.
+			ownerID, ownerTarget = id, id
 		} else {
 			// `function Base.show` extends a module this file does not
 			// declare, so no node carries the receiver's name — a
@@ -902,6 +918,7 @@ func (e *JuliaExtractor) emitCallable(
 			// of the graph that does not exist. The method's own id
 			// stays flat; the edge target becomes self-describing, the
 			// same honesty extends and call edges already carry.
+			ownerID = st.filePath + "::" + receiver
 			ownerTarget = "unresolved::" + receiver
 		}
 		baseID = ownerID + "." + name

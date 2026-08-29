@@ -1463,3 +1463,44 @@ end
 		assert.False(t, ok, "%s must not be documented, got %q", id, docs[id])
 	}
 }
+
+// A qualified method whose receiver is a module DECLARED IN THE SAME FILE
+// belongs to that module's node: `module M … end; function M.f() … end`
+// must member_of the real `file::M`, not an invented `unresolved::M`.
+// Modules are KindType nodes, indistinguishable from structs by kind, so
+// the receiver resolves through their own table after the type lookup
+// misses.
+func TestJuliaExtractor_SameFileModuleMethodOwner(t *testing.T) {
+	src := []byte(`module M
+greet() = 1
+end
+
+function M.f(x)
+    helper(x)
+end
+
+module Outer
+module Inner
+end
+function Inner.g(x)
+    x
+end
+end
+`)
+	res, err := NewJuliaExtractor().Extract("modm.jl", src)
+	require.NoError(t, err)
+
+	nodes := map[string]bool{}
+	for _, n := range res.Nodes {
+		nodes[n.ID] = true
+	}
+	require.True(t, nodes["modm.jl::M"], "the module node must exist")
+
+	owners := juliaOwners(res.Edges)
+	assert.True(t, owners["modm.jl::M.f"]["modm.jl::M"],
+		"a method on a same-file module belongs to that module's node")
+	assert.False(t, owners["modm.jl::M.f"]["unresolved::M"],
+		"it must not fall back to an invented unresolved receiver")
+	assert.True(t, owners["modm.jl::Inner.g"]["modm.jl::Inner"],
+		"a nested module receiver resolves in its own lexical scope")
+}
