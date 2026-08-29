@@ -101,11 +101,43 @@ func TestEverySentinelIsSubstituted(t *testing.T) {
 	}
 	// The template must still carry every sentinel, or a rename would
 	// pass the check above by leaving the value hard-coded.
-	for _, sentinel := range []string{sentinelBin, sentinelArgv, sentinelEnforce} {
+	for _, sentinel := range []string{sentinelBin, sentinelArgv, sentinelEnforce, sentinelTimeout} {
 		if !strings.Contains(pluginSource, sentinel) {
 			t.Fatalf("plugin/gortex.js no longer carries %s", sentinel)
 		}
 	}
+}
+
+// The shipped bridge budget must not drift behind the test seam.
+//
+// renderPlugin is what every install writes, and renderPluginWithHookTimeout
+// exists so the node tests can render a budget a loaded machine can meet.
+// That seam has a cost: it made a bad default invisible. Sabotaging
+// defaultHookTimeoutMS to 1ms leaves the whole package green without this
+// test — the node tests used to catch it, by accident, and no longer can.
+//
+// The literal is deliberate. 5000ms is a policy decision documented at
+// HOOK_TIMEOUT_MS in plugin/gortex.js (how long a user waits before a
+// pathological bridge stops holding up their tool call); asserting against
+// defaultHookTimeoutMS would move both sides together and check nothing.
+// Changing the shipped budget should require changing this line on purpose.
+func TestRenderedHookTimeoutIsTheShippedDefault(t *testing.T) {
+	env, _ := globalEnv(t)
+	if !strings.Contains(renderPlugin(env), "const HOOK_TIMEOUT_MS = 5000;") {
+		t.Fatalf("the installed bridge must carry the documented 5s budget, got %q",
+			hookTimeoutLine(renderPlugin(env)))
+	}
+}
+
+// hookTimeoutLine pulls the rendered budget line out for the failure
+// message, so a drift reports the value it found rather than the file.
+func hookTimeoutLine(rendered string) string {
+	for _, line := range strings.Split(rendered, "\n") {
+		if strings.Contains(line, "HOOK_TIMEOUT_MS =") {
+			return strings.TrimSpace(line)
+		}
+	}
+	return "no HOOK_TIMEOUT_MS line at all"
 }
 
 // TestRenderedArgvAndEnforce checks the two values the bridge cannot work
