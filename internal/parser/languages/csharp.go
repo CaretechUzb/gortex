@@ -402,15 +402,16 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 	// (emitCSharpBaseList) checks this set before falling back to name
 	// shape so a locally-known interface always wins.
 	localInterfaces := collectCSharpInterfaceNames(root, src)
-	// Per type node ID, across every declaration in the file — see
-	// csharpBaseNameCounts for why one declaration's own base list is not
-	// a sufficient ambiguity check.
-	baseNameCounts := csharpBaseNameCounts(root, src, filePath)
 
 	// Using-alias names, collected once per file: the type-argument stamp
 	// sites consult them per declaration, and a per-declaration rescan of
 	// the enclosing namespace was quadratic in sibling count.
 	fileAliases := csharpFileAliasNames(root, src)
+
+	// Per type node ID, across every declaration in the file — see
+	// csharpBaseNameCounts for why one declaration's own base list is not
+	// a sufficient ambiguity check.
+	baseNameCounts := csharpBaseNameCounts(root, src, filePath, fileAliases)
 
 	var calls []csharpDeferredCall
 	var locals []csharpDeferredLocal
@@ -2002,7 +2003,16 @@ func csharpDirectMemberOwner(member *sitter.Node, src []byte, allowed ...string)
 // Walking base_list nodes and reading the parent's name avoids
 // enumerating declaration node types, which differ across grammar
 // revisions.
-func csharpBaseNameCounts(root *sitter.Node, src []byte, filePath string) map[string]map[string]int {
+//
+// A base entry that names a using alias is recorded under the alias
+// sentinel rather than its own spelling. An alias is an opaque spelling
+// of some type - possibly a construction of the very interface a
+// sibling entry closes - so a base list containing one can never prove
+// its target unique, and the stamp site refuses the whole type. The
+// sentinel key contains a NUL so no real base name can collide with it.
+const csharpAliasBaseSentinel = "\x00alias-base"
+
+func csharpBaseNameCounts(root *sitter.Node, src []byte, filePath string, fileAliases map[string]bool) map[string]map[string]int {
 	counts := map[string]map[string]int{}
 	walkNodes(root, func(n *sitter.Node) {
 		if n.Type() != "base_list" {
@@ -2028,6 +2038,10 @@ func csharpBaseNameCounts(root *sitter.Node, src []byte, filePath string) map[st
 				continue
 			}
 			if name, _ := csharpBaseTypeName(entry, src); name != "" {
+				if fileAliases[name] {
+					m[csharpAliasBaseSentinel]++
+					continue
+				}
 				m[name]++
 			}
 		}
@@ -2162,8 +2176,12 @@ func emitCSharpBaseList(typeID string, decl *sitter.Node, src []byte, filePath s
 		}
 		// Closed generic arguments ride the edge so the dispatch fan-out
 		// can exclude type-impossible implementors — see the package doc
-		// in csharp_base_type_args.go for the conservative rules.
-		if baseNameCount[name] == 1 {
+		// in csharp_base_type_args.go for the conservative rules. A base
+		// list that spells any entry as a using alias stamps nothing at
+		// all: the alias is an opaque spelling that may construct the
+		// same interface a sibling entry closes, so no entry's target
+		// can be proven unique.
+		if baseNameCount[csharpAliasBaseSentinel] == 0 && baseNameCount[name] == 1 {
 			if args := csharpBaseTypeArgs(entry, src, declTypeParams); args != "" {
 				if edge.Meta == nil {
 					edge.Meta = map[string]any{}

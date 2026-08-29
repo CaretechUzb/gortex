@@ -112,6 +112,47 @@ func TestResolveCSharpInterfaceDispatch_SecondClosureViaBaseClass(t *testing.T) 
 // Two commits close it - the extractor descending to the final segment,
 // and the count spanning a whole type ID - so this is the end-to-end
 // pin that the two together actually cover the reported shape.
+// The alias spelling of the same duplicate: `using BX = App.IBox<Crate>;`
+// then `Dual : BX, IBox<Widget>`. The name extractor sees "BX", so the
+// duplicate count reads BX=1, IBox=1 and the bare entry stamps its
+// closure onto the whole type - and the multi-closure walk cannot help,
+// because `unresolved::BX` never resolves to the interface, leaving only
+// one visible path. An alias is an opaque spelling: a base list that
+// contains one cannot prove it names anything OTHER than the interface,
+// so no entry of that type may stamp.
+func TestResolveCSharpInterfaceDispatch_AliasSpelledBaseSuppressesStamps(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Alias.cs": `using BX = App.IBox<Crate>;
+namespace App {
+    public class Crate { }
+    public class Widget { }
+    public interface IBox<T> { void Put(T item); }
+    public class PlainCrateBox : IBox<Crate> { public void Put(Crate c) { } }
+    public class Dual : BX, IBox<Widget> {
+        public void Put(Crate c) { }
+        public void Put(Widget w) { }
+    }
+    public class Flow {
+        private readonly IBox<Crate> _box;
+        public Flow(IBox<Crate> b) { _box = b; }
+        public void Pull(Crate c) { _box.Put(c); }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	const callerID = "Alias.cs::Flow.Pull"
+	bindFieldReceiverCall(t, g, callerID, "_box", "Alias.cs::IBox.Put")
+	ResolveCSharpInterfaceDispatch(g)
+
+	assert.ElementsMatch(t, []string{
+		"Alias.cs::PlainCrateBox.Put",
+		"Alias.cs::Dual.Put",
+		"Alias.cs::Dual.Put_L9",
+	}, dispatchTargets(g, callerID),
+		"a type whose base list spells an alias keeps its whole fan-out")
+}
+
 func TestResolveCSharpInterfaceDispatch_QualifiedSpellingCountsAsDuplicate(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
