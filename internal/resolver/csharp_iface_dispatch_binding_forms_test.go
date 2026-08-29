@@ -79,6 +79,50 @@ func TestResolveCSharpInterfaceDispatch_BindingFormsShadowFieldReceivers(t *test
         public int Use(IBox<Widget> src) {
             using (var _box = Make(src)) { return _box.Get(7); }
         }`},
+		{"catch variable", "Flow.Guard", `
+        public int Guard() {
+            try { return 0; }
+            catch (BoxError _box) { return _box.Get(7); }
+        }`},
+		{"for initializer", "Flow.Loop", `
+        private IBox<Widget> Make(IBox<Widget> s) { return s; }
+        public int Loop(IBox<Widget> src) {
+            for (var _box = Make(src); _box != null; ) { return _box.Get(7); }
+            return 0;
+        }`},
+		{"anonymous method parameter", "Flow.Old", `
+        public int Old(IBox<Widget> src) {
+            System.Func<IBox<Widget>, int> f = delegate(IBox<Widget> _box) { return _box.Get(7); };
+            return f(src);
+        }`},
+		{"query from variable", "Flow.Query", `
+        public int Query(IBox<Widget>[] all) {
+            return System.Linq.Enumerable.Sum(from _box in all select _box.Get(7));
+        }`},
+		{"query let variable", "Flow.Bind", `
+        public int Bind(IBox<Widget>[] all) {
+            return System.Linq.Enumerable.Sum(from w in all let _box = w select _box.Get(7));
+        }`},
+		{"local function parameter", "Flow.Host", `
+        public int Host() {
+            int Inner(IBox<Widget> _box) { return _box.Get(7); }
+            return Inner(null);
+        }`},
+		{"recursive pattern designation", "Flow.Probe", `
+        public int Probe(object o) {
+            if (o is IBox<Widget> { } _box) { return _box.Get(7); }
+            return 0;
+        }`},
+		{"parenthesized designation", "Flow.Split", `
+        public int Split(object o) {
+            if (o is var (_box, n)) { return _box.Get(7); }
+            return 0;
+        }`},
+		{"deconstruction declaration", "Flow.Take", `
+        public int Take((IBox<Widget>, int) t) {
+            var (_box, n) = t;
+            return _box.Get(7);
+        }`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			g := buildCSharpResolverGraph(t, map[string]string{
@@ -88,6 +132,9 @@ func TestResolveCSharpInterfaceDispatch_BindingFormsShadowFieldReceivers(t *test
     public interface IBox<T> { int Get(int id); }
     public class CrateBox : IBox<Crate> { public int Get(int id) { return 1; } }
     public class WidgetBox : IBox<Widget> { public int Get(int id) { return 2; } }
+    public class BoxError : System.Exception {
+        public int Get(int id) { return 0; }
+    }
     public class Flow {
         private readonly IBox<Crate> _box;
         public Flow(IBox<Crate> b) { _box = b; }
