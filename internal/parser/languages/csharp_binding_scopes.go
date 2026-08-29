@@ -64,29 +64,59 @@ func csharpCollectExtraBindingScopes(root *sitter.Node, src []byte, funcRanges *
 			}
 		}
 	}
-	// A query's range variables bind across the query's later clauses;
-	// their extent is the whole query expression.
-	queryScope := func(n *sitter.Node) csharpLocalScope {
+	// A query's range variables bind across the query's LATER clauses
+	// only: a variable is not in scope in its own source/RHS expression,
+	// and a query continuation (`select x into g` - the grammar spells
+	// the continuation variable as a bare identifier child of the
+	// query_expression) ends every earlier range variable's scope.
+	// queryTail returns the extent from start to the enclosing query's
+	// end, clipped at the first continuation identifier at or past
+	// start. Starting the extent at the whole query instead refused
+	// receiver_name inside the variable's own source, and the extension
+	// binder then read the static form as instance form - one parameter
+	// wide.
+	queryTail := func(n *sitter.Node, start int) csharpLocalScope {
+		var q *sitter.Node
 		for cur := n; cur != nil; cur = cur.Parent() {
 			if cur.Type() == "query_expression" {
-				return spanOf(cur)
+				q = cur
+				break
 			}
 		}
-		return csharpLocalScopeOf(n)
+		if q == nil {
+			return csharpLocalScopeOf(n)
+		}
+		end := int(q.EndByte())
+		for i, _nc := 0, int(q.NamedChildCount()); i < _nc; i++ {
+			if c := q.NamedChild(i); c != nil && c.Type() == "identifier" && int(c.StartByte()) >= start {
+				end = int(c.StartByte())
+				break
+			}
+		}
+		if end < start {
+			end = start
+		}
+		return csharpLocalScope{start: start, end: end}
 	}
 	walkNodes(root, func(n *sitter.Node) {
 		switch n.Type() {
 		case "foreach_statement":
 			// left is the loop variable - an identifier, or a tuple
-			// pattern whose every identifier binds. All of them scope
-			// over the statement.
+			// pattern whose every identifier binds. The variable is NOT
+			// in scope in its own collection expression - the header
+			// still sees the enclosing meaning of the name - so the
+			// extent starts at the embedded body, not at the statement.
+			sc := spanOf(n)
+			if body := n.ChildByFieldName("body"); body != nil {
+				sc.start = int(body.StartByte())
+			}
 			if left := n.ChildByFieldName("left"); left != nil {
 				if left.Type() == "identifier" {
-					add(left, spanOf(n))
+					add(left, sc)
 				} else {
 					walkNodes(left, func(c *sitter.Node) {
 						if c.Type() == "identifier" {
-							add(c, spanOf(n))
+							add(c, sc)
 						}
 					})
 				}
@@ -144,16 +174,69 @@ func csharpCollectExtraBindingScopes(root *sitter.Node, src []byte, funcRanges *
 				})
 			}
 		case "from_clause":
-			add(n.ChildByFieldName("name"), queryScope(n))
-		case "let_clause", "join_clause":
-			// The introduced name is an unfielded child: the FIRST
-			// identifier (`let x = expr` / `join x in ...`). Later
-			// identifier children belong to the expression side and
-			// must not be collected.
+			// The range variable begins only after its own source
+			// expression - `from x in SRC` still sees the enclosing
+			// meaning of x inside SRC.
+			add(n.ChildByFieldName("name"), queryTail(n, int(n.EndByte())))
+		case "let_clause":
+			// The introduced name is the FIRST identifier child
+			// (`let x = expr`); the variable begins only after its own
+			// RHS. Later identifier children belong to the expression
+			// side and must not be collected.
 			for i, _nc := 0, int(n.NamedChildCount()); i < _nc; i++ {
 				if c := n.NamedChild(i); c != nil && c.Type() == "identifier" {
-					add(c, queryScope(n))
+					add(c, queryTail(n, int(n.EndByte())))
 					break
+				}
+			}
+		case "join_clause":
+			// `join x in SRC on LEFT equals RIGHT [into g]`: x is not
+			// in scope in SRC or in LEFT, enters scope at the RIGHT
+			// key, and - when `into` follows - dies right after that
+			// key (the group variable replaces it for the rest of the
+			// query).
+			var name, into, rightKey *sitter.Node
+			for i, _nc := 0, int(n.NamedChildCount()); i < _nc; i++ {
+				c := n.NamedChild(i)
+				if c == nil {
+					continue
+				}
+				if c.Type() == "join_into_clause" {
+					into = c
+					continue
+				}
+				if name == nil && c.Type() == "identifier" {
+					name = c
+				}
+				rightKey = c
+			}
+			start := int(n.EndByte())
+			if rightKey != nil {
+				start = int(rightKey.StartByte())
+			}
+			switch {
+			case name == nil:
+			case into == nil:
+				add(name, queryTail(n, start))
+			default:
+				if rightKey != nil {
+					add(name, csharpLocalScope{start: start, end: int(rightKey.EndByte())})
+				}
+				for i, _nc := 0, int(into.NamedChildCount()); i < _nc; i++ {
+					if c := into.NamedChild(i); c != nil && c.Type() == "identifier" {
+						add(c, queryTail(n, int(c.EndByte())))
+						break
+					}
+				}
+			}
+		case "query_expression":
+			// A continuation variable (`select x into g`) is a bare
+			// identifier child of the query expression; it scopes from
+			// after itself to the query's end (or the next
+			// continuation).
+			for i, _nc := 0, int(n.NamedChildCount()); i < _nc; i++ {
+				if c := n.NamedChild(i); c != nil && c.Type() == "identifier" {
+					add(c, queryTail(n, int(c.EndByte())))
 				}
 			}
 		case "tuple_pattern":
