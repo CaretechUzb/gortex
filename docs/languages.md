@@ -154,7 +154,10 @@ but only when the string sits immediately above the documented object —
 the adjacency Julia itself enforces, where a blank line or an own-line
 comment detaches the string and leaves the definition undocumented. A
 string at the top of a function body is executable code, not
-documentation. The stored text is the first PROSE paragraph, skipping the
+documentation. The explicit `@doc "text" object` form (which is what
+Julia lowers every docstring to) attaches the same way, with the text
+taken from inside the macro call. The stored text is the first PROSE
+paragraph, skipping the
 indented signature block Julia's convention opens a docstring with.
 
 What is **not** covered:

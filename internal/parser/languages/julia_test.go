@@ -1193,6 +1193,46 @@ end
 		"a docstring must survive the macro flag already on Meta")
 }
 
+// Julia lowers EVERY docstring — triple-quoted or explicit — through
+// Core.@doc, so `@doc "text" obj` is the same documentation mechanism as
+// a string above the object, and the string sits INSIDE the macro call
+// where the pending-doc walk never looks. Every documented-object shape
+// accepts the form: short-form definitions, long-form functions, macros,
+// structs. An orphan `@doc "text"` with no object attaches nothing.
+func TestJuliaExtractor_ExplicitDocMacroAttaches(t *testing.T) {
+	src := []byte(`@doc "Short doc." pd(x) = x
+
+Core.@doc "Long doc." function cd(x)
+    help(x)
+end
+
+@doc "Struct doc." struct DS
+    v::Int
+end
+
+@doc "Macro doc." macro dm(x)
+    x
+end
+
+@doc "Orphan."
+`)
+	res, err := NewJuliaExtractor().Extract("docm.jl", src)
+	require.NoError(t, err)
+
+	docs := map[string]string{}
+	for _, n := range res.Nodes {
+		if d, ok := n.Meta["doc"].(string); ok {
+			docs[n.ID] = d
+		}
+	}
+	assert.Equal(t, "Short doc.", docs["docm.jl::pd"], "the explicit form documents a short-form definition")
+	assert.Equal(t, "Long doc.", docs["docm.jl::cd"], "the qualified Core.@doc form documents a long-form definition")
+	assert.Equal(t, "Struct doc.", docs["docm.jl::DS"], "the explicit form documents a struct")
+	assert.Equal(t, "Macro doc.", docs["docm.jl::dm"], "the explicit form documents a macro")
+	_, orphan := docs["docm.jl::Orphan."]
+	assert.False(t, orphan, "an @doc with no object must not mint a phantom node")
+}
+
 func TestJuliaExtractor_ConstAndDocstrings(t *testing.T) {
 	src := []byte(`"""
 Circle radius helpers.

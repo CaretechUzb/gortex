@@ -57,6 +57,9 @@ import (
 // Docstrings — a string literal on the line DIRECTLY above a definition,
 // which is the adjacency Julia itself requires — attach as Meta["doc"],
 // on long and short definitions, types, modules and constants alike.
+// The explicit `@doc "text" object` / `Core.@doc "text" object` form
+// attaches the same way, with the string taken from inside the macro
+// call.
 type JuliaExtractor struct {
 	lang *sitter.Language
 }
@@ -254,10 +257,57 @@ func (e *JuliaExtractor) walkFrom(n *sitter.Node, src []byte, scope juliaScope, 
 
 // walkMacroArgs walks a macro call's arguments, carrying a docstring that
 // sat above the macro CALL into the definition it wraps.
+// juliaDocMacroArg reports the docstring carried INSIDE an explicit
+// `@doc "text" object` / `Core.@doc "text" object` call. Julia lowers
+// every docstring — triple-quoted or explicit — through Core.@doc, so
+// the string beside the object in the macro call is that object's
+// documentation, not an argument of anything. Returns false when the
+// call is not a doc form or carries no string.
+func juliaDocMacroArg(n *sitter.Node, src []byte) (string, bool) {
+	var args *sitter.Node
+	isDoc := false
+	for c := range n.NamedChildren() {
+		switch c.Type() {
+		case "macro_identifier":
+			for m := range c.NamedChildren() {
+				if m.Type() == "identifier" && m.Content(src) == "doc" {
+					isDoc = true
+				}
+			}
+		case "field_expression":
+			count := int(c.NamedChildCount())
+			if count < 2 {
+				continue
+			}
+			prop := c.NamedChild(count - 1)
+			for m := range prop.NamedChildren() {
+				if m.Type() == "identifier" && m.Content(src) == "doc" {
+					isDoc = true
+				}
+			}
+		case "macro_argument_list":
+			args = c
+		}
+	}
+	if !isDoc || args == nil {
+		return "", false
+	}
+	for a := range args.NamedChildren() {
+		if a.Type() == "string_literal" {
+			return juliaDocText(a, src), true
+		}
+		return "", false
+	}
+	return "", false
+}
+
 // `Base.@kwdef struct S ... end` is a documented struct whose docstring
 // attaches to the wrapper, so stopping at the macro boundary would leave
 // the single most common documented struct form undocumented.
 func (e *JuliaExtractor) walkMacroArgs(n *sitter.Node, src []byte, scope juliaScope, st *juliaWalkState, doc string) {
+	if inner, ok := juliaDocMacroArg(n, src); ok && doc == "" {
+		doc = inner
+	}
 	for c := range n.NamedChildren() {
 		if doc == "" || c.Type() != "macro_argument_list" {
 			e.walk(c, src, scope, st)
@@ -271,6 +321,10 @@ func (e *JuliaExtractor) walkMacroArgs(n *sitter.Node, src []byte, scope juliaSc
 				e.handleFunction(a, src, scope, st, doc)
 			case "module_definition":
 				e.handleModule(a, src, scope, st, doc)
+			case "assignment":
+				// `@doc "text" f(x) = x` documents a short-form
+				// definition, which arrives as a plain assignment.
+				e.handleAssignment(a, src, scope, st, false, doc)
 			default:
 				// Walk a macro argument the way the generic walker
 				// would, dispatching the argument's own kind before
