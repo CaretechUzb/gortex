@@ -49,7 +49,6 @@ namespace App {
 	// Ext.cs:4 takes (this Bag, int) — two parameters, which is what a
 	// static-form `BagExt.Add(bag, 5)` fills. Ext.cs:5 takes three.
 	const twoParam = "Ext.cs::BagExt.Add"
-	const threeParam = "Ext.cs::BagExt.Add_L5"
 
 	assert.Equal(t, twoParam, namedCallTarget(t, g, "Caller.cs::Use.Control", "Add"),
 		"control: with no local anywhere in the method the static form already binds correctly")
