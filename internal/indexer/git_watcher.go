@@ -3,9 +3,12 @@ package indexer
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -30,6 +33,10 @@ import (
 // File edits outside git operations (save buffer, `git stash`,
 // `git reset --mixed` leaving the working tree dirty) still fire
 // normal fsnotify events and flow through the per-file path.
+const defaultGitTopologyProbeInterval = time.Second
+
+var errGitTopologyProbeUnstable = errors.New("git topology changed while inventory was sampled")
+
 type GitWatcher struct {
 	repoPath string
 	// indexer is the construction-time stable repository-lane carrier.
@@ -49,23 +56,50 @@ type GitWatcher struct {
 	stopCalled     bool
 
 	// Worktree topology belongs to the shared git common directory, not to
-	// this checkout's private gitdir. The watcher observes the common
-	// worktrees directory, each admin child, and the checkout roots themselves
-	// so additions, removals, pruning and inaccessible roots all trigger a
-	// family reconciliation promptly.
-	gitDir            string
-	commonDir         string
-	worktreesDir      string
-	topologyTimer     *time.Timer
-	topologyChange    func(string)
-	topologyRefreshMu sync.Mutex
-	topologyOwned     bool
-	topologyPaths     map[string]struct{}
-	worktreeRoots     map[string]struct{}
-	worktreeAdminDirs map[string]struct{}
-	inventory         func(context.Context, string) (*gitstate.FamilyInventory, error)
-	topologyAdd       func(string) error
-	topologyRemove    func(string) error
+	// this checkout's private gitdir. Every watcher runs one bounded control
+	// probe for its exact ref state; exactly one elected watcher also samples
+	// family topology. Stable ticks inspect only bounded Git admin metadata and
+	// stat known roots; a full git inventory runs only after that signature
+	// changes. Source roots are never handed to fsnotify: Darwin's kqueue
+	// backend otherwise opens one descriptor per child file.
+	gitDir                 string
+	commonDir              string
+	worktreesDir           string
+	topologyTimer          *time.Timer
+	topologyChange         func(string)
+	topologyRefreshMu      sync.Mutex
+	topologyOwned          bool
+	topologyOwnerEpoch     uint64
+	topologySignature      string
+	topologyProbeSignature string
+	topologyProbeInterval  time.Duration
+	worktreeRoots          map[string]struct{}
+	inventory              func(context.Context, string) (*gitstate.FamilyInventory, error)
+	topologyDegraded       string
+	refProbeSignature      string
+	refPaths               map[string]struct{}
+	refAdd                 func(string) error
+	refRemove              func(string) error
+
+	// The control probe has an independent epoch and cancellation domain. Stop
+	// cancels and joins the exact old epoch before teardown, preventing an ABA
+	// resurrection. Topology owner epochs separately guard family publication.
+	topologyProbeMu     sync.Mutex
+	topologyProbeCancel context.CancelFunc
+	topologyProbeDone   chan struct{}
+	topologyProbeEpoch  uint64
+
+	// topologyRetryMu serializes retry admission with Stop. A callback adds to
+	// topologyRetryWG while holding this mutex, so Stop cannot race Wait with a
+	// later Add and no fsnotify registration can outlive physical teardown.
+	topologyRetryMu       sync.Mutex
+	topologyRetryTimer    *time.Timer
+	topologyRetryEpoch    uint64
+	topologyRetryAttempts uint32
+	topologyRetryBase     time.Duration
+	topologyRetryMax      time.Duration
+	topologyRetryClosing  bool
+	topologyRetryWG       sync.WaitGroup
 
 	// reconciling single-flights reconcile: a ref event landing while
 	// one is in flight sets rerun instead of spawning a second
@@ -95,24 +129,32 @@ func NewGitWatcher(repoPath string, idx *Indexer, logger *zap.Logger) (*GitWatch
 		return nil, err
 	}
 	return &GitWatcher{
-		repoPath:          absRepo,
-		indexer:           idx,
-		logger:            logger,
-		fsw:               fsw,
-		debounce:          300 * time.Millisecond,
-		done:              make(chan struct{}),
-		stopped:           make(chan struct{}),
-		topologyOwned:     true,
-		topologyPaths:     make(map[string]struct{}),
-		worktreeRoots:     make(map[string]struct{}),
-		worktreeAdminDirs: make(map[string]struct{}),
-		inventory:         gitstate.Inventory,
+		repoPath:              absRepo,
+		indexer:               idx,
+		logger:                logger,
+		fsw:                   fsw,
+		debounce:              300 * time.Millisecond,
+		done:                  make(chan struct{}),
+		stopped:               make(chan struct{}),
+		topologyOwned:         true,
+		topologyOwnerEpoch:    1,
+		topologyProbeInterval: defaultGitTopologyProbeInterval,
+		worktreeRoots:         make(map[string]struct{}),
+		refPaths:              make(map[string]struct{}),
+		inventory:             gitstate.Inventory,
+		topologyRetryBase:     time.Second,
+		topologyRetryMax:      30 * time.Second,
 	}, nil
 }
 
 // OnWorktreeChange installs the callback used to reconcile the checkout
 // family after a topology change. The callback receives the watcher checkout
 // root, which is a stable selector for resolving the family.
+//
+// Stop suppresses callbacks that have not been admitted yet, but a callback
+// already admitted by the topology debounce may finish after GitWatcher.Stop
+// returns. Consumers must make the callback reentrant-safe and epoch-gate its
+// effects. MultiWatcher provides that stronger dispatch-and-drain lifecycle.
 func (gw *GitWatcher) OnWorktreeChange(callback func(string)) {
 	gw.mu.Lock()
 	gw.topologyChange = callback
@@ -125,45 +167,62 @@ func (gw *GitWatcher) OnWorktreeChange(callback func(string)) {
 // behavior. The refresh mutex closes the disable-vs-refresh race so a demoted
 // watcher cannot re-register paths after ownership moves.
 func (gw *GitWatcher) setTopologyOwner(owner bool) {
-	gw.topologyRefreshMu.Lock()
-	defer gw.topologyRefreshMu.Unlock()
+	if err := gw.setTopologyOwnerChecked(owner); err != nil {
+		gw.recordTopologyRefresh(err)
+	}
+}
 
+// setTopologyOwnerChecked changes ownership and reports whether the required
+// common-directory topology baseline is coherent. Callers admitting a new
+// Git watcher use the error to roll back publication; established owners
+// use the best-effort wrapper above, which retains file watching and retries.
+func (gw *GitWatcher) setTopologyOwnerChecked(owner bool) error {
+	gw.topologyRefreshMu.Lock()
+	err := gw.setTopologyOwnerCheckedLocked(owner)
+	gw.topologyRefreshMu.Unlock()
+	if err == nil {
+		gw.recordTopologyRefresh(nil)
+	}
+	return err
+}
+
+func (gw *GitWatcher) setTopologyOwnerCheckedLocked(owner bool) error {
 	gw.mu.Lock()
 	if gw.stopCalled {
 		gw.mu.Unlock()
-		return
+		if owner {
+			return fmt.Errorf("git watcher is stopped")
+		}
+		return nil
 	}
 	if gw.topologyOwned == owner {
+		refsReady := gw.gitDir != "" && gw.commonDir != ""
 		gw.mu.Unlock()
-		return
+		if !owner && !refsReady {
+			return nil
+		}
+		return gw.refreshRequiredWatchesLocked()
 	}
 	gw.topologyOwned = owner
-	commonDir := gw.commonDir
+	gw.topologyOwnerEpoch++
 	if !owner {
 		if gw.topologyTimer != nil {
 			gw.topologyTimer.Stop()
 			gw.topologyTimer = nil
 		}
-		paths := clonePathSet(gw.topologyPaths)
-		gw.topologyPaths = make(map[string]struct{})
 		gw.worktreeRoots = make(map[string]struct{})
-		gw.worktreeAdminDirs = make(map[string]struct{})
+		gw.topologySignature = ""
+		gw.topologyProbeSignature = ""
+		gw.topologyDegraded = ""
+		refsReady := gw.gitDir != "" && gw.commonDir != ""
 		gw.mu.Unlock()
-		for path := range paths {
-			if gw.topologyRemove != nil {
-				_ = gw.topologyRemove(path)
-			} else {
-				_ = gw.fsw.Remove(path)
-			}
+		if !refsReady {
+			return nil
 		}
-		return
+		return gw.refreshRefWatchesLocked()
 	}
 	gw.mu.Unlock()
-
-	if commonDir != "" {
-		gw.addTopologyPath(commonDir)
-		gw.refreshTopologyWatchesLocked()
-	}
+	return gw.refreshRequiredWatchesLocked()
 }
 
 func (gw *GitWatcher) commonDirectory() string {
@@ -219,38 +278,22 @@ func (gw *GitWatcher) Start() error {
 	gw.worktreesDir = filepath.Join(gw.commonDir, "worktrees")
 	gw.mu.Unlock()
 
-	// HEAD is private to a linked checkout. Branch refs and packed refs are
-	// shared by the whole family and therefore live under the common dir.
-	for _, path := range []string{
-		filepath.Join(gitDir, "HEAD"),
-		filepath.Join(commonDir, "packed-refs"),
-		filepath.Join(commonDir, "refs", "heads"),
-	} {
-		if _, err := os.Stat(path); err != nil {
-			continue
-		}
-		if err := gw.fsw.Add(path); err != nil {
-			gw.logger.Warn("git-watcher: failed to watch ref state",
-				zap.String("path", path), zap.Error(err))
-		}
+	// Ref state is required for branch-switch correctness. Worktree topology is
+	// additionally required for the elected family owner. Admission is checked:
+	// callers must not publish a Git watcher that silently missed either class.
+	if err := gw.refreshRequiredWatchesChecked(); err != nil {
+		return fmt.Errorf("start git state watcher: %w", err)
 	}
 
-	// Watching the common dir catches creation of its worktrees directory.
-	// MultiWatcher disables this on followers before Start and elects one owner
-	// after all successfully started family members are known.
+	initialSHA, _ := gw.currentSHA(context.Background())
 	gw.mu.Lock()
-	topologyOwned := gw.topologyOwned
-	gw.mu.Unlock()
-	if topologyOwned {
-		gw.addTopologyPath(commonDir)
-		gw.refreshTopologyWatches()
-	}
-
-	gw.lastSHA, _ = gw.currentSHA(context.Background())
-	gw.mu.Lock()
+	gw.lastSHA = initialSHA
 	gw.loopStarted = true
 	gw.mu.Unlock()
 	go gw.loop()
+	// Every checkout probes its bounded ref-control signature. Only the elected
+	// family owner additionally samples worktree topology.
+	gw.startTopologyProbe()
 	return nil
 }
 
@@ -263,6 +306,7 @@ func (gw *GitWatcher) Stop() error {
 	started := gw.loopStarted
 	already := gw.stopCalled
 	gw.stopCalled = true
+	gw.topologyOwnerEpoch++
 	if gw.fireTimer != nil {
 		gw.fireTimer.Stop()
 	}
@@ -273,6 +317,18 @@ func (gw *GitWatcher) Stop() error {
 	if already {
 		return nil
 	}
+	gw.stopTopologyProbe()
+
+	gw.topologyRetryMu.Lock()
+	gw.topologyRetryClosing = true
+	gw.topologyRetryEpoch++
+	if gw.topologyRetryTimer != nil {
+		gw.topologyRetryTimer.Stop()
+		gw.topologyRetryTimer = nil
+	}
+	gw.topologyRetryMu.Unlock()
+	gw.topologyRetryWG.Wait()
+
 	close(gw.done)
 	_ = gw.fsw.Close()
 	if started {
@@ -291,14 +347,14 @@ func (gw *GitWatcher) loop() {
 			if !ok {
 				return
 			}
-			if gw.isTopologyEvent(event) {
-				// Debounce the refresh itself, not only the callback. A single
-				// worktree mutation fans out across the common dir, admin dir,
-				// and root watches; inventorying on every raw fsnotify record
-				// recreates the family N+1 storm inside the elected owner.
-				gw.scheduleTopologyChange(event.Name)
-			}
 			if gw.isRefEvent(event.Name) {
+				if event.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
+					// Atomic ref replacement invalidates the old exact file watch, but
+					// that is an expected transition, not a degraded family. The
+					// debounced refresh below re-adds the new inode and only schedules
+					// exponential retry if registration actually fails.
+					gw.invalidateRefWatch(event.Name)
+				}
 				gw.scheduleReconcile(event.Name)
 			}
 		case err, ok := <-gw.fsw.Errors:
@@ -324,6 +380,12 @@ func (gw *GitWatcher) scheduleReconcile(trigger string) {
 		gw.fireTimer.Stop()
 	}
 	gw.fireTimer = time.AfterFunc(gw.debounce, func() {
+		gw.topologyRefreshMu.Lock()
+		err := gw.refreshRefWatchesLocked()
+		gw.topologyRefreshMu.Unlock()
+		if err != nil {
+			gw.recordTopologyRefresh(err)
+		}
 		gw.reconcile(trigger)
 	})
 }
@@ -331,22 +393,21 @@ func (gw *GitWatcher) scheduleReconcile(trigger string) {
 func (gw *GitWatcher) scheduleTopologyChange(trigger string) {
 	gw.mu.Lock()
 	defer gw.mu.Unlock()
-	if gw.stopCalled || !gw.topologyOwned {
+	if gw.stopCalled || !gw.topologyOwned || gw.topologyChange == nil {
 		return
 	}
+	epoch := gw.topologyOwnerEpoch
 	if gw.topologyTimer != nil {
 		gw.topologyTimer.Stop()
 	}
 	gw.topologyTimer = time.AfterFunc(gw.debounce, func() {
-		// Re-sample after the burst settles. A common-dir create event can
-		// arrive before git has finished writing the new admin record.
-		gw.refreshTopologyWatches()
 		gw.mu.Lock()
 		callback := gw.topologyChange
 		stopped := gw.stopCalled
 		owner := gw.topologyOwned
+		currentEpoch := gw.topologyOwnerEpoch
 		gw.mu.Unlock()
-		if stopped || !owner || callback == nil {
+		if stopped || !owner || currentEpoch != epoch || callback == nil {
 			return
 		}
 		gw.logger.Debug("git-watcher: worktree topology changed", zap.String("trigger", trigger))
@@ -355,58 +416,11 @@ func (gw *GitWatcher) scheduleTopologyChange(trigger string) {
 }
 
 func (gw *GitWatcher) isRefEvent(name string) bool {
-	gw.mu.Lock()
-	gitDir, commonDir := gw.gitDir, gw.commonDir
-	gw.mu.Unlock()
 	name = filepath.Clean(name)
-	if name == filepath.Join(gitDir, "HEAD") || name == filepath.Join(commonDir, "packed-refs") {
-		return true
-	}
-	return pathWithin(filepath.Join(commonDir, "refs", "heads"), name)
-}
-
-func (gw *GitWatcher) isTopologyEvent(event fsnotify.Event) bool {
-	name := filepath.Clean(event.Name)
 	gw.mu.Lock()
-	owned := gw.topologyOwned
-	worktreesDir := gw.worktreesDir
-	_, root := gw.worktreeRoots[name]
+	_, watched := gw.refPaths[name]
 	gw.mu.Unlock()
-	if !owned {
-		return false
-	}
-	if root && event.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
-		return true
-	}
-	if worktreesDir == "" {
-		return false
-	}
-	if name == filepath.Clean(worktreesDir) {
-		return event.Op&(fsnotify.Create|fsnotify.Remove|fsnotify.Rename) != 0
-	}
-	rel, err := filepath.Rel(worktreesDir, name)
-	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return false
-	}
-	parts := strings.Split(rel, string(filepath.Separator))
-	if len(parts) == 1 {
-		// The administration directory for one linked worktree appeared or
-		// disappeared. Ordinary writes to its children are classified below.
-		return event.Op&(fsnotify.Create|fsnotify.Remove|fsnotify.Rename) != 0
-	}
-	if len(parts) != 2 {
-		return false
-	}
-	switch parts[1] {
-	case "HEAD", "gitdir", "commondir", "locked":
-		return true
-	default:
-		// In particular, a checkout coordinator refreshes the per-worktree
-		// index roughly every poll interval. Treating that payload write as a
-		// topology event created a permanent event storm and could consume the
-		// old controller debounce immediately before the one removal event.
-		return false
-	}
+	return watched
 }
 
 func pathWithin(root, candidate string) bool {
@@ -420,125 +434,731 @@ func pathWithin(root, candidate string) bool {
 	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
 }
 
-func (gw *GitWatcher) addTopologyPath(path string) {
-	path = filepath.Clean(path)
-	if _, err := os.Stat(path); err != nil {
-		return
-	}
-	gw.mu.Lock()
-	defer gw.mu.Unlock()
-	if gw.stopCalled {
-		return
-	}
-	if _, exists := gw.topologyPaths[path]; exists {
-		return
-	}
-	var err error
-	if gw.topologyAdd != nil {
-		err = gw.topologyAdd(path)
-	} else {
-		err = gw.fsw.Add(path)
-	}
-	if err != nil {
-		gw.logger.Warn("git-watcher: failed to watch worktree topology",
-			zap.String("path", path), zap.Error(err))
-		return
-	}
-	gw.topologyPaths[path] = struct{}{}
+func (gw *GitWatcher) refreshRequiredWatchesChecked() error {
+	gw.topologyRefreshMu.Lock()
+	defer gw.topologyRefreshMu.Unlock()
+	return gw.refreshRequiredWatchesLocked()
 }
 
-func (gw *GitWatcher) removeTopologyPath(path string) {
-	path = filepath.Clean(path)
+func (gw *GitWatcher) refreshRequiredWatchesLocked() error {
+	refErr := gw.refreshRefWatchesLocked()
 	gw.mu.Lock()
-	if _, exists := gw.topologyPaths[path]; !exists {
-		gw.mu.Unlock()
+	owner := gw.topologyOwned
+	gw.mu.Unlock()
+	if !owner {
+		return refErr
+	}
+	return errors.Join(refErr, gw.refreshTopologyWatchesLocked())
+}
+
+type gitRefProbeObservation struct {
+	signature string
+	desired   map[string]struct{}
+}
+
+func appendGitRefStat(builder *strings.Builder, label string, info os.FileInfo) {
+	appendTopologyField(builder, label+":present")
+	appendTopologyField(builder, strconv.FormatInt(info.Size(), 10))
+	appendTopologyField(builder, strconv.FormatInt(info.ModTime().UnixNano(), 10))
+	appendTopologyField(builder, info.Mode().String())
+}
+
+// observeGitRefProbe reads a constant number of control files. It deliberately
+// never watches a refs directory: on Darwin that would make kqueue open every
+// child. The content of HEAD and its one active loose ref catches unborn-ref
+// creation; packed-refs needs only bounded metadata because an existing file
+// also has an exact fsnotify registration.
+func observeGitRefProbe(gitDir, commonDir string) (gitRefProbeObservation, error) {
+	headPath := filepath.Clean(filepath.Join(gitDir, "HEAD"))
+	head, err := os.ReadFile(headPath)
+	if err != nil {
+		return gitRefProbeObservation{}, fmt.Errorf("read git HEAD %s: %w", headPath, err)
+	}
+	observation := gitRefProbeObservation{desired: map[string]struct{}{headPath: {}}}
+	var signature strings.Builder
+	appendTopologyField(&signature, headPath)
+	appendTopologyField(&signature, string(head))
+	var observeErr error
+
+	packedRefs := filepath.Clean(filepath.Join(commonDir, "packed-refs"))
+	if info, statErr := os.Stat(packedRefs); statErr == nil {
+		observation.desired[packedRefs] = struct{}{}
+		appendGitRefStat(&signature, "packed-refs", info)
+	} else if errors.Is(statErr, os.ErrNotExist) {
+		appendTopologyField(&signature, "packed-refs:absent")
+	} else {
+		observeErr = errors.Join(observeErr, fmt.Errorf("stat packed refs %s: %w", packedRefs, statErr))
+	}
+
+	headValue := strings.TrimSpace(string(head))
+	if strings.HasPrefix(headValue, "ref:") {
+		refName := strings.TrimSpace(strings.TrimPrefix(headValue, "ref:"))
+		if !strings.HasPrefix(refName, "refs/") || filepath.IsAbs(refName) {
+			return observation, errors.Join(observeErr, fmt.Errorf("invalid symbolic HEAD ref %q", refName))
+		}
+		refPath := filepath.Clean(filepath.Join(commonDir, filepath.FromSlash(refName)))
+		if !pathWithin(commonDir, refPath) {
+			return observation, errors.Join(observeErr, fmt.Errorf("symbolic HEAD ref escapes common directory: %q", refName))
+		}
+		appendTopologyField(&signature, refPath)
+		if info, statErr := os.Stat(refPath); statErr == nil {
+			observation.desired[refPath] = struct{}{}
+			appendGitRefStat(&signature, "active-ref", info)
+			contents, readErr := os.ReadFile(refPath)
+			if readErr != nil {
+				observeErr = errors.Join(observeErr, fmt.Errorf("read active loose ref %s: %w", refPath, readErr))
+			} else {
+				appendTopologyField(&signature, string(contents))
+			}
+		} else if errors.Is(statErr, os.ErrNotExist) {
+			appendTopologyField(&signature, "active-ref:absent")
+		} else {
+			observeErr = errors.Join(observeErr, fmt.Errorf("stat active loose ref %s: %w", refPath, statErr))
+		}
+	} else {
+		appendTopologyField(&signature, "HEAD:detached")
+	}
+	observation.signature = signature.String()
+	return observation, observeErr
+}
+
+func (gw *GitWatcher) removeRefWatch(path string) {
+	gw.mu.Lock()
+	remove := gw.refRemove
+	gw.mu.Unlock()
+	if remove != nil {
+		_ = remove(path)
 		return
 	}
-	delete(gw.topologyPaths, path)
+	_ = gw.fsw.Remove(path)
+}
+
+func (gw *GitWatcher) refreshRefWatchesLocked() error {
+	gw.mu.Lock()
+	gitDir := gw.gitDir
+	commonDir := gw.commonDir
+	stopped := gw.stopCalled
 	gw.mu.Unlock()
-	if gw.topologyRemove != nil {
-		_ = gw.topologyRemove(path)
-	} else {
-		_ = gw.fsw.Remove(path)
+	if stopped {
+		return fmt.Errorf("git watcher is stopped")
 	}
+	if gitDir == "" || commonDir == "" {
+		return fmt.Errorf("git ref directories are unavailable")
+	}
+
+	observation, discoverErr := observeGitRefProbe(gitDir, commonDir)
+	desired := observation.desired
+	if observation.signature != "" {
+		// Publish the observed state before registration. If Add fails, stable
+		// control-probe ticks defer to the unified exponential retry instead of
+		// repeating the same syscall every second.
+		gw.mu.Lock()
+		if !gw.stopCalled {
+			gw.refProbeSignature = observation.signature
+		}
+		gw.mu.Unlock()
+	}
+	var refreshErr error
+	for path := range desired {
+		gw.mu.Lock()
+		if gw.stopCalled {
+			gw.mu.Unlock()
+			return errors.Join(discoverErr, refreshErr, fmt.Errorf("git watcher is stopped"))
+		}
+		if gw.refPaths == nil {
+			gw.refPaths = make(map[string]struct{})
+		}
+		if _, exists := gw.refPaths[path]; exists {
+			gw.mu.Unlock()
+			continue
+		}
+		// Publish the path before the syscall so a Remove/Rename delivered
+		// immediately after Add can invalidate this exact registration.
+		gw.refPaths[path] = struct{}{}
+		add := gw.refAdd
+		gw.mu.Unlock()
+
+		var err error
+		if add != nil {
+			err = add(path)
+		} else {
+			err = gw.fsw.Add(path)
+		}
+
+		gw.mu.Lock()
+		_, stillRegistered := gw.refPaths[path]
+		stopped = gw.stopCalled
+		if err != nil || stopped {
+			delete(gw.refPaths, path)
+		}
+		gw.mu.Unlock()
+		if err != nil {
+			refreshErr = errors.Join(refreshErr, fmt.Errorf("watch git ref path %s: %w", path, err))
+			continue
+		}
+		if !stillRegistered || stopped {
+			gw.removeRefWatch(path)
+			refreshErr = errors.Join(refreshErr, fmt.Errorf("git ref watch invalidated during registration: %s", path))
+		}
+	}
+
+	// Do not retire a previously healthy exact watch from a partial discovery
+	// result. The unified retry will re-discover the complete desired set.
+	if discoverErr == nil {
+		gw.mu.Lock()
+		existing := clonePathSet(gw.refPaths)
+		gw.mu.Unlock()
+		for path := range existing {
+			if _, keep := desired[path]; keep {
+				continue
+			}
+			gw.mu.Lock()
+			if _, current := gw.refPaths[path]; current {
+				delete(gw.refPaths, path)
+			}
+			gw.mu.Unlock()
+			gw.removeRefWatch(path)
+		}
+	}
+	return errors.Join(discoverErr, refreshErr)
+}
+
+func (gw *GitWatcher) invalidateRefWatch(path string) bool {
+	path = filepath.Clean(path)
+	gw.mu.Lock()
+	defer gw.mu.Unlock()
+	if _, exists := gw.refPaths[path]; !exists {
+		return false
+	}
+	delete(gw.refPaths, path)
+	return true
 }
 
 func (gw *GitWatcher) refreshTopologyWatches() {
-	gw.topologyRefreshMu.Lock()
-	defer gw.topologyRefreshMu.Unlock()
-	gw.refreshTopologyWatchesLocked()
+	err := gw.refreshRequiredWatchesChecked()
+	gw.recordTopologyRefresh(err)
 }
 
-func (gw *GitWatcher) refreshTopologyWatchesLocked() {
+func (gw *GitWatcher) refreshTopologyWatchesChecked() error {
+	gw.topologyRefreshMu.Lock()
+	defer gw.topologyRefreshMu.Unlock()
+	return gw.refreshTopologyWatchesLocked()
+}
+
+func (gw *GitWatcher) refreshTopologyWatchesLocked() error {
 	gw.mu.Lock()
-	if !gw.topologyOwned || gw.stopCalled {
-		gw.mu.Unlock()
-		return
-	}
+	active := gw.topologyOwned && !gw.stopCalled
 	worktreesDir := gw.worktreesDir
-	previousRoots := clonePathSet(gw.worktreeRoots)
-	previousAdmins := clonePathSet(gw.worktreeAdminDirs)
-	inventoryFn := gw.inventory
+	roots := clonePathSet(gw.worktreeRoots)
+	ownerEpoch := gw.topologyOwnerEpoch
 	gw.mu.Unlock()
-	if worktreesDir == "" {
-		return
+	if !active {
+		return nil
 	}
+	if worktreesDir == "" {
+		return fmt.Errorf("git worktrees directory is unavailable")
+	}
+
+	// Inventory is a multi-file Git sample. Gate it with the cheap admin
+	// observation and require the same observation afterward so an admin added
+	// mid-command cannot be paired with an old inventory indefinitely.
+	before, err := observeGitTopologyProbe(worktreesDir, roots)
+	if err != nil {
+		return err
+	}
+	gw.mu.Lock()
+	if !gw.topologyOwned || gw.stopCalled || gw.topologyOwnerEpoch != ownerEpoch {
+		gw.mu.Unlock()
+		return nil
+	}
+	gw.topologyProbeSignature = before.signature
+	gw.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	snapshot, err := gw.inventoryTopologySnapshot(ctx, before.adminSignature)
+	cancel()
+	if err != nil {
+		return err
+	}
+
+	gw.mu.Lock()
+	if !gw.topologyOwned || gw.stopCalled || gw.topologyOwnerEpoch != ownerEpoch {
+		gw.mu.Unlock()
+		return nil
+	}
+	changed := gw.topologySignature != "" && gw.topologySignature != snapshot.signature
+	gw.topologySignature = snapshot.signature
+	gw.topologyProbeSignature = snapshot.probeSignature
+	gw.worktreeRoots = snapshot.roots
+	gw.mu.Unlock()
+
+	if changed {
+		gw.scheduleTopologyChange("topology-refresh")
+	}
+	return nil
+}
+
+type gitTopologyProbeObservation struct {
+	signature      string
+	adminSignature string
+	rootAccessible map[string]bool
+}
+
+type gitTopologySnapshot struct {
+	signature      string
+	probeSignature string
+	roots          map[string]struct{}
+}
+
+func appendTopologyField(builder *strings.Builder, value string) {
+	builder.WriteString(strconv.Itoa(len(value)))
+	builder.WriteByte(':')
+	builder.WriteString(value)
+	builder.WriteByte('|')
+}
+
+func topologyBool(value bool) string {
+	if value {
+		return "1"
+	}
+	return "0"
+}
+
+// observeGitTopologyProbe is the steady-state path. It reads only the bounded
+// Git worktree administration inventory and stats known roots for reachability;
+// it never walks a checkout and never spawns Git.
+func observeGitTopologyProbe(worktreesDir string, roots map[string]struct{}) (gitTopologyProbeObservation, error) {
+	observation := gitTopologyProbeObservation{
+		rootAccessible: make(map[string]bool, len(roots)),
+	}
+	var admin strings.Builder
+	entries, err := os.ReadDir(worktreesDir)
+	if errors.Is(err, os.ErrNotExist) {
+		appendTopologyField(&admin, "worktrees:absent")
+	} else if err != nil {
+		return observation, fmt.Errorf("read git worktrees directory %s: %w", worktreesDir, err)
+	} else {
+		appendTopologyField(&admin, "worktrees:present")
+		for _, entry := range entries {
+			appendTopologyField(&admin, entry.Name())
+			appendTopologyField(&admin, topologyBool(entry.IsDir()))
+			if !entry.IsDir() {
+				continue
+			}
+			adminDir := filepath.Clean(filepath.Join(worktreesDir, entry.Name()))
+			for _, name := range []string{"gitdir", "commondir"} {
+				path := filepath.Join(adminDir, name)
+				contents, readErr := os.ReadFile(path)
+				if errors.Is(readErr, os.ErrNotExist) {
+					appendTopologyField(&admin, name+":absent")
+					continue
+				}
+				if readErr != nil {
+					return observation, fmt.Errorf("read worktree admin metadata %s: %w", path, readErr)
+				}
+				appendTopologyField(&admin, name+":"+strings.TrimSpace(string(contents)))
+			}
+			lockedPath := filepath.Join(adminDir, "locked")
+			if _, statErr := os.Stat(lockedPath); statErr == nil {
+				appendTopologyField(&admin, "locked:present")
+			} else if errors.Is(statErr, os.ErrNotExist) {
+				appendTopologyField(&admin, "locked:absent")
+			} else {
+				return observation, fmt.Errorf("stat worktree lock %s: %w", lockedPath, statErr)
+			}
+		}
+	}
+	observation.adminSignature = admin.String()
+
+	rootPaths := make([]string, 0, len(roots))
+	for root := range roots {
+		rootPaths = append(rootPaths, filepath.Clean(root))
+	}
+	sort.Strings(rootPaths)
+	var signature strings.Builder
+	appendTopologyField(&signature, observation.adminSignature)
+	for _, root := range rootPaths {
+		accessible := false
+		if _, statErr := os.Stat(root); statErr == nil {
+			accessible = true
+		}
+		observation.rootAccessible[root] = accessible
+		appendTopologyField(&signature, root)
+		appendTopologyField(&signature, topologyBool(accessible))
+	}
+	observation.signature = signature.String()
+	return observation, nil
+}
+
+func (gw *GitWatcher) inventoryTopologySnapshot(ctx context.Context, expectedAdminSignature string) (gitTopologySnapshot, error) {
+	gw.mu.Lock()
+	inventoryFn := gw.inventory
+	repoPath := gw.repoPath
+	worktreesDir := gw.worktreesDir
+	gw.mu.Unlock()
 	if inventoryFn == nil {
 		inventoryFn = gitstate.Inventory
 	}
 
-	desiredRoots := previousRoots
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	inventory, err := inventoryFn(ctx, gw.repoPath)
-	cancel()
-	if err == nil {
-		desiredRoots = make(map[string]struct{}, len(inventory.Records))
-		for _, record := range inventory.Records {
-			if record.RootAccessible && !record.Bare {
-				desiredRoots[filepath.Clean(record.Path)] = struct{}{}
-			}
-		}
-	} else {
-		gw.logger.Debug("git-watcher: worktree inventory unavailable while refreshing watches", zap.Error(err))
+	inventory, err := inventoryFn(ctx, repoPath)
+	if err != nil {
+		return gitTopologySnapshot{}, fmt.Errorf("inventory worktree topology: %w", err)
 	}
-
-	desiredAdmins := make(map[string]struct{})
-	worktreesExists := false
-	if entries, readErr := os.ReadDir(worktreesDir); readErr == nil {
-		worktreesExists = true
-		for _, entry := range entries {
-			if entry.IsDir() {
-				desiredAdmins[filepath.Join(worktreesDir, entry.Name())] = struct{}{}
-			}
+	if inventory == nil {
+		return gitTopologySnapshot{}, fmt.Errorf("inventory worktree topology: empty result")
+	}
+	roots := make(map[string]struct{}, len(inventory.Records))
+	for _, record := range inventory.Records {
+		if !record.Bare && record.Path != "" {
+			roots[filepath.Clean(record.Path)] = struct{}{}
 		}
 	}
+	observation, err := observeGitTopologyProbe(worktreesDir, roots)
+	if err != nil {
+		return gitTopologySnapshot{}, err
+	}
+	if expectedAdminSignature != "" && observation.adminSignature != expectedAdminSignature {
+		return gitTopologySnapshot{}, errGitTopologyProbeUnstable
+	}
+	for _, record := range inventory.Records {
+		if record.Bare || record.Path == "" {
+			continue
+		}
+		if observation.rootAccessible[filepath.Clean(record.Path)] != record.RootAccessible {
+			return gitTopologySnapshot{}, errGitTopologyProbeUnstable
+		}
+	}
 
+	records := make([]string, 0, len(inventory.Records))
+	for _, record := range inventory.Records {
+		var encoded strings.Builder
+		appendTopologyField(&encoded, filepath.Clean(record.Path))
+		appendTopologyField(&encoded, record.AdminName)
+		appendTopologyField(&encoded, topologyBool(record.IsMain))
+		appendTopologyField(&encoded, topologyBool(record.Bare))
+		appendTopologyField(&encoded, topologyBool(record.RootAccessible))
+		appendTopologyField(&encoded, topologyBool(record.Locked))
+		appendTopologyField(&encoded, topologyBool(record.Prunable))
+		records = append(records, encoded.String())
+	}
+	sort.Strings(records)
+	var signature strings.Builder
+	appendTopologyField(&signature, observation.adminSignature)
+	for _, record := range records {
+		appendTopologyField(&signature, record)
+	}
+	return gitTopologySnapshot{
+		signature:      signature.String(),
+		probeSignature: observation.signature,
+		roots:          roots,
+	}, nil
+}
+
+func (gw *GitWatcher) startTopologyProbe() {
+	gw.topologyProbeMu.Lock()
+	if gw.topologyProbeCancel != nil {
+		gw.topologyProbeMu.Unlock()
+		return
+	}
 	gw.mu.Lock()
-	gw.worktreeRoots = desiredRoots
-	gw.worktreeAdminDirs = desiredAdmins
+	active := !gw.stopCalled && gw.gitDir != "" && gw.commonDir != ""
+	interval := gw.topologyProbeInterval
+	gw.mu.Unlock()
+	if !active {
+		gw.topologyProbeMu.Unlock()
+		return
+	}
+	if interval <= 0 {
+		interval = defaultGitTopologyProbeInterval
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	gw.topologyProbeEpoch++
+	epoch := gw.topologyProbeEpoch
+	done := make(chan struct{})
+	gw.topologyProbeCancel = cancel
+	gw.topologyProbeDone = done
+	go gw.runTopologyProbe(ctx, epoch, interval, done)
+	gw.topologyProbeMu.Unlock()
+}
+
+func (gw *GitWatcher) stopTopologyProbe() {
+	gw.topologyProbeMu.Lock()
+	gw.topologyProbeEpoch++
+	cancel := gw.topologyProbeCancel
+	done := gw.topologyProbeDone
+	if cancel != nil {
+		cancel()
+	}
+	gw.topologyProbeMu.Unlock()
+	if done == nil {
+		return
+	}
+	<-done
+	gw.topologyProbeMu.Lock()
+	if gw.topologyProbeDone == done {
+		gw.topologyProbeCancel = nil
+		gw.topologyProbeDone = nil
+	}
+	gw.topologyProbeMu.Unlock()
+}
+
+func (gw *GitWatcher) topologyProbeCurrent(epoch uint64) bool {
+	gw.topologyProbeMu.Lock()
+	current := gw.topologyProbeCancel != nil && gw.topologyProbeEpoch == epoch
+	gw.topologyProbeMu.Unlock()
+	return current
+}
+
+func (gw *GitWatcher) runTopologyProbe(ctx context.Context, epoch uint64, interval time.Duration, done chan struct{}) {
+	defer close(done)
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		}
+
+		if err := gw.probeGitStateOnce(ctx, epoch); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			// Stable failed observations are marked pending by the probe. This
+			// one error schedules the bounded exponential retry; later 1s ticks
+			// remain cheap and never run inventory in parallel with it.
+			gw.recordTopologyRefresh(err)
+		}
+		timer.Reset(interval)
+	}
+}
+
+func (gw *GitWatcher) probeGitStateOnce(ctx context.Context, epoch uint64) error {
+	gw.topologyRefreshMu.Lock()
+	defer gw.topologyRefreshMu.Unlock()
+	if !gw.topologyProbeCurrent(epoch) {
+		return nil
+	}
+	refErr := gw.probeRefOnceLocked()
+	topologyErr := gw.probeTopologyOnceLocked(ctx, epoch)
+	return errors.Join(refErr, topologyErr)
+}
+
+func (gw *GitWatcher) probeRefOnceLocked() error {
+	gw.mu.Lock()
+	gitDir := gw.gitDir
+	commonDir := gw.commonDir
+	previous := gw.refProbeSignature
+	stopped := gw.stopCalled
+	gw.mu.Unlock()
+	if stopped || gitDir == "" || commonDir == "" {
+		return nil
+	}
+	observation, err := observeGitRefProbe(gitDir, commonDir)
+	if err != nil {
+		return err
+	}
+	if observation.signature == previous {
+		return nil
+	}
+	gw.mu.Lock()
+	if gw.stopCalled {
+		gw.mu.Unlock()
+		return nil
+	}
+	gw.refProbeSignature = observation.signature
+	gw.mu.Unlock()
+	if err := gw.refreshRefWatchesLocked(); err != nil {
+		return err
+	}
+	gw.scheduleReconcile("git-ref-probe")
+	return nil
+}
+
+func (gw *GitWatcher) topologyRetryPending() bool {
+	gw.topologyRetryMu.Lock()
+	pending := gw.topologyRetryTimer != nil
+	gw.topologyRetryMu.Unlock()
+	return pending
+}
+
+func (gw *GitWatcher) probeTopologyOnce(ctx context.Context, epoch uint64) error {
+	gw.topologyRefreshMu.Lock()
+	defer gw.topologyRefreshMu.Unlock()
+	return gw.probeTopologyOnceLocked(ctx, epoch)
+}
+
+func (gw *GitWatcher) probeTopologyOnceLocked(ctx context.Context, epoch uint64) error {
+	if !gw.topologyProbeCurrent(epoch) {
+		return nil
+	}
+	gw.mu.Lock()
+	if !gw.topologyOwned || gw.stopCalled {
+		gw.mu.Unlock()
+		return nil
+	}
+	worktreesDir := gw.worktreesDir
+	roots := clonePathSet(gw.worktreeRoots)
+	previousProbe := gw.topologyProbeSignature
+	ownerEpoch := gw.topologyOwnerEpoch
 	gw.mu.Unlock()
 
-	for path := range previousRoots {
-		if _, keep := desiredRoots[path]; !keep {
-			gw.removeTopologyPath(path)
-		}
+	observation, err := observeGitTopologyProbe(worktreesDir, roots)
+	if err != nil {
+		return err
 	}
-	for path := range previousAdmins {
-		if _, keep := desiredAdmins[path]; !keep {
-			gw.removeTopologyPath(path)
-		}
+	if observation.signature == previousProbe {
+		return nil
 	}
-	if !worktreesExists {
-		gw.removeTopologyPath(worktreesDir)
+	if !gw.topologyProbeCurrent(epoch) {
+		return nil
+	}
+	// Mark this exact cheap observation pending before the expensive sample.
+	// Regardless of ordinary or unstable inventory failure, stable ticks now
+	// defer to one unified exponential-backoff retry.
+	gw.mu.Lock()
+	if !gw.topologyOwned || gw.stopCalled || gw.topologyOwnerEpoch != ownerEpoch {
+		gw.mu.Unlock()
+		return nil
+	}
+	gw.topologyProbeSignature = observation.signature
+	gw.mu.Unlock()
+	if gw.topologyRetryPending() {
+		return nil
+	}
+
+	snapshot, err := gw.inventoryTopologySnapshot(ctx, observation.adminSignature)
+	if err != nil {
+		return err
+	}
+	if !gw.topologyProbeCurrent(epoch) {
+		return nil
+	}
+	gw.mu.Lock()
+	if !gw.topologyOwned || gw.stopCalled || gw.topologyOwnerEpoch != ownerEpoch {
+		gw.mu.Unlock()
+		return nil
+	}
+	changed := gw.topologySignature != "" && gw.topologySignature != snapshot.signature
+	gw.topologySignature = snapshot.signature
+	gw.topologyProbeSignature = snapshot.probeSignature
+	gw.worktreeRoots = snapshot.roots
+	gw.mu.Unlock()
+	if changed {
+		gw.scheduleTopologyChange("topology-probe")
+	}
+	return nil
+}
+
+func (gw *GitWatcher) topologyDegradedReason() string {
+	gw.mu.Lock()
+	defer gw.mu.Unlock()
+	return gw.topologyDegraded
+}
+
+func (gw *GitWatcher) recordTopologyRefresh(err error) {
+	gw.mu.Lock()
+	active := (gw.loopStarted || gw.topologyOwned) && !gw.stopCalled
+	if err == nil {
+		gw.topologyDegraded = ""
 	} else {
-		gw.addTopologyPath(worktreesDir)
+		gw.topologyDegraded = err.Error()
 	}
-	for path := range desiredAdmins {
-		gw.addTopologyPath(path)
+	gw.mu.Unlock()
+	if err == nil || !active {
+		gw.cancelTopologyRetry()
+		return
 	}
-	for path := range desiredRoots {
-		gw.addTopologyPath(path)
+	gw.scheduleTopologyRetry()
+}
+
+func (gw *GitWatcher) cancelTopologyRetry() {
+	gw.topologyRetryMu.Lock()
+	gw.topologyRetryEpoch++
+	gw.topologyRetryAttempts = 0
+	if gw.topologyRetryTimer != nil {
+		gw.topologyRetryTimer.Stop()
+		gw.topologyRetryTimer = nil
 	}
+	gw.topologyRetryMu.Unlock()
+}
+
+func topologyRetryDelay(base, maximum time.Duration, attempt uint32) time.Duration {
+	if base <= 0 {
+		base = time.Second
+	}
+	if maximum <= 0 {
+		maximum = 30 * time.Second
+	}
+	if maximum < base {
+		maximum = base
+	}
+	delay := base
+	for remaining := attempt; remaining > 0 && delay < maximum; remaining-- {
+		if delay >= maximum/2 {
+			return maximum
+		}
+		delay *= 2
+	}
+	if delay > maximum {
+		return maximum
+	}
+	return delay
+}
+
+func (gw *GitWatcher) scheduleTopologyRetry() {
+	gw.topologyRetryMu.Lock()
+	if gw.topologyRetryClosing || gw.topologyRetryTimer != nil {
+		gw.topologyRetryMu.Unlock()
+		return
+	}
+	delay := topologyRetryDelay(gw.topologyRetryBase, gw.topologyRetryMax, gw.topologyRetryAttempts)
+	if gw.topologyRetryAttempts < ^uint32(0) {
+		gw.topologyRetryAttempts++
+	}
+	gw.topologyRetryEpoch++
+	epoch := gw.topologyRetryEpoch
+	gw.topologyRetryTimer = time.AfterFunc(delay, func() {
+		gw.runTopologyRetry(epoch)
+	})
+	gw.topologyRetryMu.Unlock()
+}
+
+func (gw *GitWatcher) runTopologyRetry(epoch uint64) {
+	gw.topologyRetryMu.Lock()
+	if gw.topologyRetryClosing || gw.topologyRetryEpoch != epoch {
+		gw.topologyRetryMu.Unlock()
+		return
+	}
+	gw.topologyRetryTimer = nil
+	gw.topologyRetryWG.Add(1)
+	gw.topologyRetryMu.Unlock()
+	defer gw.topologyRetryWG.Done()
+
+	gw.topologyRefreshMu.Lock()
+	gw.topologyRetryMu.Lock()
+	current := !gw.topologyRetryClosing && gw.topologyRetryEpoch == epoch
+	gw.topologyRetryMu.Unlock()
+	if !current {
+		gw.topologyRefreshMu.Unlock()
+		return
+	}
+	err := gw.refreshRequiredWatchesLocked()
+	// Publish retry/backoff state before releasing the refresh serialization;
+	// a 1s probe can never slip into a second inventory between failure and
+	// scheduling the next exponential retry.
+	gw.recordTopologyRefresh(err)
+	gw.topologyRefreshMu.Unlock()
+	if err != nil {
+		return
+	}
+	// A ref event can be lost while HEAD/packed-refs/refs-heads registration is
+	// degraded. Every recovered watcher therefore re-samples its own HEAD; the
+	// elected owner also nudges family topology through the ordinary debounced
+	// path. Both timers fire after this retry lease returns, so a callback may
+	// synchronously remove/stop the watcher without waiting on its own lease.
+	gw.scheduleReconcile("git-watch-recovered")
+	gw.scheduleTopologyChange("topology-watch-recovered")
 }
 
 func clonePathSet(source map[string]struct{}) map[string]struct{} {
