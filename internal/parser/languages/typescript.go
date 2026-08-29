@@ -668,6 +668,7 @@ func (e *TypeScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 	captureRTKQueryEndpoints(result, root, filePath, "typescript", src)
 	capturePiniaStoreCalls(result, root, filePath, src)
 	captureVuexDispatch(result, root, filePath, src)
+	captureOdooModule(result, root, filePath, src)
 	captureExpressInlineHandlers(result, root, filePath, src)
 	captureReactContextRefs(result, root, filePath, src)
 	return result, nil

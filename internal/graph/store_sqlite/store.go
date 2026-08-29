@@ -41,6 +41,13 @@ import (
 
 // Store is the SQLite-backed graph.Store implementation.
 type Store struct {
+	// checkoutGroups records which OTHER tracked repo prefixes are
+	// separate git worktrees of the same repository as this one (see
+	// checkout_groups.go). Runtime topology published by the indexer, not
+	// graph content: it is never persisted, and the zero value groups
+	// nothing.
+	checkoutGroups graph.CheckoutGroups
+
 	// db is the bounded, logically read-dedicated pool for on-disk stores.
 	// writerDB is a separate read-write pool capped at one physical connection. In-memory
 	// stores use the same max-one handle for both because independent

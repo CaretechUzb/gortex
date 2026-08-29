@@ -470,6 +470,13 @@ func removeEdgeFromBucket(bucket map[string][]*Edge, keys map[string][]edgeHash,
 // this single mutex serialises those phases without blocking
 // ordinary shard-scoped reads and writes.
 type Graph struct {
+	// checkoutGroups records which OTHER tracked repo prefixes are
+	// separate git worktrees of the same repository as this one (see
+	// checkout_groups.go). Runtime topology published by the indexer, not
+	// graph content: it is never persisted, and the zero value groups
+	// nothing.
+	checkoutGroups CheckoutGroups
+
 	// shards holds the lock-sharded node/edge maps. Its length is
 	// shardCount (a power of two); shardMask is shardCount-1, precomputed
 	// so the hot-path shardIdx masks with a single AND instead of a

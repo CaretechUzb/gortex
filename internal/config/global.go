@@ -23,7 +23,94 @@ var (
 
 	// projectNameRe matches valid project names: alphanumeric, hyphens, underscores.
 	projectNameRe = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+
+	// repoNameRe is the character set a repo prefix may use: the set
+	// indexer.sanitizeInstanceTag folds a derived tag down to, plus `@`,
+	// the separator a worktree instance prefix carries
+	// (`local@aurora-redesign`).
+	repoNameRe = regexp.MustCompile(`^[A-Za-z0-9._@-]+$`)
 )
+
+// ValidateRepoName reports why name cannot be used as a repo prefix, or nil
+// when it can. An empty name is valid and means "derive it from the path".
+//
+// A prefix is not a label. It is the first segment of every node ID the
+// repository contributes (`<prefix>/<path>::<Symbol>`) and it is persisted to
+// the global config, so a path separator inside one makes the boundary between
+// "which repository" and "which file" ambiguous for every consumer that splits
+// an ID. The derived-name path never had this problem — WorktreeInstanceName
+// runs its tag through sanitizeInstanceTag — but an explicit `--name` short
+// circuits that derivation entirely, and ResolvePrefix returns Name verbatim.
+// Real branch names routinely contain `/` (`feat/…`, `fix/…`, `mr/6343`), so a
+// user naming a worktree after its branch hits this immediately.
+func ValidateRepoName(name string) error {
+	if name == "" {
+		return nil
+	}
+	if !repoNameRe.MatchString(name) {
+		return fmt.Errorf(
+			"invalid repo name %q: use only letters, digits and . _ - @ "+
+				"(a path separator inside a prefix makes every node ID from that repo ambiguous)",
+			name)
+	}
+	return nil
+}
+
+// RepoNameRejection records one config entry skipped because its `name:`
+// cannot serve as a repo prefix.
+type RepoNameRejection struct {
+	Path    string
+	Name    string
+	Project string // empty for a top-level entry
+	Reason  string
+}
+
+// RejectInvalidRepoNames drops every repo entry whose `name:` is unusable as a
+// prefix and returns what it dropped, so the caller can report each one.
+//
+// AddRepo refuses such a name, so one reaches the config only by hand-editing
+// it — but once there, ResolvePrefix would hand it back verbatim and it would
+// become the ambiguous first segment of every node ID that repository
+// contributes.
+//
+// Dropping the offending entry rather than failing the load keeps the blast
+// radius at one repository: the daemon still starts, every other repository is
+// indexed and queryable, and the operator gets a named warning and a config
+// line to fix. Refusing to load would turn a cosmetic naming mistake into a
+// total outage; silently folding the name to a legal one would rewrite node IDs
+// underneath an existing graph without anyone asking.
+func (gc *GlobalConfig) RejectInvalidRepoNames() []RepoNameRejection {
+	if gc == nil {
+		return nil
+	}
+	globalConfigMu.Lock()
+	defer globalConfigMu.Unlock()
+
+	var rejected []RepoNameRejection
+	keep := func(entries []RepoEntry, project string) []RepoEntry {
+		out := entries[:0]
+		for _, entry := range entries {
+			if err := ValidateRepoName(entry.Name); err != nil {
+				rejected = append(rejected, RepoNameRejection{
+					Path:    entry.Path,
+					Name:    entry.Name,
+					Project: project,
+					Reason:  err.Error(),
+				})
+				continue
+			}
+			out = append(out, entry)
+		}
+		return out
+	}
+
+	gc.Repos = keep(gc.Repos, "")
+	for name, proj := range gc.Projects {
+		proj.Repos = keep(proj.Repos, name)
+		gc.Projects[name] = proj
+	}
+	return rejected
+}
 
 // RepoEntry defines a repository in the config.
 type RepoEntry struct {
@@ -466,6 +553,10 @@ func normalizePath(p string) string {
 func (gc *GlobalConfig) AddRepo(entry RepoEntry) error {
 	globalConfigMu.Lock()
 	defer globalConfigMu.Unlock()
+
+	if err := ValidateRepoName(entry.Name); err != nil {
+		return err
+	}
 
 	absPath, err := filepath.Abs(entry.Path)
 	if err != nil {

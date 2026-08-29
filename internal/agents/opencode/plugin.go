@@ -53,7 +53,23 @@ const (
 	sentinelBin     = "{{GORTEX_BIN}}"
 	sentinelArgv    = "{{GORTEX_HOOK_ARGV}}"
 	sentinelEnforce = "{{GORTEX_ENFORCE}}"
+	sentinelTimeout = "{{GORTEX_HOOK_TIMEOUT_MS}}"
 )
+
+// defaultHookTimeoutMS is the bridge call budget every install renders.
+// Its rationale lives with HOOK_TIMEOUT_MS in plugin/gortex.js.
+//
+// It is a template value only so that the node-level tests can widen it.
+// callHook is fail-open by contract — a bridge that does not answer in
+// time lets the tool through — so a test asserting that a `block`
+// decision BLOCKS is really asserting the stub shell got scheduled
+// inside the budget, which on a busy machine it does not. Under a full
+// `go test -race ./...` sweep that cost two real failures
+// (`TestPluginBehaviourUnderNode/block` and
+// `TestPluginEnvelopeMatchesTheBridgeContract`), and both reproduce
+// exactly by rendering a 1 ms budget. The bridge was behaving correctly
+// in every one of them.
+const defaultHookTimeoutMS = 5000
 
 // PluginFileName is the bridge's file name inside the plugin directory.
 // Stable across releases so a re-install overwrites in place rather than
@@ -87,13 +103,23 @@ func hookArgv(env agents.Env) []string {
 }
 
 // renderPlugin fills the embedded JavaScript template with the resolved
-// gortex binary, the hook argv, and the enforcement flag.
+// gortex binary, the hook argv, and the enforcement flag. This is what
+// every install writes, and the only form applyPlugin uses, so the
+// shipped bytes do not depend on the seam below.
 func renderPlugin(env agents.Env) string {
+	return renderPluginWithHookTimeout(env, defaultHookTimeoutMS)
+}
+
+// renderPluginWithHookTimeout is renderPlugin with the bridge call budget
+// named explicitly. Only tests pass anything but the default; see
+// defaultHookTimeoutMS for why they need to.
+func renderPluginWithHookTimeout(env agents.Env, hookTimeoutMS int) string {
 	argv := hookArgv(env)
 	src := pluginSource
 	src = substituteSentinel(src, sentinelBin, jsonValue(argv[0]))
 	src = substituteSentinel(src, sentinelArgv, jsonValue(argv))
 	src = substituteSentinel(src, sentinelEnforce, jsonValue(env.InstallHooks))
+	src = substituteSentinel(src, sentinelTimeout, jsonValue(hookTimeoutMS))
 	return src
 }
 

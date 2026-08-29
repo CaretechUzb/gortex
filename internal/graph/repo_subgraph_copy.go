@@ -1,0 +1,81 @@
+package graph
+
+// Duplicating a repository's subgraph under a new prefix.
+//
+// A git worktree of an already-tracked repository, checked out at the same
+// commit, is the same body of code under a different prefix. Indexing and
+// deriving it from scratch reproduces a subgraph the store already holds —
+// measured on a five-repo Odoo workspace at 162s to index and 534s to derive,
+// against 57s to copy the rows.
+//
+// The copy is only sound because it is ADDITIVE. Every write is an insert
+// under the destination prefix that yields to an existing row; nothing is
+// updated. A repository's globally-keyed nodes (`http::`, `external::`,
+// `unresolved::`) keep their ids, so they collide with the rows already there
+// and are skipped rather than overwritten — which is what keeps a copy from
+// touching any other repository. Do not reason about this together with an
+// in-place re-key, which has the opposite failure mode.
+
+// RepoSubgraphCopyResult reports what a copy moved.
+//
+// Edges and InboundEdges are counted apart because they answer different
+// questions and fail differently: Edges is what the checkout itself declares
+// (a global pass owns an edge by its source node), InboundEdges is what every
+// other repository points back at it. A copy that carries only the first is
+// complete for "what does this reference" and empty for "who uses this".
+type RepoSubgraphCopyResult struct {
+	Nodes        int
+	Edges        int
+	InboundEdges int
+	Sidecars     int
+}
+
+// RepoSubgraphCopier duplicates one repository's nodes, edges and
+// prefix-keyed sidecar rows under a new prefix.
+//
+// Implementations MUST rewrite both prefixed id grammars — `<prefix>/…` for
+// file-derived nodes and `<prefix>::…` for the synthetic stdlib / module /
+// builtin nodes — and MUST anchor on those two forms rather than on the bare
+// prefix. A bare-prefix match swallows sibling checkouts: `local@wt/…` starts
+// with `local`, and rewriting it merges two checkouts into one. Handling only
+// the `/` grammar is the subtler failure: on one real workspace it left 15,101
+// edges pointing at the SOURCE checkout's synthetic nodes, which is precisely
+// the cross-checkout contamination checkout groups exist to prevent.
+//
+// Implementations MUST also rewrite the prefixed *path* columns — a node's
+// file_path, an edge's file_path, and the same column wherever a sidecar or
+// search corpus carries it. Paths are a separate rewrite from ids: they use
+// only the `<prefix>/` grammar, so an id rewriter's synthetic arm must not be
+// applied to them. Watch for the two conventions that look alike and are not:
+// `files.file_path` is prefixed while `file_mtimes.file_path` is repo-relative
+// and must be left alone, or the mtime restat that registers the copy breaks.
+//
+// Implementations MUST select the edge frontier by those same two id ranges,
+// NOT by edges.from_repo. from_repo is a generated column derived from the
+// first '/' in from_id, so it sees only the `<prefix>/` grammar: a synthetic id
+// has no slash and generates the empty string, and one carrying a slash deeper
+// in generates a garbage prefix. Selecting on it silently drops every edge
+// SOURCED at a synthetic node — 245 member_of edges on one real workspace,
+// against 254 in the derived checkout beside it. That shows up only as a small
+// shift in the raw edge total, which reads as drift; difference the edge set by
+// kind to see it.
+//
+// Leaving paths behind is invisible to any count-based parity check and breaks
+// every read: absolute_file_path is built by stripping the node's own prefix
+// and joining to the repository root, so a stale `<src>/…` value is appended
+// whole to the destination's root and no file is ever found.
+type RepoSubgraphCopier interface {
+	CopyRepoSubgraph(srcPrefix, dstPrefix string) (RepoSubgraphCopyResult, error)
+}
+
+// CopyRepoSubgraph selects the capability when the backend has it. It reports
+// false when the store cannot copy, so callers fall back to indexing rather
+// than silently installing an empty repository.
+func CopyRepoSubgraph(s Store, srcPrefix, dstPrefix string) (RepoSubgraphCopyResult, bool, error) {
+	copier, ok := s.(RepoSubgraphCopier)
+	if !ok {
+		return RepoSubgraphCopyResult{}, false, nil
+	}
+	res, err := copier.CopyRepoSubgraph(srcPrefix, dstPrefix)
+	return res, true, err
+}

@@ -35,7 +35,9 @@ type WorktreeInfo struct {
 // `commondir` file pointing back at the shared .git, whose parent is
 // the main checkout. A git submodule also uses a `.git` file but has
 // no `commondir`, so it resolves to itself — a submodule is a separate
-// repository, not a worktree. A main checkout or a non-git directory
+// repository, not a worktree. A worktree *of* a submodule is a
+// worktree, and resolves to the submodule's own working directory —
+// see mainCheckoutForCommonDir. A main checkout or a non-git directory
 // likewise resolves to itself.
 //
 // A worktree can be tracked either as part of its canonical repo (the
@@ -89,11 +91,78 @@ func ResolveWorktree(path string) WorktreeInfo {
 
 	info.IsWorktree = true
 	info.GitCommonDir = common
-	// The main checkout is the directory that contains the shared .git.
-	if filepath.Base(common) == ".git" {
-		info.MainRepoPath = filepath.Dir(common)
+	if main := mainCheckoutForCommonDir(common); main != "" {
+		info.MainRepoPath = main
 	}
 	return info
+}
+
+// mainCheckoutForCommonDir maps a shared git dir back to the working
+// directory of the checkout that owns it, or "" when it cannot be
+// determined.
+//
+// For an ordinary repository the common dir IS `<repo>/.git`, so the
+// main checkout is simply its parent. A submodule's worktrees point
+// instead at `<super>/.git/modules/<name>`, whose parent is `modules` —
+// which used to leave every worktree of one submodule resolving to
+// itself, so nothing downstream could tell they were checkouts of the
+// same repository. That matters because the checkout-group gate keys on
+// exactly this value (see resolvedMainRepo): without a shared key the
+// gate never fires, and two branches of one submodule get bound to each
+// other's copies of every symbol they both define.
+//
+// Git records the submodule's working directory as `core.worktree` in
+// that dir's config, resolved relative to the config's own directory.
+// That pointer is the answer, and it stays correct when the submodule's
+// name differs from its path.
+func mainCheckoutForCommonDir(common string) string {
+	if filepath.Base(common) == ".git" {
+		return filepath.Dir(common)
+	}
+	wt := gitConfigCoreWorktree(filepath.Join(common, "config"))
+	if wt == "" {
+		return ""
+	}
+	if !filepath.IsAbs(wt) {
+		wt = filepath.Join(common, wt)
+	}
+	return filepath.Clean(wt)
+}
+
+// gitConfigCoreWorktree reads `core.worktree` out of a git config file.
+// It parses the file directly rather than shelling out because
+// ResolveWorktree is a pure filesystem probe — it runs on paths that are
+// not tracked yet, during warmup, and must not depend on a git binary.
+//
+// Only the `[core]` section is considered, and git's own precedence is
+// preserved: the last value wins. Section and key names are matched
+// case-insensitively, as git does.
+func gitConfigCoreWorktree(configPath string) string {
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return ""
+	}
+	inCore := false
+	value := ""
+	for _, raw := range strings.Split(string(data), "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+			continue
+		}
+		if strings.HasPrefix(line, "[") {
+			inCore = strings.EqualFold(strings.Trim(line, "[]"), "core")
+			continue
+		}
+		if !inCore {
+			continue
+		}
+		key, val, ok := strings.Cut(line, "=")
+		if !ok || !strings.EqualFold(strings.TrimSpace(key), "worktree") {
+			continue
+		}
+		value = strings.Trim(strings.TrimSpace(val), `"`)
+	}
+	return value
 }
 
 // WorktreeRootGone reports whether a directory that was previously

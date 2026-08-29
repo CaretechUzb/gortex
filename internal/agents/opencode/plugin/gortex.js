@@ -42,7 +42,11 @@ const ENFORCE = {{GORTEX_ENFORCE}};
 // milliseconds; this ceiling exists for the pathological case (daemon
 // mid-restart, machine swapping), where waiting longer would be felt as
 // the agent hanging.
-const HOOK_TIMEOUT_MS = 5000;
+//
+// Templated rather than literal so a test that asserts what a decision
+// DOES can buy itself a budget the machine can actually meet. Every
+// install renders the 5000 ms default; see defaultHookTimeoutMS.
+const HOOK_TIMEOUT_MS = {{GORTEX_HOOK_TIMEOUT_MS}};
 
 // Cap on the per-call decision map. A session is thousands of tool calls
 // long and OpenCode gives no "call finished" signal we can trust for

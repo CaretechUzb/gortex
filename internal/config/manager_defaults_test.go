@@ -41,6 +41,38 @@ index:
 		"content-admission caps must survive a partial workspace config")
 	// The file's own settings still land.
 	assert.Contains(t, cfg.Index.Exclude, "**/[Bb]in/**")
+	assert.True(t, cfg.Index.AllowedFrameworks().Allows("django"),
+		"an unset index.frameworks block must allow every framework")
+}
+
+// TestGetRepoConfig_FrameworkAllowSurvivesMerge: the allow-list is read
+// by the indexer through IndexConfig, so it has to survive the
+// global+workspace merge intact — a dropped entry would silently exclude
+// a framework the repository asked to keep.
+func TestGetRepoConfig_FrameworkAllowSurvivesMerge(t *testing.T) {
+	cm, err := NewConfigManager(filepath.Join(t.TempDir(), "config.yaml"))
+	require.NoError(t, err)
+
+	repoDir := t.TempDir()
+	wsContent := `
+index:
+  frameworks:
+    allow:
+      - celery-dispatch
+      - godot*
+`
+	require.NoError(t, os.WriteFile(filepath.Join(repoDir, ".gortex.yaml"), []byte(wsContent), 0644))
+	cm.LoadWorkspaceConfig("my-repo", repoDir)
+
+	cfg := cm.GetRepoConfig("my-repo")
+	require.NotNil(t, cfg)
+
+	set := cfg.Index.AllowedFrameworks()
+	assert.True(t, set.Allows("celery-dispatch"))
+	assert.True(t, set.Allows("godot-autoload"), "trailing-* must survive as a prefix match")
+	assert.False(t, set.Allows("django"))
+	// Unrelated defaults are untouched by the new block.
+	assert.Equal(t, runtime.NumCPU(), cfg.Index.Workers)
 }
 
 // TestGetRepoConfig_ExplicitWorkspaceValuesStillWin: seeding defaults

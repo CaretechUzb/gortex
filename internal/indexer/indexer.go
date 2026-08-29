@@ -3906,7 +3906,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			// deferGlobalPasses; the batch caller folds it into
 			// shared multi-repository global-pass pipeline.
 			reporter.Report("framework dispatch synthesis", 0, 0)
-			if rep := resolver.RunFrameworkSynthesizers(idx.graph); rep.Total > 0 {
+			if rep := resolver.RunFrameworkSynthesizers(idx.graph, resolver.WithAllowedFrameworks(idx.allowedFrameworks())); rep.Total > 0 {
 				idx.logger.Info("framework dispatch calls synthesized",
 					zap.Int("edges", rep.Total),
 					zap.Any("per_synthesizer", rep.Per),
@@ -4786,7 +4786,7 @@ func (idx *Indexer) ResolveAll() {
 	// Framework dynamic-dispatch synthesis (gRPC / Temporal / event
 	// channels / native bridges) depends on InferImplements (the
 	// interface-satisfaction signals) having run first.
-	resolver.RunFrameworkSynthesizers(idx.graph)
+	resolver.RunFrameworkSynthesizers(idx.graph, resolver.WithAllowedFrameworks(idx.allowedFrameworks()))
 	// External-call placeholder synthesis (opt-in) — runs after the
 	// resolver and stub passes so only genuinely un-indexed external
 	// targets remain to materialise.
@@ -6206,7 +6206,10 @@ func (idx *Indexer) TotalDetected() int {
 // check per file.
 func (idx *Indexer) buildPerFileContractExtractors() ([]contracts.Extractor, map[string][]contracts.Extractor) {
 	extractors := []contracts.Extractor{
-		&contracts.HTTPExtractor{ClientAliases: idx.config.HTTPClientAliases},
+		&contracts.HTTPExtractor{
+			ClientAliases:     idx.config.HTTPClientAliases,
+			AllowedFrameworks: idx.allowedFrameworks(),
+		},
 		&contracts.GRPCExtractor{},
 		&contracts.ThriftExtractor{},
 		&contracts.GraphQLExtractor{},

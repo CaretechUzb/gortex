@@ -380,27 +380,24 @@ func looksLikeGlob(s string) bool {
 // .gortex.yaml. When one is found, its path and containing dir are
 // returned. Otherwise it returns a prospective path at the nearest
 // git root (or cwd as a last resort) so `add` can create the file.
+//
+// The search itself is config.FindWorkspaceConfig — the same walk the
+// daemon's per-repo loader uses. They were separate before, and differed:
+// this one climbed to the filesystem root while the daemon read only the
+// repo root, so `gortex config` could list a file as the active workspace
+// config that indexing ignored entirely. One walk, one answer.
 func findWorkspaceConfigPath() (path, repoRoot string, err error) {
 	cwd, err := os.Getwd()
 	if err != nil {
 		return "", "", err
 	}
-	dir := cwd
-	for {
-		candidate := filepath.Join(dir, ".gortex.yaml")
-		if _, statErr := os.Stat(candidate); statErr == nil {
-			return candidate, dir, nil
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			break
-		}
-		dir = parent
+	if found := config.FindWorkspaceConfig(cwd); found != "" {
+		return found, filepath.Dir(found), nil
 	}
 	if root := gitToplevel(cwd); root != "" {
-		return filepath.Join(root, ".gortex.yaml"), root, nil
+		return filepath.Join(root, config.WorkspaceConfigName), root, nil
 	}
-	return filepath.Join(cwd, ".gortex.yaml"), cwd, nil
+	return filepath.Join(cwd, config.WorkspaceConfigName), cwd, nil
 }
 
 func gitToplevel(start string) string {

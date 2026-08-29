@@ -12,6 +12,7 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/zzet/gortex/internal/gitcmd"
+	"github.com/zzet/gortex/internal/graph"
 	"go.uber.org/zap"
 )
 
@@ -134,12 +135,65 @@ func (gw *GitWatcher) Start() error {
 		}
 	}
 
-	gw.lastSHA, _ = gw.currentSHA(context.Background())
+	head, _ := gw.currentSHA(context.Background())
+	seed := gw.seedSHA(head)
 	gw.mu.Lock()
+	gw.lastSHA = seed
 	gw.loopStarted = true
 	gw.mu.Unlock()
 	go gw.loop()
+
+	// A commit that landed while no watcher was running produces no event to
+	// react to, so the catch-up has to be started here or it never happens.
+	// It goes through the debounce like any other trigger: Start runs on the
+	// warmup path, concurrently across every tracked repository, and must not
+	// block on a diff.
+	if seed != "" && head != "" && seed != head {
+		gw.logger.Info("git-watcher: catching up on commits that landed while the watcher was down",
+			zap.String("from", seed[:min(len(seed), 12)]),
+			zap.String("to", head[:min(len(head), 12)]))
+		gw.scheduleReconcile("startup-catchup")
+	}
 	return nil
+}
+
+// seedSHA picks the commit the next ref change should be diffed against.
+//
+// The working tree's HEAD is the wrong answer whenever HEAD moved while no
+// watcher was running — across a daemon restart, or between a repository
+// being tracked and its watcher being started. Seeding from it makes that
+// move permanently invisible: the next event reads the current SHA, finds
+// lastSHA already equal to it, and returns without ever taking a diff. The
+// graph keeps the previous commit's content, nothing restamps the freshness
+// row, and `gortex repos` reports the repository stale for the whole life of
+// the daemon with no path back.
+//
+// The persisted index state records the commit the graph was actually built
+// at, which is the honest base. It is used only when git can still resolve
+// it: a stamp left dangling by a force-push or a gc would otherwise make
+// every diff fail and every reconcile retry forever against a commit that no
+// longer exists.
+func (gw *GitWatcher) seedSHA(head string) string {
+	idx := gw.registeredIndexer()
+	if idx == nil {
+		return head
+	}
+	r, ok := graph.Store(idx.graph).(graph.RepoIndexStateReader)
+	if !ok {
+		return head
+	}
+	st, found, err := r.GetRepoIndexState(idx.repoPrefix)
+	if err != nil || !found || st.IndexedSHA == "" || st.IndexedSHA == head {
+		return head
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := gitcmd.Output(ctx, gw.repoPath, "cat-file", "-e", st.IndexedSHA+"^{commit}"); err != nil {
+		gw.logger.Warn("git-watcher: indexed commit is unreachable, starting from HEAD",
+			zap.String("indexed", st.IndexedSHA), zap.Error(err))
+		return head
+	}
+	return st.IndexedSHA
 }
 
 // Stop halts the watcher. Idempotent — safe whether Start succeeded,
@@ -359,6 +413,7 @@ func (gw *GitWatcher) reconcile(trigger string) {
 	gw.mu.Unlock()
 
 	gw.logger.Info("git-watcher: reconciled ref change",
+		zap.String("trigger", trigger),
 		zap.String("from", oldSHA[:min(len(oldSHA), 12)]),
 		zap.String("to", newSHA[:min(len(newSHA), 12)]),
 		zap.Int("paths", patched),

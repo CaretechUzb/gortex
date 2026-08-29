@@ -332,6 +332,15 @@ type StatusResponse struct {
 	// semantic manager is wired or it has never run a pass.
 	Enrichment *EnrichmentProgress `json:"enrichment,omitempty"`
 
+	// DerivingWorkspace is true while the workspace-wide derivation
+	// passes triggered by a repository tracked outside a batch are still
+	// running. Until it clears, derived edges INTO the newly tracked repo
+	// — framework dispatch, cross-repo, inferred implements — are
+	// incomplete, so a query against it can under-report. Reported
+	// separately from EnrichmentComplete, which covers warmup only and
+	// stays true across a later track.
+	DerivingWorkspace bool `json:"deriving_workspace,omitempty"`
+
 	// Workspaces aggregates TrackedRepos by workspace slug. Empty
 	// when no repo declares one (every repo defaults to its own
 	// workspace; the table form is more compact in that case).

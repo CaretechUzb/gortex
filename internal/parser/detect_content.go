@@ -178,8 +178,13 @@ func sniffAmbiguous(filePath, ext string, content []byte) (string, bool) {
 			return "mathematica", true
 		}
 	case ".xml":
-		// A MyBatis mapper / Spring beans XML routes to its specific
-		// extractor; every other .xml keeps the generic "xml" default.
+		// An Odoo data / MyBatis mapper / Spring beans XML routes to its
+		// specific extractor; every other .xml keeps the generic "xml"
+		// default. The three marker sets are mutually exclusive in
+		// practice, so the order is a tie-break only.
+		if hasOdooXMLMarkers(probe) {
+			return "odoo_xml", true
+		}
 		if hasMyBatisMapperMarkers(probe) {
 			return "mybatis", true
 		}
@@ -202,6 +207,20 @@ func isShopifyThemeJSONPath(filePath string) bool {
 // section file. A cheap byte pre-filter; the extractor parses and validates.
 func hasShopifyTemplateMarkers(b []byte) bool {
 	return bytes.Contains(b, []byte(`"sections"`)) && bytes.Contains(b, []byte(`"type"`))
+}
+
+// hasOdooXMLMarkers reports whether the content is an Odoo data / view
+// XML document — an `<odoo>` root (or the pre-v10 `<openerp>`), or a
+// standalone QWeb asset template file, which has a bare `<templates>`
+// root carrying `t-name` and no `<odoo>` wrapper at all. Kept in package
+// parser (inlined rather than calling languages.IsOdooXML) to avoid an
+// import cycle.
+func hasOdooXMLMarkers(b []byte) bool {
+	lower := bytes.ToLower(b)
+	if bytes.Contains(lower, []byte("<odoo")) || bytes.Contains(lower, []byte("<openerp")) {
+		return true
+	}
+	return bytes.Contains(lower, []byte("<templates")) && bytes.Contains(lower, []byte("t-name"))
 }
 
 // hasMyBatisMapperMarkers reports whether the content is a MyBatis mapper

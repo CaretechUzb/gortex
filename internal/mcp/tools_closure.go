@@ -282,7 +282,7 @@ func filterClosureNodes(nodes []query.ClosureNode, allowed map[string]bool) []qu
 		if m.Node == nil {
 			continue
 		}
-		if repoNarrowAdmits(allowed, m.Node.RepoPrefix) {
+		if repoNarrowAdmitsNode(allowed, m.Node) {
 			kept = append(kept, m)
 		}
 	}

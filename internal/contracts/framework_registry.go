@@ -142,6 +142,14 @@ func safeFrameworkExtract(p FrameworkRoutePass, ctx *RouteExtractCtx) (out []Con
 func runFrameworkRoutePasses(ctx *RouteExtractCtx) []Contract {
 	var out []Contract
 	for _, p := range ApplicableFrameworkRoutePasses(ctx.Lang) {
+		// The configured allow-list is checked before Detect so an
+		// excluded pass costs nothing — not even its content pre-filter.
+		// The registry itself stays whole: ApplicableFrameworkRoutePasses
+		// is the inventory read behind `analyze route_frameworks`, and
+		// policy belongs at the driver, not in a registry query.
+		if ctx.H != nil && !ctx.H.AllowedFrameworks.Allows(p.Name()) {
+			continue
+		}
 		if !safeFrameworkDetect(p, ctx.FilePath, ctx.Src) {
 			continue
 		}
@@ -195,6 +203,16 @@ func init() {
 		detect: func(_ string, src []byte) bool { return bytes.Contains(src, []byte(".route(")) },
 		run: func(h *HTTPExtractor, c *RouteExtractCtx) []Contract {
 			return h.extractFlaskDecoratorRoutes(c.FilePath, c.Text, c.Lines, c.FileNodes, c.Lang, c.Tree)
+		},
+	})
+	// Odoo controller routes. Detection keys on the decorator rather than
+	// on an import, because `from odoo.http import route` lets a
+	// controller write the bare @route(...) form.
+	RegisterFrameworkRoutePass(&routePass{
+		name: "odoo", langs: []string{"python"},
+		detect: func(_ string, src []byte) bool { return odooRouteDecoratorRE.Match(src) },
+		run: func(h *HTTPExtractor, c *RouteExtractCtx) []Contract {
+			return h.extractOdooRoutes(c.FilePath, c.Text, c.Lines, c.FileNodes, c.Lang, c.Tree)
 		},
 	})
 	RegisterFrameworkRoutePass(&routePass{

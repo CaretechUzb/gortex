@@ -96,6 +96,10 @@ func materializeCrossRepoCandidates(g graph.Store, rows []graph.CrossRepoCandida
 	if len(rows) == 0 {
 		return 0
 	}
+	rows = dropSiblingCheckoutRows(g, rows)
+	if len(rows) == 0 {
+		return 0
+	}
 
 	type pendingRelationship struct {
 		base     *graph.Edge
@@ -194,6 +198,9 @@ func materializeCrossRepoCandidates(g graph.Store, rows []graph.CrossRepoCandida
 // kind list verbatim so single-repo graphs return no rows without a
 // whole-table scan.
 func crossRepoCandidates(g graph.Store) []graph.CrossRepoCandidateRow {
+	if !crossRepoPossible(g) {
+		return nil
+	}
 	baseKinds := graph.BaseKindsForCrossRepo()
 	if cap, ok := g.(graph.CrossRepoCandidates); ok {
 		return cap.CrossRepoCandidates(baseKinds)
@@ -202,6 +209,9 @@ func crossRepoCandidates(g graph.Store) []graph.CrossRepoCandidateRow {
 }
 
 func crossRepoCandidatesForRepos(g graph.Store, repoPrefixes []string) []graph.CrossRepoCandidateRow {
+	if !crossRepoPossible(g) {
+		return nil
+	}
 	baseKinds := graph.BaseKindsForCrossRepo()
 	if cap, ok := g.(graph.ScopedCrossRepoCandidates); ok {
 		return cap.CrossRepoCandidatesForRepos(baseKinds, repoPrefixes)
@@ -209,12 +219,73 @@ func crossRepoCandidatesForRepos(g graph.Store, repoPrefixes []string) []graph.C
 	return crossRepoCandidatesFallback(g, baseKinds, stringSet(repoPrefixes), nil)
 }
 
+// Deliberately NOT guarded by crossRepoPossible: this is the watcher's
+// per-save path, its candidate query is already bounded by the changed
+// files, and the guard's prefix scan reads every node row — a cost worth
+// paying once per workspace pass but not once per keystroke-save.
 func crossRepoCandidatesForMutationFiles(g graph.Store, edgeSourceFiles, incidentNodeFiles []string) []graph.CrossRepoCandidateRow {
 	baseKinds := graph.BaseKindsForCrossRepo()
 	if cap, ok := g.(graph.MutationScopedCrossRepoCandidates); ok {
 		return cap.CrossRepoCandidatesForMutation(baseKinds, edgeSourceFiles, incidentNodeFiles)
 	}
 	return crossRepoCandidatesFallbackScopes(g, baseKinds, nil, stringSet(edgeSourceFiles), stringSet(incidentNodeFiles))
+}
+
+// crossRepoPossible reports whether the graph can hold a cross-repo edge
+// at all. Below two distinct repositories the answer is no, and proving
+// it costs one prefix lookup instead of a query.
+//
+// The candidate queries below join BOTH endpoints of every
+// calls/implements/extends edge against `nodes` to read their
+// repo_prefix. That work is proportional to the whole base-kind edge set
+// whether or not any row can survive the `nf.repo_prefix <> nt.repo_prefix`
+// filter, so a single-repository graph pays the full two-way join to
+// return nothing. Measured on one 117k-node repository, the whole-graph
+// pass ran 745 seconds and could not, by construction, have produced an
+// edge — and it is reached on every workspace derivation, including the
+// one that follows an untrack down to a single repo.
+//
+// The guard is a precondition, not an optimisation: with fewer than two
+// repositories the correct result IS nil.
+func crossRepoPossible(g graph.Store) bool {
+	if g == nil {
+		return false
+	}
+	// Distinct REPOSITORIES, not distinct prefixes: a workspace holding a
+	// repo and a git worktree of it has two prefixes over one repository,
+	// and no edge between them is a cross-repo relationship. Counting
+	// prefixes there would run the whole two-way join to produce rows that
+	// dropSiblingCheckoutRows then discards wholesale.
+	return graph.DistinctCheckoutGroups(g, g.RepoPrefixes()) >= 2
+}
+
+// dropSiblingCheckoutRows removes candidates whose two endpoints live in
+// separate checkouts of the SAME repository.
+//
+// Such a row is structurally a cross-repo relationship and semantically
+// nothing: the two repo prefixes are one body of code, so "repo A's symbol
+// implements repo B's interface" restates a same-repo fact with the
+// endpoints in different checkouts. Materialising it mints a parallel
+// cross_repo_* edge and flips Edge.CrossRepo on the base edge, which is
+// how a tracked worktree used to inflate `analyze kind=cross_repo` with
+// boundary crossings that never happened.
+//
+// The filter sits here, at the single point every candidate path funnels
+// through — graph-wide, repo-scoped, reindex-batch and mutation-file
+// alike — so no future candidate source can bypass it.
+func dropSiblingCheckoutRows(g graph.Store, rows []graph.CrossRepoCandidateRow) []graph.CrossRepoCandidateRow {
+	grouped, ok := g.(graph.CheckoutGrouped)
+	if !ok || !grouped.HasCheckoutGroups() {
+		return rows
+	}
+	out := rows[:0]
+	for _, row := range rows {
+		if graph.SiblingCheckouts(g, row.FromRepo, row.ToRepo) {
+			continue
+		}
+		out = append(out, row)
+	}
+	return out
 }
 
 func stringSet(values []string) map[string]struct{} {

@@ -293,7 +293,11 @@ func (o QueryOptions) ScopeAllows(n *graph.Node) bool {
 		if ws != o.WorkspaceID {
 			return false
 		}
-		if o.ProjectID != "" {
+		// The project narrow is a soft sub-boundary INSIDE the
+		// workspace, so it yields to shared rendezvous nodes for the
+		// same reason the repo narrow below does. The workspace check
+		// above does not: it is the hard rail.
+		if o.ProjectID != "" && !graph.SharedAcrossRepos(n) {
 			proj := n.ProjectID
 			if proj == "" {
 				proj = n.RepoPrefix
@@ -318,7 +322,12 @@ func (o QueryOptions) ScopeAllows(n *graph.Node) bool {
 	// API-impact filters apply. Every repo-narrow predicate in the codebase
 	// must agree on it: one that rejects instead of admitting turns a scoped
 	// query into an empty result rather than a narrower one.
-	if len(o.RepoAllow) > 0 && n.RepoPrefix != "" && !o.RepoAllow[n.RepoPrefix] {
+	// graph.SharedAcrossRepos covers the third population: contract
+	// nodes DO carry a prefix, but it records which repo minted the
+	// global ID first, not ownership — so honouring it would hide a
+	// contract from the other repos whose symbols consume it.
+	if len(o.RepoAllow) > 0 && n.RepoPrefix != "" && !o.RepoAllow[n.RepoPrefix] &&
+		!graph.SharedAcrossRepos(n) {
 		return false
 	}
 	return true

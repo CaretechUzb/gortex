@@ -373,17 +373,48 @@ func (s *Store) CrossRepoCandidatesForMutation(baseKinds []graph.EdgeKind, edgeS
 	return s.crossRepoCandidates(baseKinds, nil, edgeFiles, incidentFiles)
 }
 
-func (s *Store) crossRepoCandidates(baseKinds []graph.EdgeKind, repoPrefixes, edgeSourceFiles, incidentNodeFiles []string) []graph.CrossRepoCandidateRow {
+// crossRepoCandidatesQuery builds the candidate query and its arguments.
+// Split out from the method so a test can EXPLAIN it: the join ORDER is
+// what this query is about, and no assertion on the returned rows can
+// see it — a Cartesian plan returns exactly the same rows, just never.
+// The bool reports whether a query is worth running at all.
+func crossRepoCandidatesQuery(baseKinds []graph.EdgeKind, repoPrefixes, edgeSourceFiles, incidentNodeFiles []string) (string, []any, bool) {
 	uniq := anaDedupeEdgeKinds(baseKinds)
 	if len(uniq) == 0 {
-		return nil
+		return "", nil, false
 	}
+	// CROSS JOIN, not JOIN, and the difference is the whole query.
+	//
+	// SQLite treats CROSS JOIN as an ordering constraint: the left table
+	// stays the outer loop. Left to reorder freely, the planner drives
+	// this from `nodes` twice —
+	//
+	//	SCAN nf USING COVERING INDEX nodes_by_repo
+	//	SCAN nt USING COVERING INDEX nodes_by_repo
+	//	SEARCH e USING sqlite_autoindex_edges_1 (from_id=? AND to_id=? ...)
+	//
+	// which is every node paired against every node, ~5.5e10 probes on a
+	// 234k-node workspace. It picks that because nodes_by_repo is a
+	// covering partial index and it reads `repo_prefix <> ''` as
+	// selective, when in fact that predicate excludes almost nothing.
+	//
+	// Pinning `edges` outermost gives the intended plan — one index scan
+	// of the base kinds, two primary-key lookups per row:
+	//
+	//	SEARCH e USING INDEX edges_by_kind (kind=?)
+	//	SEARCH nf USING PRIMARY KEY (id=?)
+	//	SEARCH nt USING PRIMARY KEY (id=?)
+	//
+	// Measured on one 117k-node repository the old plan ran past 745s
+	// without finishing; on a two-repository workspace the pinned plan
+	// answers the same question in ~6s, returning 1,909 rows out of
+	// 572,733 base-kind edges. The cost was never the result size.
 	const projection = `SELECT e.from_id, e.to_id, e.kind, e.file_path, e.line,
        e.confidence, e.confidence_label, e.origin, e.tier, e.cross_repo,
        nf.repo_prefix, nt.repo_prefix
 FROM %s
-JOIN nodes nf ON nf.id = e.from_id
-JOIN nodes nt ON nt.id = e.to_id
+CROSS JOIN nodes nf ON nf.id = e.from_id
+CROSS JOIN nodes nt ON nt.id = e.to_id
 	WHERE nf.repo_prefix <> '' AND nt.repo_prefix <> ''
   AND nf.repo_prefix <> nt.repo_prefix`
 
@@ -398,7 +429,7 @@ JOIN nodes nt ON nt.id = e.to_id
 	if len(repoPrefixes) > 0 {
 		scopeJSON, ok := projectionJSON(repoPrefixes)
 		if !ok {
-			return nil
+			return "", nil, false
 		}
 		q = `WITH candidate_edges(id) AS (
   SELECT e.id
@@ -413,7 +444,7 @@ JOIN nodes nt ON nt.id = e.to_id
   WHERE n.repo_prefix IN (SELECT CAST(value AS TEXT) FROM json_each(?))
     AND e.kind IN (` + inPlaceholders(len(uniq)) + `)
 )
-` + fmt.Sprintf(projection, `candidate_edges ce JOIN edges e ON e.id = ce.id`)
+` + fmt.Sprintf(projection, `candidate_edges ce CROSS JOIN edges e ON e.id = ce.id`)
 		args = append(args, scopeJSON)
 		args = appendKinds(args)
 		args = append(args, scopeJSON)
@@ -423,7 +454,7 @@ JOIN nodes nt ON nt.id = e.to_id
 		if len(edgeSourceFiles) > 0 {
 			scopeJSON, ok := projectionJSON(edgeSourceFiles)
 			if !ok {
-				return nil
+				return "", nil, false
 			}
 			candidateQueries = append(candidateQueries, `SELECT e.id
   FROM edges e
@@ -435,7 +466,7 @@ JOIN nodes nt ON nt.id = e.to_id
 		if len(incidentNodeFiles) > 0 {
 			scopeJSON, ok := projectionJSON(incidentNodeFiles)
 			if !ok {
-				return nil
+				return "", nil, false
 			}
 			candidateQueries = append(candidateQueries, `SELECT e.id
   FROM nodes n
@@ -455,10 +486,18 @@ JOIN nodes nt ON nt.id = e.to_id
 		q = `WITH candidate_edges(id) AS (
 ` + strings.Join(candidateQueries, "\n  UNION\n  ") + `
 )
-` + fmt.Sprintf(projection, `candidate_edges ce JOIN edges e ON e.id = ce.id`)
+` + fmt.Sprintf(projection, `candidate_edges ce CROSS JOIN edges e ON e.id = ce.id`)
 	} else {
 		q = fmt.Sprintf(projection, `edges e`) + ` AND e.kind IN (` + inPlaceholders(len(uniq)) + `)`
 		args = appendKinds(args)
+	}
+	return q, args, true
+}
+
+func (s *Store) crossRepoCandidates(baseKinds []graph.EdgeKind, repoPrefixes, edgeSourceFiles, incidentNodeFiles []string) []graph.CrossRepoCandidateRow {
+	q, args, ok := crossRepoCandidatesQuery(baseKinds, repoPrefixes, edgeSourceFiles, incidentNodeFiles)
+	if !ok {
+		return nil
 	}
 	rows, err := s.db.Query(q, args...)
 	if err != nil {

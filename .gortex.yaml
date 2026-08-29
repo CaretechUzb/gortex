@@ -20,6 +20,41 @@ index:
     - "results/**"
   workers: 8
 
+  # Which framework passes may run, and where their edges may land.
+  #
+  # This list is NOT a local preference — it is load-bearing for the whole
+  # daemon. MultiIndexer.allowedFrameworks (internal/indexer/framework_gate.go:35)
+  # UNIONS every tracked repo's list to decide which passes EXECUTE, and
+  # frameworkgate.Union returns "allow everything" the moment one repo is
+  # unconfigured (internal/frameworkgate/frameworkgate.go, Union). This repo
+  # was that one repo: six of seven tracked repos narrow to [odoo], and gortex
+  # alone re-admitted all ~55 passes for the whole workspace. Measured cost of
+  # that on the shared Odoo workspace: ~235s per global synthesis pass burnt by
+  # godot-connection, celery-dispatch, sql-callsite, grpc-stub, react-setstate,
+  # flutter-setstate and rails-resolve, all emitting zero edges.
+  #
+  # The names below are exactly the passes that emit into this repo, counted
+  # from the live store rather than guessed:
+  #   fn-value-callback 5352 · value-ref 4459 · gin-middleware 14
+  #   fastapi-resolve 5 · observer-channel 1
+  # Every other registered pass emits nothing here.
+  #
+  # Not gated by this list, and so not lost by narrowing it: the Go-AST route
+  # pass and the per-line httpPatterns table, which are hard-wired in extract
+  # rather than registered (internal/contracts/framework_registry.go:161-166).
+  # This repo's 43 http:: and 9 grpc:: contract nodes come from those.
+  #
+  # Adding a fixture for a new framework means adding its pass here, or its
+  # edges will be gated out of this repo with no error. `analyze kind=frameworks`
+  # reports what is registered and which entries name nothing.
+  frameworks:
+    allow:
+      - fn-value-callback
+      - value-ref
+      - gin-middleware
+      - fastapi-resolve
+      - observer-channel
+
 watch:
   enabled: false
   paths:

@@ -31,6 +31,8 @@ Two-tier config hierarchy:
 - **Global config** (`~/.gortex/config.yaml`) — projects, repo lists, active project, reference tags, and machine-level MCP policy
 - **Workspace config** (`.gortex.yaml` per repo) — guards, excludes, local overrides
 
+A workspace config is found by walking **up** from the tracked root and taking the first `.gortex.yaml`, so one file can configure several tracked repos at once. A deployment that tracks `<deploy>/src/odoo`, `<deploy>/src/addons` and `<deploy>/src/local` separately declares its frameworks and excludes once at `<deploy>/.gortex.yaml`; a checkout that needs to differ still wins by keeping its own file, since the walk starts at the root itself. The walk stops before `$HOME` and before the filesystem root — `~/.gortex/config.yaml` is already the machine-level layer, and a stray `.gortex.yaml` in a home directory silently reconfiguring every repo beneath it would be a trap rather than a feature. `gortex config exclude list` resolves the file the same way, so what it reports is what indexing uses.
+
 Excludes are layered — builtin → the repo's `.gitignore` chain → global → per-repo entry → workspace — with gitignore semantics. `.gitignore` is respected by default so you don't have to re-declare entries already curated for git; opt out per-workspace with `respect_gitignore: false` in `.gortex.yaml`. Use `!pattern` in a later layer to re-include something an earlier layer excluded. Beyond `.gitignore`, the index walk also honors per-directory `.gortexignore` files (Gortex's own ignore file, a sibling to `.gitignore`) and ripgrep's `.ignore` / `.rgignore` — each scoped to the directory that contains it.
 
 When a tracked root sits below its git root — the monorepo case, `gortex track repo/projects/App` with the repository at `repo/` — every `.gitignore` from the git root down to the tracked root applies, as it would for git, with ancestor patterns re-anchored onto the tracked root. A deeper file overrides a shallower one, so a `!pattern` next to your code still wins over the repository-wide rule. Ancestor patterns that describe a sibling subtree are dropped, and so is one that would ignore the tracked root itself: you asked Gortex to index that directory explicitly.
@@ -67,6 +69,42 @@ projects:
 ```
 
 The embedded MCP fallback is a machine-level, default-off policy. Enable `mcp.allow_embedded` only in the user-level config; see [Daemon availability and embedded fallback](mcp.md#daemon-availability-and-embedded-fallback).
+
+### Framework allow-list across repositories
+
+`index.frameworks.allow` narrows which framework passes run (see
+[features.md](features.md)). It resolves differently for the two layers,
+because they have different scopes:
+
+```yaml
+# .gortex.yaml
+index:
+  frameworks:
+    allow: [odoo, celery-dispatch]   # absent/empty = all; `none` = none
+```
+
+* **Route passes** run per repository during extraction, so each
+  repository honours its own list exactly.
+* **The dispatch synthesizers and claiming resolvers** run once over the
+  shared graph. Whether a pass *executes* is the **union** of every
+  tracked repository's list — a framework narrowed away in repository A
+  still runs if repository B allows it, otherwise A's setting would strip
+  B's edges and B never opted out. Where that pass may *write* is decided
+  separately, per edge: an edge is attributed to the repository owning its
+  **source** node, and it is dropped unless that repository's own list
+  admits the pass.
+
+So each repository gets exactly what it asked for. Given four Odoo
+checkouts with `allow: [odoo]` alongside an unconfigured repository, the
+Go and React passes still run — for the unconfigured repository — but land
+no edges in the four that excluded them.
+
+`analyze kind=frameworks` reports each pass's effective state, naming the
+admitting repositories when they disagree, and the global pass logs
+`repo_gated` with the number of edges refused this way. Setting the key in
+the global `~/.gortex/config.yaml` narrows the workspace as a whole, which
+stops the excluded passes from running at all rather than merely confining
+their output.
 
 `synthesize_external_calls: true` (opt-in, default off — set in `.gortex.yaml` or the global config) makes the resolver synthesize placeholder nodes for calls into un-indexed external packages or sibling services, so call-chains keep the external hop instead of terminating at the indexed boundary.
 
@@ -163,6 +201,43 @@ gortex config exclude add testdata/ --repo backend  # Write to a RepoEntry
 gortex config exclude remove pkg/generated          # Remove from the same target
 ```
 
+### Tracking a repository into an existing workspace
+
+`gortex track` indexes the new repository and then re-runs the
+workspace-wide derivation passes in the background — framework dispatch
+synthesis, cross-repo edges, inferred implements/overrides, test and
+capability edges.
+
+That second step is not optional bookkeeping. Those passes attribute every
+derived edge to the repository owning its **source** node, so the edges
+that bind a newly tracked repo to the rest of the workspace belong to its
+*siblings*, not to it. Deriving only the tracked repo would leave them
+missing: an `untrack` + `track` of a shared dependency in a five-repo Odoo
+workspace was measured dropping that repo from 912,448 edges to 402,411,
+with no later daemon restart recovering them — a warm restart sees nodes
+already on disk and skips the passes.
+
+The pass costs minutes on a large workspace, so `track` returns before it
+finishes and `gortex daemon status` reports it:
+
+```
+state   ready (warmup 7m11s); deriving workspace edges (recently tracked repos not yet fully bound)
+```
+
+Queries work throughout; edges **into** the newly tracked repository are
+incomplete until the row goes quiet. A burst of tracks — `gortex daemon
+reload` adopting several repos — collapses into a bounded number of passes
+rather than one per repository.
+
+The pass holds the gates a repository mutation needs, so it yields to one
+rather than making it wait: a `track`, an `untrack`, a batch transition, or
+a daemon shutdown arriving mid-derivation cancels it at the next pass
+boundary and it re-runs afterwards. `daemon status` keeps reporting
+`deriving workspace edges` across the handover. Without that a single
+`gortex untrack` issued during a derivation waited the whole pass out —
+19.7 minutes on a two-repository workspace, with `gortex daemon stop`
+having to force-kill.
+
 ### Deleted checkouts
 
 Tracking outlives the directory: nothing removes a repo entry when you
@@ -179,6 +254,86 @@ it: `daemon status` reconciles the live indexer registry against
 `~/.gortex/config.yaml`, so a repo the daemon could not load shows as
 `not indexed` rather than dropping out of one view while the other keeps
 listing it.
+
+### Worktrees of a tracked repository
+
+A `git worktree` has its own root directory, so tracking one registers an
+independent repository with its own prefix — two prefixes over one body
+of code. Gortex recognises the relationship: repositories that resolve to
+the same main checkout form a **checkout group**, and no pass will bind a
+reference in one member to a definition in another.
+
+That gate matters because the two trees are byte-identical, so every
+name-keyed pass otherwise finds a second, equally good definition of
+every symbol and has no reason to prefer the right one. Lexical order
+usually picks the wrong one: measured on a 117k-node Odoo repository
+tracked alongside a worktree of itself, ~190k edges crossed into the
+worktree — model references, view inheritance, JS imports, even classes
+that "extended" themselves in the other checkout — and 1,909 of them were
+promoted to `cross_repo_*` relationships that reported boundary crossings
+that never happened.
+
+What the grouping changes:
+
+- A reference resolves inside its own checkout. Only when the asking
+  repository declares nothing does the lookup leave it, and it then skips
+  its own worktrees and considers genuinely separate repositories only.
+- `cross_repo_*` edges are never minted between members, and
+  `Edge.CrossRepo` is never set on an edge between them.
+- The cross-repo candidate pass is skipped entirely when every tracked
+  prefix belongs to one checkout group — there is nothing it could find.
+
+Genuine multi-repository setups are unaffected: two directories holding
+identical files are two repositories unless git says they share a
+checkout, and cross-repository resolution between them works as before.
+
+The grouping is recomputed whenever a repository is tracked, untracked,
+or reconciled, and is never persisted — untracking a worktree stops it
+being anyone's sibling immediately. Edges minted **before** a worktree was
+recognised are not retro-actively removed; reindexing (or re-tracking)
+the repository clears them.
+
+#### Naming a worktree instance
+
+A worktree tracked as its own instance gets a `<base>@<tag>` prefix, where
+the tag is the repo's declared workspace slug when that differs from the
+base, else the checked-out branch, else a short hash of the path
+(`WorktreeInstanceName`). `--name` overrides the whole derivation and is
+stored verbatim, so it is the only path that can produce a prefix the
+sanitizer never saw.
+
+That matters because a prefix is not a label. It is the first segment of
+every node ID the repository contributes (`<prefix>/<path>::<Symbol>`) and
+it is persisted to the global config, so a path separator inside one makes
+the boundary between "which repository" and "which file" ambiguous for
+everything that splits an ID. `gortex track` therefore refuses a `--name`
+outside `[A-Za-z0-9._@-]` — `@` stays legal because it is the instance
+separator itself. A name that reached the config by a hand-edit is dropped
+at daemon start with a warning naming the path and the reason: one
+repository is skipped, the daemon still starts, and every other repository
+stays queryable.
+
+Prefer a short, stable id over the branch name. Branch names are renamed,
+reused across forks, and mostly carry slashes, and the prefix is repeated
+in every symbol id in every result you read — `local@DEV-1284` beats
+`local@feat-DEV-1284-stock-quant-supplier-column`.
+
+#### Work only in worktrees you have tracked
+
+A session's scope comes from its working directory, and `ScopeForCWD`
+picks the **longest tracked root containing** that directory. A worktree
+that is not itself tracked but sits under a tracked repository therefore
+binds the session to the *enclosing* repository, and locate-intent tools
+— which default to the current repo — answer from it without any error.
+Measured on a deployment that tracks `docker-env` and its submodule
+separately: a session opened in an untracked worktree under `docker-env/`
+searched for an Odoo model and got a hit from `docker-env/tasks.py`, out
+of a 63-file graph, while the 120k-node graph it meant to search sat one
+directory away.
+
+A directory outside every tracked root fails closed instead, with the
+structured `repo_not_tracked` error. The nested case is the one to watch,
+because it looks like it worked.
 
 ### Empty indexes
 

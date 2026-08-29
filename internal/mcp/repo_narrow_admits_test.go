@@ -73,3 +73,29 @@ func TestRepoNarrowPredicatesAgree(t *testing.T) {
 		}
 	}
 }
+
+// TestRepoNarrowAdmitsNode covers the node-aware form every caller
+// holding a *graph.Node must use: it agrees with query.ScopeAllows that
+// a shared rendezvous node survives a narrow aimed at another repo.
+func TestRepoNarrowAdmitsNode(t *testing.T) {
+	allow := map[string]bool{"local": true}
+	tests := []struct {
+		name string
+		node *graph.Node
+		want bool
+	}{
+		{"nil node is rejected", nil, false},
+		{"in-scope symbol admitted", &graph.Node{Kind: graph.KindFunction, RepoPrefix: "local"}, true},
+		{"out-of-scope symbol rejected", &graph.Node{Kind: graph.KindFunction, RepoPrefix: "local@aurora"}, false},
+		{"prefix-less node admitted", &graph.Node{Kind: graph.KindFunction}, true},
+		{"sibling-minted contract admitted", &graph.Node{Kind: graph.KindContract, RepoPrefix: "local@aurora"}, true},
+		{"out-of-scope bridge rejected", &graph.Node{Kind: graph.KindContractBridge, RepoPrefix: "local@aurora"}, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := repoNarrowAdmitsNode(allow, tc.node); got != tc.want {
+				t.Fatalf("repoNarrowAdmitsNode(%v, %v) = %v, want %v", allow, tc.node, got, tc.want)
+			}
+		})
+	}
+}

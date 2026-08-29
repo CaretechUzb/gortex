@@ -42,6 +42,24 @@ case "$GORTEX_STUB_MODE" in
 esac
 `
 
+// nodeTestHookTimeoutMS is the bridge call budget these tests render.
+//
+// It is not the shipped 5000 ms, and the difference is the whole point.
+// callHook is fail-open by contract: a bridge that does not answer inside
+// the budget lets the tool through. So every case below that asserts a
+// decision took EFFECT (block, tip, orient) is only really asserting that
+// `/bin/sh` got scheduled in time — a property of the machine, not of the
+// bridge. Under `go test -race ./...` it is routinely false: both
+// TestPluginBehaviourUnderNode/block and
+// TestPluginEnvelopeMatchesTheBridgeContract failed that way, and both
+// reproduce exactly, message for message, by rendering a 1 ms budget
+// instead. The bridge was correct every time.
+//
+// Widening it here weakens nothing. The three fail-open cases (crash,
+// garbage, empty) do not depend on the budget at all, and the shipped
+// default is still asserted through renderPlugin everywhere else.
+const nodeTestHookTimeoutMS = 120_000
+
 // driver exercises every hook the plugin exposes and reports what
 // happened, so one node run covers the whole surface.
 const driver = `import { GortexPlugin } from "./gortex.mjs";
@@ -151,7 +169,8 @@ func TestPluginBehaviourUnderNode(t *testing.T) {
 			env, _ := agentstest.NewEnv(t)
 			env.Mode = agents.ModeGlobal
 			env.HookCommand = stub + " hook"
-			if err := os.WriteFile(filepath.Join(dir, "gortex.mjs"), []byte(renderPlugin(env)), 0o644); err != nil {
+			if err := os.WriteFile(filepath.Join(dir, "gortex.mjs"),
+				[]byte(renderPluginWithHookTimeout(env, nodeTestHookTimeoutMS)), 0o644); err != nil {
 				t.Fatal(err)
 			}
 			if err := os.WriteFile(filepath.Join(dir, "driver.mjs"), []byte(driver), 0o644); err != nil {
@@ -216,7 +235,8 @@ func TestPluginEnvelopeMatchesTheBridgeContract(t *testing.T) {
 	env, _ := agentstest.NewEnv(t)
 	env.Mode = agents.ModeGlobal
 	env.HookCommand = stub + " hook"
-	if err := os.WriteFile(filepath.Join(dir, "gortex.mjs"), []byte(renderPlugin(env)), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "gortex.mjs"),
+		[]byte(renderPluginWithHookTimeout(env, nodeTestHookTimeoutMS)), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "driver.mjs"), []byte(driver), 0o644); err != nil {
