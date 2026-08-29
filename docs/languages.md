@@ -114,7 +114,9 @@ Recent extraction refinements (each covered by a per-feature CI golden): Java `@
 `module` / `baremodule` index as `KindType` nodes (the graph's `KindModule`
 is reserved for ecosystem packages) and carry the module's `export` list in
 `Meta["exports"]` — including exported macros and operators, recorded
-verbatim (`export @m, ⊗` records `@m` and `⊗`); definitions, constants and
+verbatim (`export @m, ⊗` records `@m` and `⊗`) — and the Julia 1.11
+`public` list in `Meta["public"]` (public-without-reexport, operators
+included); definitions, constants and
 nested modules inside a module get `member_of` edges to it.
 Node ids stay flat — the enclosing module rides on `Meta["scope_mod"]`, the
 Rust `mod` convention — and two definitions that would collide on one id
@@ -162,6 +164,15 @@ indented signature block Julia's convention opens a docstring with.
 
 What is **not** covered:
 
+- **Calls inside anonymous functions and do-blocks**
+  (`double = x -> f(x)`, `map(xs) do y g(y) end`) attribute to the
+  ENCLOSING function — source locality outranks a closure node for the
+  graph's consumers, so the closure itself mints no node. A short-form
+  definition nested in a block (`nested() = 1`) is still its own node.
+- **`@enum` members** are not extracted — the macro generates the enum
+  type and its member constants at runtime.
+- **`@.`** records no macro edge (a target named `.` is meaningless);
+  calls inside its arguments edge normally.
 - **Operator calls in infix position** (`a + b`) — dispatch on operators is
   not statically attributable. Explicit call syntax (`Base.:+(a, b)`) is a
   normal call.
