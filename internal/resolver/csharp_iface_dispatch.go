@@ -779,9 +779,16 @@ func csharpAliasComparableForms(alias string) []string {
 // ability to NOTICE a second construction arriving through an inherited
 // interface or a base class, and to refuse on it.
 //
-// So the walk can only ever remove filtering power, never add it. That
-// keeps the existing conservative rules intact and makes every outcome
-// change here a preserved edge rather than a dropped one.
+// The precise guarantee is that the TARGET filter is monotonically
+// weakened: this function returns either the same string the old
+// direct-stamp read produced or "". The END-TO-END edge set is not a
+// strict superset, because the family loop also reads a bound member's
+// stamp as the SOURCE side's receiver construction — a member whose
+// stamp is refused here sends its sites to the receiver-declared
+// fallback instead, whose verdict can differ. In the shapes measured
+// the fallback is the more correct one: the old source-side read
+// painted one arbitrary closure over a multi-closure type, the same
+// defect this walk fixes on the target side.
 func csharpUniqueClosureToIface(sub, ifaceID string, implEdges map[string]map[string][]string) string {
 	// The implementor's own base list. Absent, ambiguous, or unstamped
 	// means there is nothing to filter on, exactly as before.
@@ -805,12 +812,18 @@ func csharpUniqueClosureToIface(sub, ifaceID string, implEdges map[string]map[st
 		cur := queue[0]
 		queue = queue[1:]
 		for to, closures := range implEdges[cur] {
-			if to == ifaceID && cur != sub {
-				for _, c := range closures {
-					if c != direct {
-						return ""
+			if to == ifaceID {
+				if cur != sub {
+					for _, c := range closures {
+						if c != direct {
+							return ""
+						}
 					}
 				}
+				// Never walk THROUGH the interface: its supertypes are
+				// not paths to it, and a collision-merged cycle above it
+				// would otherwise read as a disagreeing second path.
+				continue
 			}
 			if !visited[to] {
 				visited[to] = true
