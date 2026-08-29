@@ -1579,3 +1579,28 @@ end
 	assert.True(t, calls["mseg.jl::work -> unresolved::A.B.m"],
 		"an any-depth qualified macro receiver decodes")
 }
+
+// A parametric constructor callee can nest — `Vector{Tuple{Int,String}}` —
+// and a nested parameter list may be broken across lines. Canonicalising
+// only the outer list left the inner `{…}` as raw source, so a newline in
+// it leaked into the unresolved target. Every level is rebuilt from
+// children.
+func TestJuliaExtractor_NestedParametrizedConstructorCallee(t *testing.T) {
+	src := []byte("build(x) = Vector{Tuple{Int,\n    String}}(x)\n" +
+		"nested(x) = Dict{String,Vector{Int}}(x)\n")
+	res, err := NewJuliaExtractor().Extract("np.jl", src)
+	require.NoError(t, err)
+
+	calls := map[string]bool{}
+	for _, ed := range res.Edges {
+		if ed.Kind == graph.EdgeCalls {
+			calls[ed.From+" -> "+ed.To] = true
+		}
+		require.NotContains(t, ed.To, "\n", "a target must never carry a line break")
+		require.NotContains(t, ed.To, " ", "a canonical type target carries no whitespace")
+	}
+	assert.True(t, calls["np.jl::build -> unresolved::Vector{Tuple{Int,String}}"],
+		"a nested parametric callee is canonicalised at every level")
+	assert.True(t, calls["np.jl::nested -> unresolved::Dict{String,Vector{Int}}"],
+		"a nested type parameter keeps its own parameters")
+}

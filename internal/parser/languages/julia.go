@@ -753,7 +753,10 @@ func juliaParametrizedCallee(n *sitter.Node, src []byte) (name, receiver string)
 		if c := n.NamedChild(i); c != nil && c.Type() == "curly_expression" {
 			for j, jcount := 0, int(c.NamedChildCount()); j < jcount; j++ {
 				if p := c.NamedChild(j); p != nil {
-					params = append(params, p.Content(src))
+					// Canonicalise nested type parameters so a nested `{…}`
+					// split across lines cannot leak a newline into the
+					// target.
+					params = append(params, juliaCanonType(p, src))
 				}
 			}
 		}
@@ -783,6 +786,49 @@ func juliaMacroReceiver(n *sitter.Node, src []byte) string {
 		return recv + "." + name
 	}
 	return ""
+}
+
+// juliaCanonType renders a type expression to a single-line canonical
+// spelling, rebuilding any nested `{…}` parameter list from its children
+// so source formatting — inner spaces, or a parameter list split across
+// lines — cannot leak into a constructor-callee target.
+func juliaCanonType(n *sitter.Node, src []byte) string {
+	if n == nil {
+		return ""
+	}
+	switch n.Type() {
+	case "parametrized_type_expression":
+		head := juliaCanonType(n.NamedChild(0), src)
+		var params []string
+		for i, count := 1, int(n.NamedChildCount()); i < count; i++ {
+			c := n.NamedChild(i)
+			if c == nil || c.Type() != "curly_expression" {
+				continue
+			}
+			for j, jcount := 0, int(c.NamedChildCount()); j < jcount; j++ {
+				if p := c.NamedChild(j); p != nil {
+					params = append(params, juliaCanonType(p, src))
+				}
+			}
+		}
+		if len(params) > 0 {
+			return head + "{" + strings.Join(params, ",") + "}"
+		}
+		return head
+	case "field_expression":
+		name, recv := juliaCalleeName(n, src)
+		if name == "" {
+			return strings.Join(strings.Fields(n.Content(src)), "")
+		}
+		if recv == "" {
+			return name
+		}
+		return recv + "." + name
+	default:
+		// identifier, operator, a literal type parameter — collapse any
+		// internal whitespace so a line break cannot survive.
+		return strings.Join(strings.Fields(n.Content(src)), "")
+	}
 }
 
 // juliaSignatureCall peels the wrappers a definition head can carry until
