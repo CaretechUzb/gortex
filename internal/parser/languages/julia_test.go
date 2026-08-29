@@ -1504,3 +1504,25 @@ end
 	assert.True(t, owners["modm.jl::Inner.g"]["modm.jl::Inner"],
 		"a nested module receiver resolves in its own lexical scope")
 }
+
+// Julia lowers a documented constant through the same @doc mechanism:
+// `@doc "text" const X = 1`. The object is a const_statement, not a bare
+// assignment, so walkMacroArgs has to dispatch it AS const or both the
+// constant and its documentation vanish.
+func TestJuliaExtractor_ExplicitDocOnConstant(t *testing.T) {
+	src := []byte(`@doc "Tuning knob." const K = 42
+`)
+	res, err := NewJuliaExtractor().Extract("dc.jl", src)
+	require.NoError(t, err)
+
+	var k *graph.Node
+	for _, n := range res.Nodes {
+		if n.ID == "dc.jl::K" {
+			k = n
+		}
+	}
+	require.NotNil(t, k, "the documented constant must mint its variable node")
+	assert.Equal(t, graph.KindVariable, k.Kind)
+	assert.Equal(t, "Tuning knob.", k.Meta["doc"],
+		"the constant keeps the docstring the explicit @doc form carries")
+}

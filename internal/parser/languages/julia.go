@@ -336,6 +336,17 @@ func (e *JuliaExtractor) walkMacroArgs(n *sitter.Node, src []byte, scope juliaSc
 				// `@doc "text" f(x) = x` documents a short-form
 				// definition, which arrives as a plain assignment.
 				e.handleAssignment(a, src, scope, st, false, doc)
+			case "const_statement":
+				// `@doc "text" const X = 1` documents a constant, which
+				// arrives wrapped in a const_statement — dispatch its
+				// inner assignment AS const, the shape walkFrom gives a
+				// top-level constant, so neither the constant nor its doc
+				// is dropped.
+				for inner := range a.NamedChildren() {
+					if inner.Type() == "assignment" {
+						e.handleAssignment(inner, src, scope, st, true, doc)
+					}
+				}
 			default:
 				// Walk a macro argument the way the generic walker
 				// would, dispatching the argument's own kind before
