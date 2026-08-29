@@ -171,12 +171,42 @@ func (s *Server) trackMutationTicket(ticket *indexer.MutationTicket) *mutationRe
 		receipt.result = result
 		receipt.completed = true
 		receipt.mu.Unlock()
+		if result.Err == nil && result.Reindexed {
+			s.resolveSupersededFailedReceipts(receipt)
+		}
 		close(receipt.done)
 		time.AfterFunc(mutationReceiptRetention, func() {
 			s.mutationReceipts.Delete(receipt.id)
 		})
 	}()
 	return receipt
+}
+
+// resolveSupersededFailedReceipts drops terminally failed receipts for a path
+// once a later generation of the same path has been applied successfully. The
+// graph then reflects newer bytes than the failed generation ever wrote, so
+// the stale failure no longer describes a real freshness gap — keeping it
+// would only fail freshness barriers that waiting cannot heal, because a
+// terminal error never completes differently. Pending receipts and failures
+// at or above the succeeded generation are left untouched.
+func (s *Server) resolveSupersededFailedReceipts(succeeded *mutationReceipt) {
+	succeededPath := filepath.Clean(succeeded.path)
+	s.mutationReceipts.Range(func(key, value any) bool {
+		other, ok := value.(*mutationReceipt)
+		if !ok || other == succeeded {
+			return true
+		}
+		if other.generation >= succeeded.generation || filepath.Clean(other.path) != succeededPath {
+			return true
+		}
+		other.mu.RLock()
+		terminalFailure := other.completed && (other.result.Err != nil || !other.result.Reindexed)
+		other.mu.RUnlock()
+		if terminalFailure {
+			s.mutationReceipts.Delete(key)
+		}
+		return true
+	})
 }
 
 func (r *mutationReceipt) outcome(pending bool) mutationReindexOutcome {
@@ -313,16 +343,19 @@ waitLoop:
 	}
 
 	issues := make([]string, 0, len(receipts))
+	hasTerminalFailure := false
 	for _, receipt := range receipts {
 		select {
 		case <-receipt.done:
 			outcome := receipt.outcome(false)
 			switch {
 			case outcome.Err != nil:
+				hasTerminalFailure = true
 				issues = append(issues, fmt.Sprintf(
 					"failed receipt=%s repo=%q path=%q generation=%d error=%q",
 					receipt.id, receipt.repo, receipt.path, receipt.generation, outcome.Err.Error()))
 			case !outcome.Reindexed:
+				hasTerminalFailure = true
 				issues = append(issues, fmt.Sprintf(
 					"failed receipt=%s repo=%q path=%q generation=%d error=%q",
 					receipt.id, receipt.repo, receipt.path, receipt.generation, "reindex not confirmed"))
@@ -351,6 +384,11 @@ waitLoop:
 			message += "; "
 		}
 		message += issue
+	}
+	if hasTerminalFailure {
+		message += "; terminally failed generations do not recover by waiting — " +
+			"they clear when a later mutation of the same path succeeds or when " +
+			"the receipt retention lapses"
 	}
 	return fmt.Errorf("%s", message)
 }
