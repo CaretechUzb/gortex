@@ -200,3 +200,47 @@ SELECT ?, ?, 0
 		repoPrefix, graph.EnrichProviderNone, repoPrefix)
 	return err
 }
+
+// RefreshEnrichmentProviders declares every provider that has ALREADY completed
+// a pass for this repo current as of the repo's content counter, and creates
+// nothing.
+//
+// The caller is the warm-restart gate that decides a repo needs no enrichment
+// at all because its whole-repo completion marker already records this clean
+// HEAD. That decision is the system asserting every applicable provider
+// finished for this revision; if it is trusted enough to skip minutes of hover
+// work, it is trusted enough to record what it certified.
+//
+// Without it, every store that carried enrichment rows written before the
+// content stamp existed would read "partial" the moment its legacy derive row
+// cleared — and stay there, because the very gate that would refresh it is the
+// one deciding not to run. A permanent false alarm on every upgraded install is
+// how a readiness column teaches people to ignore it.
+//
+// Two guards make this a renewal rather than an invention. indexed_sha <> ”
+// admits only providers that really completed a pass at some revision, so a row
+// declared applicable and never run keeps its zero — laundering that is the one
+// thing the applicability model exists to prevent. And the sentinels are
+// excluded: they are rollups, not providers.
+func (s *Store) RefreshEnrichmentProviders(repoPrefix string) (int, error) {
+	if repoPrefix == "" {
+		return 0, nil
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	res, err := s.execActiveWriteLocked(context.Background(), `
+UPDATE enrichment_state
+   SET content_gen = COALESCE((SELECT content_gen FROM repo_graph_gen WHERE repo_prefix = ?), 0),
+       gen         = COALESCE((SELECT gen         FROM repo_graph_gen WHERE repo_prefix = ?), 0)
+ WHERE repo_prefix = ? AND provider NOT IN (?, ?) AND indexed_sha <> ''`,
+		repoPrefix, repoPrefix, repoPrefix,
+		graph.EnrichProviderRepoMarker, graph.EnrichProviderNone)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, nil
+	}
+	return int(n), nil
+}

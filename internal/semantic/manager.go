@@ -668,6 +668,23 @@ func DeclareNoApplicableProviders(g graph.Store, repoPrefix string) {
 	_ = store.DeclareNoEnrichmentProvidersIfUnrecorded(repoPrefix)
 }
 
+// RefreshCompletedProviders records that a repo whose whole-repo completion
+// marker is already current needs no enrichment pass — so the providers that
+// completed one are current for its content too.
+//
+// The caller is the indexer's warm-restart gate, which declines to schedule
+// enrichment on exactly that evidence. Nothing downstream of that decline ever
+// reaches a provider, so this is the only place the assertion can be recorded,
+// and without it a store carrying pre-content-stamp enrichment rows reads
+// "partial" permanently.
+func RefreshCompletedProviders(g graph.Store, repoPrefix string) {
+	store, ok := g.(graph.EnrichmentApplicabilityStore)
+	if !ok {
+		return
+	}
+	_, _ = store.RefreshEnrichmentProviders(repoPrefix)
+}
+
 // observeContentGen reads the repo's content counter before a pass starts.
 //
 // Before, not after: enrichment runs with no write gate held, so the watcher

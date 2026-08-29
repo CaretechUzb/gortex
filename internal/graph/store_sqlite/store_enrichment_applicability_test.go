@@ -211,3 +211,66 @@ func minProviderGen(gens map[string]int64) int64 {
 	}
 	return out
 }
+
+// The upgrade path, and the false alarm it would otherwise deliver to every
+// existing install at once.
+//
+// A store written before the content stamp existed carries enrichment rows with
+// an indexed_sha and content_gen 0. Its legacy derive row makes the repo read
+// "unknown" until a real derive lands — and the moment it does, the enrichment
+// clause becomes live and reports "partial". Permanently: the warm-restart gate
+// that would refresh it is the same one deciding the repo needs no pass.
+func TestRefreshingCompletedProvidersClearsThePostUpgradeFalseAlarm(t *testing.T) {
+	t.Parallel()
+	store := openGenTestStore(t)
+	require.NoError(t, store.BulkSetFileMtimes("repoA", map[string]int64{"a.go": 1}))
+
+	// What the old code left behind: a completed pass with no content stamp.
+	require.NoError(t, store.SetEnrichmentState(graph.EnrichmentState{
+		RepoPrefix: "repoA", Provider: "go-types", IndexedSHA: "abc123", Coverage: 91,
+	}))
+	require.NoError(t, store.SetEnrichmentState(graph.EnrichmentState{
+		RepoPrefix: "repoA", Provider: graph.EnrichProviderRepoMarker, IndexedSHA: "abc123",
+	}))
+	gens, err := store.EnrichmentContentGens("repoA")
+	require.NoError(t, err)
+	require.Zero(t, gens["go-types"], "the pre-upgrade shape: complete, but unstamped")
+
+	n, err := store.RefreshEnrichmentProviders("repoA")
+	require.NoError(t, err)
+	require.Equal(t, 1, n, "the rollup marker is not a provider and is not counted")
+
+	gens, err = store.EnrichmentContentGens("repoA")
+	require.NoError(t, err)
+	require.Equal(t, int64(1), gens["go-types"])
+	require.Zero(t, gens[graph.EnrichProviderRepoMarker], "sentinels stay out of the verdict")
+
+	st, _, err := store.GetEnrichmentState("repoA", "go-types")
+	require.NoError(t, err)
+	require.Equal(t, "abc123", st.IndexedSHA, "a refresh renews currency, it does not rewrite provenance")
+	require.Equal(t, 91.0, st.Coverage)
+}
+
+// The one thing the refresh must not do, and the reason it keys on indexed_sha:
+// a provider declared applicable that has never completed a pass has nothing to
+// renew, and promoting it would bless the silent subset the whole model exists
+// to expose.
+func TestRefreshingNeverPromotesAProviderThatNeverRan(t *testing.T) {
+	t.Parallel()
+	store := openGenTestStore(t)
+	require.NoError(t, store.BulkSetFileMtimes("repoA", map[string]int64{"a.go": 1}))
+	require.NoError(t, store.DeclareEnrichmentProviders("repoA", []string{"go-types", "python-types"}))
+	require.NoError(t, store.SetEnrichmentState(graph.EnrichmentState{
+		RepoPrefix: "repoA", Provider: "go-types", IndexedSHA: "abc123",
+	}))
+
+	n, err := store.RefreshEnrichmentProviders("repoA")
+	require.NoError(t, err)
+	require.Equal(t, 1, n)
+
+	gens, err := store.EnrichmentContentGens("repoA")
+	require.NoError(t, err)
+	require.Equal(t, int64(1), gens["go-types"])
+	require.Zero(t, gens["python-types"], "declared applicable, never ran, still owed")
+	require.Zero(t, minProviderGen(gens), "so the repo is still not enriched")
+}

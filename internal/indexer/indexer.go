@@ -1217,6 +1217,12 @@ func (idx *Indexer) MaybeSeedPendingEnrich() bool {
 			reason = "enrichment state not persisted"
 		case current:
 			reason = "completion marker current"
+			// The marker says every applicable provider finished at this clean
+			// HEAD, which is why no pass is scheduled. Record that against the
+			// content counter here — nothing downstream ever reaches a provider
+			// to do it, and a store whose enrichment rows predate the content
+			// stamp would otherwise read "partial" forever.
+			semantic.RefreshCompletedProviders(idx.graph, idx.repoPrefix)
 		default:
 			// Known-incomplete. The marker is only trustworthy against
 			// committed content, so a dirty tree falls through to the ledger

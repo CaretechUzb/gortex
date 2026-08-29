@@ -1426,6 +1426,13 @@ type EnrichmentApplicabilityStore interface {
 	// pass what it returned to CompleteEnrichmentProvider after.
 	RepoContentGen(repoPrefix string) (int64, error)
 
+	// RefreshEnrichmentProviders renews the content stamp on providers that
+	// have already completed a pass, and creates nothing. For the warm-restart
+	// gate that skips a repo whose whole-repo completion marker is current: the
+	// skip is that assertion, and recording it is what stops an upgraded store
+	// from reading "partial" forever.
+	RefreshEnrichmentProviders(repoPrefix string) (int, error)
+
 	// DeclareNoEnrichmentProvidersIfUnrecorded is the additive-only form, for
 	// callers whose "nothing applies" is a weaker signal than the enrichment
 	// pass's own language census and so must never delete a real completion.
