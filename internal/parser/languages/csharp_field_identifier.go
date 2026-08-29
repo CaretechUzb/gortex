@@ -98,8 +98,14 @@ func emitCSharpFieldIdentifierUses(
 	}
 
 	// eligible resolves the enclosing owner and reports whether name is
-	// an unshadowed field of the owner's type.
-	eligible := func(line int, name string) (owner, ownerType string, ok bool) {
+	// an unshadowed field of the owner's type. Sites carrying a byte
+	// offset ask the shadow question at their own coordinate — a lambda
+	// parameter or foreach variable elsewhere in the method must not
+	// delete a genuine field read outside its extent. A site with no
+	// coordinate (offset < 0: the assignment buffer) keeps the
+	// function-wide question, which can only withhold a read, never
+	// invent one.
+	eligible := func(line, offset int, name string) (owner, ownerType string, ok bool) {
 		owner = funcRanges.enclosing(line)
 		if owner == "" {
 			return "", "", false
@@ -108,11 +114,11 @@ func emitCSharpFieldIdentifierUses(
 		if ownerType == "" || !fieldsByType[ownerType][name] {
 			return "", "", false
 		}
-		// This emitter's three input buffers do not all carry a byte
-		// offset, so it asks the function-wide question. That is the
-		// pre-extent behavior and stays conservative: it can only
-		// withhold a read edge, never invent one.
-		if paramsByOwner[owner][name] || localScopes.shadowsAnywhere(owner, name) ||
+		shadowed := localScopes.shadowsAnywhere(owner, name)
+		if offset >= 0 {
+			shadowed = localScopes.shadows(owner, name, offset)
+		}
+		if paramsByOwner[owner][name] || shadowed ||
 			builtinsByOwner[owner][name] != "" {
 			return "", "", false
 		}
@@ -129,8 +135,8 @@ func emitCSharpFieldIdentifierUses(
 		kind  graph.EdgeKind
 	}
 	seen := map[siteKey]bool{}
-	emit := func(line int, name string, kind graph.EdgeKind) {
-		owner, ownerType, ok := eligible(line, name)
+	emit := func(line, offset int, name string, kind graph.EdgeKind) {
+		owner, ownerType, ok := eligible(line, offset, name)
 		if !ok {
 			return
 		}
@@ -152,7 +158,7 @@ func emitCSharpFieldIdentifierUses(
 		if !c.isMember || c.recvType != "" || !csharpBareIdentifier(c.receiver) {
 			continue
 		}
-		emit(c.line, c.receiver, graph.EdgeReads)
+		emit(c.line, c.offset, c.receiver, graph.EdgeReads)
 	}
 
 	for _, a := range accesses {
@@ -171,10 +177,10 @@ func emitCSharpFieldIdentifierUses(
 		if csharpAccessInCallPosition(a.node) {
 			continue
 		}
-		emit(a.line, recv.Content(src), graph.EdgeReads)
+		emit(a.line, int(a.node.StartByte()), recv.Content(src), graph.EdgeReads)
 	}
 
 	for _, fa := range fieldAssigns {
-		emit(fa.line, fa.name, graph.EdgeWrites)
+		emit(fa.line, -1, fa.name, graph.EdgeWrites)
 	}
 }
