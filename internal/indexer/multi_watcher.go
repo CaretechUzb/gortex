@@ -202,11 +202,15 @@ func (mw *MultiWatcher) Start() error {
 				if err == nil {
 					mw.configureGitWatcher(prefix, gw)
 				}
+				// Warn, not Debug: without a git watcher the repo has no path
+				// that restamps freshness after a checkout, so it reads stale
+				// for the life of the daemon. That is worth a line the default
+				// log level actually shows.
 				if err != nil {
-					mw.logger.Debug("git-watcher: init failed",
+					mw.logger.Warn("git-watcher: init failed; ref changes will not be reconciled",
 						zap.String("prefix", prefix), zap.Error(err))
 				} else if err := gw.Start(); err != nil {
-					mw.logger.Debug("git-watcher: start failed",
+					mw.logger.Warn("git-watcher: start failed; ref changes will not be reconciled",
 						zap.String("prefix", prefix), zap.Error(err))
 					_ = gw.Stop()
 				} else {
@@ -480,12 +484,23 @@ func (mw *MultiWatcher) AddRepo(repoPrefix string, cfg config.WatchConfig) error
 	mw.started[repoPrefix] = true
 	delete(mw.startFailures, repoPrefix)
 	if idx := mw.multi.GetIndexer(repoPrefix); idx != nil {
-		if gw, err := NewGitWatcher(meta.RootPath, idx, mw.logger.With(zap.String("repo", repoPrefix))); err == nil {
+		// A git watcher that fails to start leaves the repo reachable only
+		// through the per-file path, which cannot restamp freshness — so the
+		// repo reads stale forever. Silence made that indistinguishable from
+		// a watcher that was simply quiet, and cost a full misdiagnosis.
+		gw, err := NewGitWatcher(meta.RootPath, idx, mw.logger.With(zap.String("repo", repoPrefix)))
+		switch {
+		case err != nil:
+			mw.logger.Warn("git-watcher: init failed; ref changes will not be reconciled",
+				zap.String("prefix", repoPrefix), zap.Error(err))
+		default:
 			mw.configureGitWatcher(repoPrefix, gw)
-			if err := gw.Start(); err == nil {
-				mw.gitWatchers[repoPrefix] = gw
-			} else {
+			if err := gw.Start(); err != nil {
+				mw.logger.Warn("git-watcher: start failed; ref changes will not be reconciled",
+					zap.String("prefix", repoPrefix), zap.Error(err))
 				_ = gw.Stop()
+			} else {
+				mw.gitWatchers[repoPrefix] = gw
 			}
 		}
 	}
