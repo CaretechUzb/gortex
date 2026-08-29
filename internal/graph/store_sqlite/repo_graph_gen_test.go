@@ -79,6 +79,57 @@ func TestRepoGraphGenAdvancesBothEndsOfACrossRepoEdge(t *testing.T) {
 	require.Greater(t, readGen(t, store, "repoB"), genB, "the called repo gained an inbound edge")
 }
 
+// A node id is not a repository name. RepoPrefixOfID splits at the first '/',
+// which is right for a repo-owned id and wrong for every other id grammar, so
+// an unguarded upsert let synthetic namespaces accrue anchor rows without
+// limit -- 396 of them beside 7 real repositories on a live store, every one
+// of which bumpAllRepoGensTx then updates on every store-wide mutation.
+//
+// The rule that stops it is ownership. The half that matters just as much is
+// the second assertion: the repository owning the call site must still
+// advance, or the guard would have bought hygiene with a fail-open verdict.
+func TestSyntheticIDNamespacesNeverEarnAnAnchorRow(t *testing.T) {
+	t.Parallel()
+	store := openGenTestStore(t)
+	caller := genNode("repoA", "A")
+	store.AddBatch([]*graph.Node{caller}, nil)
+	genA := readGen(t, store, "repoA")
+	require.Positive(t, genA)
+
+	var before int
+	require.NoError(t, store.db.QueryRow(`SELECT COUNT(*) FROM repo_graph_gen`).Scan(&before))
+
+	// The shape the resolver writes by the thousand: a real symbol pointing at
+	// a target that lives in no repository. Each id below parses to a
+	// plausible-looking prefix that owns nothing.
+	for _, target := range []string{
+		"ext::go:database/sql::Bool",
+		"external::../a/apicontent.js::fetchContent",
+		"unresolved::odoo::jsmodule::@web/core::Component",
+	} {
+		store.AddBatch(nil, []*graph.Edge{{
+			From: caller.ID, To: target, Kind: graph.EdgeCalls,
+			FilePath: caller.FilePath, Line: 7,
+		}})
+	}
+
+	require.Greater(t, readGen(t, store, "repoA"), genA,
+		"the repository owning the call site really did change and must advance")
+
+	var after int
+	require.NoError(t, store.db.QueryRow(`SELECT COUNT(*) FROM repo_graph_gen`).Scan(&after))
+	require.Equal(t, before, after, "no synthetic namespace may create an anchor row")
+
+	for _, fragment := range []string{
+		"ext::go:database",
+		"external::..",
+		"unresolved::odoo::jsmodule::@web",
+	} {
+		require.Zero(t, readGen(t, store, fragment),
+			"%q is an id namespace, not a repository", fragment)
+	}
+}
+
 // The bump must belong to the caller's transaction, not merely run near it.
 // If it committed separately, a crash in the gap would leave a mutated graph
 // sitting at the old anchor -- and every stage stamped there would read
@@ -107,6 +158,13 @@ func TestRepoGraphGenBumpRollsBackWithItsTransaction(t *testing.T) {
 func TestRepoGraphGenBumpsOncePerRepoPerTransaction(t *testing.T) {
 	t.Parallel()
 	store := openGenTestStore(t)
+	// repoA has to own a node before it can be advanced: an anchor row is
+	// earned by ownership, so bumping a prefix the store has never seen now
+	// creates nothing. AddBatch takes writeMu, so it runs before the lock.
+	store.AddBatch([]*graph.Node{genNode("repoA", "A")}, nil)
+	before := readGen(t, store, "repoA")
+	require.Positive(t, before)
+
 	store.writeMu.Lock()
 	defer store.writeMu.Unlock()
 
@@ -115,7 +173,8 @@ func TestRepoGraphGenBumpsOncePerRepoPerTransaction(t *testing.T) {
 	require.NoError(t, bumpRepoGensTx(tx, []string{"repoA", "repoA", "repoA", ""}))
 	require.NoError(t, tx.Commit())
 
-	require.Equal(t, int64(1), readGen(t, store, "repoA"))
+	require.Equal(t, before+1, readGen(t, store, "repoA"),
+		"three mentions inside one transaction are one mutation")
 	require.Equal(t, int64(0), readGen(t, store, ""),
 		"the empty prefix is no repository and must never get an anchor row")
 }

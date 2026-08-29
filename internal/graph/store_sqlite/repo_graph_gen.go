@@ -50,15 +50,55 @@ import (
 // longer describes -- the exact silent wrong answer readiness exists to catch.
 
 // bumpRepoGensTx advances the anchor for each named repo inside the caller's
-// transaction. The upsert seeds a repo whose row does not exist yet (tracked
-// after the v13 migration ran), so no caller has to pre-create one.
+// transaction.
 //
 // Duplicate prefixes are collapsed first: one transaction is one mutation, and
 // a batch naming a repo twice must advance it once, not once per mention.
+//
+// Two statements rather than one upsert, because creating an anchor row and
+// advancing one need different levels of proof. Most prefixes arriving here
+// were PARSED out of a node id by RepoPrefixOfID, which splits at the first
+// '/'. That is right for a repo-owned id and wrong for every other id grammar:
+// a synthetic namespace containing a slash yields a fragment of itself.
+//
+//	ext::go:database/sql::Bool             ->  "ext::go:database"
+//	external::../a/apicontent.js::fetch    ->  "external::.."
+//	unresolved::odoo::jsmodule::@web/foo   ->  "unresolved::odoo::jsmodule::@web"
+//
+// RepoPrefixOfID says as much itself -- treat a non-empty result as unverified
+// until it matches a known prefix -- and an unconditional upsert skips exactly
+// that step. A live store accrued 403 anchor rows of which 7 were repositories.
+// The 396 others are not merely untidy: bumpAllRepoGensTx advances every row it
+// finds, so each store-wide mutation pays for all of them, indefinitely.
+//
+// The check is OWNERSHIP, read from the authoritative column rather than
+// guessed from the id's shape: a prefix earns a row by owning a node. On that
+// same store none of the 396 fragments owned one and all 7 repositories did.
+// Rejecting prefixes containing "::" would be only a proxy for that fact, and
+// would silently stop advancing a repo whose --name carried the separator --
+// trading a hygiene bug for a fail-open one.
+//
+// UPDATE runs first, so the ordinary path is one indexed write that never
+// consults nodes. The EXISTS seek is reached only when no row exists yet: once
+// per repository, and on each mention of a fragment, where nodes_by_repo makes
+// it an empty index seek rather than a scan.
+//
+// An existing row is always advanced, even for a repo that no longer owns a
+// node. Evicting a repo's last file is precisely when its anchor must move.
 func bumpRepoGensTx(tx *sql.Tx, prefixes []string) error {
 	for _, prefix := range dedupePrefixes(prefixes) {
-		if _, err := tx.Exec(`INSERT INTO repo_graph_gen (repo_prefix, gen) VALUES (?, 1)
-			ON CONFLICT(repo_prefix) DO UPDATE SET gen = repo_graph_gen.gen + 1`, prefix); err != nil {
+		res, err := tx.Exec(
+			`UPDATE repo_graph_gen SET gen = gen + 1 WHERE repo_prefix = ?`, prefix)
+		if err != nil {
+			return err
+		}
+		if affected, err := res.RowsAffected(); err == nil && affected > 0 {
+			continue
+		}
+		if _, err := tx.Exec(
+			`INSERT OR IGNORE INTO repo_graph_gen (repo_prefix, gen)
+				SELECT ?, 1 WHERE EXISTS (SELECT 1 FROM nodes WHERE repo_prefix = ?)`,
+			prefix, prefix); err != nil {
 			return err
 		}
 	}
@@ -164,11 +204,21 @@ func (s *Store) commitGraphMutation(tx *sql.Tx, changed bool, prefixes []string,
 // by every caller.
 func (s *Store) noteGraphMutation(ctx context.Context, changed bool, prefixes []string) error {
 	if changed {
+		// Same two-step ownership rule as bumpRepoGensTx -- see there for why a
+		// parsed prefix may advance an anchor but not conjure one.
 		for _, prefix := range dedupePrefixes(prefixes) {
+			res, err := s.execActiveWriteLocked(ctx,
+				`UPDATE repo_graph_gen SET gen = gen + 1 WHERE repo_prefix = ?`, prefix)
+			if err != nil {
+				return err
+			}
+			if affected, err := res.RowsAffected(); err == nil && affected > 0 {
+				continue
+			}
 			if _, err := s.execActiveWriteLocked(ctx,
-				`INSERT INTO repo_graph_gen (repo_prefix, gen) VALUES (?, 1)
-				ON CONFLICT(repo_prefix) DO UPDATE SET gen = repo_graph_gen.gen + 1`,
-				prefix); err != nil {
+				`INSERT OR IGNORE INTO repo_graph_gen (repo_prefix, gen)
+					SELECT ?, 1 WHERE EXISTS (SELECT 1 FROM nodes WHERE repo_prefix = ?)`,
+				prefix, prefix); err != nil {
 				return err
 			}
 		}
