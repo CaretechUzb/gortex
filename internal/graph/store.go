@@ -1376,6 +1376,55 @@ type EnrichmentStateStore interface {
 	SetEnrichmentState(state EnrichmentState) error
 }
 
+// Reserved provider keys in enrichment_state. Neither names a real semantic
+// provider, so neither can collide with one, and readiness excludes both from
+// its per-provider verdict.
+const (
+	// EnrichProviderRepoMarker records that EVERY applicable provider finished
+	// for a repo, so a warm restart can decide with one keyed lookup whether to
+	// resume. It is a rollup of the provider rows, not one of them.
+	EnrichProviderRepoMarker = "__repo__"
+
+	// EnrichProviderNone records that NO semantic provider applies to a repo --
+	// it has no supported languages, or enrichment is switched off. Without it,
+	// "nothing applies" and "nothing has been recorded yet" are the same empty
+	// row set, and readiness cannot tell a repo that needs no enrichment from
+	// one whose enrichment has never been looked at.
+	EnrichProviderNone = "__none__"
+)
+
+// EnrichmentApplicabilityStore records WHICH providers apply to a repo and how
+// far each has got, which is what lets readiness take the MINIMUM across them.
+//
+// Absence cannot carry that meaning on its own. If a missing row meant "does
+// not apply", a repo where python-types is current and go-types has never run
+// would look fully enriched -- one fresh provider masking a sibling that never
+// started. So the applicable set is written down before any of them runs, and a
+// provider that applies but has not completed is a visible gen-0 row.
+type EnrichmentApplicabilityStore interface {
+	// DeclareEnrichmentProviders makes providers the authoritative applicable
+	// set for a repo: each gains a row at content_gen 0 if it has none, rows
+	// for providers no longer in the set are dropped, and the EnrichProviderNone
+	// sentinel is written or cleared to match. An empty set means none apply.
+	DeclareEnrichmentProviders(repoPrefix string, providers []string) error
+
+	// CompleteEnrichmentProvider records that one provider finished a pass over
+	// content as of contentGen -- the value the caller observed BEFORE the pass
+	// started, because enrichment runs with no write gate and the watcher can
+	// reindex underneath it. The store clamps to the current counter and never
+	// moves a row backwards, so a caller cannot claim content it did not see.
+	CompleteEnrichmentProvider(repoPrefix, provider string, contentGen int64) error
+
+	// RepoContentGen reads the repo's content counter. Call it before a pass;
+	// pass what it returned to CompleteEnrichmentProvider after.
+	RepoContentGen(repoPrefix string) (int64, error)
+
+	// DeclareNoEnrichmentProvidersIfUnrecorded is the additive-only form, for
+	// callers whose "nothing applies" is a weaker signal than the enrichment
+	// pass's own language census and so must never delete a real completion.
+	DeclareNoEnrichmentProvidersIfUnrecorded(repoPrefix string) error
+}
+
 // DeriveState is the per-repo completion marker for the derived-pass tier:
 // implements/overrides inference, test edges, entry-point hierarchy,
 // capability edges, framework-dispatch synthesis, external-call placeholders

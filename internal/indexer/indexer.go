@@ -1194,6 +1194,12 @@ func (idx *Indexer) runDeferredEnrich() {
 // debug with the reason, since it is the ordinary warm-restart outcome.
 func (idx *Indexer) MaybeSeedPendingEnrich() bool {
 	if idx.semanticMgr == nil || !idx.semanticMgr.Enabled() || !idx.semanticMgr.HasProviders() {
+		// Nothing will enrich this repo in this configuration, and nothing else
+		// will ever say so: with no provider, EnrichAll -- which is what
+		// normally records a repo's applicable set -- is never reached. Record
+		// it here so readiness can report "no enrichment applies" instead of
+		// leaving the stage permanently unknown.
+		semantic.DeclareNoApplicableProviders(idx.graph, idx.repoPrefix)
 		return false
 	}
 	if idx.pendingEnrich.Load() {

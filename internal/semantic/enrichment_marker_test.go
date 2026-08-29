@@ -164,14 +164,24 @@ func TestEnrichAll_PartialWritesNoMarker(t *testing.T) {
 	assert.False(t, found, "a partial pass must NOT persist a completion marker")
 }
 
-// TestEnrichAll_DirtyWritesNoMarker: a non-partial pass over a DIRTY working
-// tree must persist NO completion marker. The pass enriched uncommitted
-// content, so its edges do not describe the committed state the HEAD sha names;
-// recording a marker keyed by that sha would be honored as authoritative once
-// the tree becomes clean at the same sha (enrichMarkerCurrent refuses to skip
-// while dirty but skips once clean), suppressing the re-enrichment the reverted
-// files need.
-func TestEnrichAll_DirtyWritesNoMarker(t *testing.T) {
+// TestEnrichAll_DirtyWritesNoShaMarkerButDoesStampContent: a non-partial pass
+// over a DIRTY working tree must persist no SHA marker — and must still record
+// the content generation it covered.
+//
+// The two halves of the row answer different questions and so obey different
+// rules. The sha marker claims "the committed state at SHA is enriched", which
+// a dirty pass makes a lie: it enriched uncommitted content, and the marker
+// would be honored as authoritative once the tree became clean at that same sha
+// (enrichMarkerCurrent refuses to skip while dirty but skips once clean),
+// suppressing the re-enrichment the reverted files need. The content stamp
+// claims only "these edges were built from the graph as of counter N", which is
+// true whatever the working tree looks like — and the next edit advances the
+// counter and re-stales it without anyone's help.
+//
+// Gating the content stamp on a clean tree instead would leave every repo with
+// uncommitted work reading "partial" forever, which contradicts the decision
+// that working-tree dirtiness is not a readiness input.
+func TestEnrichAll_DirtyWritesNoShaMarkerButDoesStampContent(t *testing.T) {
 	mgr, ran := markerManager(t)
 	g := newMarkerStore(t)
 
@@ -184,9 +194,15 @@ func TestEnrichAll_DirtyWritesNoMarker(t *testing.T) {
 	require.Len(t, results, 1)
 	assert.False(t, partial[markerRepo], "the pass completed non-partial")
 
-	_, found, err := g.GetEnrichmentState(markerRepo, "test-go")
+	st, found, err := g.GetEnrichmentState(markerRepo, "test-go")
 	require.NoError(t, err)
-	assert.False(t, found, "a dirty pass must NOT persist a completion marker")
+	require.True(t, found, "the content stamp lands even on a dirty tree")
+	assert.Empty(t, st.IndexedSHA,
+		"a dirty pass must NOT record the sha — that is what the skip gate reads")
+
+	gens, err := g.EnrichmentContentGens(markerRepo)
+	require.NoError(t, err)
+	assert.Contains(t, gens, "test-go", "the provider recorded the content it covered")
 }
 
 // TestEnrichAll_ForceEnvBypassesMarkerGate: GORTEX_WARMUP_FORCE_ENRICH=1
