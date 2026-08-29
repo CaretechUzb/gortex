@@ -223,7 +223,10 @@ func (s *Store) OrphanRepoPrefixes(known []string) []string {
 // to new. Every one is keyed by repo_prefix (+ file_path or provider), NOT
 // by node_id, so its row content survives a node-id change: file_mtimes /
 // files by (repo_prefix, file_path); repo_index_state / contract_state /
-// enrichment_state by repo_prefix (+ provider). At a solo->multi migration
+// enrichment_state / repo_graph_gen / derive_state by repo_prefix (+ provider).
+// The last two travel for the same reason the copy carries them: leaving them
+// behind would make a renamed repo read "never derived", sending a user to
+// re-run work that is already done. At a solo->multi migration
 // every ” row in these belongs to the one migrating repo — global externals
 // live in the NODES table and hold NO rows here — so moving them wholesale
 // is safe. UPDATE OR REPLACE folds any row the re-mint re-index already wrote
@@ -235,6 +238,8 @@ var rekeyMoveTables = []string{
 	"repo_index_state",
 	"enrichment_state",
 	"contract_state",
+	"repo_graph_gen",
+	"derive_state",
 }
 
 // rekeyDropTables are the sidecar tables RekeyRepoPrefix DROPS (rather than

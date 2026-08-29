@@ -501,6 +501,16 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 	// the repo at "never derived" for the length of the pass.
 	if state.multiIndexer != nil {
 		state.multiIndexer.SetRuntimeMarker(runtimeStateMarker{logger: logger})
+		// Publish the derive-relevant config hash immediately rather than
+		// waiting for the first derive: until it is there a reader has nothing
+		// to compare a stamped completion against and skips the clause, so a
+		// config change made while the daemon was down would go unreported for
+		// as long as the daemon stayed idle.
+		if hash := state.multiIndexer.DeriveConfigHash(); hash != "" {
+			_ = daemon.UpdateRuntimeState(func(st *daemon.RuntimeState) {
+				st.DeriveConfigHash = hash
+			})
+		}
 	}
 	fmt.Fprintf(cmd.ErrOrStderr(),
 		"[gortex daemon] listening on %s (pid %d)\n",

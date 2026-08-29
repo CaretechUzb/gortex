@@ -41,6 +41,16 @@ type RuntimeState struct {
 	// Symmetric with the derive markers, and needed for the same reason:
 	// enrichment counts toward readiness and is long-running.
 	EnrichingRepos []string `json:"enriching_repos,omitempty"`
+
+	// DeriveConfigHash is what this daemon's derive-relevant configuration
+	// hashes to right now — the framework allow-list and the external-call
+	// synthesis flags, which change derived output with no code change.
+	//
+	// Published here rather than recomputed by the reader because resolving it
+	// means merging the global config with every repo's own .gortex.yaml, and a
+	// second implementation of that merge would drift. A reader with no live
+	// daemon sees an empty string and skips the comparison instead of guessing.
+	DeriveConfigHash string `json:"derive_config_hash,omitempty"`
 }
 
 // IsDeriving reports whether a derived-pass run currently covers repoPrefix.

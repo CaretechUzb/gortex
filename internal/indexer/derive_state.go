@@ -1,8 +1,11 @@
 package indexer
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"sort"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -18,12 +21,51 @@ import (
 // nothing having failed.
 var errDeriveNoGraph = errors.New("global graph passes: indexer has no graph")
 
-// derivePassVersion is the semantic version of the derived-pass tier as a
+// DerivePassVersion is the semantic version of the derived-pass tier as a
 // whole. Bump it when a pass changes what it emits — a new synthesizer, a
 // corrected gate, a fixed inference — so that stores derived by the previous
 // build re-derive instead of reading current forever on a graph whose derived
-// edges this build would no longer produce.
-const derivePassVersion = 1
+// edges this build would no longer produce. The same contract
+// repo_index_state.extractor_versions carries for extraction.
+//
+// Exported because the readiness reader compares against it from outside this
+// package.
+const DerivePassVersion = 1
+
+const derivePassVersion = DerivePassVersion
+
+// DeriveConfigHash fingerprints the CONFIGURATION the derived passes run
+// under, so a config change invalidates a completion the way a code change
+// does. Today that is the framework allow-list, which decides which of ~55
+// synthesis passes execute at all — change it and the derived graph changes
+// with no code change, and a stamp that only versioned code would read "ready"
+// on edges the current config would never produce.
+//
+// The workspace-wide UNION is the right input, because that union is what
+// governs execution: a pass runs when any tracked repository allows it. A
+// durable lesson sits behind that — one unconfigured repository re-admits all
+// ~55 passes for everyone — so the hash has to move when a sibling's list
+// moves, not only when this repo's does.
+//
+// An unconfigured union hashes to the empty string rather than to the hash of
+// nothing. Empty means "no comparison to make", and the reader skips the clause
+// instead of accusing every repo of a config drift it cannot see.
+func (mi *MultiIndexer) DeriveConfigHash() string {
+	if mi == nil {
+		return ""
+	}
+	patterns := mi.allowedFrameworks().Patterns()
+	if len(patterns) == 0 {
+		return ""
+	}
+	sorted := make([]string, len(patterns))
+	copy(sorted, patterns)
+	sort.Strings(sorted)
+	// NUL-joined: a pattern cannot contain one, so no two distinct lists can
+	// collide by concatenation ("a","bc" vs "ab","c").
+	sum := sha256.Sum256([]byte(strings.Join(sorted, "\x00")))
+	return hex.EncodeToString(sum[:8])
+}
 
 // derivedCoverage lists the repos a global-pass run covers.
 //
@@ -109,11 +151,16 @@ func (mi *MultiIndexer) stampDeriveState(covered []string, scoped bool) {
 		return
 	}
 	reader, _ := graph.Store(mi.graph).(graph.RepoIndexStateReader)
+	// Hashed once for the whole run: the allow-list is a workspace-wide union,
+	// so every repo this run covered was derived under the same one, and the
+	// fold walks every tracked indexer.
+	configHash := mi.DeriveConfigHash()
 	completions := make([]graph.DeriveCompletion, 0, len(covered))
 	for _, prefix := range covered {
 		c := graph.DeriveCompletion{
 			RepoPrefix:  prefix,
 			PassVersion: derivePassVersion,
+			ConfigHash:  configHash,
 			Scoped:      scoped,
 		}
 		if reader != nil {
@@ -196,7 +243,7 @@ func (mi *MultiIndexer) refreshDeriveState(prefixes []string) {
 type RuntimeMarker interface {
 	// DeriveBegan opens a derived-pass run over exactly the named repos. An
 	// empty scope means the whole workspace.
-	DeriveBegan(scope []string)
+	DeriveBegan(scope []string, configHash string)
 	// DeriveEnded closes the run, whether it completed or was preempted. A
 	// marker left open would freeze a reader on "deriving…" until the daemon
 	// exits, so this must fire on every exit path.

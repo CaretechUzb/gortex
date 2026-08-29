@@ -215,3 +215,60 @@ func TestContentGenIsPerRepo(t *testing.T) {
 	require.Equal(t, int64(2), readContentGen(t, store, "repoA"))
 	require.Equal(t, int64(1), readContentGen(t, store, "repoB"))
 }
+
+// The route from partial back to ready that the system actually takes.
+//
+// The oracle above closes the gap with a fresh global derive, but in steady
+// state a saved file is repaired by the INCREMENTAL derive calling
+// RefreshDeriveState. That is how nearly every "ready" verdict a working
+// developer sees is produced, and nothing asserted it.
+//
+// Refresh advancing the stamp is a deliberate trust boundary, not an oversight.
+// The incremental passes run only the derived families one edit invalidated, so
+// "ready" afterwards asserts slightly more than they verified. The alternative
+// is worse: a repo would read "partial" from the first save until some later
+// daemon restart, so an actively-edited repo — the normal case — would sit
+// permanently below ready and the column would become noise. If the incremental
+// families are ever an unsound subset, that is a bug in the incremental derive
+// to fix there, not something readiness should paper over by crying wolf.
+//
+// The guard that carries the weight is the other half: refresh RENEWS a
+// completion and can never create one.
+func TestAnIncrementalDeriveRepairsTheStampButNeverCreatesOne(t *testing.T) {
+	t.Parallel()
+	store := openGenTestStore(t)
+
+	indexFiles(t, store, "repoA", map[string]int64{"a.go": 100})
+	require.NoError(t, store.StampDeriveState(
+		[]graph.DeriveCompletion{{RepoPrefix: "repoA", PassVersion: 1}}, 1700))
+
+	// A file is saved. The derive is stranded.
+	indexFiles(t, store, "repoA", map[string]int64{"a.go": 200})
+	derive, _, err := store.GetDeriveState("repoA")
+	require.NoError(t, err)
+	require.Less(t, derive.DerivedContentGen, readContentGen(t, store, "repoA"))
+
+	// The incremental derived passes run and renew it.
+	n, err := store.RefreshDeriveState([]string{"repoA"}, 1800)
+	require.NoError(t, err)
+	require.Equal(t, 1, n)
+
+	derive, _, err = store.GetDeriveState("repoA")
+	require.NoError(t, err)
+	require.Equal(t, readContentGen(t, store, "repoA"), derive.DerivedContentGen)
+	require.Equal(t, int64(1), derive.PassVersion,
+		"refresh renews currency, and must not restate what produced the completion")
+
+	// The repo that was never globally derived — the warmup-swallowed case.
+	// A saved file must not promote it out of "never derived" and into ready
+	// while implements inference, framework synthesis and cross-repo detection
+	// have still never run over it.
+	indexFiles(t, store, "swallowed", map[string]int64{"b.go": 100})
+	n, err = store.RefreshDeriveState([]string{"swallowed"}, 1800)
+	require.NoError(t, err)
+	require.Zero(t, n, "nothing to renew is the correct outcome, not a row to create")
+
+	_, found, err := store.GetDeriveState("swallowed")
+	require.NoError(t, err)
+	require.False(t, found)
+}

@@ -1640,6 +1640,22 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 	}
 
 	// The coverage claim, decided here beside the scope it is derived from.
+	//
+	// This function deliberately reads no generation. What the completion is
+	// stamped against is repo_graph_gen.content_gen, which only the indexer's
+	// file bookkeeping advances — never the derived passes' own edges, and never
+	// the semantic enrichment that follows them:
+	//
+	//	files indexed                 content_gen 3
+	//	these passes emit edges       content_gen 3   (gen moves; this does not)
+	//	completion stamped        ->  derived_content_gen 3
+	//	enrichment emits edges        content_gen 3   (gen moves; this does not)
+	//	readiness: 3 >= 3         ->  READY
+	//
+	// StampDeriveState reads it inside the transaction that writes the row, so
+	// no number travels from here and none can be supplied wrongly. See the
+	// repo_graph_gen block in store_sqlite/schema.go for why a single
+	// any-mutation counter cannot do this job.
 	// Returning it rather than letting each caller recompute it is the point:
 	// the scope rules live in this function, and a caller re-deriving them
 	// from the same inputs would stop agreeing the first time either moved,
@@ -1655,7 +1671,7 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 	// middle, and a marker left set would freeze the column on "deriving…"
 	// until the daemon exits.
 	if marker := mi.runtimeMarkerRef(); marker != nil {
-		marker.DeriveBegan(covered)
+		marker.DeriveBegan(covered, mi.DeriveConfigHash())
 		defer marker.DeriveEnded()
 	}
 

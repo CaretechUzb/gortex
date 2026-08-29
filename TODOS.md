@@ -70,3 +70,49 @@ so most of the data a merged-branch check needs is already collected.
 **Priority:** P3
 **Depends on:** Per-worktree tracking being the adopted workflow — without it
 this barely matters.
+
+## Readiness
+
+### Warn on queries against a not-ready repo
+
+**What:** MCP and CLI query paths consult the readiness verdict and warn, or
+refuse under a flag.
+
+**Why:** "who uses this" returns a silent subset against an underived repo
+today. The `READY` column on `gortex repos` makes that detectable for the first
+time, but the column is advisory — a user has to know to run `repos` first, and
+an agent asking the graph a question has no reason to. The real fix is for the
+answer itself to carry the caveat.
+
+**Context:** The verdict is `readyVerdict` in `cmd/gortex/repos_ready.go`. It is
+pure, and its inputs come from `store_sqlite.ReadReadinessStates` plus the
+daemon runtime record — one read-only open, no control socket — so the same
+inputs are available to any surface. Open design questions: warn always, or
+refuse under a flag; per-tool or global; and how an agent surfaces the warning
+through the response envelope without it being ignored like every other
+advisory field.
+
+**Effort:** M
+**Priority:** P2
+**Depends on:** the `READY` column, which supplies the verdict.
+
+### Surface readiness in `gortex daemon status`
+
+**What:** Add derive / enrichment fields to `TrackedRepoStatus`
+(`internal/daemon/proto.go`, today `Files, Nodes, Edges, LastIndex, Memory,
+Missing, Unloaded`) and render them in `renderDaemonRepos`
+(`cmd/gortex/daemon.go`, labels from `repoStateLabel`).
+
+**Why:** Two commands disagreeing about repo health is worse than one command
+being incomplete. `daemon status` is where a user looks first.
+
+**Context:** `StatusResponse` already carries a workspace-wide
+`DerivingWorkspace bool` (`proto.go`, from `WorkspaceRederivePending()`); the
+per-repo dimension is what is missing. Caveat: this path goes over the control
+socket and fails when the daemon is busy — which is exactly when readiness
+matters, and is why `gortex repos` reads the store directly and was the right
+first home. This complements that rather than replacing it.
+
+**Effort:** M
+**Priority:** P3
+**Depends on:** the `READY` column, for the verdict and its vocabulary.

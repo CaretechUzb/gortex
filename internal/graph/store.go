@@ -1401,6 +1401,13 @@ const (
 // would look fully enriched -- one fresh provider masking a sibling that never
 // started. So the applicable set is written down before any of them runs, and a
 // provider that applies but has not completed is a visible gen-0 row.
+// CopiedReadinessRestamper declares a subgraph copy's carried stage stamps
+// current for the destination checkout, once that checkout's own file
+// bookkeeping has been written. See store_sqlite.RestampCopiedReadiness.
+type CopiedReadinessRestamper interface {
+	RestampCopiedReadiness(dstPrefix string) error
+}
+
 type EnrichmentApplicabilityStore interface {
 	// DeclareEnrichmentProviders makes providers the authoritative applicable
 	// set for a repo: each gains a row at content_gen 0 if it has none, rows

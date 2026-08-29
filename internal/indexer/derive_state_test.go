@@ -213,13 +213,17 @@ func TestRefreshDeriveStateOnlyRenewsWhatTheGlobalPassesEstablished(t *testing.T
 
 // fakeMarker records the marker calls a run makes, in order.
 type fakeMarker struct {
-	opened    [][]string
-	closes    int
-	enriching [][]string
+	opened     [][]string
+	configHash []string
+	closes     int
+	enriching  [][]string
 }
 
-func (f *fakeMarker) DeriveBegan(scope []string) { f.opened = append(f.opened, scope) }
-func (f *fakeMarker) DeriveEnded()               { f.closes++ }
+func (f *fakeMarker) DeriveBegan(scope []string, configHash string) {
+	f.opened = append(f.opened, scope)
+	f.configHash = append(f.configHash, configHash)
+}
+func (f *fakeMarker) DeriveEnded() { f.closes++ }
 func (f *fakeMarker) EnrichingChanged(r []string) {
 	f.enriching = append(f.enriching, r)
 }

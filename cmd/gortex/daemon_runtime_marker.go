@@ -22,13 +22,21 @@ type runtimeStateMarker struct {
 	logger *zap.Logger
 }
 
-func (m runtimeStateMarker) DeriveBegan(scope []string) {
+func (m runtimeStateMarker) DeriveBegan(scope []string, configHash string) {
 	m.update(func(st *daemon.RuntimeState) {
 		st.DerivingSince = time.Now().Unix()
 		st.DerivingScope = scope
+		// Refreshed on every run, not written once at startup: tracking or
+		// untracking a repository changes the workspace-wide allow-list union,
+		// and a reader comparing against a stale hash would report a config
+		// drift that no longer exists.
+		st.DeriveConfigHash = configHash
 	})
 }
 
+// DeriveEnded clears the in-flight fields and deliberately leaves
+// DeriveConfigHash alone: it describes the configuration, not the run, and is
+// what a reader compares a stamped completion against long after the run ends.
 func (m runtimeStateMarker) DeriveEnded() {
 	m.update(func(st *daemon.RuntimeState) {
 		st.DerivingSince = 0

@@ -314,8 +314,14 @@ func (m *Manager) EnrichAll(g graph.Store, roots map[string]string, opts EnrichO
 		// Enrichment being switched off is a genuine "no provider applies", not
 		// an absence of information, and saying so is what keeps every repo on
 		// such an install from reading "unknown" forever.
+		//
+		// The ADDITIVE form, though. A config toggle is reversible, and the
+		// authoritative form would delete every completion — including each
+		// provider's indexed_sha — so flipping enrichment off and on again
+		// would cost a full re-enrichment of every repo for a setting that
+		// ended where it started.
 		for repoPrefix := range roots {
-			m.declareProviders(g, repoPrefix, nil)
+			DeclareNoApplicableProviders(g, repoPrefix)
 		}
 		return nil, partial, nil
 	}
@@ -595,6 +601,18 @@ func (m *Manager) declareApplicableProviders(
 	langProviders map[string]Provider,
 	repoLangs map[string]map[string]bool,
 ) {
+	if len(langProviders) == 0 {
+		// No provider is registered at all. That is a weaker claim than "this
+		// repo's languages match none of them" — a registry can be empty
+		// because it has not been populated yet — and the authoritative form
+		// below would delete every completion on the strength of it, with
+		// nothing left to restore them. Record only what an unrecorded repo is
+		// missing.
+		for repoPrefix := range roots {
+			DeclareNoApplicableProviders(g, repoPrefix)
+		}
+		return
+	}
 	for repoPrefix := range roots {
 		langs := repoLangs[repoPrefix]
 		seen := make(map[string]bool)
@@ -609,6 +627,9 @@ func (m *Manager) declareApplicableProviders(
 			}
 		}
 		sort.Strings(applicable)
+		// Authoritative: providers exist and this repo's languages match these
+		// ones, so a row for anything else is out of date and must go. This is
+		// the case the downward authority was written for.
 		m.declareProviders(g, repoPrefix, applicable)
 	}
 }

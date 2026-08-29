@@ -183,7 +183,7 @@ gortex untrack /path/to/repo        # Remove a repo from the workspace
 gortex mcp --track /path/to/repo    # Track additional repos on startup
 gortex mcp --project my-saas        # Set active project scope
 gortex status                       # Per-repo and per-project stats
-gortex repos                        # List tracked repos — head-commit SHA, last-indexed time, freshness
+gortex repos                        # List tracked repos — head-commit SHA, last-indexed time, freshness, readiness
 gortex repos --json                 # Same, machine-readable (for scripts / CI)
 
 # Stamp workspace / project slugs across tracked repos (migration helper)
@@ -248,6 +248,35 @@ true` under `--json`), `gortex status` and `gortex daemon status` mark the
 row `MISSING`, and `index_health` reports `tracked_repo_paths_ok: false`
 with the dead paths under `missing_repo_paths`. Each prints the
 `gortex untrack <path>` that clears it.
+
+### `FRESHNESS` is not `READY`
+
+`FRESHNESS` answers one question: is the index current with git HEAD? That is
+only the first of three per-repo stages. Afterwards the daemon runs the derived
+passes (implements, overrides, test edges, entrypoint hierarchy, capability
+edges, framework-dispatch synthesis, external-call placeholders, cross-repo
+edges) and, where the languages qualify, semantic enrichment. Until those
+finish, `who uses this` returns a subset — silently.
+
+The `READY` column is that missing signal, and it is composite:
+
+| value | meaning |
+|---|---|
+| `ready` | index, derived passes and enrichment all current |
+| `partial` | a stage is behind the indexed content |
+| `never derived` | the derived passes have never run for this repo |
+| `deriving…` / `enriching…` | that work is in flight right now |
+| `unknown` | the store predates derive tracking, or the row does |
+| `stale` / `not indexed` / `MISSING` | the index itself is the problem |
+
+`--json` carries the per-stage detail: `derived`, `derived_content_gen`,
+`repo_content_gen`, `repo_gen`, `enriched`, `enriched_content_gen`, and a
+`not_ready_reason` naming what to do.
+
+A repo can be `fresh` and not `ready` — that is the case the column exists for.
+It reads the store directly and issues no control request, so it still answers
+while the daemon is too busy to serve `gortex daemon status`, which is exactly
+when readiness matters.
 
 The repo also stays listed after a daemon restart that failed to index
 it: `daemon status` reconciles the live indexer registry against

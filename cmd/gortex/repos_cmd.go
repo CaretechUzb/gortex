@@ -17,6 +17,7 @@ import (
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/platform"
 	"github.com/zzet/gortex/internal/progress"
 	"github.com/zzet/gortex/internal/tui"
@@ -102,6 +103,39 @@ type repoStatus struct {
 	// go fresh again, so it is reported as its own state rather than
 	// collapsing into "stale" behind an empty HEAD (#312).
 	Missing bool `json:"missing,omitempty"`
+
+	// Ready is the composite verdict — index AND derived passes AND (where
+	// applicable) semantic enrichment all current. A string, not a bool: a
+	// bool with omitempty makes the positive case vanish from JSON and become
+	// indistinguishable from "no information", which is the trap IndexedDirty
+	// sits next to. See readyVerdict for the full ladder.
+	Ready string `json:"ready"`
+	// NotReadyReason names what to do about a Ready that is not "ready".
+	NotReadyReason string `json:"not_ready_reason,omitempty"`
+
+	// Derived is true when a derived-pass completion has been recorded.
+	Derived bool `json:"derived"`
+	// DerivedContentGen is the content generation those passes covered, and
+	// RepoContentGen is the repo's current one. The derive is behind when the
+	// first is less than the second.
+	DerivedContentGen int64 `json:"derived_content_gen"`
+	RepoContentGen    int64 `json:"repo_content_gen"`
+	// RepoGen is the graph-wide mutation counter — provenance, never the
+	// comparand. It tells a reader whether the graph has moved at all since the
+	// derive, as against whether the CONTENT has.
+	RepoGen int64 `json:"repo_gen"`
+	// DerivedCommit and DerivedAt are provenance for humans and are never
+	// compared against anything.
+	DerivedCommit string     `json:"derived_commit,omitempty"`
+	DerivedAt     *time.Time `json:"derived_at,omitempty"`
+
+	// Enriched is the semantic sub-verdict: current | stale | n/a | unknown.
+	// A string for the same reason Ready is.
+	Enriched string `json:"enriched"`
+	// EnrichedContentGen is the MINIMUM content generation across the repo's
+	// applicable providers — the minimum, so one fresh provider cannot speak
+	// for a sibling that never ran.
+	EnrichedContentGen int64 `json:"enriched_content_gen"`
 }
 
 func runRepos(cmd *cobra.Command, _ []string) error {
@@ -115,14 +149,22 @@ func runRepos(cmd *cobra.Command, _ []string) error {
 	// once, read-only, so a single open serves the whole list. A store that
 	// does not exist yet yields an empty map and every repo reports as never
 	// indexed; a store that exists but cannot be read fails the command.
-	indexStates, err := loadRepoIndexStates()
+	states, err := loadReadinessStates()
 	if err != nil {
 		return err
 	}
 
+	// The daemon's runtime record, read once. It names work in flight, so a
+	// repo mid-derive says "deriving…" rather than being accused of a missing
+	// one — and ReadRuntimeState discards a dead daemon's record wholesale, so
+	// a daemon killed mid-derive leaves no stuck marker behind.
+	runtime, runtimeLive := daemon.ReadRuntimeState()
+
 	entries := make([]repoStatus, 0, len(repos))
 	for _, r := range repos {
-		entries = append(entries, describeRepo(indexStates, len(repos), r))
+		entry := describeRepo(states.Index, len(repos), r)
+		applyReadiness(&entry, states, runtime, runtimeLive, config.ResolvePrefix(r), len(repos))
+		entries = append(entries, entry)
 	}
 	// Stable order regardless of config-file ordering so scripted
 	// diffs and the table stay deterministic.
@@ -142,24 +184,70 @@ func runRepos(cmd *cobra.Command, _ []string) error {
 	return renderReposTable(cmd, entries)
 }
 
-// loadRepoIndexStates reads the daemon's per-repo index-freshness rows
-// (the SQLite repo_index_state table) keyed by repo prefix. It opens the
-// backend store read-only so it is safe to run while a daemon holds the
-// same store.
+// loadReadinessStates reads index freshness and both later stages in one
+// read-only open of the daemon's SQLite backend, so it is safe to run while a
+// daemon holds the same store.
 //
-// "No store yet" is a legitimate empty answer and returns an empty map. A
-// store that exists but cannot be read — corrupt bytes, wrong permissions, a
-// schema the query cannot run against — is an error. Degrading those to an
-// empty map printed a confident "never indexed" for every repo, which reads as
-// a fact about the repos rather than a failure to look, and sends the user to
-// re-index work that is already done.
-func loadRepoIndexStates() (map[string]graph.RepoIndexState, error) {
+// "No store yet" is a legitimate empty answer. A store that exists but cannot
+// be read — corrupt bytes, wrong permissions, a schema the query cannot run
+// against — is an error. Degrading those to an empty result printed a confident
+// "never indexed" for every repo, which reads as a fact about the repos rather
+// than a failure to look, and sends the user to re-index work that is already
+// done.
+func loadReadinessStates() (store_sqlite.ReadinessStates, error) {
 	path := resolveReposBackendPath()
-	states, err := store_sqlite.ReadRepoIndexStates(path)
+	states, err := store_sqlite.ReadReadinessStates(path)
 	if err != nil {
-		return nil, fmt.Errorf("read index freshness from %s: %w", path, err)
+		return states, fmt.Errorf("read readiness state from %s: %w", path, err)
 	}
 	return states, nil
+}
+
+// applyReadiness fills in one entry's readiness fields. It resolves the store
+// rows and the runtime markers for this repo and hands both to readyVerdict,
+// which is where the actual decision lives — this function does lookup, not
+// judgement, so every verdict state stays reachable from a struct literal.
+func applyReadiness(
+	entry *repoStatus,
+	states store_sqlite.ReadinessStates,
+	runtime daemon.RuntimeState,
+	runtimeLive bool,
+	prefix string,
+	repoCount int,
+) {
+	repo, ok := states.Repos[prefix]
+	if !ok && repoCount == 1 {
+		// A single-repo (lone) index is keyed under the empty prefix, exactly
+		// as describeRepo already handles for freshness.
+		if lone, found := states.Repos[""]; found {
+			repo, prefix = lone, ""
+		}
+	}
+
+	in := readinessInputs{
+		deriveTable: states.DeriveTable,
+		enrichTable: states.EnrichTable,
+		repo:        repo,
+		passVersion: indexer.DerivePassVersion,
+	}
+	if runtimeLive {
+		in.deriving = runtime.IsDeriving(prefix)
+		in.enriching = runtime.IsEnriching(prefix)
+		in.configHash = runtime.DeriveConfigHash
+	}
+
+	entry.Derived = repo.DeriveFound
+	entry.DerivedContentGen = repo.Derive.DerivedContentGen
+	entry.RepoContentGen = repo.ContentGen
+	entry.RepoGen = repo.Gen
+	entry.DerivedCommit = repo.Derive.DerivedSHA
+	if repo.Derive.DerivedAt > 0 {
+		ts := time.Unix(repo.Derive.DerivedAt, 0)
+		entry.DerivedAt = &ts
+	}
+	entry.Enriched = enrichVerdict(in)
+	entry.EnrichedContentGen = repo.EnrichMinContentGen
+	entry.Ready, entry.NotReadyReason = readyVerdict(*entry, in)
 }
 
 // resolveReposBackendPath picks the store to read freshness from:
@@ -262,7 +350,7 @@ func renderReposTable(cmd *cobra.Command, entries []repoStatus) error {
 	t := table.NewWriter()
 	t.SetOutputMirror(out)
 	t.SetStyle(table.StyleLight)
-	t.AppendHeader(table.Row{"repo", "head", "indexed", "last indexed", "freshness", "path"})
+	t.AppendHeader(table.Row{"repo", "head", "indexed", "last indexed", "freshness", "ready", "path"})
 	t.SetColumnConfigs([]table.ColumnConfig{
 		{Number: 1, Align: text.AlignLeft},
 		{Number: 2, Align: text.AlignLeft},
@@ -270,6 +358,7 @@ func renderReposTable(cmd *cobra.Command, entries []repoStatus) error {
 		{Number: 4, Align: text.AlignLeft},
 		{Number: 5, Align: text.AlignLeft},
 		{Number: 6, Align: text.AlignLeft},
+		{Number: 7, Align: text.AlignLeft},
 	})
 
 	for _, e := range entries {
@@ -279,12 +368,14 @@ func renderReposTable(cmd *cobra.Command, entries []repoStatus) error {
 			shortSHA(e.IndexedCommit),
 			lastIndexedCell(e),
 			freshnessCell(e, tty),
+			readyCell(e, tty),
 			e.Path,
 		})
 	}
 	t.Render()
 
 	emitReposMissingHint(stderr, entries)
+	emitReposNotReadyHint(stderr, entries)
 	if tty {
 		emitReposSummary(stderr, entries)
 	}
@@ -367,6 +458,24 @@ func emitReposSummary(w interface{ Write([]byte) (int, error) }, entries []repoS
 	if missing > 0 {
 		stats = append(stats, progress.Stat(strconv.Itoa(missing), "missing", progress.StatBad))
 	}
+
+	// The readiness buckets ride below the freshness ones rather than replacing
+	// them: a repo can be a fresh index and still not be queryable, and
+	// collapsing the two would hide exactly that case.
+	ready, notReady := 0, 0
+	for _, e := range entries {
+		switch {
+		case e.Ready == readyLabelReady:
+			ready++
+		case readyBlocksQueries(e.Ready):
+			notReady++
+		}
+	}
+	stats = append(stats, progress.Stat(strconv.Itoa(ready), "ready", progress.StatGood))
+	if notReady > 0 {
+		stats = append(stats, progress.Stat(strconv.Itoa(notReady), "not queryable", progress.StatBad))
+	}
+
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "  "+progress.StatStrip(stats...))
 	fmt.Fprintln(w)
@@ -397,6 +506,62 @@ func lastIndexedCell(e repoStatus) string {
 // the label is colour-tiered (green/yellow/red) so the eye picks up risk
 // from a long list at a glance; non-TTY keeps the plain text so scripts
 // that grep for "stale" / "fresh" still match.
+// readyCell renders the composite readiness verdict for the table, mirroring
+// freshnessCell: colour-tiered on a TTY so the eye picks risk out of a long
+// list, and the BARE label off it, because scripts grep these values.
+func readyCell(e repoStatus, tty bool) string {
+	if !tty {
+		return e.Ready
+	}
+	style := progress.StyleOK
+	switch e.Ready {
+	case readyLabelMissing, readyLabelNotIndexed, readyLabelNeverDerived:
+		style = progress.StyleErr
+	case readyLabelReady:
+		style = progress.StyleOK
+	default:
+		// stale / partial / unknown / deriving… / enriching… — all recoverable,
+		// most of them on their own.
+		style = progress.StyleHint
+	}
+	return style.Render(e.Ready)
+}
+
+// emitReposNotReadyHint names the repos whose queries may quietly return less
+// than they should, and what to do about it.
+//
+// On stderr unconditionally, following emitReposMissingHint: this is the one
+// part of the output a user has to act on, so a scripted `gortex repos | grep …`
+// must still see it, and putting it on stdout would inject prose into the table
+// that same pipeline parses. Scripted callers read `ready` from --json.
+//
+// Deliberately narrow. Only "never derived" and "partial" mean an answer is
+// incomplete right now with no process already fixing it; listing "stale",
+// "deriving…" and "unknown" too would bury the two actionable states under the
+// ones that resolve themselves.
+func emitReposNotReadyHint(w interface{ Write([]byte) (int, error) }, entries []repoStatus) {
+	var blocked []repoStatus
+	for _, e := range entries {
+		if readyBlocksQueries(e.Ready) {
+			blocked = append(blocked, e)
+		}
+	}
+	if len(blocked) == 0 {
+		return
+	}
+	subject := "repo is not fully queryable"
+	if len(blocked) > 1 {
+		subject = "repos are not fully queryable"
+	}
+	fmt.Fprintf(w, "\n!! %d tracked %s — graph queries against them return a subset.\n",
+		len(blocked), subject)
+	for _, e := range blocked {
+		fmt.Fprintf(w, "     %-24s %s: %s\n", e.Name, e.Ready, e.NotReadyReason)
+	}
+	fmt.Fprintln(w, "   A daemon restart runs the derived passes for every tracked repo:")
+	fmt.Fprintln(w, "     gortex daemon restart")
+}
+
 func freshnessCell(e repoStatus, tty bool) string {
 	label := "fresh"
 	style := progress.StyleOK
