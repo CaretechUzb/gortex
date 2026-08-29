@@ -611,6 +611,13 @@ func (m *Manager) declareApplicableProviders(
 		for repoPrefix := range roots {
 			DeclareNoApplicableProviders(g, repoPrefix)
 		}
+		if m.logger != nil {
+			m.logger.Info("semantic: no enrichment provider is registered; "+
+				"recorded the no-provider sentinel where nothing was recorded yet",
+				zap.Int("repos", len(roots)),
+				zap.String("graph_type", fmt.Sprintf("%T", g)),
+			)
+		}
 		return
 	}
 	for repoPrefix := range roots {
@@ -652,15 +659,56 @@ var applicabilityMissOnce sync.Once
 // Naming the concrete type is the whole point: the indexer rebinds idx.graph
 // to an in-memory shadow and back while it works, so WHICH graph reaches a
 // pass is a real question with a real answer, and one worth printing.
+// durableStore resolves the store that outlives the graph this pass is running
+// against.
+//
+// The indexer mounts an in-memory shadow over the real store while it indexes
+// (graph.ShadowedStore), and enrichment runs inside that window. Content
+// written to the shadow is drained into the owner afterwards, so the edges a
+// provider adds do survive — but the per-repo bookkeeping tables have no
+// in-memory form at all. A state write addressed to the shadow is not merged
+// later; it is dropped when the shadow is, silently, because every writer
+// below type-asserts and returns on failure. That is exactly how a repo
+// enriched at track time came to report "enriched: unknown" forever.
+//
+// Shadows nest (a chunk shadow over a streaming disk target), so walk rather
+// than unwrap once. The bound is paranoia about a cycle, not a real case: a
+// pass must not hang here.
+func durableStore(g graph.Store) graph.Store {
+	for i := 0; i < 8; i++ {
+		shadow, ok := g.(graph.ShadowedStore)
+		if !ok {
+			return g
+		}
+		owner := shadow.ShadowOwner()
+		if owner == nil {
+			return g
+		}
+		g = owner
+	}
+	return g
+}
+
 func (m *Manager) applicabilityStore(g graph.Store) (graph.EnrichmentApplicabilityStore, bool) {
-	store, ok := g.(graph.EnrichmentApplicabilityStore)
+	resolved := durableStore(g)
+	store, ok := resolved.(graph.EnrichmentApplicabilityStore)
 	if !ok && m.logger != nil {
 		applicabilityMissOnce.Do(func() {
 			m.logger.Warn("semantic: this graph does not model enrichment applicability; "+
 				"readiness will report enrichment as unknown",
-				zap.String("graph_type", fmt.Sprintf("%T", g)))
+				zap.String("graph_type", fmt.Sprintf("%T", g)),
+				zap.String("durable_type", fmt.Sprintf("%T", resolved)))
 		})
 	}
+	return store, ok
+}
+
+// enrichmentStateStore is applicabilityStore's sibling for the sha-keyed
+// completion marker. It resolves through the same owner walk so the marker is
+// read back from the store it was written to — a reader that stops at the
+// shadow would find nothing and re-run every provider on every pass.
+func (m *Manager) enrichmentStateStore(g graph.Store) (graph.EnrichmentStateStore, bool) {
+	store, ok := durableStore(g).(graph.EnrichmentStateStore)
 	return store, ok
 }
 
@@ -678,6 +726,20 @@ func (m *Manager) declareProviders(g graph.Store, repoPrefix string, providers [
 			zap.Strings("providers", providers),
 			zap.Error(err),
 		)
+		return
+	}
+	if m.logger != nil {
+		// The positive half of applicabilityStore's report, and the reason it
+		// is per repo rather than once per process: a repo stuck on
+		// "enriched: unknown" has either no line here at all — nothing on its
+		// path ever declared applicability for it — or a line naming a graph
+		// that is not the durable store. Those are different faults with
+		// different fixes, and only the successful write tells them apart.
+		m.logger.Info("semantic: applicable enrichment providers declared",
+			zap.String("repo", repoPrefix),
+			zap.Strings("providers", providers),
+			zap.String("graph_type", fmt.Sprintf("%T", g)),
+		)
 	}
 }
 
@@ -691,7 +753,7 @@ func (m *Manager) declareProviders(g graph.Store, repoPrefix string, providers [
 // enrichment pass's own language census (it may simply not be populated yet),
 // so this must not be able to delete a completion the pass recorded earlier.
 func DeclareNoApplicableProviders(g graph.Store, repoPrefix string) {
-	store, ok := g.(graph.EnrichmentApplicabilityStore)
+	store, ok := durableStore(g).(graph.EnrichmentApplicabilityStore)
 	if !ok {
 		return
 	}
@@ -708,7 +770,7 @@ func DeclareNoApplicableProviders(g graph.Store, repoPrefix string) {
 // and without it a store carrying pre-content-stamp enrichment rows reads
 // "partial" permanently.
 func RefreshCompletedProviders(g graph.Store, repoPrefix string) {
-	store, ok := g.(graph.EnrichmentApplicabilityStore)
+	store, ok := durableStore(g).(graph.EnrichmentApplicabilityStore)
 	if !ok {
 		return
 	}
@@ -1091,7 +1153,7 @@ func (m *Manager) enrichMarkerCurrent(g graph.Store, repoPrefix, provider string
 	if rs.SHA == "" || rs.Dirty {
 		return false
 	}
-	store, ok := g.(graph.EnrichmentStateStore)
+	store, ok := m.enrichmentStateStore(g)
 	if !ok {
 		return false
 	}
@@ -1115,7 +1177,7 @@ func (m *Manager) recordEnrichMarker(g graph.Store, repoPrefix, provider string,
 	if rs.SHA == "" || rs.Dirty {
 		return
 	}
-	store, ok := g.(graph.EnrichmentStateStore)
+	store, ok := m.enrichmentStateStore(g)
 	if !ok {
 		return
 	}
@@ -1164,7 +1226,7 @@ func (m *Manager) RecordRepoEnrichmentComplete(g graph.Store, repoPrefix, sha st
 // yields (false, true): no positive evidence of completeness, but the backend
 // does persist state.
 func (m *Manager) RepoEnrichmentMarkerState(g graph.Store, repoPrefix, sha string) (current, persisted bool) {
-	store, ok := g.(graph.EnrichmentStateStore)
+	store, ok := m.enrichmentStateStore(g)
 	if !ok {
 		return false, false
 	}
