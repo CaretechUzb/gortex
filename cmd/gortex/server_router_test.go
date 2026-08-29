@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"sync"
@@ -253,6 +254,42 @@ func TestLocalExecutor_NullBodyRejected(t *testing.T) {
 	assert.Equal(t, 400, status)
 	assert.Contains(t, string(out), "invalid_json")
 	assert.False(t, handlerRan, "a JSON-null body must not run the handler")
+}
+
+// TestLocalExecutor_ErrorResponseUsesIsErrorTag pins the fix for a
+// second review round's finding #4: the local executor's response
+// must serialize the error flag as "isError" (matching the standard
+// ToolResponse / Streamable HTTP wrapToolResultAsJSONRPC contract),
+// not "is_error". A prior version of the response struct used the
+// wrong tag, so wrapToolResultAsJSONRPC's `json:"isError"` field
+// never matched, silently defaulting IsError to false — a genuine
+// tool error routed through the Streamable HTTP transport's
+// local-fast path was reported to the client as success.
+func TestLocalExecutor_ErrorResponseUsesIsErrorTag(t *testing.T) {
+	srv, exec := executorTestServer(t)
+	srv.MCPServer().AddTool(
+		mcp.NewTool("boom_tool", mcp.WithDescription("test")),
+		func(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return mcp.NewToolResultError("boom"), nil
+		},
+	)
+
+	out, status, err := exec(context.Background(), "boom_tool", []byte(`{}`))
+	require.NoError(t, err)
+	assert.Equal(t, 200, status)
+	assert.Contains(t, string(out), `"isError":true`, "must use the standard isError tag")
+	assert.NotContains(t, string(out), "is_error", "must not use the old snake_case tag")
+
+	var decoded struct {
+		IsError bool `json:"isError"`
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	require.NoError(t, json.Unmarshal(out, &decoded))
+	assert.True(t, decoded.IsError, "isError must round-trip through the standard tag")
+	require.Len(t, decoded.Content, 1)
+	assert.Equal(t, "boom", decoded.Content[0].Text)
 }
 
 // TestLocalExecutor_NestedArgumentsNullRejected covers the second null

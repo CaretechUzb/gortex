@@ -381,41 +381,61 @@ func (h *Handler) handleToolCall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Overlay session binding for the HTTP transport. The standard
-	// `Mcp-Session-Id` header (set by mcp-go's Streamable HTTP
-	// client) is preferred; a gortex-specific
-	// `X-Gortex-Overlay-Session` header takes precedence when
-	// callers want to scope an overlay to a session ID that differs
-	// from their MCP transport session (e.g. a CI harness that
-	// orchestrates several overlay scopes from one connection). A
-	// `?session_id=` query parameter is the final fallback so curl /
-	// integration tests can attach overlays without setting HTTP
-	// headers. The session ID flows through gortexmcp.WithSessionID
-	// so the MCP overlay middleware (overlay.go::wrapToolHandler)
-	// finds the right overlay snapshot. This MUST happen before the
-	// router decision below: the router's local-fast path threads ctx
-	// straight through to the in-process tool dispatch (including the
-	// deferred-tool promotion gate), so a session ID attached only
-	// after routing would leave that path evaluating the daemon's
-	// default surface instead of the caller's actual session policy.
+	// Session identity for the HTTP transport. `Mcp-Session-Id` (set
+	// by mcp-go's Streamable HTTP client) or the `?session_id=` query
+	// fallback (for curl / integration tests) is the caller's REAL
+	// session id — this is what gortexmcp.WithSessionID carries, and
+	// it MUST be the caller's actual identity: it drives
+	// effectiveSessionPolicy / every tool-policy gate, token-stats
+	// accounting, the agent registry, notes/memory scoping, and
+	// diagnostics subscriptions (see session_ctx.go). It must never be
+	// substituted with an unrelated selector — doing so previously let
+	// a session's own tool-policy gate be bypassed by pairing a
+	// restricted Mcp-Session-Id with a permissive
+	// X-Gortex-Overlay-Session, since both fed the same context value.
+	//
+	// `X-Gortex-Overlay-Session` is a NARROWER, separate override: it
+	// lets a caller scope overlay state (only) to a cohort id that
+	// differs from their own session — e.g. a CI harness orchestrating
+	// several overlay scopes from one connection. It flows through
+	// gortexmcp.WithOverlayCohortID, which only the overlay subsystem's
+	// own accessors consult (overlay.go::wrapToolHandler and friends);
+	// every other per-session subsystem keeps reading the real session
+	// id above, untouched by this header.
+	//
+	// Both attachments MUST happen before the router decision below:
+	// the router's local-fast path threads ctx straight through to the
+	// in-process tool dispatch (including the deferred-tool promotion
+	// gate), so attaching either only after routing would leave that
+	// path evaluating the daemon's default surface instead of the
+	// caller's actual session policy.
 	ctx := r.Context()
-	if sid := firstNonEmpty(
-		r.Header.Get("X-Gortex-Overlay-Session"),
-		r.Header.Get("Mcp-Session-Id"),
-		r.URL.Query().Get("session_id"),
-	); sid != "" {
+	if sid := firstNonEmpty(r.Header.Get("Mcp-Session-Id"), r.URL.Query().Get("session_id")); sid != "" {
 		ctx = gortexmcp.WithSessionID(ctx, sid)
 	}
+	if cohort := r.Header.Get("X-Gortex-Overlay-Session"); cohort != "" {
+		ctx = gortexmcp.WithOverlayCohortID(ctx, cohort)
+	}
 
-	// If a Router is wired, peek the body for `workspace` / `cwd`
-	// overrides and let the router
-	// decide local vs remote. Local path falls through to the
+	// Peek the body for `workspace` / `cwd` overrides. `cwd` is
+	// attached to ctx as the session's workspace boundary
+	// (gortexmcp.WithSessionCWD) regardless of whether a router is
+	// wired — the direct in-process dispatch below needs it exactly
+	// as much as the router's local-fast path does; a tool that reads
+	// the session's workspace boundary from context otherwise sees
+	// nothing and enforces no boundary at all.
+	scope, cwd := h.peekRouteContext(body, r)
+	if cwd != "" {
+		ctx = gortexmcp.WithSessionCWD(ctx, cwd)
+	}
+
+	// If a Router is wired, let it decide local vs remote using the
+	// scope/cwd peeked above. Local path falls through to the
 	// existing in-process tool dispatch below; remote path returns
 	// the proxied response verbatim. Only the proxy short-circuits
 	// — local routing reuses the legacy code so downstream features
 	// (combo / frecency / session state) keep working unchanged.
 	if h.router != nil && h.decision != nil {
-		scope, cwd := h.peekRouteContext(body, r)
 		outcome := h.decision.Decide(ctx, daemon.RouteInputs{
 			ToolName: toolName,
 			Body:     body,

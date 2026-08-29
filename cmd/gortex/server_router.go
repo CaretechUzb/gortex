@@ -10,6 +10,7 @@ import (
 
 	"github.com/zzet/gortex/internal/daemon"
 	gortexmcp "github.com/zzet/gortex/internal/mcp"
+	"github.com/zzet/gortex/internal/server"
 )
 
 // newLocalToolExecutor builds the daemon.LocalExecutor closure used by
@@ -133,17 +134,24 @@ func newLocalToolExecutor(srv *gortexmcp.Server, logger *zap.Logger) daemon.Loca
 			return out, 500, nil
 		}
 
-		// Mirror the same response shape the HTTP handler emits so
-		// the proxy and local paths are indistinguishable downstream.
-		resp := struct {
-			IsError bool             `json:"is_error,omitempty"`
-			Content []map[string]any `json:"content,omitempty"`
-		}{IsError: result.IsError}
+		// Reuse the SAME response type internal/server's HTTP handler
+		// and the Streamable HTTP transport's wrapToolResultAsJSONRPC
+		// both serialize/parse (server.ToolResponse: "content"/
+		// "isError") — not an independently-typed lookalike. A prior
+		// version of this struct tagged the error field "is_error"
+		// (snake_case); wrapToolResultAsJSONRPC only recognizes
+		// "isError" and silently defaults IsError to false on a
+		// mismatch, so a genuine tool error routed through the
+		// Streamable HTTP transport's local-fast path was reported to
+		// the client as a successful result. Sharing one type makes
+		// that class of drift a compile error instead of a silent
+		// wire-format bug.
+		resp := server.ToolResponse{IsError: result.IsError}
 		for _, c := range result.Content {
 			if tc, ok := c.(mcp.TextContent); ok {
-				resp.Content = append(resp.Content, map[string]any{
-					"type": "text",
-					"text": tc.Text,
+				resp.Content = append(resp.Content, server.ToolContent{
+					Type: "text",
+					Text: tc.Text,
 				})
 			}
 		}

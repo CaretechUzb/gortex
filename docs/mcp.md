@@ -525,7 +525,7 @@ Editor extensions push in-flight (unsaved) buffers as **overlays**. Gortex compo
 | `overlay_drop_branch` | Delete a named branch — refuses to drop the active branch or the implicit `main` |
 | `compare_branches` | Run `find_usages` / `get_callers` / `get_call_chain` / `get_dependencies` / `get_dependents` against two branches and report each side plus the delta |
 
-HTTP transport mirrors the surface at `/v1/overlay/sessions/*`; the `/v1/tools/<name>` entry point reads the overlay session from `Mcp-Session-Id` (preferred), `X-Gortex-Overlay-Session`, or `?session_id=`. Overlays are bound to their MCP session — when the session ends the overlay is dropped synchronously. Idle TTL is a fail-safe (default 30 m, configurable via `GORTEX_OVERLAY_IDLE_TTL`); every tool call against a live overlay refreshes it.
+HTTP transport mirrors the surface at `/v1/overlay/sessions/*`. The `/v1/tools/<name>` entry point resolves the caller's real session identity from `Mcp-Session-Id` (preferred) or `?session_id=` — this identity drives every per-session subsystem: tool-policy gating, token-stats accounting, notes/memory scoping, and so on. `X-Gortex-Overlay-Session`, when present, is a narrower, independent override that scopes *only* overlay state to a different cohort id than the caller's own session (e.g. a CI harness orchestrating several overlay scopes from one connection) — it never substitutes for the real session identity anywhere else. Overlays are bound to their cohort id — when the owning session ends the overlay is dropped synchronously. Idle TTL is a fail-safe (default 30 m, configurable via `GORTEX_OVERLAY_IDLE_TTL`); every tool call against a live overlay refreshes it.
 
 ## Speculative execution
 
