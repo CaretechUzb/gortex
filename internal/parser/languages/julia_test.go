@@ -1554,3 +1554,28 @@ end
 	assert.Equal(t, "real doc", docs["fd.jl::h"],
 		"Core.@doc still attaches, so the restriction is not over-broad")
 }
+
+// A module-qualified macro receiver can be a dotted chain, not just a bare
+// module: `Base.Threads.@spawn`, `A.B.@m`. Matching only a single
+// identifier base dropped these edges; the receiver is decoded from its
+// children to any depth, keeping the full qualification.
+func TestJuliaExtractor_MultiSegmentQualifiedMacroCall(t *testing.T) {
+	src := []byte(`function work(xs)
+    Base.Threads.@spawn compute(xs)
+    A.B.@m(xs)
+end
+`)
+	res, err := NewJuliaExtractor().Extract("mseg.jl", src)
+	require.NoError(t, err)
+
+	calls := map[string]bool{}
+	for _, ed := range res.Edges {
+		if ed.Kind == graph.EdgeCalls {
+			calls[ed.From+" -> "+ed.To] = true
+		}
+	}
+	assert.True(t, calls["mseg.jl::work -> unresolved::Base.Threads.spawn"],
+		"a two-segment qualifier keeps its full module path")
+	assert.True(t, calls["mseg.jl::work -> unresolved::A.B.m"],
+		"an any-depth qualified macro receiver decodes")
+}

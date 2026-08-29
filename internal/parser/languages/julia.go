@@ -764,6 +764,27 @@ func juliaParametrizedCallee(n *sitter.Node, src []byte) (name, receiver string)
 	return name, receiver
 }
 
+// juliaMacroReceiver decodes the receiver of a module-qualified macro
+// call (`Base.@time`, `Base.Threads.@threads`) into its dotted spelling,
+// from children rather than source text so a chain of any depth keeps its
+// full qualification. Returns "" when the receiver is not a name.
+func juliaMacroReceiver(n *sitter.Node, src []byte) string {
+	switch n.Type() {
+	case "identifier":
+		return n.Content(src)
+	case "field_expression":
+		name, recv := juliaCalleeName(n, src)
+		if name == "" {
+			return ""
+		}
+		if recv == "" {
+			return name
+		}
+		return recv + "." + name
+	}
+	return ""
+}
+
 // juliaSignatureCall peels the wrappers a definition head can carry until
 // it reaches the call_expression that names the definition. Three wrappers
 // occur, and they nest in either order:
@@ -1390,13 +1411,21 @@ func (e *JuliaExtractor) handleMacroCall(n *sitter.Node, src []byte, scope julia
 					emit(m.Content(src))
 				}
 			}
-		case "field_expression": // `Base.@time x`
+		case "field_expression": // `Base.@time x`, `Base.Threads.@threads x`
 			count := int(c.NamedChildCount())
 			if count < 2 {
 				continue
 			}
 			prop, base := c.NamedChild(count-1), c.NamedChild(0)
-			if prop.Type() != "macro_identifier" || base.Type() != "identifier" {
+			if prop.Type() != "macro_identifier" {
+				continue
+			}
+			// The receiver can be a bare module (`Base`) or a dotted
+			// chain (`Base.Threads`), decoded from its children to any
+			// depth so a multi-segment qualifier keeps its module instead
+			// of losing the edge.
+			receiver := juliaMacroReceiver(base, src)
+			if receiver == "" {
 				continue
 			}
 			name := ""
@@ -1408,12 +1437,18 @@ func (e *JuliaExtractor) handleMacroCall(n *sitter.Node, src []byte, scope julia
 			if name == "" {
 				continue
 			}
-			// `import Foo as F` then `F.@spawn ...`: name the module,
-			// not the file-local nickname, exactly as a qualified call
-			// callee does.
-			receiver := base.Content(src)
-			if module, ok := st.importAliases[juliaTypeKey(scope.modulePath, receiver)]; ok {
-				receiver = module
+			// `import Foo as F` then `F.@spawn ...`: name the module, not
+			// the file-local nickname, exactly as a qualified call callee
+			// does. An alias binds a single name, so only the leading
+			// segment of a dotted receiver can be one.
+			head, rest, dotted := strings.Cut(receiver, ".")
+			if module, ok := st.importAliases[juliaTypeKey(scope.modulePath, head)]; ok {
+				head = module
+			}
+			if dotted {
+				receiver = head + "." + rest
+			} else {
+				receiver = head
 			}
 			emit(receiver + "." + name)
 		}
