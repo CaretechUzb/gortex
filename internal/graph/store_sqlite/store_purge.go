@@ -38,6 +38,8 @@ var purgeSidecarTables = []string{
 	"symbol_fts_state",
 	"enrichment_state",
 	"contract_state",
+	"repo_graph_gen",
+	"derive_state",
 	"semantic_binding_types",
 	"clone_shingles",
 	"clone_corpus_state",
@@ -105,6 +107,15 @@ func (s *Store) PurgeRepo(prefix string) error {
 		return fmt.Errorf("store_sqlite: PurgeRepo edges: %w", err)
 	}
 	changed := len(ids) > 0
+	// Purging a repo also deletes every cross-repo edge that pointed INTO it,
+	// which mutates the graph of each repo those edges came from: their "who
+	// uses this" answers just changed. Advance every anchor before the loop
+	// below drops this repo's own repo_graph_gen row.
+	if changed {
+		if err := bumpAllRepoGensTx(tx); err != nil {
+			return fmt.Errorf("store_sqlite: PurgeRepo graph generation: %w", err)
+		}
+	}
 	for _, table := range purgeSidecarTables {
 		res, err := tx.Exec(`DELETE FROM `+table+` WHERE repo_prefix = ?`, prefix)
 		if err != nil {
@@ -123,10 +134,11 @@ func (s *Store) PurgeRepo(prefix string) error {
 		changed = true
 	}
 
-	if err := tx.Commit(); err != nil {
+	// Anchors were advanced above, ahead of the sidecar deletes, so this
+	// commit names no prefixes of its own.
+	if err := s.commitGraphMutation(tx, len(ids) > 0, nil, false); err != nil {
 		return err
 	}
-	s.finishAnalysisMutationLocked(len(ids) > 0)
 	if changed {
 		s.markMutationReceiptsIncompleteLocked()
 	}

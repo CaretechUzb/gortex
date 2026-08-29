@@ -244,6 +244,11 @@ func (s *Store) reindexEdgesSetTransactionLocked(ctx context.Context, batch []gr
 	for _, row := range inserts {
 		receipt.recordInserted(row.receiptEdge, true)
 	}
+	// This helper owns the transaction, so the durable anchor bump belongs
+	// here rather than at the caller's post-commit hook.
+	if err := bumpRepoGensTx(tx, repoPrefixesOfReindex(batch)); err != nil {
+		return stats, false, false, nil, err
+	}
 	if err := tx.Commit(); err != nil {
 		return stats, false, false, nil, err
 	}

@@ -74,14 +74,15 @@ func (s *Store) persistEdgeTerminalStamps(edges []*graph.Edge) (edgeTerminalStam
 			}
 			invalidatedAnalysis = true
 		}
-		if err := tx.Commit(); err != nil {
+		if err := s.commitGraphMutation(
+			tx, txChanged > 0, repoPrefixesOfEdges(edges[txStart:txEnd]), false,
+		); err != nil {
 			return stats, err
 		}
 		stats.changedRows += txChanged
 		if invalidatedAnalysis {
 			s.analysisGenerationPresent = false
 		}
-		s.finishAnalysisMutationLocked(txChanged > 0)
 	}
 	return stats, nil
 }

@@ -32,7 +32,7 @@ import (
 // index changes in a way an old on-disk DB would not already have, and append a
 // matching schemaMigrations entry describing how to bring an older store
 // forward (in place, or by rebuild).
-const currentSchemaVersion = 12
+const currentSchemaVersion = 13
 
 // schemaMigration is one forward step. Exactly one strategy applies:
 //   - rebuild=true: the change introduces structure/data that can only come
@@ -80,6 +80,67 @@ var schemaMigrations = []schemaMigration{
 	{version: 10, name: "rebuild vector corpus ownership and parents", inPlace: rebuildVectorCorpusSchema},
 	{version: 11, name: "add symbol FTS normalization state", inPlace: createSymbolFTSNormalizationStateTable},
 	{version: 12, name: "normalize dir column separators", inPlace: normalizeDirColumnSeparators},
+	// Nothing recorded per-repo derive completion before v13, and both
+	// readiness stages need an anchor an incremental reindex actually moves.
+	// Purely additive and mechanically seedable, so in-place rather than a
+	// rebuild: no existing row has to be re-derived from source.
+	{version: 13, name: "add per-repo graph generation and derive state", inPlace: createReadinessStateTables},
+}
+
+// createReadinessStateTables is the explicit v13 migration. schemaSQL owns the
+// canonical fresh-store definitions; this idempotent step brings an existing
+// store forward and seeds the rows readiness needs to tell "never derived"
+// apart from "derived before anything recorded derives".
+//
+// Every pre-v13 repo is seeded legacy=1. Derive completion was not persisted
+// anywhere before this table -- the passes only logged -- so stamping a
+// completion here would be inventing data about work this store cannot
+// confirm happened. Legacy rows deliberately render "unknown" until the next
+// real derive overwrites them.
+func createReadinessStateTables(tx *sql.Tx) error {
+	if _, err := tx.Exec(`CREATE TABLE IF NOT EXISTS repo_graph_gen (
+		repo_prefix TEXT PRIMARY KEY,
+		gen         INTEGER NOT NULL DEFAULT 0
+	) WITHOUT ROWID`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`CREATE TABLE IF NOT EXISTS derive_state (
+		repo_prefix  TEXT PRIMARY KEY,
+		derived_gen  INTEGER NOT NULL DEFAULT 0,
+		derived_sha  TEXT    NOT NULL DEFAULT '',
+		derived_at   INTEGER NOT NULL DEFAULT 0,
+		pass_version INTEGER NOT NULL DEFAULT 0,
+		config_hash  TEXT    NOT NULL DEFAULT '',
+		scoped       INTEGER NOT NULL DEFAULT 0,
+		legacy       INTEGER NOT NULL DEFAULT 0
+	) WITHOUT ROWID`); err != nil {
+		return err
+	}
+	// SQLite has no ADD COLUMN IF NOT EXISTS, and a duplicate ADD is a hard
+	// error that would roll the entire migration transaction back on a re-run.
+	var hasGen int
+	if err := tx.QueryRow(
+		`SELECT COUNT(*) FROM pragma_table_info('enrichment_state') WHERE name = 'gen'`,
+	).Scan(&hasGen); err != nil {
+		return err
+	}
+	if hasGen == 0 {
+		if _, err := tx.Exec(
+			`ALTER TABLE enrichment_state ADD COLUMN gen INTEGER NOT NULL DEFAULT 0`,
+		); err != nil {
+			return err
+		}
+	}
+	// OR IGNORE, not a bare INSERT: schemaSQL runs before the migration steps,
+	// so on a fresh store both tables already exist, and a re-run must not
+	// collide with -- or overwrite -- rows a real derive has since written.
+	if _, err := tx.Exec(`INSERT OR IGNORE INTO repo_graph_gen (repo_prefix, gen)
+		SELECT repo_prefix, 1 FROM repo_index_state`); err != nil {
+		return err
+	}
+	_, err := tx.Exec(`INSERT OR IGNORE INTO derive_state (repo_prefix, legacy)
+		SELECT repo_prefix, 1 FROM repo_index_state`)
+	return err
 }
 
 // normalizeDirColumnSeparators rebuilds the two generated dir columns whose

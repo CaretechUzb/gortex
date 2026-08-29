@@ -88,7 +88,9 @@ func (s *Store) persistSemanticNodeStamps(stamps []graph.SemanticNodeStamp) (sem
 			}
 			invalidatedAnalysis = true
 		}
-		if err := tx.Commit(); err != nil {
+		if err := s.commitGraphMutation(
+			tx, txChanged > 0, repoPrefixesOfStamps(stamps[txStart:txEnd]), false,
+		); err != nil {
 			return stats, err
 		}
 		stats.enriched += txEnriched
@@ -96,7 +98,6 @@ func (s *Store) persistSemanticNodeStamps(stamps []graph.SemanticNodeStamp) (sem
 		if invalidatedAnalysis {
 			s.analysisGenerationPresent = false
 		}
-		s.finishAnalysisMutationLocked(txChanged > 0)
 	}
 	return stats, nil
 }

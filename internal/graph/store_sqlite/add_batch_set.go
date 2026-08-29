@@ -721,12 +721,15 @@ func (s *Store) addBatchSetOriented(nodes []*graph.Node, edges []*graph.Edge) (s
 		}
 	}
 
-	if err := tx.Commit(); err != nil {
+	changed := stats.nodeRowsChanged > 0 || stats.edgeRowsInserted > 0
+	// The primary graph write path. Every repo whose nodes or edges are in
+	// this batch has its anchor advanced inside the same transaction, so a
+	// reader can never observe the new rows against the old generation.
+	touched := append(repoPrefixesOfNodes(nodes), repoPrefixesOfEdges(edges)...)
+	if err := s.commitGraphMutation(tx, changed, touched, false); err != nil {
 		return stats, err
 	}
 	committed = true
-	changed := stats.nodeRowsChanged > 0 || stats.edgeRowsInserted > 0
-	s.finishAnalysisMutationLocked(changed)
 	if changed {
 		s.mergeMutationReceiptLocked(receiptDelta)
 	}

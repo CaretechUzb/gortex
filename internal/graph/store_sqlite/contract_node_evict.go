@@ -83,13 +83,12 @@ func (s *Store) EvictContractNodesByIDs(ids []string) (nodesRemoved, edgesRemove
 		}
 		nodesRemoved += int(rows)
 	}
-	if err := tx.Commit(); err != nil {
+	changed := nodesRemoved > 0 || edgesRemoved > 0
+	if err := s.commitGraphMutation(tx, changed, repoPrefixesOfIDs(ids), false); err != nil {
 		panicOnFatal(err)
 		return 0, 0
 	}
 	committed = true
-	changed := nodesRemoved > 0 || edgesRemoved > 0
-	s.finishAnalysisMutationLocked(changed)
 	if changed {
 		s.markMutationReceiptsIncompleteLocked()
 	}

@@ -98,13 +98,12 @@ func (s *Store) RemoveEdgesExact(edges []*graph.Edge) int {
 		}
 		removed += int(rows)
 	}
-	if err := tx.Commit(); err != nil {
+	changed := removed > 0
+	if err := s.commitGraphMutation(tx, changed, repoPrefixesOfEdges(edges), false); err != nil {
 		panicOnFatal(err)
 		return 0
 	}
 	committed = true
-	changed := removed > 0
-	s.finishAnalysisMutationLocked(changed)
 	if changed {
 		s.markMutationReceiptsIncompleteLocked()
 	}

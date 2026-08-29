@@ -84,14 +84,15 @@ func (s *Store) markEdgesCrossRepo(edges []*graph.Edge) (changed, statements int
 			}
 			invalidatedAnalysis = true
 		}
-		if commitErr := tx.Commit(); commitErr != nil {
+		if commitErr := s.commitGraphMutation(
+			tx, txChanged > 0, repoPrefixesOfEdges(unique[txStart:txEnd]), false,
+		); commitErr != nil {
 			return changed, statements, commitErr
 		}
 		changed += txChanged
 		if invalidatedAnalysis {
 			s.analysisGenerationPresent = false
 		}
-		s.finishAnalysisMutationLocked(txChanged > 0)
 	}
 	return changed, statements, nil
 }

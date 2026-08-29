@@ -119,12 +119,11 @@ DELETE FROM nodes WHERE id IN (SELECT id FROM orphan)`,
 		result.NodesRemoved = int(rows)
 	}
 
-	if err := tx.Commit(); err != nil {
+	changed := result.EdgesRemoved > 0 || result.NodesRemoved > 0 || result.NodesChanged > 0 || result.EdgesAdded > 0
+	if err := s.commitGraphMutation(tx, changed, []string{replacement.RepoPrefix}, false); err != nil {
 		return graph.ContractOwnerReplaceResult{}, err
 	}
 	committed = true
-	changed := result.EdgesRemoved > 0 || result.NodesRemoved > 0 || result.NodesChanged > 0 || result.EdgesAdded > 0
-	s.finishAnalysisMutationLocked(changed)
 	if changed {
 		s.markMutationReceiptsIncompleteLocked()
 	}

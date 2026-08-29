@@ -42,12 +42,13 @@ WHERE kind IN (SELECT CAST(value AS TEXT) FROM json_each(?))`, kindsJSON)
 		panicOnFatal(err)
 		return 0
 	}
-	if err := tx.Commit(); err != nil {
+	// An edge-kind eviction deletes across every repository at once and never
+	// enumerates the rows it removed, so it cannot name the repos it touched.
+	changed := removed64 > 0
+	if err := s.commitGraphMutation(tx, changed, nil, true); err != nil {
 		panicOnFatal(err)
 		return 0
 	}
-	changed := removed64 > 0
-	s.finishAnalysisMutationLocked(changed)
 	if changed {
 		s.markMutationReceiptsIncompleteLocked()
 	}

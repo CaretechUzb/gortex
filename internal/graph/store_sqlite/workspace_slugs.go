@@ -81,14 +81,15 @@ func (s *Store) BackfillWorkspaceSlugsWithImpact(slugs []graph.WorkspaceSlug) gr
 		}
 		invalidatedAnalysis = true
 	}
-	if err := tx.Commit(); err != nil {
+	if err := s.commitGraphMutation(
+		tx, backfill.Changed > 0, repoPrefixesOfSlugs(slugs), false,
+	); err != nil {
 		panicOnFatal(err)
 		return graph.WorkspaceSlugBackfillResult{}
 	}
 	if invalidatedAnalysis {
 		s.analysisGenerationPresent = false
 	}
-	s.finishAnalysisMutationLocked(backfill.Changed > 0)
 	return backfill
 }
 

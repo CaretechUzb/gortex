@@ -66,6 +66,11 @@ func (s *Store) evictByPredicateResult(predicate string, arg any) (nodesRemoved,
 	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
 
 	ctx := context.Background()
+	// Ownership lives only on the rows about to be deleted, so read it first.
+	touched, err := evictionTouchedPrefixesTx(ctx, tx, predicate, arg)
+	if err != nil {
+		return 0, 0, err
+	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM semantic_binding_types WHERE `+predicate, arg); err != nil {
 		return 0, 0, err
 	}
@@ -98,14 +103,13 @@ func (s *Store) evictByPredicateResult(predicate string, arg any) (nodesRemoved,
 		}
 		invalidatedAnalysis = true
 	}
-	if err := tx.Commit(); err != nil {
+	if err := s.commitGraphMutation(tx, changed, touched, false); err != nil {
 		return 0, 0, err
 	}
 
 	if invalidatedAnalysis {
 		s.analysisGenerationPresent = false
 	}
-	s.finishAnalysisMutationLocked(changed)
 	if changed {
 		s.markMutationReceiptsIncompleteLocked()
 	}

@@ -187,7 +187,9 @@ func (s *Store) setEdgeProvenanceBatchSetOriented(batch []graph.EdgeProvenanceUp
 				err = updateErr
 				return
 			}
-			if commitErr := tx.Commit(); commitErr != nil {
+			if commitErr := s.commitGraphMutation(
+				tx, true, repoPrefixesOfProvenance(batch[start:end]), false,
+			); commitErr != nil {
 				err = commitErr
 				return
 			}
@@ -196,7 +198,6 @@ func (s *Store) setEdgeProvenanceBatchSetOriented(batch []graph.EdgeProvenanceUp
 				s.analysisGenerationPresent = false
 			}
 			s.edgeIdentityRevs.Add(int64(chunkChanged))
-			s.finishAnalysisMutationLocked(true)
 			totalChanged += chunkChanged
 		}()
 		if err != nil {

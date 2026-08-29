@@ -583,12 +583,22 @@ CREATE TABLE IF NOT EXISTS repo_index_state (
 -- provider whose IndexedSHA still matches HEAD on a clean tree. One row per
 -- (repo_prefix, provider); WITHOUT ROWID — the PK index IS the table, like
 -- file_mtimes / repo_index_state.
+--
+-- gen is the repo_graph_gen value this provider last enriched at, and it is
+-- what readiness compares -- see repo_graph_gen for why a timestamp cannot do
+-- this job. Rows are ALSO the applicability model: the admission gate writes
+-- one row per APPLICABLE provider with gen 0 before any of them runs, so a
+-- provider that applies but has never completed is a visible gen-0 row rather
+-- than an absent one. That distinction matters because readiness takes the
+-- MINIMUM gen across a repo's rows: with absence meaning "not applicable", a
+-- single fresh provider would otherwise mask a sibling that never ran.
 CREATE TABLE IF NOT EXISTS enrichment_state (
     repo_prefix  TEXT NOT NULL,
     provider     TEXT NOT NULL,
     indexed_sha  TEXT NOT NULL DEFAULT '',
     completed_at INTEGER NOT NULL DEFAULT 0,
     coverage     REAL NOT NULL DEFAULT 0,
+    gen          INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (repo_prefix, provider)
 ) WITHOUT ROWID;
 
@@ -607,6 +617,56 @@ CREATE TABLE IF NOT EXISTS contract_state (
     indexed_sha    TEXT NOT NULL DEFAULT '',
     completed_at   INTEGER NOT NULL DEFAULT 0,
     contract_count INTEGER NOT NULL DEFAULT 0
+) WITHOUT ROWID;
+
+-- repo_graph_gen is the per-repo MUTATION ANCHOR every downstream stage
+-- compares itself against: a monotonic counter bumped inside the same
+-- transaction as any batch that changes this repo's nodes or edges.
+--
+-- Why a generation and not a timestamp: repo_index_state.indexed_at has
+-- exactly two writers -- a full (re)index, and the git watcher on a HEAD
+-- transition -- so an incremental single-file reindex mutates the graph
+-- WITHOUT advancing it. A stage stamped against indexed_at would therefore
+-- read "current" forever after the most common way a repo goes stale. Two
+-- integers also cannot collide the way two same-second timestamps can.
+--
+--   derive starts, repo gen = 41  ->  derive_state.derived_gen = 41
+--   file saved, batch commits     ->  repo_graph_gen.gen       = 42
+--   verdict: 41 < 42              ->  PARTIAL (correct)
+--
+-- One row per repo_prefix; WITHOUT ROWID -- the PK index IS the table, like
+-- file_mtimes / repo_index_state.
+CREATE TABLE IF NOT EXISTS repo_graph_gen (
+    repo_prefix TEXT PRIMARY KEY,
+    gen         INTEGER NOT NULL DEFAULT 0
+) WITHOUT ROWID;
+
+-- derive_state records that the global derived passes (implements, overrides,
+-- test edges, entrypoint hierarchy, capability edges, framework-dispatch
+-- synthesis, external-call placeholders, cross-repo edges) completed for one
+-- repo, and what they ran against. Nothing persisted derive completion before
+-- this table: the passes emitted log lines only, so a repo tracked during
+-- daemon warmup could silently never be derived while every query against it
+-- returned a subset with no signal that anything was missing.
+--
+-- derived_gen is the repo_graph_gen value observed at derive START, so a repo
+-- mutated mid-derive reads stale rather than falsely current. derived_sha and
+-- derived_at are provenance for humans and are never compared. pass_version
+-- invalidates a store derived by a build whose synthesis has since changed
+-- semantics; config_hash does the same for derive-relevant CONFIG changes
+-- (the framework allow-list), which alter derived output with no code change.
+-- legacy marks rows planted by the v13 migration for repos derived before this
+-- table existed: their true state is unknowable, so they render "unknown"
+-- rather than claim a completion that was never recorded.
+CREATE TABLE IF NOT EXISTS derive_state (
+    repo_prefix  TEXT PRIMARY KEY,
+    derived_gen  INTEGER NOT NULL DEFAULT 0,
+    derived_sha  TEXT    NOT NULL DEFAULT '',
+    derived_at   INTEGER NOT NULL DEFAULT 0,
+    pass_version INTEGER NOT NULL DEFAULT 0,
+    config_hash  TEXT    NOT NULL DEFAULT '',
+    scoped       INTEGER NOT NULL DEFAULT 0,
+    legacy       INTEGER NOT NULL DEFAULT 0
 ) WITHOUT ROWID;
 
 -- clone_shingles is the per-symbol MinHash shingle-set sidecar. Each
