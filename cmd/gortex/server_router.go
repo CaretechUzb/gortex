@@ -75,31 +75,36 @@ func newLocalToolExecutor(srv *gortexmcp.Server, logger *zap.Logger) daemon.Loca
 			}
 		}
 
-		// Session-aware gate, checked unconditionally — regardless of
-		// whether the tool is already live, deferred, or unknown. This
-		// must run BEFORE any lookup/promotion decision: checking it
-		// only on a registry miss (the pre-fix shape) let an
-		// already-promoted tool bypass the session's effective surface
-		// entirely, since a live GetTool hit skipped the gate below.
-		if !srv.IsToolEnabledForSession(ctx, toolName) {
-			payload := map[string]any{
-				"error":   "tool_not_found",
-				"message": fmt.Sprintf("tool '%s' not found", toolName),
-			}
-			out, _ := json.Marshal(payload)
-			return out, 404, nil
-		}
-		ctx = gortexmcp.WithAuthorizedToolCall(ctx, toolName)
-
+		// An already-live tool (whether generally allowed or blocked by
+		// the session's active preset/facade surface) dispatches
+		// straight to its handler with NO gate here: every production
+		// registration path (addTool, addControlTool, lazy promote,
+		// facade_tools) wraps the handler with wrapToolHandlerMode,
+		// which runs checkToolGate on every call — including this one,
+		// now that ctx carries the caller's session id (see the
+		// handleToolCall / tryRouteToolCall ctx-ordering fix). That gate
+		// is what should decide a blocked-by-preset call: it returns a
+		// structured tool_blocked_by_mode error the client can act on
+		// (which preset, how to reconnect). Adding a coarser gate here
+		// too previously collapsed that structured error into a bare
+		// 404 "not found" — a lie for a tool that IS registered — so
+		// this path deliberately does not duplicate the check for an
+		// already-live tool.
+		//
+		// A NOT-yet-live (deferred) tool is different: promoting it is
+		// itself a side effect (it mutates the shared lazy registry
+		// process-wide), so that side effect must stay gated on the
+		// session's effective surface — EnsureToolPromotedForSession
+		// checks IsToolEnabledForSession before promoting, so a session
+		// whose surface hides the tool never promotes it (and gets a
+		// 404, since there's nothing live to dispatch to and nothing to
+		// promote on its behalf).
 		tool := srv.MCPServer().GetTool(toolName)
 		if tool == nil {
-			// Deferred/lazy catalog under the defer-mode tools_search
-			// split (the shipped core-preset default) — not yet in the
-			// live registry until promoted just now. The session gate
-			// above already cleared this name for ctx's effective
-			// surface, so promoting it here cannot leak a hidden tool.
-			srv.EnsureToolPromoted(toolName)
-			tool = srv.MCPServer().GetTool(toolName)
+			if srv.EnsureToolPromotedForSession(ctx, toolName) {
+				ctx = gortexmcp.WithAuthorizedToolCall(ctx, toolName)
+				tool = srv.MCPServer().GetTool(toolName)
+			}
 		}
 		if tool == nil {
 			payload := map[string]any{

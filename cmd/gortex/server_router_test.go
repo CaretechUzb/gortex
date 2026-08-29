@@ -208,9 +208,15 @@ func TestLocalExecutor_HiddenSessionDeniedWithoutPromotion(t *testing.T) {
 
 // TestLocalExecutor_HiddenSessionDeniedEvenWhenAlreadyLive is the
 // other half of reviewer concern #1: the pre-fix code only checked
-// session policy on a registry miss, so a tool some other caller had
-// already promoted bypassed the gate entirely. Promote it out-of-band
-// first, then confirm a hidden session still gets 404.
+// session policy on a registry miss (guarding promotion), never on an
+// already-live tool. Promote it out-of-band first, then confirm a
+// hidden session's call is still denied — but via the SAME structured
+// tool_blocked_by_mode error every other blocked-by-preset call gets
+// (checkToolGate, running inside every registered handler), not a
+// bare 404. An executor-level pre-check that turned this into 404
+// would be lying about tool existence and would throw away the
+// error's recovery guidance — that was a real regression an earlier
+// draft of this fix introduced and a later review caught.
 func TestLocalExecutor_HiddenSessionDeniedEvenWhenAlreadyLive(t *testing.T) {
 	t.Setenv("GORTEX_LAZY_TOOLS", "1")
 	srv, exec := executorTestServer(t)
@@ -222,8 +228,9 @@ func TestLocalExecutor_HiddenSessionDeniedEvenWhenAlreadyLive(t *testing.T) {
 
 	out, status, err := exec(ctx, "find_clones", []byte(`{}`))
 	require.NoError(t, err)
-	assert.Equal(t, 404, status, "an already-live tool must still be denied for a session whose surface hides it")
-	assert.Contains(t, string(out), "tool_not_found")
+	assert.Equal(t, 200, status, "an already-live tool blocked by the session's active preset dispatches to its handler, which reports the block structurally — it is not a 404")
+	assert.Contains(t, string(out), "tool_blocked_by_mode", "the structured error code must survive, not collapse into a bare not-found")
+	assert.Contains(t, string(out), "find_clones")
 }
 
 // TestLocalExecutor_NullBodyRejected pins reviewer concern #2: a

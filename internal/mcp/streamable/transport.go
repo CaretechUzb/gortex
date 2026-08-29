@@ -487,16 +487,20 @@ func (t *Transport) tryRouteToolCall(r *http.Request, state SessionState, frame 
 	if err != nil {
 		return nil, 0, false
 	}
-	// Attach the session id to ctx before the routing decision — the
-	// local-fast path (Decide -> RouteToolCall -> callLocal ->
+	// Attach the session id AND cwd to ctx before the routing decision —
+	// the local-fast path (Decide -> RouteToolCall -> callLocal ->
 	// newLocalToolExecutor) threads this ctx straight into the
-	// session-policy gate, so a call routed here with no session id
-	// would evaluate the daemon's default surface instead of this
-	// session's actual effective surface (mirrors localDispatch below
-	// and the internal/server/handler.go handleToolCall fix).
+	// session-policy gate and the handler itself. Session id alone
+	// isn't enough: localDispatch below (and the daemon dispatcher's
+	// tryProxyToolCall) also attach WithSessionCWD, because handlers
+	// use it as a workspace boundary — without it, a session in
+	// workspace A could see workspace B's nodes on this routed path.
 	ctx := r.Context()
 	if state.ID != "" {
 		ctx = gortexmcp.WithSessionID(ctx, state.ID)
+	}
+	if cwd != "" {
+		ctx = gortexmcp.WithSessionCWD(ctx, cwd)
 	}
 	decision := daemon.NewProxyDecision(func() *daemon.Router { return t.router })
 	outcome := decision.Decide(ctx, daemon.RouteInputs{
