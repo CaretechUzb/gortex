@@ -173,3 +173,50 @@ func TestResolveCSharpInterfaceDispatch_ArityTwinFieldCollisionNeverFilters(t *t
 	}, dispatchTargets(g, callerID),
 		"a field ID shared by an arity twin is not evidence about this caller's receiver")
 }
+
+// The span check proves ownership only when the colliding declarations
+// have disjoint spans. A same-named type nested INSIDE its twin is
+// legal (CS0542 bars only the immediate enclosing type's name) and puts
+// the dropped declaration's lines inside the survivor's span, so both
+// the caller and the foreign field pass the check and the gate filters
+// on evidence from the wrong declaration - keeping precisely the
+// type-impossible implementor.
+//
+// A span cannot close this shape; a positive collision signal can. The
+// extractor now stamps duplicate_decl on a type node whose ID a second
+// declaration collided with - the same OR-onto-the-survivor move the
+// variance stamp uses - and the receiver lookup refuses any owner so
+// stamped. Refusal covers every collision shape at once.
+func TestResolveCSharpInterfaceDispatch_NestedTwinFieldCollisionNeverFilters(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"B.cs": `namespace App {
+    public class Crate { }
+    public class Widget { }
+    public interface IBox<T> { int Get(int id); }
+    public class CrateBox : IBox<Crate> { public int Get(int id) { return 1; } }
+    public class WidgetBox : IBox<Widget> { public int Get(int id) { return 2; } }
+    public class A {
+        private readonly IBox<Crate> _box;
+        public A(IBox<Crate> b) { _box = b; }
+        public class B {
+            public class A {
+                private readonly IBox<Widget> _box;
+                public A(IBox<Widget> b) { _box = b; }
+                public int Load(int id) { return _box.Get(id); }
+            }
+        }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	const callerID = "B.cs::A.Load"
+	bindFieldReceiverCall(t, g, callerID, "_box", "B.cs::IBox.Get")
+	ResolveCSharpInterfaceDispatch(g)
+
+	assert.ElementsMatch(t, []string{
+		"B.cs::CrateBox.Get",
+		"B.cs::WidgetBox.Get",
+	}, dispatchTargets(g, callerID),
+		"a collided owner ID proves nothing about which declaration's field the receiver is")
+}

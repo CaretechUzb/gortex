@@ -1065,6 +1065,15 @@ func csharpReceiverField(g graph.Store, e *graph.Edge, lookups *csharpReceiverLo
 		field.StartLine < owner.StartLine || field.StartLine > owner.EndLine {
 		return nil
 	}
+	// The positive collision signal: the extractor stamps duplicate_decl
+	// on a type node whose ID a second declaration collided with. The
+	// span check above cannot prove ownership for a twin declared INSIDE
+	// the survivor (a nested same-named type), and no span heuristic
+	// can - whichever declaration's evidence survived, a collided owner
+	// proves nothing about which field the receiver names.
+	if dup, _ := owner.Meta["duplicate_decl"].(bool); dup {
+		return nil
+	}
 	return field
 }
 

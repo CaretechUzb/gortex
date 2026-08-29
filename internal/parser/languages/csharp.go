@@ -961,13 +961,13 @@ func (e *CSharpExtractor) emitNamespace(m parser.QueryResult, filePath, fileID s
 	})
 }
 
-// csharpMarkVariantTypeParams ORs the variance stamp onto an already
-// emitted type node. Type node IDs carry no arity, so a generic
-// interface can collide with a non-generic twin and be dropped whole -
-// but variance is a REFUSAL signal, and a refusal that only one
+// csharpOrTypeMeta ORs a boolean stamp onto an already emitted type
+// node. Type node IDs carry no arity and no namespace, so declarations
+// can collide and be dropped whole - but a REFUSAL signal that only one
 // colliding declaration carries has to survive the collision. Union is
-// therefore the conservative merge: it can only widen a fan-out.
-func csharpMarkVariantTypeParams(result *parser.ExtractionResult, id string) {
+// the conservative merge: every consumer of these stamps can only
+// widen a fan-out or refuse evidence on seeing one.
+func csharpOrTypeMeta(result *parser.ExtractionResult, id, key string) {
 	for i := len(result.Nodes) - 1; i >= 0; i-- {
 		n := result.Nodes[i]
 		if n == nil || n.ID != id {
@@ -976,7 +976,7 @@ func csharpMarkVariantTypeParams(result *parser.ExtractionResult, id string) {
 		if n.Meta == nil {
 			n.Meta = map[string]any{}
 		}
-		n.Meta["variant_type_params"] = true
+		n.Meta[key] = true
 		return
 	}
 }
@@ -991,14 +991,24 @@ func (e *CSharpExtractor) emitContainer(m parser.QueryResult, kind string, nodeK
 	if seen[id] {
 		// A second declaration on an ID already taken: the arity pair
 		// (ISource / ISource<out T>, Result / Result<T>), same-file
-		// partial parts, or two namespaces in one file. The node is
-		// dropped, but variance must not be dropped with it - the gate
-		// reads that stamp off whichever node survives, and evaluating
-		// it behind this return meant a bare-named sibling could delete
-		// a covariant family's only protection.
+		// partial parts, nested same-named types, or two namespaces in
+		// one file. The node is dropped, but two refusal signals must
+		// not be dropped with it.
+		//
+		// Variance: the gate reads that stamp off whichever node
+		// survives, and evaluating it behind this return meant a
+		// bare-named sibling could delete a covariant family's only
+		// protection.
 		if kind == "iface" && csharpHasVariantTypeParams(def.Node) {
-			csharpMarkVariantTypeParams(result, id)
+			csharpOrTypeMeta(result, id, "variant_type_params")
 		}
+		// The collision itself: a consumer that assembles evidence from
+		// this ID (the field-receiver lookup in particular) cannot know
+		// WHICH declaration's evidence survived, and no span heuristic
+		// can prove it - a same-named type nested inside its twin puts
+		// the dropped declaration's lines inside the survivor's span.
+		// The positive signal closes every collision shape at once.
+		csharpOrTypeMeta(result, id, "duplicate_decl")
 		return
 	}
 	seen[id] = true
