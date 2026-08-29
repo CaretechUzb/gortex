@@ -8,11 +8,17 @@ import (
 )
 
 // TestAnalyzeAliasedKindFromLegacySession pins the dashboard fix: a plain
-// analyze(kind=processes) call from a NON-facade session (the HTTP
-// dashboard path, which has no session policy) must route through the
-// facade to the captured get_processes legacy handler instead of falling
-// into the analyze dispatcher's "unknown analyze kind" error. This is the
-// reviewer-required replacement for generic registry promotion.
+// analyze(kind=processes) call from a NON-facade, session-less caller (the
+// HTTP dashboard path — CallToolStrict invokes the tool handler directly
+// with no MCP session) must route through the facade to the captured
+// get_processes legacy handler instead of falling into the analyze
+// dispatcher's "unknown analyze kind" error. This is the reviewer-required
+// replacement for generic registry promotion.
+//
+// Regression: this fails on the pre-rework code — without a facade session
+// (clientDefaultPolicy only fires for identified MCP clients) the old
+// wrapLegacyFacade routed plain analyze(kind=processes) to the raw
+// dispatcher, which rejected the aliased kind.
 func TestAnalyzeAliasedKindFromLegacySession(t *testing.T) {
 	srv := setupPresetServer(t, ToolPolicyConfig{Preset: "core", Mode: "defer"})
 	ctx := context.Background()
@@ -21,8 +27,15 @@ func TestAnalyzeAliasedKindFromLegacySession(t *testing.T) {
 	// reach it without promoting it into the live registry.
 	require.True(t, srv.lazy.IsDeferred("get_processes"))
 
-	call := facadeFrameCaller(t, srv, ctx)
-	res := call(400, "analyze", map[string]any{"kind": "processes"})
+	// Invoke the analyze tool's registered handler directly with a bare
+	// context — exactly what the HTTP dashboard path does via
+	// CallToolStrict (no MCP initialize, no session, no client name).
+	tool := srv.MCPServer().GetTool("analyze")
+	require.NotNil(t, tool, "analyze must be live under the core/defer surface")
+	req := makeReq("analyze", map[string]any{"kind": "processes"})
+	res, err := tool.Handler(ctx, req)
+	require.NoError(t, err)
+	require.NotNil(t, res)
 	require.False(t, res.IsError, "analyze kind=processes must not error: %s", toolResultText(res))
 	require.Contains(t, toolResultText(res), "processes",
 		"the facade must reach the get_processes handler's JSON payload")
@@ -35,13 +48,17 @@ func TestAnalyzeAliasedKindFromLegacySession(t *testing.T) {
 
 // TestAnalyzeAliasedKindWithIDReachesProcessDetail covers the web app's
 // processDetail path: analyze(kind=processes, id=...) must forward the id
-// to the legacy handler.
+// to the legacy handler. Same session-less direct-handler invocation.
 func TestAnalyzeAliasedKindWithIDReachesProcessDetail(t *testing.T) {
 	srv := setupPresetServer(t, ToolPolicyConfig{Preset: "core", Mode: "defer"})
 	ctx := context.Background()
 
-	call := facadeFrameCaller(t, srv, ctx)
-	res := call(401, "analyze", map[string]any{"kind": "processes", "id": "proc_1"})
+	tool := srv.MCPServer().GetTool("analyze")
+	require.NotNil(t, tool)
+	req := makeReq("analyze", map[string]any{"kind": "processes", "id": "proc_1"})
+	res, err := tool.Handler(ctx, req)
+	require.NoError(t, err)
+	require.NotNil(t, res)
 	require.False(t, res.IsError, "analyze kind=processes with id must not error: %s", toolResultText(res))
 	require.Contains(t, toolResultText(res), "processes")
 }
@@ -53,8 +70,12 @@ func TestAnalyzeNativeKindStillUsesDispatcher(t *testing.T) {
 	srv := setupPresetServer(t, ToolPolicyConfig{Preset: "core", Mode: "defer"})
 	ctx := context.Background()
 
-	call := facadeFrameCaller(t, srv, ctx)
-	res := call(402, "analyze", map[string]any{"kind": "hotspots"})
+	tool := srv.MCPServer().GetTool("analyze")
+	require.NotNil(t, tool)
+	req := makeReq("analyze", map[string]any{"kind": "hotspots"})
+	res, err := tool.Handler(ctx, req)
+	require.NoError(t, err)
+	require.NotNil(t, res)
 	// Hotspots is a native kind — the dispatcher answers it. On the tiny
 	// fixture it may report "codebase too small", which is a dispatcher
 	// result, never an unknown-kind error.

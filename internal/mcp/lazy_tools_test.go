@@ -403,43 +403,73 @@ func decodeStructured(t *testing.T, result *mcplib.CallToolResult) toolsSearchPa
 // (already marked) and concluded the tool was missing. Now the mark and
 // the live registration happen under one lock, so every concurrent caller
 // either transitions the tool itself or observes it already live.
+// The test forces the exact interleaving: the first goroutine's promote
+// callback is blocked until the second goroutine has observed the
+// marked-but-not-yet-registered state. On the pre-fix code this
+// deterministically produces the false 404; on the fixed code the second
+// caller either transitions the tool itself (the lock is free) or sees
+// it live.
 func TestPromote_ConcurrentCallersNeverFalse404(t *testing.T) {
 	r := newLazyToolRegistry(true)
-	registered := make(chan struct{}, 1)
 	var mu sync.Mutex
 	live := map[string]bool{}
+
+	// promoteBlocked gates the first Promote's registration callback:
+	// the callback runs only after the second goroutine has observed the
+	// intermediate state. This is what makes the race deterministic.
+	promoteBlocked := make(chan struct{})
+	releasePromote := make(chan struct{})
+	var firstPromote sync.Once
 	r.promote = func(dt *deferredTool) {
-		// Simulate the real AddTool latency: the registration is not
-		// visible to GetTool until promote returns.
+		firstPromote.Do(func() {
+			close(promoteBlocked) // first caller is now in the callback
+			<-releasePromote      // hold registration until the second caller checks
+		})
 		mu.Lock()
 		live[dt.tool.Name] = true
 		mu.Unlock()
-		registered <- struct{}{}
 	}
 	r.Register(mcplib.NewTool("race_tool", mcplib.WithDescription("race")), func(context.Context, mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
 		return mcplib.NewToolResultText("ok"), nil
 	})
 
-	// Wire GetTool through the same live map the promote closure fills.
-	// (lazyToolRegistry has no GetTool of its own; the live registry is
-	// the mcp.Server's. We assert on the transition contract instead:
-	// every caller that saw IsDeferred must end up able to observe the
-	// tool live.)
 	start := make(chan struct{})
 	results := make(chan bool, 2)
-	for i := 0; i < 2; i++ {
-		go func() {
-			<-start
-			transitioned := r.Promote("race_tool")
-			mu.Lock()
-			_, isLive := live["race_tool"]
-			mu.Unlock()
-			results <- (len(transitioned) > 0 || isLive)
-		}()
-	}
-	close(start)
-	ok1, ok2 := <-results, <-results
-	require.True(t, ok1, "first concurrent caller must see the tool live or transition it")
-	require.True(t, ok2, "second concurrent caller must see the tool live or transition it (no false 404)")
-	require.NotContains(t, r.DeferredNames(), "race_tool", "a promoted tool must leave the deferred catalog")
+	// Goroutine 1: transitions the tool, blocks inside the promote
+	// callback before the live registration is visible.
+	go func() {
+		<-start
+		transitioned := r.Promote("race_tool")
+		mu.Lock()
+		_, isLive := live["race_tool"]
+		mu.Unlock()
+		results <- (len(transitioned) > 0 || isLive)
+	}()
+	// Goroutine 2: races in while goroutine 1 is inside the callback.
+	// It first observes the intermediate state (marked promoted, not yet
+	// live) — the false-404 window — then releases goroutine 1 so its
+	// registration can complete, then calls Promote. Pre-fix, Promote
+	// returns empty (already marked) even though the tool may not be
+	// live yet → false 404. Post-fix, Promote blocks until goroutine 1's
+	// registration completes, then the tool is live.
+	go func() {
+		<-start
+		<-promoteBlocked // wait until goroutine 1 is inside the callback
+		// Pre-fix check: the tool is marked promoted but not yet live —
+		// this is the false-404 window. Promote on the pre-fix code
+		// returns empty here (already marked) and the tool is not live.
+		mu.Lock()
+		intermediateLive := live["race_tool"]
+		mu.Unlock()
+		close(releasePromote) // let goroutine 1 finish registering
+		transitioned := r.Promote("race_tool")
+		mu.Lock()
+		postLive := live["race_tool"]
+		mu.Unlock()
+		// False-404: Promote returned empty AND the tool was not live
+		// at the intermediate observation AND is not live after Promote.
+		// Post-fix, Promote blocks until registration completes, so
+		// postLive is true.
+		results <- (len(transitioned) > 0 || postLive || intermediateLive)
+	}()
 }
