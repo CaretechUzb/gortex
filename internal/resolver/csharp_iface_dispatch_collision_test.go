@@ -1,6 +1,7 @@
 package resolver
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -127,6 +128,70 @@ func TestResolveCSharpInterfaceDispatch_SameFilePartialPartsKeepBothOverloads(t 
 		"Boxes.cs::Store.Put_L6",
 	}, dispatchTargets(g, callerID),
 		"a type whose parts close IBox twice must keep its whole fan-out")
+}
+
+// The other two declaration shapes that collapse onto one type ID and
+// close the interface twice - the arity twin (Result / Result<T>) and
+// two namespaces in one file. Both flow through the same per-type-ID
+// count as the partial parts above; pinned separately because a future
+// narrowing of the count's key (arity, namespace - the deferred "real
+// fix") would silently reopen exactly these while the partial pin
+// stayed green.
+func TestResolveCSharpInterfaceDispatch_TypeIDCollisionShapesKeepFanout(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		src  string
+	}{
+		{"arity twin", `namespace App {
+    public class Crate { }
+    public class Widget { }
+    public interface IBox<T> { void Put(T item); }
+    public class Store : IBox<Widget> { public void Put(Widget w) { } }
+    public class Store<T> : IBox<Crate> { public void Put(Crate c) { } }
+    public class Flow {
+        private readonly IBox<Crate> _box;
+        public Flow(IBox<Crate> b) { _box = b; }
+        public void Pull(Crate c) { _box.Put(c); }
+    }
+}`},
+		{"two namespaces in one file", `namespace A {
+    public class Store : IBox<App.Widget> { public void Put(App.Widget w) { } }
+}
+namespace App {
+    public class Crate { }
+    public class Widget { }
+    public interface IBox<T> { void Put(T item); }
+    public class Store : IBox<Crate> { public void Put(Crate c) { } }
+    public class Flow {
+        private readonly IBox<Crate> _box;
+        public Flow(IBox<Crate> b) { _box = b; }
+        public void Pull(Crate c) { _box.Put(c); }
+    }
+}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := buildCSharpResolverGraph(t, map[string]string{"Boxes.cs": tc.src})
+			New(g).ResolveAll()
+
+			const callerID = "Boxes.cs::Flow.Pull"
+			bindFieldReceiverCall(t, g, callerID, "_box", "Boxes.cs::IBox.Put")
+			ResolveCSharpInterfaceDispatch(g)
+
+			targets := dispatchTargets(g, callerID)
+			// The colliding declarations' member IDs differ only in the
+			// overload suffix, which depends on each fixture's line
+			// numbers - assert the invariant that matters: BOTH Put
+			// declarations survive, so the set holds two Store members.
+			storePuts := 0
+			for _, tgt := range targets {
+				if strings.HasPrefix(tgt, "Boxes.cs::Store.Put") {
+					storePuts++
+				}
+			}
+			assert.Equal(t, 2, storePuts,
+				"a type ID closing IBox twice keeps both members; targets: %v", targets)
+		})
+	}
 }
 
 // Field node IDs collide through the same door: `ownerID + "." + name`
