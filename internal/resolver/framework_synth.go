@@ -192,15 +192,30 @@ func UnstampSynthesized(e *graph.Edge) {
 // consume the changed-repo prefix set directly. Every other pass runs through
 // frameworkScopedStore on a partial invocation; no synthFunc is permitted to
 // fall back to the unfiltered workspace store.
+// scopedFilesFn is the exact incremental form of scopedFn. A pass that supplies
+// one is handed the changed-FILE frontier as well as the repository prefixes,
+// and is trusted to narrow its own collection with it. This exists because
+// declaring scopedFn is otherwise a pessimization on a large repository: those
+// passes bypass frameworkScopedStore, which is where the file frontier is
+// applied for everyone else, so "scoped" ended up meaning "scoped to a whole
+// repository" — 923,510 edges for a 38-file edit on the workspace that
+// motivated it. Leave it nil unless the pass can genuinely use the frontier;
+// scopedFn stays the fallback for a caller with no file list.
 type synthFunc struct {
-	name     string
-	fn       func(graph.Store) int
-	scopedFn func(graph.Store, map[string]bool) int
+	name          string
+	fn            func(graph.Store) int
+	scopedFn      func(graph.Store, map[string]bool) int
+	scopedFilesFn func(graph.Store, map[string]bool, []string) int
 	// candFn is the shared-stream form: the pass consumes the candidate
 	// buffers the census dispatcher collected instead of re-decoding whole
 	// edge kinds. Used only when a full-census run armed the pass's
 	// collectors; every other invocation keeps fn / scopedFn.
 	candFn func(graph.Store, *frameworkPassCandidates) int
+	// phases is where this entry's pass leaves its phase breakdown, and nil
+	// for the passes that report none. It is a POINTER because synthFunc is
+	// type-asserted and copied by value; the slot has to outlive the copy.
+	// See synthPhases for why the slot is per-entry rather than package-level.
+	phases *synthPhases
 }
 
 func (s synthFunc) Name() string                 { return s.name }
@@ -901,6 +916,41 @@ func frameworkSynthNodeGatesPass(name string, present, markers map[string]int) b
 // EdgeImplements edges they produce) and before DetectCrossRepoEdges (so
 // a cross-repo synthesized call gets its parallel cross_repo_calls edge).
 // Native-bridge resolvers append to this slice.
+
+// odooSynthFunc builds the Odoo registry entry together with the run-local
+// slot its phase timings land in.
+//
+// Odoo runs as one pass; its three binding families are ordered sub-steps
+// inside resolveOdooRefs rather than registry entries, so their order cannot
+// drift with registry edits.
+//
+// It is the only pass that reports phases, and it is a closure rather than
+// three bare function references because that is what gives the timings an
+// owner. The two halves of the pass — whole-store declaration indexes and
+// scope-narrowed edge collection — have unrelated costs and unrelated fixes,
+// and the 340s reading that started the frontier work was exactly the
+// ambiguity of one aggregate number. Reporting them is worth a closure;
+// reporting them through a package-level variable was worth a data race.
+func odooSynthFunc() synthFunc {
+	phases := &synthPhases{}
+	run := func(g graph.Store, scope map[string]bool, filePaths []string) int {
+		n, reported := resolveOdooRefs(g, scope, filePaths)
+		phases.record(reported)
+		return n
+	}
+	return synthFunc{
+		name:   SynthOdoo,
+		phases: phases,
+		fn:     func(g graph.Store) int { return run(g, nil, nil) },
+		scopedFn: func(g graph.Store, scope map[string]bool) int {
+			return run(g, scope, nil)
+		},
+		scopedFilesFn: func(g graph.Store, scope map[string]bool, filePaths []string) int {
+			return run(g, scope, filePaths)
+		},
+	}
+}
+
 func defaultFrameworkSynthesizers() []FrameworkSynthesizer {
 	return []FrameworkSynthesizer{
 		synthFunc{name: SynthGRPCStub, fn: ResolveGRPCStubCalls, candFn: resolveGRPCStubCalls},
@@ -917,10 +967,7 @@ func defaultFrameworkSynthesizers() []FrameworkSynthesizer {
 		synthFunc{name: SynthExpoModules, fn: ResolveExpoModuleBridge},
 		synthFunc{name: SynthFabric, fn: ResolveFabricComponents},
 		synthFunc{name: SynthMyBatis, fn: ResolveMyBatisCalls},
-		// Odoo runs as one pass; its three binding families are ordered
-		// sub-steps inside ResolveOdooRefs rather than registry entries,
-		// so their order cannot drift with registry edits.
-		synthFunc{name: SynthOdoo, fn: ResolveOdooRefs, scopedFn: ResolveOdooRefsScoped},
+		odooSynthFunc(),
 		synthFunc{name: SynthSQLCallsite, fn: ResolveSQLCallsites},
 		// Store-factory (Zustand/Redux/Pinia/MobX) indirect action calls —
 		// binds getState()-chain and destructured calls to the action node.
@@ -1094,22 +1141,44 @@ type SynthCount struct {
 	PhaseMillis map[string]int64 `json:"phase_ms,omitempty"`
 }
 
-// frameworkSynthPhaseSink carries a pass's self-reported phase timings to
-// the loop that builds its SynthCount. One slot is enough and no lock is
-// needed: the synthesizer loop is serial by construction (registration
-// order is load-bearing and every write funnels through one edge batch).
-var frameworkSynthPhaseSink map[string]int64
+// synthPhases carries a pass's self-reported phase timings to the loop that
+// builds its SynthCount. It hangs off the REGISTRY ENTRY, and
+// defaultFrameworkSynthesizers builds a fresh registry — hence a fresh slot —
+// for every run, which is what keeps two runs from seeing each other's
+// timings. Within one run the loop is serial, so the slot needs no lock.
+//
+// This replaced a package-level variable whose comment argued the same "the
+// loop is serial by construction" and concluded no lock was needed. That
+// holds WITHIN a run and says nothing about two: both callers of the loop
+// (runGlobalGraphPassesTopologyHeld, runIncrementalDerivedPassesTopologyHeld)
+// hold their own MultiIndexer's topology lock and nothing wider, so two
+// indexers in one process ran two loops through one variable. -race reported
+// it four times over, every block on the same address, with the read and the
+// clear inside takeSynthPhases racing across unrelated tests — which is why
+// it read as suite flakiness rather than as one defect.
+//
+// A mutex would have silenced the detector and kept the bug: two independent
+// runs would still take each other's timings, and a report would name a
+// breakdown belonging to another workspace's graph. Per-run ownership is the
+// fix; the lock would only have hidden the need for it.
+type synthPhases struct{ millis map[string]int64 }
 
-// publishSynthPhases is called by a pass, from inside its own execution,
-// to attach a breakdown of its time to the report.
-func publishSynthPhases(phases map[string]int64) { frameworkSynthPhaseSink = phases }
+// record is called by a pass, from inside its own execution, to attach a
+// breakdown of its time to the report. A nil slot discards it, so a pass may
+// report phases whether or not the registry kept a slot for it.
+func (p *synthPhases) record(millis map[string]int64) {
+	if p != nil {
+		p.millis = millis
+	}
+}
 
-// takeSynthPhases collects and clears the slot, so a pass that publishes
-// nothing inherits nothing from the pass before it.
-func takeSynthPhases() map[string]int64 {
-	phases := frameworkSynthPhaseSink
-	frameworkSynthPhaseSink = nil
-	return phases
+// reported is the loop's read. Every pass that reports nothing has a nil
+// slot and yields nil, which SynthCount.PhaseMillis omits.
+func (p *synthPhases) reported() map[string]int64 {
+	if p == nil {
+		return nil
+	}
+	return p.millis
 }
 
 // FrameworkSynthReport is the aggregate result of one
@@ -1307,8 +1376,12 @@ func runFrameworkSynthesizersScoped(
 		// this pass, which is the unconfigured hot path.
 		gated := newFrameworkRepoGateStore(g, repoGate, s.Name(), g)
 		var gatedScope graph.Store
+		// Hoisted out of the dispatch below because the phase slot it
+		// carries is read where the SynthCount is built — after the pass
+		// ran, and also on the branches where it did not.
+		sf, isSynthFunc := s.(synthFunc)
 		if !disabled && shouldRunFrameworkSynthesizer(s, executionScope, candidates) {
-			if sf, ok := s.(synthFunc); ok {
+			if isSynthFunc {
 				bundle = candidates.streams.passStreams(g, sf.name)
 				switch {
 				case sf.candFn != nil && bundle != nil:
@@ -1320,6 +1393,11 @@ func runFrameworkSynthesizersScoped(
 					})
 				case executionScope == nil:
 					n = runLegacyFrameworkSynthWithCache(gated, fullReadCache, sf.fn)
+				case sf.scopedFilesFn != nil:
+					// Ordered before scopedFn: a pass that can use the file
+					// frontier must never silently fall back to the
+					// repository-wide form just because both are declared.
+					n = sf.scopedFilesFn(gated, executionScope, filePaths)
 				case sf.scopedFn != nil:
 					n = sf.scopedFn(gated, executionScope)
 				default:
@@ -1350,7 +1428,7 @@ func runFrameworkSynthesizersScoped(
 		count := SynthCount{
 			Name: s.Name(), Edges: n, Millis: time.Since(start).Milliseconds(),
 			Disabled: disabled, RepoGated: repoGated, SiblingGated: siblingGated,
-			PhaseMillis: takeSynthPhases(),
+			PhaseMillis: sf.phases.reported(),
 		}
 		if passScope != nil {
 			stats := passScope.stats()

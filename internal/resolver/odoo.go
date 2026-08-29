@@ -75,8 +75,42 @@ func ResolveOdooRefs(g graph.Store) int {
 // graph. Scoping the collection instead of the indexes keeps "absent from
 // the index" meaning what it says.
 func ResolveOdooRefsScoped(g graph.Store, scope map[string]bool) int {
+	n, _ := resolveOdooRefs(g, scope, nil)
+	return n
+}
+
+// ResolveOdooRefsScopedForFiles is the exact incremental form: it collects only
+// the edges a changed-file frontier can move, instead of every Odoo edge in the
+// changed repository.
+//
+// A repository is not a narrowing on a real Odoo workspace. Collecting one
+// repository's Odoo edges pulls 923,510 rows across the storage boundary and
+// decompresses a meta blob on each of them to read one tag — ~199s, against
+// ~6,000 rows and ~0.4s for the frontier that can actually change. The scoped
+// path was measurably slower than the cold whole-workspace one, which at least
+// streams rather than materialising and sorting.
+//
+// filePaths must be graph file paths (repository-prefixed, as stored on the
+// node rows), and an empty list falls back to the repository scope rather than
+// collecting nothing — a caller that lost its frontier must still get a correct
+// pass, only a slow one. See odoo_frontier.go for why the frontier is a set of
+// SOURCE nodes and what the four ways into it are.
+func ResolveOdooRefsScopedForFiles(g graph.Store, scope map[string]bool, filePaths []string) int {
+	n, _ := resolveOdooRefs(g, scope, filePaths)
+	return n
+}
+
+// resolveOdooRefs returns the edges it bound and its own phase breakdown.
+//
+// The breakdown is RETURNED rather than published into a package-level sink.
+// The sink's argument for needing no lock was that "the synthesizer loop is
+// serial by construction", which holds within one run and says nothing about
+// two: both callers of that loop hold their own MultiIndexer's topology lock
+// and nothing wider, so two indexers in one process ran two loops through one
+// variable. See synthPhases in framework_synth.go for the slot this lands in.
+func resolveOdooRefs(g graph.Store, scope map[string]bool, filePaths []string) (int, map[string]int64) {
 	if g == nil {
-		return 0
+		return 0, nil
 	}
 	// One sibling-checkout memo for the whole pass. All three families
 	// ask the same questions about the same handful of repo prefixes,
@@ -95,7 +129,7 @@ func ResolveOdooRefsScoped(g graph.Store, scope map[string]bool) int {
 	models := &odooFamily{via: odooModelVia, kinds: odooModelEdgeKinds}
 	xmlIDs := &odooFamily{via: odooXMLVia, kinds: odooXMLEdgeKinds}
 	js := &odooFamily{via: odooJSVia, kinds: odooJSEdgeKinds}
-	// Phase timings, published to the pass report. The two halves of this
+	// Phase timings, returned to the pass report. The two halves of this
 	// pass have unrelated costs and unrelated fixes — edge collection
 	// narrows with the scope, the declaration indexes never can — and one
 	// aggregate number cannot tell them apart.
@@ -105,24 +139,40 @@ func ResolveOdooRefsScoped(g graph.Store, scope map[string]bool) int {
 		fn()
 		phases[name] = time.Since(start).Milliseconds()
 	}
-	phase("collect_edges", func() { odooCollectFamilies(g, scope, models, xmlIDs, js) })
-
 	// The declaration indexes every binder looks through, likewise built
 	// once for the whole pass rather than once per binder. They are
 	// whole-store by construction — a reference in one repository binds
 	// to a declaration in another — so a scoped pass pays for them in
 	// full and the only thing that helps is not paying eleven times over.
 	// See odoo_decl_index.go.
+	//
+	// They are built BEFORE collection, not after, because the changed-file
+	// frontier is keyed on them: "which other nodes declare a key this change
+	// touches" is a question only the indexes can answer. Nothing about the
+	// single-walk guarantee changes — this is a node walk, and no family is
+	// streaming edges yet.
 	var decls *odooDecls
 	phase("build_decls", func() { decls = buildOdooDecls(g) })
+
+	phase("collect_edges", func() {
+		if scope != nil && len(filePaths) > 0 {
+			sources, stats := odooChangedFrontierSources(g, decls, frameworkScopePrefixes(scope), filePaths)
+			phases["frontier_sources"] = int64(len(sources))
+			odooCollectFamiliesForSources(g, sources, stats, models, xmlIDs, js)
+			for name, value := range stats {
+				phases[name] = value
+			}
+			return
+		}
+		odooCollectFamilies(g, scope, models, xmlIDs, js)
+	})
 
 	n := 0
 	phase("bind_models", func() { n += bindOdooModels(g, models.edges, sc, decls) })
 	phase("bind_xmlids", func() { n += bindOdooXMLIDs(g, xmlIDs.edges, sc, decls) })
 	phase("bind_js", func() { n += bindOdooJS(g, js.edges, sc, decls) })
 	phases["edges_collected"] = int64(len(models.edges) + len(xmlIDs.edges) + len(js.edges))
-	publishSynthPhases(phases)
-	return n
+	return n, phases
 }
 
 // odooBindPlan is one edge queued for rebinding. placeholder is the

@@ -167,6 +167,21 @@ func (v *frameworkRepoGateStore) HasCheckoutGroups() bool {
 	return ok && grouped.HasCheckoutGroups()
 }
 
+// DanglingEdgeTargets republishes the target-side read the Odoo changed-file
+// frontier is built from, for the same reason and at the same kind of cost as
+// the checkout grouping above: graph.DanglingEdgeTargetReader is not part of
+// graph.Store, so embedding promotes nothing and the backend's indexed
+// anti-join disappears behind the wrapper. The generic fallback that replaces
+// it walks every requested kind bucket — measured at 115s of a 118s collection
+// step on the live workspace, against 22ms for the query it was hiding.
+//
+// Forwarding is safe because this is a pure read. The gate exists to refuse
+// WRITES; it has never filtered what a pass may look at, and refuses() still
+// adjudicates every edge the pass tries to write afterwards.
+func (v *frameworkRepoGateStore) DanglingEdgeTargets(idPrefixes []string, kinds []graph.EdgeKind) []string {
+	return graph.DanglingEdgeTargets(v.Store, idPrefixes, kinds)
+}
+
 // refuses reports whether this pass may not write the edge, recording
 // which of the two rules refused it.
 //
