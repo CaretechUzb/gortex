@@ -34,6 +34,12 @@ import (
 type csharpDeferredFieldAssign struct {
 	name string
 	line int
+	// offset is the assignment target's own start byte, so the shadow
+	// question is asked at the write's coordinate. With no coordinate
+	// (-1) the question falls back to function-wide, and an expired
+	// same-named binder elsewhere in the method deletes a genuine
+	// write (round-5 finding 3).
+	offset int
 }
 
 // csharpFieldNamesByType indexes the file's declared field names per
@@ -100,10 +106,10 @@ func emitCSharpFieldIdentifierUses(
 	// eligible resolves the enclosing owner and reports whether name is
 	// an unshadowed field of the owner's type. Sites carrying a byte
 	// offset ask the shadow question at their own coordinate — a lambda
-	// parameter or foreach variable elsewhere in the method must not
-	// delete a genuine field read outside its extent. A site with no
-	// coordinate (offset < 0: the assignment buffer) keeps the
-	// function-wide question, which can only withhold a read, never
+	// parameter, foreach variable, or builtin-typed local elsewhere in
+	// the method must not delete a genuine field use outside its
+	// extent. A site with no coordinate (offset < 0) keeps the
+	// function-wide questions, which can only withhold a use, never
 	// invent one.
 	eligible := func(line, offset int, name string) (owner, ownerType string, ok bool) {
 		owner = funcRanges.enclosing(line)
@@ -115,11 +121,18 @@ func emitCSharpFieldIdentifierUses(
 			return "", "", false
 		}
 		shadowed := localScopes.shadowsAnywhere(owner, name)
+		builtinVeto := builtinsByOwner[owner][name] != ""
 		if offset >= 0 {
 			shadowed = localScopes.shadows(owner, name, offset)
+			// The scope index already answers offset-aware for EVERY
+			// local, builtin-typed ones included - the flat builtin map
+			// would resurrect the function-wide question and delete a
+			// read/write after the local's block has closed (round-5
+			// finding 3's read half). It stays as the fallback veto only
+			// for sites with no coordinate.
+			builtinVeto = false
 		}
-		if paramsByOwner[owner][name] || shadowed ||
-			builtinsByOwner[owner][name] != "" {
+		if paramsByOwner[owner][name] || shadowed || builtinVeto {
 			return "", "", false
 		}
 		return owner, ownerType, true
@@ -181,6 +194,6 @@ func emitCSharpFieldIdentifierUses(
 	}
 
 	for _, fa := range fieldAssigns {
-		emit(fa.line, -1, fa.name, graph.EdgeWrites)
+		emit(fa.line, fa.offset, fa.name, graph.EdgeWrites)
 	}
 }

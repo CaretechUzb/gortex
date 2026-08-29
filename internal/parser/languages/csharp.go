@@ -549,10 +549,15 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 			}, expr.Node))
 
 		case m.Captures["fassign.name"] != nil:
-			fieldAssigns = append(fieldAssigns, csharpDeferredFieldAssign{
-				name: m.Captures["fassign.name"].Text,
-				line: m.Captures["fassign.expr"].StartLine + 1,
-			})
+			fa := csharpDeferredFieldAssign{
+				name:   m.Captures["fassign.name"].Text,
+				line:   m.Captures["fassign.expr"].StartLine + 1,
+				offset: -1,
+			}
+			if node := m.Captures["fassign.name"].Node; node != nil {
+				fa.offset = int(node.StartByte())
+			}
+			fieldAssigns = append(fieldAssigns, fa)
 
 		case m.Captures["maccess.expr"] != nil:
 			accesses = append(accesses, csharpDeferredAccess{
