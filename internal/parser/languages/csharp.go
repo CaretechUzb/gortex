@@ -263,13 +263,45 @@ func (s csharpLocalScopes) shadowsAnywhere(owner, name string) bool {
 	return len(s[owner][name]) > 0
 }
 
-// csharpLocalScopeOf returns the extent of the block declaring a local.
-// A declaration with no enclosing block gets an unbounded extent, which
-// keeps its refusal function-wide — exactly what every local had before
-// extents existed, so an unrecognized shape can never lose a refusal.
+// csharpScopeFormers are the ancestors that bound a local binding's
+// extent. `block` alone is not enough: a switch section, a
+// switch-expression arm, a loop header, or an expression-bodied lambda
+// each form a scope the grammar does not spell as a block, and climbing
+// past them hands the binding a method-wide extent — which turns the
+// shadow refusal back into the function-wide question the extent
+// machinery exists to replace, and costs unrelated calls their
+// static-form evidence.
+//
+// `if_statement` is deliberately absent: a pattern variable declared in
+// an `if` condition escapes to the ENCLOSING block (definite-assignment
+// scoping), so stopping at the `if` would under-refuse. Loop headers do
+// not leak their pattern variables past the statement, and a switch
+// section is its own declaration space.
+var csharpScopeFormers = map[string]bool{
+	"block":                       true,
+	"switch_section":              true,
+	"switch_expression_arm":       true,
+	"lambda_expression":           true,
+	"anonymous_method_expression": true,
+	"local_function_statement":    true,
+	"arrow_expression_clause":     true,
+	"while_statement":             true,
+	"do_statement":                true,
+	"for_statement":               true,
+	"foreach_statement":           true,
+	"using_statement":             true,
+	"lock_statement":              true,
+	"fixed_statement":             true,
+}
+
+// csharpLocalScopeOf returns the extent of the scope declaring a local.
+// A declaration with no scope-forming ancestor gets an unbounded
+// extent, which keeps its refusal function-wide — exactly what every
+// local had before extents existed, so an unrecognized shape can never
+// lose a refusal.
 func csharpLocalScopeOf(n *sitter.Node) csharpLocalScope {
 	for cur := n; cur != nil; cur = cur.Parent() {
-		if cur.Type() == "block" {
+		if csharpScopeFormers[cur.Type()] {
 			return csharpLocalScope{start: int(cur.StartByte()), end: int(cur.EndByte())}
 		}
 	}

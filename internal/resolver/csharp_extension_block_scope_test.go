@@ -56,3 +56,74 @@ namespace App {
 	assert.Equal(t, twoParam, namedCallTarget(t, g, "Caller.cs::Use.Shadowed", "Add"),
 		"a local in a closed nested block shadows nothing at the call site and must not cost the call its static-form evidence")
 }
+
+// The extent recorded for a binding decides where the shadow refusal
+// fires, and "the nearest block ancestor" over-widens for every binder
+// that sits in a scope the grammar does not spell as a block: a switch
+// section, a switch-expression arm, a loop condition, an expression
+// lambda. Each of these bodies binds `BagExt` somewhere the call at the
+// end can never see, so the static-form evidence must survive.
+//
+// An if-condition pattern is deliberately NOT here: `if (o is int x)`
+// genuinely escapes to the enclosing block (definite-assignment
+// scoping), so the block extent is its correct one.
+func TestResolveCSharpExtension_NonBlockScopesKeepStaticForm(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"switch-section pattern variable", `
+        public void M(Bag bag, object o) {
+            switch (o) { case int BagExt: System.Console.WriteLine(BagExt); break; }
+            BagExt.Add(bag, 5);
+        }`},
+		{"switch-expression arm", `
+        public void M(Bag bag, object o) {
+            var q = o switch { int BagExt => BagExt, _ => 0 };
+            BagExt.Add(bag, 5);
+        }`},
+		{"out var inside an expression lambda", `
+        public void M(Bag bag, int[] xs, System.Collections.Generic.Dictionary<int,int> map) {
+            var ok = System.Linq.Enumerable.Any(xs, x => map.TryGetValue(x, out var BagExt));
+            BagExt.Add(bag, 5);
+        }`},
+		{"declaration pattern inside an expression lambda", `
+        public void M(Bag bag, int[] xs) {
+            var ok = System.Linq.Enumerable.Any(xs, x => ((object)x) is int BagExt);
+            BagExt.Add(bag, 5);
+        }`},
+		{"pattern variable in a while condition", `
+        public void M(Bag bag, object o) {
+            while (o is int BagExt) { System.Console.WriteLine(BagExt); break; }
+            BagExt.Add(bag, 5);
+        }`},
+		{"switch-section local declaration", `
+        public void M(Bag bag, object o) {
+            switch (((object)1)) { default: var BagExt = 1; System.Console.WriteLine(BagExt); break; }
+            BagExt.Add(bag, 5);
+        }`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := buildCSharpResolverGraph(t, map[string]string{
+				"Ext.cs": `namespace Lib {
+    public class Bag { }
+    public static class BagExt {
+        public static void Add(this Bag b, int x) { }
+        public static void Add(this Bag b, int x, int y) { }
+    }
+}`,
+				"Caller.cs": `using Lib;
+namespace App {
+    public class Use {
+` + tc.body + `
+    }
+}`,
+			})
+			New(g).ResolveAll()
+
+			assert.Equal(t, "Ext.cs::BagExt.Add",
+				namedCallTarget(t, g, "Caller.cs::Use.M", "Add"),
+				"the binder's scope has closed before the call, so the static form keeps its two-parameter overload")
+		})
+	}
+}
