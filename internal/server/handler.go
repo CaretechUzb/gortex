@@ -381,6 +381,32 @@ func (h *Handler) handleToolCall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Overlay session binding for the HTTP transport. The standard
+	// `Mcp-Session-Id` header (set by mcp-go's Streamable HTTP
+	// client) is preferred; a gortex-specific
+	// `X-Gortex-Overlay-Session` header takes precedence when
+	// callers want to scope an overlay to a session ID that differs
+	// from their MCP transport session (e.g. a CI harness that
+	// orchestrates several overlay scopes from one connection). A
+	// `?session_id=` query parameter is the final fallback so curl /
+	// integration tests can attach overlays without setting HTTP
+	// headers. The session ID flows through gortexmcp.WithSessionID
+	// so the MCP overlay middleware (overlay.go::wrapToolHandler)
+	// finds the right overlay snapshot. This MUST happen before the
+	// router decision below: the router's local-fast path threads ctx
+	// straight through to the in-process tool dispatch (including the
+	// deferred-tool promotion gate), so a session ID attached only
+	// after routing would leave that path evaluating the daemon's
+	// default surface instead of the caller's actual session policy.
+	ctx := r.Context()
+	if sid := firstNonEmpty(
+		r.Header.Get("X-Gortex-Overlay-Session"),
+		r.Header.Get("Mcp-Session-Id"),
+		r.URL.Query().Get("session_id"),
+	); sid != "" {
+		ctx = gortexmcp.WithSessionID(ctx, sid)
+	}
+
 	// If a Router is wired, peek the body for `workspace` / `cwd`
 	// overrides and let the router
 	// decide local vs remote. Local path falls through to the
@@ -390,7 +416,7 @@ func (h *Handler) handleToolCall(w http.ResponseWriter, r *http.Request) {
 	// (combo / frecency / session state) keep working unchanged.
 	if h.router != nil && h.decision != nil {
 		scope, cwd := h.peekRouteContext(body, r)
-		outcome := h.decision.Decide(r.Context(), daemon.RouteInputs{
+		outcome := h.decision.Decide(ctx, daemon.RouteInputs{
 			ToolName: toolName,
 			Body:     body,
 			Cwd:      cwd,
@@ -425,21 +451,38 @@ func (h *Handler) handleToolCall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Parse via an `any` probe rather than unmarshalling straight into
+	// ToolRequest: a JSON `null` body (or `{"arguments": null}`) is a
+	// silent no-op for both a struct and a map target in Go, so the
+	// previous req-then-flat-fallback shape let a null body through
+	// with nil arguments instead of 400ing (reviewer concern #2 — this
+	// direct-dispatch path is a second producer of the same defect
+	// fixed in cmd/gortex/server_router.go's newLocalToolExecutor).
 	var args map[string]any
 	var bodyFormat string
 	if len(body) > 0 {
-		var req ToolRequest
-		if err := json.Unmarshal(body, &req); err != nil {
-			if err2 := json.Unmarshal(body, &args); err2 != nil {
-				WriteJSONError(w, http.StatusBadRequest, fmt.Sprintf("malformed JSON: %s", err.Error()))
+		var probe any
+		if err := json.Unmarshal(body, &probe); err != nil {
+			WriteJSONError(w, http.StatusBadRequest, fmt.Sprintf("malformed JSON: %s", err.Error()))
+			return
+		}
+		obj, ok := probe.(map[string]any)
+		if !ok {
+			WriteJSONError(w, http.StatusBadRequest, "malformed JSON: expected a JSON object")
+			return
+		}
+		if f, ok := obj["format"].(string); ok {
+			bodyFormat = f
+		}
+		if rawArgs, present := obj["arguments"]; present {
+			nested, ok := rawArgs.(map[string]any)
+			if !ok {
+				WriteJSONError(w, http.StatusBadRequest, `malformed JSON: "arguments" must be a JSON object`)
 				return
 			}
+			args = nested
 		} else {
-			args = req.Arguments
-			bodyFormat = req.Format
-			if args == nil {
-				_ = json.Unmarshal(body, &args)
-			}
+			args = obj
 		}
 	}
 
@@ -463,26 +506,6 @@ func (h *Handler) handleToolCall(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
-	// Overlay session binding for the HTTP transport. The standard
-	// `Mcp-Session-Id` header (set by mcp-go's Streamable HTTP
-	// client) is preferred; a gortex-specific
-	// `X-Gortex-Overlay-Session` header takes precedence when
-	// callers want to scope an overlay to a session ID that differs
-	// from their MCP transport session (e.g. a CI harness that
-	// orchestrates several overlay scopes from one connection). A
-	// `?session_id=` query parameter is the final fallback so curl /
-	// integration tests can attach overlays without setting HTTP
-	// headers. The session ID flows through gortexmcp.WithSessionID
-	// so the MCP overlay middleware (overlay.go::wrapToolHandler)
-	// finds the right overlay snapshot.
-	ctx := r.Context()
-	if sid := firstNonEmpty(
-		r.Header.Get("X-Gortex-Overlay-Session"),
-		r.Header.Get("Mcp-Session-Id"),
-		r.URL.Query().Get("session_id"),
-	); sid != "" {
-		ctx = gortexmcp.WithSessionID(ctx, sid)
-	}
 	result, err := tool.Handler(ctx, mcpReq)
 	if err != nil {
 		h.logger.Error("tool call failed",

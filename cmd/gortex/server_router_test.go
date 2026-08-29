@@ -4,7 +4,9 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/assert"
@@ -129,4 +131,139 @@ func TestLocalExecutor_UnknownTool404(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 404, status)
 	assert.Contains(t, string(out), "tool_not_found")
+}
+
+// TestLocalExecutor_ColdPromotionDispatchesDeferredTool pins reviewer
+// concern #4: a cold call to a real deferred tool (not manually
+// registered live, not the generic "unknown name" case) must promote
+// it and dispatch, not 404.
+func TestLocalExecutor_ColdPromotionDispatchesDeferredTool(t *testing.T) {
+	t.Setenv("GORTEX_LAZY_TOOLS", "1")
+	srv, exec := executorTestServer(t)
+	require.Nil(t, srv.MCPServer().GetTool("find_clones"), "find_clones must start deferred, not live")
+
+	out, status, err := exec(context.Background(), "find_clones", []byte(`{}`))
+	require.NoError(t, err)
+	assert.NotEqual(t, 404, status, "a deferred tool must promote and dispatch, not 404: %s", out)
+	assert.NotNil(t, srv.MCPServer().GetTool("find_clones"), "find_clones must be live after a successful cold dispatch")
+}
+
+// TestLocalExecutor_ConcurrentColdCallsBothDispatch covers two
+// concurrent cold callers racing to promote the same deferred tool
+// through the router's local executor (as opposed to lazy_tools_test.go's
+// TestPromote_ConcurrentCallersNeverFalse404, which exercises the
+// registry in isolation) — reviewer concern #4's cold-promotion race.
+func TestLocalExecutor_ConcurrentColdCallsBothDispatch(t *testing.T) {
+	t.Setenv("GORTEX_LAZY_TOOLS", "1")
+	srv, exec := executorTestServer(t)
+	require.Nil(t, srv.MCPServer().GetTool("find_clones"))
+
+	const n = 2
+	statuses := make([]int, n)
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, status, err := exec(context.Background(), "find_clones", []byte(`{}`))
+			statuses[i] = status
+			errs[i] = err
+		}(i)
+	}
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for concurrent cold calls — possible deadlock")
+	}
+
+	for i := 0; i < n; i++ {
+		require.NoError(t, errs[i])
+		assert.NotEqual(t, 404, statuses[i], "concurrent cold caller %d must not observe a false 404", i)
+	}
+	assert.NotNil(t, srv.MCPServer().GetTool("find_clones"))
+}
+
+// TestLocalExecutor_HiddenSessionDeniedWithoutPromotion pins reviewer
+// concern #1: a session whose effective surface hides a tool (the
+// exact facade-v1/hide repro fixture from the review) must get 404
+// without the call ever promoting the tool into the live registry —
+// regardless of whether the tool was already live or still deferred.
+func TestLocalExecutor_HiddenSessionDeniedWithoutPromotion(t *testing.T) {
+	t.Setenv("GORTEX_LAZY_TOOLS", "1")
+	srv, exec := executorTestServer(t)
+	require.Nil(t, srv.MCPServer().GetTool("find_clones"))
+
+	srv.NoteSessionToolPolicy("facade-session", "facade-v1", "hide")
+	ctx := gortexmcp.WithSessionID(context.Background(), "facade-session")
+
+	out, status, err := exec(ctx, "find_clones", []byte(`{}`))
+	require.NoError(t, err)
+	assert.Equal(t, 404, status)
+	assert.Contains(t, string(out), "tool_not_found")
+	assert.Nil(t, srv.MCPServer().GetTool("find_clones"), "a session-hidden tool must never be promoted into the live registry")
+}
+
+// TestLocalExecutor_HiddenSessionDeniedEvenWhenAlreadyLive is the
+// other half of reviewer concern #1: the pre-fix code only checked
+// session policy on a registry miss, so a tool some other caller had
+// already promoted bypassed the gate entirely. Promote it out-of-band
+// first, then confirm a hidden session still gets 404.
+func TestLocalExecutor_HiddenSessionDeniedEvenWhenAlreadyLive(t *testing.T) {
+	t.Setenv("GORTEX_LAZY_TOOLS", "1")
+	srv, exec := executorTestServer(t)
+	require.True(t, srv.EnsureToolPromoted("find_clones"), "test setup: find_clones must promote cleanly before the policy is applied")
+	require.NotNil(t, srv.MCPServer().GetTool("find_clones"), "test setup: find_clones must be live before the policy is applied")
+
+	srv.NoteSessionToolPolicy("facade-session", "facade-v1", "hide")
+	ctx := gortexmcp.WithSessionID(context.Background(), "facade-session")
+
+	out, status, err := exec(ctx, "find_clones", []byte(`{}`))
+	require.NoError(t, err)
+	assert.Equal(t, 404, status, "an already-live tool must still be denied for a session whose surface hides it")
+	assert.Contains(t, string(out), "tool_not_found")
+}
+
+// TestLocalExecutor_NullBodyRejected pins reviewer concern #2: a
+// top-level JSON `null` body must 400, not silently dispatch with nil
+// arguments — json.Unmarshal treats null as a no-op for both struct
+// and map targets, so a naïve parse lets it through.
+func TestLocalExecutor_NullBodyRejected(t *testing.T) {
+	srv, exec := executorTestServer(t)
+	handlerRan := false
+	srv.MCPServer().AddTool(
+		mcp.NewTool("probe_tool", mcp.WithDescription("test")),
+		func(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			handlerRan = true
+			return mcp.NewToolResultText("ran"), nil
+		},
+	)
+
+	out, status, err := exec(context.Background(), "probe_tool", []byte("null"))
+	require.NoError(t, err)
+	assert.Equal(t, 400, status)
+	assert.Contains(t, string(out), "invalid_json")
+	assert.False(t, handlerRan, "a JSON-null body must not run the handler")
+}
+
+// TestLocalExecutor_NestedArgumentsNullRejected covers the second null
+// form from reviewer concern #2: `{"arguments": null}` must also 400.
+func TestLocalExecutor_NestedArgumentsNullRejected(t *testing.T) {
+	srv, exec := executorTestServer(t)
+	handlerRan := false
+	srv.MCPServer().AddTool(
+		mcp.NewTool("probe_tool", mcp.WithDescription("test")),
+		func(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			handlerRan = true
+			return mcp.NewToolResultText("ran"), nil
+		},
+	)
+
+	out, status, err := exec(context.Background(), "probe_tool", []byte(`{"arguments": null}`))
+	require.NoError(t, err)
+	assert.Equal(t, 400, status)
+	assert.Contains(t, string(out), "invalid_json")
+	assert.False(t, handlerRan, `{"arguments": null} must not run the handler`)
 }

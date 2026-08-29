@@ -474,16 +474,32 @@ func (t *Transport) tryRouteToolCall(r *http.Request, state SessionState, frame 
 	// the local executor's nested-arguments unmarshal path (see
 	// cmd/gortex/server_router.go newLocalToolExecutor) finds them.
 	// This matches cmd/gortex/daemon_mcp.go:tryProxyToolCall exactly.
+	// A missing `arguments` key AND an explicit JSON `null` both mean
+	// "no arguments" at the MCP layer (params.arguments is optional);
+	// normalize both to `{}` so the executor's "arguments must be an
+	// object when present" check (added for reviewer concern #2) never
+	// rejects a legitimate no-arg call.
 	rawArgs := envelope.Params.Arguments
-	if len(rawArgs) == 0 {
+	if len(rawArgs) == 0 || strings.TrimSpace(string(rawArgs)) == "null" {
 		rawArgs = json.RawMessage(`{}`)
 	}
 	body, err := json.Marshal(map[string]json.RawMessage{"arguments": rawArgs})
 	if err != nil {
 		return nil, 0, false
 	}
+	// Attach the session id to ctx before the routing decision — the
+	// local-fast path (Decide -> RouteToolCall -> callLocal ->
+	// newLocalToolExecutor) threads this ctx straight into the
+	// session-policy gate, so a call routed here with no session id
+	// would evaluate the daemon's default surface instead of this
+	// session's actual effective surface (mirrors localDispatch below
+	// and the internal/server/handler.go handleToolCall fix).
+	ctx := r.Context()
+	if state.ID != "" {
+		ctx = gortexmcp.WithSessionID(ctx, state.ID)
+	}
 	decision := daemon.NewProxyDecision(func() *daemon.Router { return t.router })
-	outcome := decision.Decide(r.Context(), daemon.RouteInputs{
+	outcome := decision.Decide(ctx, daemon.RouteInputs{
 		ToolName: envelope.Params.Name,
 		Body:     body,
 		Cwd:      cwd,

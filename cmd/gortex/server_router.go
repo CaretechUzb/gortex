@@ -34,13 +34,15 @@ func newLocalToolExecutor(srv *gortexmcp.Server, logger *zap.Logger) daemon.Loca
 	return func(ctx context.Context, toolName string, body []byte) ([]byte, int, error) {
 		// Validate the request body before any lookup, promotion, or
 		// invocation: malformed JSON must 400 without touching the
-		// registry or running a handler.
+		// registry or running a handler. A JSON-null body (top-level
+		// `null` or `{"arguments": null}`) is rejected explicitly —
+		// json.Unmarshal treats null as a silent no-op for both struct
+		// and map targets, so it would otherwise sail through as "no
+		// arguments" instead of being flagged as malformed input.
 		var args map[string]any
 		if len(body) > 0 {
-			var nested struct {
-				Arguments map[string]any `json:"arguments"`
-			}
-			if err := json.Unmarshal(body, &nested); err != nil {
+			var probe any
+			if err := json.Unmarshal(body, &probe); err != nil {
 				payload := map[string]any{
 					"error":   "invalid_json",
 					"message": fmt.Sprintf("malformed request body: %s", err.Error()),
@@ -48,32 +50,56 @@ func newLocalToolExecutor(srv *gortexmcp.Server, logger *zap.Logger) daemon.Loca
 				out, _ := json.Marshal(payload)
 				return out, 400, nil
 			}
-			if nested.Arguments != nil {
-				args = nested.Arguments
-			} else if err := json.Unmarshal(body, &args); err != nil {
+			obj, ok := probe.(map[string]any)
+			if !ok {
 				payload := map[string]any{
 					"error":   "invalid_json",
-					"message": fmt.Sprintf("malformed request body: %s", err.Error()),
+					"message": "malformed request body: expected a JSON object",
 				}
 				out, _ := json.Marshal(payload)
 				return out, 400, nil
+			}
+			if rawArgs, present := obj["arguments"]; present {
+				nested, ok := rawArgs.(map[string]any)
+				if !ok {
+					payload := map[string]any{
+						"error":   "invalid_json",
+						"message": `malformed request body: "arguments" must be a JSON object`,
+					}
+					out, _ := json.Marshal(payload)
+					return out, 400, nil
+				}
+				args = nested
+			} else {
+				args = obj
 			}
 		}
 
+		// Session-aware gate, checked unconditionally — regardless of
+		// whether the tool is already live, deferred, or unknown. This
+		// must run BEFORE any lookup/promotion decision: checking it
+		// only on a registry miss (the pre-fix shape) let an
+		// already-promoted tool bypass the session's effective surface
+		// entirely, since a live GetTool hit skipped the gate below.
+		if !srv.IsToolEnabledForSession(ctx, toolName) {
+			payload := map[string]any{
+				"error":   "tool_not_found",
+				"message": fmt.Sprintf("tool '%s' not found", toolName),
+			}
+			out, _ := json.Marshal(payload)
+			return out, 404, nil
+		}
+		ctx = gortexmcp.WithAuthorizedToolCall(ctx, toolName)
+
 		tool := srv.MCPServer().GetTool(toolName)
 		if tool == nil {
-			// Promote-on-demand, session-aware: a deferred/lazy tool
-			// (the defer-mode tools_search split, the shipped core-preset
-			// default) is not in the live registry until promoted. Mirror
-			// the daemon dispatcher: check the effective session surface
-			// before touching the process-global lazy registry so a
-			// facade-v1 / hide-mode session cannot mutate it, then mark
-			// the call authorized so the MCP surface filter recognises it
-			// (the per-call gate inside the handler still decides).
-			if srv.IsToolEnabledForSession(ctx, toolName) && srv.EnsureToolPromotedForSession(ctx, toolName) {
-				ctx = gortexmcp.WithAuthorizedToolCall(ctx, toolName)
-				tool = srv.MCPServer().GetTool(toolName)
-			}
+			// Deferred/lazy catalog under the defer-mode tools_search
+			// split (the shipped core-preset default) — not yet in the
+			// live registry until promoted just now. The session gate
+			// above already cleared this name for ctx's effective
+			// surface, so promoting it here cannot leak a hidden tool.
+			srv.EnsureToolPromoted(toolName)
+			tool = srv.MCPServer().GetTool(toolName)
 		}
 		if tool == nil {
 			payload := map[string]any{

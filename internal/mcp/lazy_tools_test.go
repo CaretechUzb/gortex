@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	mcplib "github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/assert"
@@ -435,9 +436,11 @@ func TestPromote_ConcurrentCallersNeverFalse404(t *testing.T) {
 
 	start := make(chan struct{})
 	results := make(chan bool, 2)
+	done := make(chan struct{}, 2)
 	// Goroutine 1: transitions the tool, blocks inside the promote
 	// callback before the live registration is visible.
 	go func() {
+		defer func() { done <- struct{}{} }()
 		<-start
 		transitioned := r.Promote("race_tool")
 		mu.Lock()
@@ -453,6 +456,7 @@ func TestPromote_ConcurrentCallersNeverFalse404(t *testing.T) {
 	// live yet → false 404. Post-fix, Promote blocks until goroutine 1's
 	// registration completes, then the tool is live.
 	go func() {
+		defer func() { done <- struct{}{} }()
 		<-start
 		<-promoteBlocked // wait until goroutine 1 is inside the callback
 		// Pre-fix check: the tool is marked promoted but not yet live —
@@ -472,4 +476,29 @@ func TestPromote_ConcurrentCallersNeverFalse404(t *testing.T) {
 		// postLive is true.
 		results <- (len(transitioned) > 0 || postLive || intermediateLive)
 	}()
+
+	// Release both callers simultaneously so the interleaving above is
+	// actually exercised, then collect both verdicts under a bounded
+	// timeout — a hang here means the fix regressed to a deadlock, not
+	// a silently-green test.
+	close(start)
+	timeout := time.After(5 * time.Second)
+	for i := 0; i < 2; i++ {
+		select {
+		case ok := <-results:
+			assert.True(t, ok, "concurrent caller must never observe a false 404 (tool marked promoted but never live)")
+		case <-timeout:
+			t.Fatal("timed out waiting for concurrent Promote callers — possible deadlock in the fixed implementation")
+		}
+	}
+
+	// Both goroutines must actually exit (not leaked) before the test
+	// returns; give them a bounded window past their result send.
+	for i := 0; i < 2; i++ {
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for a goroutine to exit — possible leak")
+		}
+	}
 }
