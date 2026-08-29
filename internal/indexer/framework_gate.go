@@ -32,6 +32,9 @@ func (idx *Indexer) allowedFrameworks() frameworkgate.Set {
 // Scoping the fold to the *changed* prefixes instead was rejected: the
 // effective set would then depend on which file was last touched, so the
 // same workspace would settle into different graphs on different runs.
+// Scoping it to the *workspace* is a different question and is answered by
+// allowedFrameworksForScope below — workspace membership is stable config,
+// so it carries none of that non-determinism.
 func (mi *MultiIndexer) allowedFrameworks() frameworkgate.Set {
 	mi.mu.RLock()
 	defer mi.mu.RUnlock()
@@ -51,6 +54,79 @@ func (mi *MultiIndexer) allowedFrameworks() frameworkgate.Set {
 	}
 	mi.logFrameworkAllowListUnion(narrowedBy, out)
 	return out
+}
+
+// allowedFrameworksForScope is allowedFrameworks restricted to the WORKSPACES
+// a partial synthesis run actually covers.
+//
+// One daemon tracks unrelated workspaces in one process, and the fold above
+// unions across all of them, so a pass that only one workspace asks for still
+// EXECUTES against every other workspace's scope. Measured on a 5,535-file
+// Odoo reconcile in the `his` workspace: fastapi-resolve (17.9 min) and
+// fn-value-callback (13.6 min) ran only because the `gortex` repository — a
+// different workspace, with an honest and minimal allow-list of its own — asks
+// for them. Neither contributed anything: the per-repo gate dropped every edge
+// they staged (fn-value-callback staged 1,297 and lost all 1,297).
+//
+// This does NOT reopen the alternative rejected on allowedFrameworks. That one
+// scoped the fold to the *changed prefixes*, so the effective set moved with
+// whichever file happened to be touched. Workspace membership is stable
+// configuration, so this set is identical on every run over the same workspace.
+//
+// Deliberately NOT used by the global pass. A global run can carry a nil scope
+// covering the whole store, where there is no single workspace to resolve, and
+// narrowing there would stop emitting a sibling workspace's edges on a full
+// derive — which is a real graph change, and the thing the rejected alternative
+// was guarding against. An empty scope therefore falls back to the daemon-wide
+// union, and so does a scope naming no tracked repository.
+func (mi *MultiIndexer) allowedFrameworksForScope(prefixes map[string]bool) frameworkgate.Set {
+	if mi == nil {
+		return frameworkgate.Set{}
+	}
+	if len(prefixes) == 0 {
+		return mi.allowedFrameworks()
+	}
+
+	mi.mu.RLock()
+	defer mi.mu.RUnlock()
+
+	workspaces := make(map[string]bool, len(prefixes))
+	for prefix := range prefixes {
+		workspaces[mi.workspaceIDForPrefixLocked(prefix)] = true
+	}
+
+	out, first := frameworkgate.Set{}, true
+	for prefix, idx := range mi.indexers {
+		if idx == nil || !workspaces[mi.workspaceIDForPrefixLocked(prefix)] {
+			continue
+		}
+		s := idx.allowedFrameworks()
+		if first {
+			out, first = s, false
+			continue
+		}
+		out = frameworkgate.Union(out, s)
+	}
+	// `first` still set means the scope named no tracked repository. `out` is
+	// then the unset Set, which allows everything — the pre-existing behaviour
+	// and the safe direction, consistent with frameworkgate.Union.
+	return out
+}
+
+// workspaceIDForPrefixLocked returns the workspace slug a repository belongs
+// to, following the same singleton fallback as ReposInWorkspace: a repository
+// declaring no workspace is its own workspace, keyed on its prefix. That
+// fallback is what keeps one unconfigured repo from dragging siblings — it
+// lands in a workspace of its own rather than widening theirs.
+//
+// The caller holds mi.mu.
+func (mi *MultiIndexer) workspaceIDForPrefixLocked(prefix string) string {
+	if idx := mi.indexers[prefix]; idx != nil {
+		if ws := idx.WorkspaceID(); ws != "" {
+			return ws
+		}
+	}
+	return prefix
 }
 
 // allowedFrameworksByRepo returns each tracked repository's own

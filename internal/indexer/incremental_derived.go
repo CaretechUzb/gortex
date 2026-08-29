@@ -207,7 +207,13 @@ func (mi *MultiIndexer) runIncrementalDerivedPassesTopologyHeld(
 		merged.Flags.Has(DerivedInvalidatesRuntime) {
 		framework := resolver.RunFrameworkSynthesizersScopedForFiles(
 			mi.graph, scopedPrefixes, merged.Files, merged.CSharpHierarchyChanged,
-			resolver.WithAllowedFrameworks(mi.allowedFrameworks()),
+			// Scoped to the workspaces this run covers, not to every repo
+			// the daemon happens to track: a sibling workspace's passes can
+			// only ever stage edges the per-repo gate below discards, and
+			// paid 31.5 min of a 67 min tail to do it. WithFrameworkAllowByRepo
+			// stays daemon-wide — it is the enforcement half and must remain
+			// exact for every repository an edge could land in.
+			resolver.WithAllowedFrameworks(mi.allowedFrameworksForScope(prefixScope)),
 			resolver.WithFrameworkAllowByRepo(mi.allowedFrameworksByRepo()),
 		)
 		report.Framework = framework.Total
