@@ -172,7 +172,7 @@ func (s *Server) trackMutationTicket(ticket *indexer.MutationTicket) *mutationRe
 		receipt.completed = true
 		receipt.mu.Unlock()
 		if result.Err == nil && result.Reindexed {
-			s.resolveSupersededFailedReceipts(receipt)
+			s.resolveSupersededFailedReceipts(receipt.path, receipt.generation, result)
 		}
 		close(receipt.done)
 		time.AfterFunc(mutationReceiptRetention, func() {
@@ -182,29 +182,40 @@ func (s *Server) trackMutationTicket(ticket *indexer.MutationTicket) *mutationRe
 	return receipt
 }
 
-// resolveSupersededFailedReceipts drops terminally failed receipts for a path
-// once a later generation of the same path has been applied successfully. The
-// graph then reflects newer bytes than the failed generation ever wrote, so
-// the stale failure no longer describes a real freshness gap — keeping it
-// would only fail freshness barriers that waiting cannot heal, because a
-// terminal error never completes differently. Pending receipts and failures
-// at or above the succeeded generation are left untouched.
-func (s *Server) resolveSupersededFailedReceipts(succeeded *mutationReceipt) {
-	succeededPath := filepath.Clean(succeeded.path)
-	s.mutationReceipts.Range(func(key, value any) bool {
+// resolveSupersededFailedReceipts resolves terminally failed receipts for a
+// path once a later generation of the same path has been applied
+// successfully. The graph then reflects newer bytes than the failed
+// generation ever wrote, so the stale failure no longer describes a real
+// freshness gap — keeping it would only fail freshness barriers that waiting
+// cannot heal, because a terminal error never completes differently.
+//
+// The failed receipt is resolved in place rather than deleted: the
+// mutation-commit ledger refreshes its graph half through
+// mutationReceiptState, and a deleted receipt would leave that record
+// reading "pending" forever. Stamping the superseding apply mirrors how
+// completeMutationWaiters resolves earlier waiters with the later apply's
+// result. Pending receipts and failures at or above the succeeded
+// generation are left untouched. The succeeded result is passed by value so
+// the sweep holds no lock besides the receipt it is stamping.
+func (s *Server) resolveSupersededFailedReceipts(succeededPath string, succeededGeneration uint64, applied indexer.MutationResult) {
+	cleanPath := filepath.Clean(succeededPath)
+	s.mutationReceipts.Range(func(_, value any) bool {
 		other, ok := value.(*mutationReceipt)
-		if !ok || other == succeeded {
+		if !ok {
 			return true
 		}
-		if other.generation >= succeeded.generation || filepath.Clean(other.path) != succeededPath {
+		if other.generation >= succeededGeneration || filepath.Clean(other.path) != cleanPath {
 			return true
 		}
-		other.mu.RLock()
-		terminalFailure := other.completed && (other.result.Err != nil || !other.result.Reindexed)
-		other.mu.RUnlock()
-		if terminalFailure {
-			s.mutationReceipts.Delete(key)
+		other.mu.Lock()
+		if other.completed && (other.result.Err != nil || !other.result.Reindexed) {
+			other.result = indexer.MutationResult{
+				RequestedGeneration: other.generation,
+				AppliedGeneration:   applied.AppliedGeneration,
+				Reindexed:           true,
+			}
 		}
+		other.mu.Unlock()
 		return true
 	})
 }
