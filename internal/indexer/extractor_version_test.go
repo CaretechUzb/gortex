@@ -206,6 +206,14 @@ func TestStaleLangsDetection(t *testing.T) {
 			snapshotJSON(t, nil, "julia")); !reflect.DeepEqual(got, []string{"julia"}) {
 			t.Errorf("previous-release snapshot without julia = %v, want [julia]", got)
 		}
+		// A store extracted by the previous Julia extractor version must
+		// re-extract unchanged .jl files too: the callee decoder, macro
+		// and export handling, containment edges, and docstring metadata
+		// all changed what the graph records without any content change.
+		if got := ExtractorVersionStaleLangs(
+			snapshotJSON(t, map[string]int{"julia": 2})); !reflect.DeepEqual(got, []string{"julia"}) {
+			t.Errorf("snapshot stored at the previous julia version = %v, want [julia]", got)
+		}
 		if got := extractorVersionsSnapshot()[postExtractionPolicySnapshotKey]; got != postExtractionPolicyVersion {
 			t.Errorf("persisted policy epoch = %d, want %d", got, postExtractionPolicyVersion)
 		}
@@ -238,7 +246,7 @@ func TestStaleLangsDetection(t *testing.T) {
 		// The Merkle half of the Julia bump: without the .jl → julia
 		// mapping the leaf salt stays empty and Merkle mode misses the
 		// bump the same way the mtime path did.
-		if got, want := merkleSaltFor("src/model.jl"), policySalt+"|julia@2"; got != want {
+		if got, want := merkleSaltFor("src/model.jl"), policySalt+"|julia@3"; got != want {
 			t.Errorf("Julia extractor salt = %q, want %q", got, want)
 		}
 	})
