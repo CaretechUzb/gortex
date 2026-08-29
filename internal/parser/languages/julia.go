@@ -290,7 +290,18 @@ func juliaDocMacroArg(n *sitter.Node, src []byte) (string, bool) {
 			if count < 2 {
 				continue
 			}
-			prop := c.NamedChild(count - 1)
+			// Only the standard-library documentation macros lower a
+			// docstring: `Core.@doc` and `Base.@doc` (bare `@doc` is the
+			// macro_identifier case above). A user macro that merely ends
+			// in `.@doc`, like `Foo.@doc`, is something else and must not
+			// hijack the docstring slot.
+			base, prop := c.NamedChild(0), c.NamedChild(count-1)
+			if base.Type() != "identifier" {
+				continue
+			}
+			if mod := base.Content(src); mod != "Core" && mod != "Base" {
+				continue
+			}
 			for m := range prop.NamedChildren() {
 				if m.Type() == "identifier" && m.Content(src) == "doc" {
 					isDoc = true

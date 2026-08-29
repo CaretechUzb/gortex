@@ -1526,3 +1526,31 @@ func TestJuliaExtractor_ExplicitDocOnConstant(t *testing.T) {
 	assert.Equal(t, "Tuning knob.", k.Meta["doc"],
 		"the constant keeps the docstring the explicit @doc form carries")
 }
+
+// Only bare `@doc`, `Core.@doc`, and `Base.@doc` lower a docstring. A user
+// macro that merely ends in `.@doc` — `Foo.@doc` — is unrelated and must
+// not attach its string as documentation; the standard forms still do, so
+// the restriction is not over-broad.
+func TestJuliaExtractor_ForeignDocMacroDoesNotAttach(t *testing.T) {
+	src := []byte(`Foo.@doc "not a docstring" function g(x)
+    x
+end
+
+Core.@doc "real doc" function h(x)
+    x
+end
+`)
+	res, err := NewJuliaExtractor().Extract("fd.jl", src)
+	require.NoError(t, err)
+
+	docs := map[string]string{}
+	for _, n := range res.Nodes {
+		if d, ok := n.Meta["doc"].(string); ok {
+			docs[n.ID] = d
+		}
+	}
+	_, gDoc := docs["fd.jl::g"]
+	assert.False(t, gDoc, "Foo.@doc must not hijack the docstring slot")
+	assert.Equal(t, "real doc", docs["fd.jl::h"],
+		"Core.@doc still attaches, so the restriction is not over-broad")
+}
