@@ -634,11 +634,41 @@ func (m *Manager) declareApplicableProviders(
 	}
 }
 
+// applicabilityMissOnce keeps the report below to one line per process. The
+// miss repeats on every repo of every pass, and a warning per occurrence would
+// bury the signal it exists to raise.
+var applicabilityMissOnce sync.Once
+
+// applicabilityStore resolves the durable applicability writer behind g.
+//
+// A miss is not always a defect: the in-memory graph and every test double
+// legitimately model no applicability. Inside the daemon it is one, and a
+// silent one -- the three call sites below each returned early and logged
+// nothing, so a store that never received a single row was indistinguishable
+// from a workspace where no provider applied. Readiness then reports the
+// enrichment half as "unknown" forever, which does not block "ready", so the
+// column keeps answering while the half that motivated it is inert.
+//
+// Naming the concrete type is the whole point: the indexer rebinds idx.graph
+// to an in-memory shadow and back while it works, so WHICH graph reaches a
+// pass is a real question with a real answer, and one worth printing.
+func (m *Manager) applicabilityStore(g graph.Store) (graph.EnrichmentApplicabilityStore, bool) {
+	store, ok := g.(graph.EnrichmentApplicabilityStore)
+	if !ok && m.logger != nil {
+		applicabilityMissOnce.Do(func() {
+			m.logger.Warn("semantic: this graph does not model enrichment applicability; "+
+				"readiness will report enrichment as unknown",
+				zap.String("graph_type", fmt.Sprintf("%T", g)))
+		})
+	}
+	return store, ok
+}
+
 // declareProviders persists one repo's applicable set, tolerating a backend
 // that does not model applicability (the in-memory graph, and every test double
 // that only implements graph.Store).
 func (m *Manager) declareProviders(g graph.Store, repoPrefix string, providers []string) {
-	store, ok := g.(graph.EnrichmentApplicabilityStore)
+	store, ok := m.applicabilityStore(g)
 	if !ok {
 		return
 	}
@@ -694,7 +724,7 @@ func RefreshCompletedProviders(g graph.Store, repoPrefix string) {
 // first is fail-closed instead: the repo reads "partial" until the next pass,
 // which is the correct answer.
 func (m *Manager) observeContentGen(g graph.Store, repoPrefix string) int64 {
-	store, ok := g.(graph.EnrichmentApplicabilityStore)
+	store, ok := m.applicabilityStore(g)
 	if !ok {
 		return 0
 	}
@@ -718,7 +748,7 @@ func (m *Manager) observeContentGen(g graph.Store, repoPrefix string) int64 {
 // repo with uncommitted work reading "partial" forever, contradicting the
 // decision that working-tree dirtiness is not a readiness input.
 func (m *Manager) completeProvider(g graph.Store, repoPrefix, provider string, contentGen int64) {
-	store, ok := g.(graph.EnrichmentApplicabilityStore)
+	store, ok := m.applicabilityStore(g)
 	if !ok {
 		return
 	}
