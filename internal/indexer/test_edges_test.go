@@ -565,3 +565,27 @@ func TestMasterResolveWholeGraphReconcilesRetargetedTestCalls(t *testing.T) {
 		}
 	})
 }
+
+// A cold index runs its own graph-wide test projection after ResolveAll,
+// so every test caller the resolver noted on the retarget frontier is
+// already covered - a frontier left parked there would make the first
+// warm save re-project the entire test corpus under ResolveMutex for
+// nothing. The cold path must discard it.
+func TestColdIndexDiscardsRetargetedTestCallFrontier(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "foo.go"), "package pkg\n\nfunc Foo() {}\n")
+	writeFile(t, filepath.Join(dir, "foo_test.go"),
+		"package pkg\n\nimport \"testing\"\n\nfunc TestFoo(t *testing.T) { Foo() }\n")
+	g := graph.New()
+	idx := newTestIndexer(g)
+	if _, err := idx.Index(dir); err != nil {
+		t.Fatalf("cold index: %v", err)
+	}
+	if e := findEdge(g, graph.EdgeTests, "foo_test.go::TestFoo", "foo.go::Foo"); e == nil {
+		t.Fatalf("fixture: cold index must project the resolved test call")
+	}
+	if files := idx.resolver.TakeRetargetedTestCallFiles(); len(files) != 0 {
+		t.Fatalf("cold index parked %d test caller(s) on the retarget frontier "+
+			"after its own graph-wide projection: %v", len(files), files)
+	}
+}

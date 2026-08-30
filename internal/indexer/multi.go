@@ -1682,6 +1682,12 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 		zap.Int("test_symbols", marked),
 		zap.Int("edges", emitted),
 		zap.Duration("elapsed", time.Since(testStart)))
+	// This projection covers every test caller in scanPrefixes (nil =
+	// whole graph), so the retarget frontiers the per-repo ResolveAll
+	// calls parked for those repos are already served - discard them, or
+	// the first later incremental save drains the entire test corpus into
+	// a scoped re-projection under ResolveMutex.
+	mi.discardRetargetedTestCallFiles(scanPrefixes)
 	passStart("entrypoint_hierarchy")
 	ctrlStart := time.Now()
 	// Seeds from already-stamped entry points, so cost is O(seed

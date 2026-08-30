@@ -95,6 +95,25 @@ func (mi *MultiIndexer) drainRetargetedTestCallFiles(prefixSet map[string]struct
 	return appendUniqueSorted(nil, files...)
 }
 
+// discardRetargetedTestCallFiles drops the per-repo retarget frontiers a
+// graph-wide (or repo-scoped) test projection has just superseded. A nil
+// prefix set discards every tracked repo's frontier. Destructive by
+// design: the callers noted there are already covered by the projection
+// that just ran, so draining them later would only re-project them.
+func (mi *MultiIndexer) discardRetargetedTestCallFiles(prefixes map[string]bool) {
+	mi.mu.RLock()
+	defer mi.mu.RUnlock()
+	for prefix, idx := range mi.indexers {
+		if idx == nil || idx.resolver == nil {
+			continue
+		}
+		if prefixes != nil && !prefixes[prefix] {
+			continue
+		}
+		idx.resolver.TakeRetargetedTestCallFiles()
+	}
+}
+
 // RunIncrementalDerivedPasses executes only the derived families invalidated
 // by the exact per-file plans. A legacy database without persisted fingerprints
 // takes the old scoped-global path once; ordinary body/metadata edits never do.
