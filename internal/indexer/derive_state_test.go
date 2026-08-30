@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -211,21 +212,55 @@ func TestRefreshDeriveStateOnlyRenewsWhatTheGlobalPassesEstablished(t *testing.T
 	require.False(t, found, "a never-derived repo must stay never-derived")
 }
 
-// fakeMarker records the marker calls a run makes, in order.
+// fakeMarker records the marker calls a run makes, in order. The scheduler
+// publishes the owed set from its own goroutine, so every field is guarded.
 type fakeMarker struct {
+	mu         sync.Mutex
 	opened     [][]string
 	configHash []string
 	closes     int
 	enriching  [][]string
+	pending    [][]string
 }
 
 func (f *fakeMarker) DeriveBegan(scope []string, configHash string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.opened = append(f.opened, scope)
 	f.configHash = append(f.configHash, configHash)
 }
-func (f *fakeMarker) DeriveEnded() { f.closes++ }
+func (f *fakeMarker) DeriveEnded() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.closes++
+}
 func (f *fakeMarker) EnrichingChanged(r []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.enriching = append(f.enriching, r)
+}
+func (f *fakeMarker) DerivePendingChanged(p []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pending = append(f.pending, p)
+}
+
+// owedNow is the last set published, which is the only one a reader ever sees:
+// the marker is level-triggered, so the history matters to a test only for
+// showing that the set was never empty at the wrong moment.
+func (f *fakeMarker) owedNow() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.pending) == 0 {
+		return nil
+	}
+	return f.pending[len(f.pending)-1]
+}
+
+func (f *fakeMarker) publishedOwedSets() [][]string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([][]string(nil), f.pending...)
 }
 
 // A preempted run is the case that matters: it returns from the middle of the

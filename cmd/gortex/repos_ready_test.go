@@ -72,6 +72,13 @@ func TestReadyVerdictLadder(t *testing.T) {
 				in.repo.DeriveFound = false
 			}, readyLabelDeriving},
 
+		{"work the daemon owes but has not opened is named too — the same rows " +
+			"that read never-derived without the marker",
+			func(_ *repoStatus, in *readinessInputs) {
+				in.derivePending = true
+				in.repo.DeriveFound = false
+			}, readyLabelDeriving},
+
 		{"enrichment in flight, same",
 			func(_ *repoStatus, in *readinessInputs) {
 				in.enriching = true
@@ -136,6 +143,34 @@ func TestReadyVerdictLadder(t *testing.T) {
 // The enrichment sub-verdict, and the distinction the __none__ sentinel exists
 // to draw. "Nothing applies" is an answer; "nothing recorded" is the absence of
 // one, and only the first can be trusted to let a repo through.
+// Running and owed share a label — a reader needs "the daemon is on it", and a
+// second label would ripple through readyCell, the summary buckets and the
+// JSON contract for no gain. They must not share a reason: the two differ by
+// minutes of cross-repo resolve, and "running now" against a pass that has not
+// opened is the kind of small lie that makes someone stop believing the column.
+func TestAnOwedDeriveIsNamedAsQueuedNotAsRunning(t *testing.T) {
+	t.Parallel()
+	entry, in := derivedRepo()
+	in.repo.DeriveFound = false
+
+	in.deriving, in.derivePending = true, false
+	runningLabel, runningReason := readyVerdict(entry, in)
+
+	in.deriving, in.derivePending = false, true
+	owedLabel, owedReason := readyVerdict(entry, in)
+
+	require.Equal(t, readyLabelDeriving, runningLabel)
+	require.Equal(t, readyLabelDeriving, owedLabel)
+	require.NotEqual(t, runningReason, owedReason)
+	require.Contains(t, owedReason, "queued")
+
+	// The control: the same store rows with no marker at all are the verdict
+	// this fix exists to stop being reported.
+	in.derivePending = false
+	bareLabel, _ := readyVerdict(entry, in)
+	require.Equal(t, readyLabelNeverDerived, bareLabel)
+}
+
 func TestEnrichVerdict(t *testing.T) {
 	t.Parallel()
 	base := store_sqlite.RepoReadiness{ContentGen: 5}

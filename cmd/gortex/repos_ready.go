@@ -24,8 +24,8 @@ import (
 //	                            │no
 //	 indexed sha != git HEAD ───yes───────> stale         the index is behind
 //	                            │no
-//	 a live daemon is working ──yes───────> deriving… /   in flight, not broken
-//	 on this repo               │           enriching…
+//	 a live daemon is working ──yes───────> deriving… /   in flight or queued,
+//	 or owes work on this repo  │           enriching…    not broken
 //	                            │no
 //	 derive_state table absent ─yes───────> unknown       binary newer than store
 //	                            │no
@@ -79,11 +79,20 @@ type readinessInputs struct {
 
 	repo store_sqlite.RepoReadiness
 
-	// deriving and enriching come from the daemon's runtime record, already
-	// filtered to this repo and already discarded wholesale if the recording
-	// process is dead.
-	deriving  bool
-	enriching bool
+	// deriving, derivePending and enriching come from the daemon's runtime
+	// record, already filtered to this repo and already discarded wholesale if
+	// the recording process is dead.
+	//
+	// derivePending is the run the scheduler owes but has not opened. It is
+	// separate from deriving because the two are separated by minutes — a
+	// debounce, a checkout-group republish, a whole-workspace cross-repo
+	// resolve and the batch-mutation gate all sit between them — and a repo
+	// tracked into that gap has no derive_state row, so without it the verdict
+	// falls through to "never derived" while the daemon is working on exactly
+	// that repo.
+	deriving      bool
+	derivePending bool
+	enriching     bool
 
 	// passVersion is what this build's derived passes would stamp. configHash is
 	// what the running daemon's derive-relevant config hashes to, or empty when
@@ -140,6 +149,12 @@ func readyVerdict(entry repoStatus, in readinessInputs) (label, reason string) {
 		return readyLabelStale, "the index is behind git HEAD; the daemon reindexes on its own"
 	case in.deriving:
 		return readyLabelDeriving, "derived passes are running now"
+	case in.derivePending:
+		// Same label, different reason. A reader needs to know the repo is
+		// being worked on, which is the label's whole job; whether the pass
+		// has opened yet is detail, and a separate label would ripple through
+		// readyCell, the summary buckets and the JSON contract for no gain.
+		return readyLabelDeriving, "derived passes are queued for this repo"
 	case in.enriching:
 		return readyLabelEnriching, "semantic enrichment is running now"
 	case !in.deriveTable:

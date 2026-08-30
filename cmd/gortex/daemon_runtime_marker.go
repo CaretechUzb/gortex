@@ -44,6 +44,14 @@ func (m runtimeStateMarker) DeriveEnded() {
 	})
 }
 
+// DerivePendingChanged publishes the owed-but-not-started set. It is written
+// even when empty, because the empty write is what retires a set that has
+// since started or been abandoned; skipping it would leave a live daemon
+// reporting a derive it no longer owes.
+func (m runtimeStateMarker) DerivePendingChanged(prefixes []string) {
+	m.update(func(st *daemon.RuntimeState) { st.DerivePending = prefixes })
+}
+
 func (m runtimeStateMarker) EnrichingChanged(repos []string) {
 	m.update(func(st *daemon.RuntimeState) { st.EnrichingRepos = repos })
 }

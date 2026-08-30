@@ -232,6 +232,7 @@ func applyReadiness(
 	}
 	if runtimeLive {
 		in.deriving = runtime.IsDeriving(prefix)
+		in.derivePending = runtime.IsDerivePending(prefix)
 		in.enriching = runtime.IsEnriching(prefix)
 		in.configHash = runtime.DeriveConfigHash
 	}

@@ -37,6 +37,26 @@ type RuntimeState struct {
 	DerivingSince int64    `json:"deriving_since,omitempty"`
 	DerivingScope []string `json:"deriving_scope,omitempty"`
 
+	// DerivePending names the repos a derived-pass run is OWED but has not
+	// opened yet. DerivingSince covers the run itself; this covers everything
+	// before it, and that gap is not small: the scheduler debounces for two
+	// seconds, republishes the checkout grouping, runs a whole-workspace
+	// cross-repo resolve and then waits on the batch-mutation gate, all before
+	// the passes call DeriveBegan. A repo tracked into that window has no
+	// derive_state row yet and no in-flight marker either, so it reads "never
+	// derived" — the one verdict that tells a reader the graph is silently
+	// wrong — while `gortex daemon status`, which asks the scheduler directly,
+	// says a derive is pending for it. Two surfaces disagreeing about repo
+	// health is worse than one of them being incomplete.
+	//
+	// Only the owed repos are listed, never the whole workspace. The set a
+	// pending pass will actually cover is not decided until it starts
+	// (rederiveScope reads a checkout grouping that is republished on the way
+	// in), and the repos this exists to rescue are precisely the newly tracked
+	// ones. Marking the others would hide their real verdict behind a run that
+	// has nothing to say about them.
+	DerivePending []string `json:"derive_pending,omitempty"`
+
 	// EnrichingRepos names the repos with a semantic-enrichment pass running.
 	// Symmetric with the derive markers, and needed for the same reason:
 	// enrichment counts toward readiness and is long-running.
@@ -64,6 +84,14 @@ func (st RuntimeState) IsDeriving(repoPrefix string) bool {
 		return true
 	}
 	return containsPrefix(st.DerivingScope, repoPrefix)
+}
+
+// IsDerivePending reports whether a derived-pass run is owed to repoPrefix but
+// has not opened yet. Unlike IsDeriving, an empty list means nothing is owed:
+// the set is always explicit here, because a pending pass has not yet decided
+// what it will cover and an absent value must not be read as "everything".
+func (st RuntimeState) IsDerivePending(repoPrefix string) bool {
+	return containsPrefix(st.DerivePending, repoPrefix)
 }
 
 // IsEnriching reports whether a semantic-enrichment pass is running for

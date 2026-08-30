@@ -248,6 +248,13 @@ type RuntimeMarker interface {
 	// marker left open would freeze a reader on "deriving…" until the daemon
 	// exits, so this must fire on every exit path.
 	DeriveEnded()
+	// DerivePendingChanged republishes the set of repos a derived-pass run is
+	// owed to but has not opened yet — queued behind the debounce, behind the
+	// cross-repo resolve, or behind the batch-mutation gate. Level-triggered
+	// for the same reason as EnrichingChanged: each call carries the complete
+	// current set, so a dropped publication is repaired by the next transition
+	// instead of stranding a reader on a set that no longer exists.
+	DerivePendingChanged(prefixes []string)
 	// EnrichingChanged republishes the set of repos with an enrichment pass in
 	// flight. It is level-triggered, not edge-triggered: each call carries the
 	// complete current set, so a dropped notification is repaired by the next
