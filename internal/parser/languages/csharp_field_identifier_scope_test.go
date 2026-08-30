@@ -65,3 +65,40 @@ func TestCSharpFieldIdentifier_UsesSurviveExpiredShadows(t *testing.T) {
 	assert.Equal(t, 0, csharpFieldEdgeCount(res, "F.cs::FWFlow.LocalOnly", "_box", graph.EdgeWrites),
 		"guard: an assignment to a LIVE same-named local is not a field write")
 }
+
+// A pattern variable declared in a catch FILTER scopes over its catch
+// clause, and one declared in a query clause over its query - not over
+// the whole method. csharpLocalScopeOf climbed past both (neither
+// catch_clause nor query_expression formed a scope), so
+// `catch (...) when (o is int store)` shadowed `store` method-wide and
+// an EARLIER receiver read of the `store` field lost its reads edge
+// (round-6 non-blocking finding 1; PR-introduced - the merge base
+// mints the edge).
+func TestCSharpFieldIdentifier_FilterAndQueryPatternsScopeToTheirClause(t *testing.T) {
+	src := []byte(`using System.Linq;
+namespace App {
+    public sealed class CFBag {
+        public void Fill() { }
+    }
+    public sealed class CFFlow {
+        private CFBag store = new CFBag();
+        public void ReadBeforeCatchFilter(object o) {
+            store.Fill();
+            try { } catch (System.Exception e) when (o is int store) { _ = store; }
+        }
+        public void ReadBeforeQueryPattern(object o, int[] xs) {
+            store.Fill();
+            var q = from x in xs where o is int store select x;
+            _ = q;
+        }
+    }
+}
+`)
+	res, err := NewCSharpExtractor().Extract("CF.cs", src)
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, csharpFieldEdgeCount(res, "CF.cs::CFFlow.ReadBeforeCatchFilter", "store", graph.EdgeReads),
+		"the filter pattern's scope is its catch clause - the earlier receiver read is the FIELD")
+	assert.Equal(t, 1, csharpFieldEdgeCount(res, "CF.cs::CFFlow.ReadBeforeQueryPattern", "store", graph.EdgeReads),
+		"the query pattern's scope is its query - the earlier receiver read is the FIELD")
+}

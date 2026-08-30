@@ -297,6 +297,14 @@ var csharpScopeFormers = map[string]bool{
 	"using_statement":             true,
 	"lock_statement":              true,
 	"fixed_statement":             true,
+	// A pattern variable in a catch FILTER scopes over its catch clause
+	// (filter plus handler); one in a query clause scopes within the
+	// query. Climbing past either shadowed the name method-wide, and an
+	// earlier same-named field use lost its evidence (round-6
+	// non-blocking finding 1). Locals inside the catch handler's or a
+	// query lambda's own block still stop at that block first.
+	"catch_clause":     true,
+	"query_expression": true,
 }
 
 // csharpLocalScopeOf returns the extent of the scope declaring a local.
