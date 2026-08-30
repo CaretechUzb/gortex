@@ -993,7 +993,9 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 	// response). Aggregated stats remain available via the `savings` tool.
 	returned := tokens.CachedCountInt64(source)
 	fullFile := int64(tokens.EstimateFromSample(totalFileChars, source))
-	s.tokenStatsFor(ctx).record(s.savingsAttributionNode(node), "get_symbol_source", returned, fullFile)
+	symStats := s.tokenStatsFor(ctx)
+	symStats.creditFile(absPath)
+	symStats.record(s.savingsAttributionNode(node), "get_symbol_source", returned, fullFile)
 
 	result := map[string]any{
 		"id":         node.ID,
@@ -1266,7 +1268,9 @@ func (s *Server) handleBatchSymbols(ctx context.Context, req mcp.CallToolRequest
 					entry["from_line"] = fromLine
 					returned := tokens.CachedCountInt64(source)
 					fullFile := int64(tokens.EstimateFromSample(totalFileChars, source))
-					s.tokenStatsFor(ctx).record(s.savingsAttributionNode(node), "batch_symbols", returned, fullFile)
+					batchStats := s.tokenStatsFor(ctx)
+					batchStats.creditFile(absPath)
+					batchStats.record(s.savingsAttributionNode(node), "batch_symbols", returned, fullFile)
 				}
 			}
 		}
@@ -2168,7 +2172,9 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 					sourcesEmbedded++
 					returned := tokens.CachedCountInt64(source)
 					fullFile := int64(tokens.EstimateFromSample(totalFileChars, source))
-					s.tokenStatsFor(ctx).record(s.savingsAttributionNode(sym), "smart_context", returned, fullFile)
+					ctxStats := s.tokenStatsFor(ctx)
+					ctxStats.creditFile(absPath)
+					ctxStats.record(s.savingsAttributionNode(sym), "smart_context", returned, fullFile)
 				}
 			}
 		}

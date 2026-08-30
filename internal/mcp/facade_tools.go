@@ -1111,6 +1111,11 @@ func (s *Server) invokeFacadeSpec(ctx context.Context, req mcpgo.CallToolRequest
 	forwarded.Params.RawArguments = nil
 	result, err = legacy.handler(ctx, forwarded)
 	if err == nil {
+		// Book the retrieval half of the savings ledger under the LEGACY tool
+		// name, so a facade call and a direct legacy call land in the same
+		// per-tool bucket. Runs before decoration: the baseline is what the
+		// handler actually retrieved, not the riders bolted on afterwards.
+		s.recordRetrievalSavings(ctx, spec.Legacy, result)
 		result = s.decorateFacadeFreshness(spec.Legacy, forwarded, result)
 	}
 	result = decorateFacadeResultIdentity(result, spec)
