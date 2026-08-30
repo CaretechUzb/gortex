@@ -796,6 +796,30 @@ import Base: + as plus, -
 		"and the selected names are still recorded on it")
 }
 
+// An export list can export a macro (`export @m`) and an operator
+// (`export ⊗`) — a macro_identifier node and an operator node, the same
+// distinction import selections already decode — so an identifier-only
+// scan dropped them from the module's recorded public surface.
+func TestJuliaExtractor_MacroAndOperatorExports(t *testing.T) {
+	src := []byte(`module Ops
+export apply, @m, ⊗
+end
+`)
+	res, err := NewJuliaExtractor().Extract("exports.jl", src)
+	require.NoError(t, err)
+
+	mod := map[string]*graph.Node{}
+	for _, n := range res.Nodes {
+		mod[n.ID] = n
+	}
+	m := mod["exports.jl::Ops"]
+	require.NotNil(t, m)
+	exports, ok := m.Meta["exports"].([]string)
+	require.True(t, ok, "module Meta exports missing")
+	assert.ElementsMatch(t, []string{"apply", "@m", "⊗"}, exports,
+		"a module's exported macros and operators are part of its public surface")
+}
+
 func TestJuliaExtractor_Calls(t *testing.T) {
 	src := []byte(`module Calls
 
@@ -866,6 +890,377 @@ end
 			t.Errorf("self-recursion edge emitted")
 		}
 	}
+}
+
+// A chained callee's base is a call, not a name: `get(cfg).run(x)` used
+// to reach the graph as `unresolved::get(cfg).run` — arguments and all —
+// because the callee was decoded by splitting its source text on the
+// last dot, and a chain broken across lines even carried the line break
+// into the target. Decoding the field_expression's children instead
+// degrades the callee to its method name, the only part a resolver
+// could ever match, while a genuinely dotted base (A.B.c) keeps its
+// full qualification.
+func TestJuliaExtractor_ChainedCalleeDegradesToMethodName(t *testing.T) {
+	src := []byte(`launch(cfg) = get(cfg).run(x)
+
+wrapped(x) = foo(x,
+    1,
+).bar(y)
+
+deep(x) = A.B.c(x)
+`)
+	res, err := NewJuliaExtractor().Extract("chain.jl", src)
+	require.NoError(t, err)
+
+	calls := map[string]bool{}
+	for _, ed := range res.Edges {
+		if ed.Kind == graph.EdgeCalls {
+			calls[ed.From+" -> "+ed.To] = true
+		}
+		require.NotContains(t, ed.To, "\n", "a target must never carry a line break")
+		require.NotContains(t, ed.To, "(", "a target must never carry argument text")
+	}
+	require.True(t, calls["chain.jl::launch -> unresolved::run"],
+		"a chained callee degrades to its method name, not its argument text")
+	require.True(t, calls["chain.jl::wrapped -> unresolved::bar"],
+		"a chain broken across lines must not leak the break into the target")
+	require.True(t, calls["chain.jl::deep -> unresolved::A.B.c"],
+		"a dotted base keeps its full qualification")
+}
+
+// `Base.:(==)(a, b)` used to normalise its callee to `(==)` — the
+// parenthesised quote survived the text trim — while `Base.:+` trimmed
+// to `+`. Both spellings name the same operator, so both must decode to
+// the operator's own name; a bare `(==)(a, b)` callee, which wears only
+// the parentheses, does too.
+func TestJuliaExtractor_QuotedOperatorCallee(t *testing.T) {
+	src := []byte(`same(a, b) = Base.:(==)(a, b)
+plus(a, b) = Base.:+(a, b)
+plain(a, b) = (==)(a, b)
+`)
+	res, err := NewJuliaExtractor().Extract("op.jl", src)
+	require.NoError(t, err)
+
+	calls := map[string]bool{}
+	for _, ed := range res.Edges {
+		if ed.Kind == graph.EdgeCalls {
+			calls[ed.From+" -> "+ed.To] = true
+		}
+	}
+	require.True(t, calls["op.jl::same -> unresolved::Base.=="],
+		"`:(==)` must normalise to the operator name like `:+` does")
+	require.True(t, calls["op.jl::plus -> unresolved::Base.+"],
+		"`:+` keeps its existing normalisation")
+	require.True(t, calls["op.jl::plain -> unresolved::=="],
+		"a bare parenthesised operator callee decodes too")
+}
+
+// Constructing a parametric type is one of the most common calls in real
+// Julia, and its callee is a parametrized_type_expression, not an
+// identifier — a decoder with no case for it dropped the edge, so
+// `Vector{Int}(xs)` vanished from the call graph. The edge names the
+// constructor the way Julia prints it, parameters included, and a
+// qualified head keeps its module.
+func TestJuliaExtractor_ParametrizedConstructorCallee(t *testing.T) {
+	src := []byte(`build(xs) = Vector{Int}(xs)
+qualified(xs) = Base.Vector{Int}(xs)
+table(xs) = Dict{String,Int}(xs)
+`)
+	res, err := NewJuliaExtractor().Extract("param.jl", src)
+	require.NoError(t, err)
+
+	calls := map[string]bool{}
+	for _, ed := range res.Edges {
+		if ed.Kind == graph.EdgeCalls {
+			calls[ed.From+" -> "+ed.To] = true
+		}
+		require.NotContains(t, ed.To, "\n", "a target must never carry a line break")
+	}
+	require.True(t, calls["param.jl::build -> unresolved::Vector{Int}"],
+		"a parametric constructor call is a call edge")
+	require.True(t, calls["param.jl::qualified -> unresolved::Base.Vector{Int}"],
+		"a qualified parametric head keeps its module")
+	require.True(t, calls["param.jl::table -> unresolved::Dict{String,Int}"],
+		"multi-parameter constructors carry their parameters")
+}
+
+// A module-qualified macro call nests its macro_identifier under a
+// field_expression (Base.@time), so a scan that matches only a direct
+// macro_identifier child recorded the inner helper call but never the
+// macro's own edge. The qualified form must record both, with the
+// module as receiver — the same spelling qualified call callees use —
+// and the import-alias rewrite applies to it just as it does to calls.
+func TestJuliaExtractor_QualifiedMacroCall(t *testing.T) {
+	src := []byte(`module M
+import Foo as F
+
+function work(xs)
+    Base.@time helper(xs)
+    F.@spawn helper(xs)
+end
+end
+`)
+	res, err := NewJuliaExtractor().Extract("qmac.jl", src)
+	require.NoError(t, err)
+
+	type call struct {
+		to   string
+		meta map[string]any
+	}
+	calls := map[string][]call{}
+	for _, ed := range res.Edges {
+		if ed.Kind == graph.EdgeCalls {
+			meta := map[string]any{}
+			for k, v := range ed.Meta {
+				meta[k] = v
+			}
+			calls[ed.From] = append(calls[ed.From], call{ed.To, meta})
+		}
+	}
+	var sawBase, sawAliased, sawHelper bool
+	for _, c := range calls["qmac.jl::work"] {
+		switch c.to {
+		case "unresolved::Base.time":
+			sawBase = c.meta["macro"] == true
+		case "unresolved::Foo.spawn":
+			sawAliased = c.meta["macro"] == true
+		case "unresolved::helper":
+			sawHelper = true
+		}
+	}
+	assert.True(t, sawBase, "Base.@time needs its macro edge, receiver included")
+	assert.True(t, sawAliased, "an aliased module qualifies the macro edge, as it does for calls")
+	assert.True(t, sawHelper, "the inner call of a qualified macro keeps its own edge")
+}
+
+// A docstring above a macro call switches walkMacroArgs into its
+// doc-carrying loop, which dispatched definition arguments to their
+// handlers but walked every other argument with walk() — and walk()
+// visits a node's children, never the node itself. A call_expression
+// argument therefore never reached handleCall; since ordinary call
+// edges need an enclosing function, which a documented module-level
+// macro call never has, the one observable loss is the include() that
+// loads a file on every worker.
+func TestJuliaExtractor_DocumentedMacroArgumentsKeepCalls(t *testing.T) {
+	src := []byte(`module M
+"""load helpers on every worker"""
+@everywhere include("helpers.jl")
+end
+`)
+	res, err := NewJuliaExtractor().Extract("everywhere.jl", src)
+	require.NoError(t, err)
+
+	var got bool
+	for _, ed := range res.Edges {
+		if ed.Kind == graph.EdgeImports && ed.To == "unresolved::import::helpers.jl" {
+			got = true
+		}
+	}
+	assert.True(t, got, "an include() in a documented macro argument keeps its import edge")
+
+	// The undocumented form must keep working identically.
+	plain, err := NewJuliaExtractor().Extract("plain.jl", []byte("module M\n@everywhere include(\"more.jl\")\nend\n"))
+	require.NoError(t, err)
+	var plainGot bool
+	for _, ed := range plain.Edges {
+		if ed.Kind == graph.EdgeImports && ed.To == "unresolved::import::more.jl" {
+			plainGot = true
+		}
+	}
+	assert.True(t, plainGot, "the undocumented form is unchanged")
+}
+
+// Functions, types and fields inside a module carry a member_of edge to
+// it, but a constant and a nested module carried only scope_mod on
+// Meta — recorded, yet unreachable from a traversal of the module. A
+// constant belongs to its module and a nested module to its parent
+// through the same edge every other resident uses; at the top level
+// (no enclosing module) neither gets one.
+func TestJuliaExtractor_ConstAndNestedModuleContainment(t *testing.T) {
+	src := []byte(`module Outer
+const X = 1
+module Inner
+const Y = 2
+f() = 1
+end
+end
+
+const TOP = 3
+`)
+	res, err := NewJuliaExtractor().Extract("own.jl", src)
+	require.NoError(t, err)
+
+	nodes := map[string]*graph.Node{}
+	for _, n := range res.Nodes {
+		nodes[n.ID] = n
+	}
+	require.NotNil(t, nodes["own.jl::Outer"])
+	require.NotNil(t, nodes["own.jl::X"])
+	inner := nodes["own.jl::Inner"]
+	require.NotNil(t, inner)
+	assert.Equal(t, "Outer", inner.Meta["scope_mod"], "scope_mod keeps recording the lexical path")
+	require.NotNil(t, nodes["own.jl::Y"])
+	require.NotNil(t, nodes["own.jl::TOP"], "a top-level constant still mints its variable node")
+
+	owners := juliaOwners(res.Edges)
+	assert.True(t, owners["own.jl::X"]["own.jl::Outer"],
+		"a module-level constant belongs to its module")
+	assert.True(t, owners["own.jl::Inner"]["own.jl::Outer"],
+		"a nested module belongs to its parent")
+	assert.True(t, owners["own.jl::Y"]["own.jl::Inner"],
+		"a constant in the inner module belongs to the inner module")
+	assert.True(t, owners["own.jl::f"]["own.jl::Inner"],
+		"the pre-existing function containment is unchanged")
+	assert.Empty(t, owners["own.jl::TOP"],
+		"a top-level constant has no enclosing module to belong to")
+	assert.Empty(t, owners["own.jl::Outer"],
+		"a top-level module has no enclosing module to belong to")
+}
+
+// A qualified definition's member_of names its receiver. When the
+// receiver is a type in the same file the edge targets that node — but
+// `function Base.show` extends a module this file does not declare, and
+// a member_of to a node-shaped id that has no node claims a resident of
+// the graph that does not exist. Such a target must be self-describing,
+// the way extends and call edges already are: prefixed unresolved::,
+// while the method's own id stays flat.
+func TestJuliaExtractor_ExternalReceiverMemberOfIsUnresolved(t *testing.T) {
+	src := []byte(`function Base.show(io, x)
+    nothing
+end
+
+struct Box
+    v::Int
+end
+
+function Box.f(x)
+    x
+end
+`)
+	res, err := NewJuliaExtractor().Extract("ext.jl", src)
+	require.NoError(t, err)
+
+	owners := juliaOwners(res.Edges)
+	assert.True(t, owners["ext.jl::Base.show"]["unresolved::Base"],
+		"a receiver no node in the file declares must not be minted as a node id")
+	nodes := map[string]bool{}
+	for _, n := range res.Nodes {
+		nodes[n.ID] = true
+	}
+	assert.False(t, nodes["ext.jl::Base"],
+		"the external receiver itself must not become a phantom node")
+	assert.True(t, owners["ext.jl::Box.f"]["ext.jl::Box"],
+		"an in-file receiver still targets the real type node")
+}
+
+// A docstring and the other Meta a definition carries are not in
+// competition: a qualified method keeps its doc next to its receiver,
+// and a macro keeps its doc next to its macro flag. Docstring handling
+// builds the node's Meta in one place, so no key can evict another.
+func TestJuliaExtractor_DocstringSurvivesOtherMeta(t *testing.T) {
+	src := []byte(`module M
+
+"""Render p compactly."""
+function Base.show(io, p)
+    nothing
+end
+
+"""Build a point."""
+macro point(x)
+    x
+end
+
+end
+`)
+	res, err := NewJuliaExtractor().Extract("meta.jl", src)
+	require.NoError(t, err)
+
+	nodes := map[string]*graph.Node{}
+	for _, n := range res.Nodes {
+		nodes[n.ID] = n
+	}
+
+	show := nodes["meta.jl::Base.show"]
+	require.NotNil(t, show, "the qualified method must exist")
+	assert.Equal(t, "Base", show.Meta["receiver"])
+	assert.Equal(t, "Render p compactly.", show.Meta["doc"],
+		"a docstring must survive a receiver already on Meta")
+
+	pt := nodes["meta.jl::point"]
+	require.NotNil(t, pt, "the macro must exist")
+	assert.Equal(t, true, pt.Meta["macro"])
+	assert.Equal(t, "Build a point.", pt.Meta["doc"],
+		"a docstring must survive the macro flag already on Meta")
+}
+
+// Julia lowers EVERY docstring — triple-quoted or explicit — through
+// Core.@doc, so `@doc "text" obj` is the same documentation mechanism as
+// a string above the object, and the string sits INSIDE the macro call
+// where the pending-doc walk never looks. Every documented-object shape
+// accepts the form: short-form definitions, long-form functions, macros,
+// structs. An orphan `@doc "text"` with no object attaches nothing.
+func TestJuliaExtractor_ExplicitDocMacroAttaches(t *testing.T) {
+	src := []byte(`@doc "Short doc." pd(x) = x
+
+Core.@doc "Long doc." function cd(x)
+    help(x)
+end
+
+@doc "Struct doc." struct DS
+    v::Int
+end
+
+@doc "Macro doc." macro dm(x)
+    x
+end
+
+@doc "Orphan."
+`)
+	res, err := NewJuliaExtractor().Extract("docm.jl", src)
+	require.NoError(t, err)
+
+	docs := map[string]string{}
+	for _, n := range res.Nodes {
+		if d, ok := n.Meta["doc"].(string); ok {
+			docs[n.ID] = d
+		}
+	}
+	assert.Equal(t, "Short doc.", docs["docm.jl::pd"], "the explicit form documents a short-form definition")
+	assert.Equal(t, "Long doc.", docs["docm.jl::cd"], "the qualified Core.@doc form documents a long-form definition")
+	assert.Equal(t, "Struct doc.", docs["docm.jl::DS"], "the explicit form documents a struct")
+	assert.Equal(t, "Macro doc.", docs["docm.jl::dm"], "the explicit form documents a macro")
+	_, orphan := docs["docm.jl::Orphan."]
+	assert.False(t, orphan, "an @doc with no object must not mint a phantom node")
+}
+
+// Julia 1.11 `public` names API that is visible WITHOUT being
+// re-exported — a different contract from `export`, so it rides on its
+// own Meta key next to the export list. The statement's children are the
+// same node kinds exports accept, operators included (`public +`).
+func TestJuliaExtractor_PublicStatementRecorded(t *testing.T) {
+	src := []byte(`module Pubbed
+export kept
+public shown, also_shown, +
+
+kept() = 1
+shown() = 2
+end
+`)
+	res, err := NewJuliaExtractor().Extract("public.jl", src)
+	require.NoError(t, err)
+
+	mod := map[string]*graph.Node{}
+	for _, n := range res.Nodes {
+		mod[n.ID] = n
+	}
+	m := mod["public.jl::Pubbed"]
+	require.NotNil(t, m)
+	exports, ok := m.Meta["exports"].([]string)
+	require.True(t, ok, "exports stay recorded")
+	assert.ElementsMatch(t, []string{"kept"}, exports)
+	public, ok := m.Meta["public"].([]string)
+	require.True(t, ok, "public names missing")
+	assert.ElementsMatch(t, []string{"shown", "also_shown", "+"}, public)
 }
 
 func TestJuliaExtractor_ConstAndDocstrings(t *testing.T) {
@@ -1067,4 +1462,145 @@ end
 		_, ok := docs[id]
 		assert.False(t, ok, "%s must not be documented, got %q", id, docs[id])
 	}
+}
+
+// A qualified method whose receiver is a module DECLARED IN THE SAME FILE
+// belongs to that module's node: `module M … end; function M.f() … end`
+// must member_of the real `file::M`, not an invented `unresolved::M`.
+// Modules are KindType nodes, indistinguishable from structs by kind, so
+// the receiver resolves through their own table after the type lookup
+// misses.
+func TestJuliaExtractor_SameFileModuleMethodOwner(t *testing.T) {
+	src := []byte(`module M
+greet() = 1
+end
+
+function M.f(x)
+    helper(x)
+end
+
+module Outer
+module Inner
+end
+function Inner.g(x)
+    x
+end
+end
+`)
+	res, err := NewJuliaExtractor().Extract("modm.jl", src)
+	require.NoError(t, err)
+
+	nodes := map[string]bool{}
+	for _, n := range res.Nodes {
+		nodes[n.ID] = true
+	}
+	require.True(t, nodes["modm.jl::M"], "the module node must exist")
+
+	owners := juliaOwners(res.Edges)
+	assert.True(t, owners["modm.jl::M.f"]["modm.jl::M"],
+		"a method on a same-file module belongs to that module's node")
+	assert.False(t, owners["modm.jl::M.f"]["unresolved::M"],
+		"it must not fall back to an invented unresolved receiver")
+	assert.True(t, owners["modm.jl::Inner.g"]["modm.jl::Inner"],
+		"a nested module receiver resolves in its own lexical scope")
+}
+
+// Julia lowers a documented constant through the same @doc mechanism:
+// `@doc "text" const X = 1`. The object is a const_statement, not a bare
+// assignment, so walkMacroArgs has to dispatch it AS const or both the
+// constant and its documentation vanish.
+func TestJuliaExtractor_ExplicitDocOnConstant(t *testing.T) {
+	src := []byte(`@doc "Tuning knob." const K = 42
+`)
+	res, err := NewJuliaExtractor().Extract("dc.jl", src)
+	require.NoError(t, err)
+
+	var k *graph.Node
+	for _, n := range res.Nodes {
+		if n.ID == "dc.jl::K" {
+			k = n
+		}
+	}
+	require.NotNil(t, k, "the documented constant must mint its variable node")
+	assert.Equal(t, graph.KindVariable, k.Kind)
+	assert.Equal(t, "Tuning knob.", k.Meta["doc"],
+		"the constant keeps the docstring the explicit @doc form carries")
+}
+
+// Only bare `@doc`, `Core.@doc`, and `Base.@doc` lower a docstring. A user
+// macro that merely ends in `.@doc` — `Foo.@doc` — is unrelated and must
+// not attach its string as documentation; the standard forms still do, so
+// the restriction is not over-broad.
+func TestJuliaExtractor_ForeignDocMacroDoesNotAttach(t *testing.T) {
+	src := []byte(`Foo.@doc "not a docstring" function g(x)
+    x
+end
+
+Core.@doc "real doc" function h(x)
+    x
+end
+`)
+	res, err := NewJuliaExtractor().Extract("fd.jl", src)
+	require.NoError(t, err)
+
+	docs := map[string]string{}
+	for _, n := range res.Nodes {
+		if d, ok := n.Meta["doc"].(string); ok {
+			docs[n.ID] = d
+		}
+	}
+	_, gDoc := docs["fd.jl::g"]
+	assert.False(t, gDoc, "Foo.@doc must not hijack the docstring slot")
+	assert.Equal(t, "real doc", docs["fd.jl::h"],
+		"Core.@doc still attaches, so the restriction is not over-broad")
+}
+
+// A module-qualified macro receiver can be a dotted chain, not just a bare
+// module: `Base.Threads.@spawn`, `A.B.@m`. Matching only a single
+// identifier base dropped these edges; the receiver is decoded from its
+// children to any depth, keeping the full qualification.
+func TestJuliaExtractor_MultiSegmentQualifiedMacroCall(t *testing.T) {
+	src := []byte(`function work(xs)
+    Base.Threads.@spawn compute(xs)
+    A.B.@m(xs)
+end
+`)
+	res, err := NewJuliaExtractor().Extract("mseg.jl", src)
+	require.NoError(t, err)
+
+	calls := map[string]bool{}
+	for _, ed := range res.Edges {
+		if ed.Kind == graph.EdgeCalls {
+			calls[ed.From+" -> "+ed.To] = true
+		}
+	}
+	assert.True(t, calls["mseg.jl::work -> unresolved::Base.Threads.spawn"],
+		"a two-segment qualifier keeps its full module path")
+	assert.True(t, calls["mseg.jl::work -> unresolved::A.B.m"],
+		"an any-depth qualified macro receiver decodes")
+}
+
+// A parametric constructor callee can nest — `Vector{Tuple{Int,String}}` —
+// and a nested parameter list may be broken across lines. Canonicalising
+// only the outer list left the inner `{…}` as raw source, so a newline in
+// it leaked into the unresolved target. Every level is rebuilt from
+// children.
+func TestJuliaExtractor_NestedParametrizedConstructorCallee(t *testing.T) {
+	src := []byte("build(x) = Vector{Tuple{Int,\n    String}}(x)\n" +
+		"nested(x) = Dict{String,Vector{Int}}(x)\n")
+	res, err := NewJuliaExtractor().Extract("np.jl", src)
+	require.NoError(t, err)
+
+	calls := map[string]bool{}
+	for _, ed := range res.Edges {
+		if ed.Kind == graph.EdgeCalls {
+			calls[ed.From+" -> "+ed.To] = true
+		}
+		require.NotContains(t, ed.To, "\n", "a target must never carry a line break")
+		require.NotContains(t, ed.To, " ", "a canonical type target carries no whitespace")
+	}
+	assert.True(t, calls["np.jl::build -> unresolved::Vector{Tuple{Int,String}}"],
+		"a nested parametric callee is canonicalised at every level")
+	assert.True(t, calls["np.jl::nested -> unresolved::Dict{String,Vector{Int}}"],
+		"a nested type parameter keeps its own parameters")
 }

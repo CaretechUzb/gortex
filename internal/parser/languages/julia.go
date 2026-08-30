@@ -27,7 +27,8 @@ import (
 //     (`<: Living` → EdgeExtends), plus struct fields (KindField),
 //     including the `x::T = default` form `Base.@kwdef` requires
 //   - `module` / `baremodule` — KindType node whose Meta carries the
-//     module's `export` list; definitions inside get EdgeMemberOf
+//     module's `export` list; definitions, constants and nested modules
+//     inside get EdgeMemberOf
 //   - `const X = ...` constants (KindVariable)
 //
 // Node ids stay flat (`<file>::<Name>`, `<file>::<Owner>.<member>`) as in
@@ -56,6 +57,9 @@ import (
 // Docstrings — a string literal on the line DIRECTLY above a definition,
 // which is the adjacency Julia itself requires — attach as Meta["doc"],
 // on long and short definitions, types, modules and constants alike.
+// The explicit `@doc "text" object` / `Core.@doc "text" object` form
+// attaches the same way, with the string taken from inside the macro
+// call.
 type JuliaExtractor struct {
 	lang *sitter.Language
 }
@@ -113,6 +117,13 @@ type juliaWalkState struct {
 	// several modules giving the same short nickname to different
 	// packages.
 	importAliases map[string]string
+	// modules maps a lexical scope + module name to the minted module
+	// id, so `module M … end; function M.f() … end` binds the qualified
+	// method to the real module node instead of an invented
+	// unresolved::M. Keyed like the type and alias tables — modules are
+	// KindType nodes, indistinguishable from structs by kind, so a
+	// receiver that is a module needs its own table to resolve through.
+	modules map[string]string
 }
 
 func (e *JuliaExtractor) Extract(filePath string, src []byte) (*parser.ExtractionResult, error) {
@@ -141,6 +152,7 @@ func (e *JuliaExtractor) Extract(filePath string, src []byte) (*parser.Extractio
 		types:         map[string]string{},
 		declaredTypes: map[string]bool{},
 		importAliases: map[string]string{},
+		modules:       map[string]string{},
 	}
 	juliaPrescan(root, src, "", st)
 	e.walk(root, src, juliaScope{}, st)
@@ -236,6 +248,9 @@ func (e *JuliaExtractor) walkFrom(n *sitter.Node, src []byte, scope juliaScope, 
 		case "export_statement":
 			e.handleExport(c, src, scope, st)
 
+		case "public_statement":
+			e.handlePublic(c, src, scope, st)
+
 		case "call_expression", "broadcast_call_expression":
 			e.handleCall(c, src, scope, st)
 			e.walk(c, src, scope, st)
@@ -253,10 +268,68 @@ func (e *JuliaExtractor) walkFrom(n *sitter.Node, src []byte, scope juliaScope, 
 
 // walkMacroArgs walks a macro call's arguments, carrying a docstring that
 // sat above the macro CALL into the definition it wraps.
+// juliaDocMacroArg reports the docstring carried INSIDE an explicit
+// `@doc "text" object` / `Core.@doc "text" object` call. Julia lowers
+// every docstring — triple-quoted or explicit — through Core.@doc, so
+// the string beside the object in the macro call is that object's
+// documentation, not an argument of anything. Returns false when the
+// call is not a doc form or carries no string.
+func juliaDocMacroArg(n *sitter.Node, src []byte) (string, bool) {
+	var args *sitter.Node
+	isDoc := false
+	for c := range n.NamedChildren() {
+		switch c.Type() {
+		case "macro_identifier":
+			for m := range c.NamedChildren() {
+				if m.Type() == "identifier" && m.Content(src) == "doc" {
+					isDoc = true
+				}
+			}
+		case "field_expression":
+			count := int(c.NamedChildCount())
+			if count < 2 {
+				continue
+			}
+			// Only the standard-library documentation macros lower a
+			// docstring: `Core.@doc` and `Base.@doc` (bare `@doc` is the
+			// macro_identifier case above). A user macro that merely ends
+			// in `.@doc`, like `Foo.@doc`, is something else and must not
+			// hijack the docstring slot.
+			base, prop := c.NamedChild(0), c.NamedChild(count-1)
+			if base.Type() != "identifier" {
+				continue
+			}
+			if mod := base.Content(src); mod != "Core" && mod != "Base" {
+				continue
+			}
+			for m := range prop.NamedChildren() {
+				if m.Type() == "identifier" && m.Content(src) == "doc" {
+					isDoc = true
+				}
+			}
+		case "macro_argument_list":
+			args = c
+		}
+	}
+	if !isDoc || args == nil {
+		return "", false
+	}
+	for a := range args.NamedChildren() {
+		if a.Type() == "string_literal" {
+			return juliaDocText(a, src), true
+		}
+		return "", false
+	}
+	return "", false
+}
+
 // `Base.@kwdef struct S ... end` is a documented struct whose docstring
 // attaches to the wrapper, so stopping at the macro boundary would leave
 // the single most common documented struct form undocumented.
 func (e *JuliaExtractor) walkMacroArgs(n *sitter.Node, src []byte, scope juliaScope, st *juliaWalkState, doc string) {
+	if inner, ok := juliaDocMacroArg(n, src); ok && doc == "" {
+		doc = inner
+	}
 	for c := range n.NamedChildren() {
 		if doc == "" || c.Type() != "macro_argument_list" {
 			e.walk(c, src, scope, st)
@@ -270,7 +343,37 @@ func (e *JuliaExtractor) walkMacroArgs(n *sitter.Node, src []byte, scope juliaSc
 				e.handleFunction(a, src, scope, st, doc)
 			case "module_definition":
 				e.handleModule(a, src, scope, st, doc)
+			case "assignment":
+				// `@doc "text" f(x) = x` documents a short-form
+				// definition, which arrives as a plain assignment.
+				e.handleAssignment(a, src, scope, st, false, doc)
+			case "const_statement":
+				// `@doc "text" const X = 1` documents a constant, which
+				// arrives wrapped in a const_statement — dispatch its
+				// inner assignment AS const, the shape walkFrom gives a
+				// top-level constant, so neither the constant nor its doc
+				// is dropped.
+				for inner := range a.NamedChildren() {
+					if inner.Type() == "assignment" {
+						e.handleAssignment(inner, src, scope, st, true, doc)
+					}
+				}
 			default:
+				// Walk a macro argument the way the generic walker
+				// would, dispatching the argument's own kind before
+				// its children: walk() visits a node's children but
+				// never the node itself, so a call_expression argument
+				// was never shown to handleCall. `@everywhere
+				// include("f.jl")` under a docstring is the shape that
+				// loses its edge — call edges otherwise need an
+				// enclosing function, which a documented (module- or
+				// file-level) macro call never has.
+				switch a.Type() {
+				case "call_expression", "broadcast_call_expression":
+					e.handleCall(a, src, scope, st)
+				case "macrocall_expression":
+					e.handleMacroCall(a, src, scope, st)
+				}
 				e.walk(a, src, scope, st)
 				continue
 			}
@@ -311,10 +414,23 @@ func (e *JuliaExtractor) handleModule(n *sitter.Node, src []byte, scope juliaSco
 			}
 			st.result.Nodes = append(st.result.Nodes, node)
 			st.nodes[id] = node
+			// Record the module by lexical scope so a later qualified
+			// method (`function M.f()`) in the same file resolves it as
+			// the receiver's owner rather than inventing unresolved::M.
+			st.modules[juliaTypeKey(scope.modulePath, name)] = id
 			st.result.Edges = append(st.result.Edges, &graph.Edge{
 				From: st.fileNode.ID, To: id, Kind: graph.EdgeDefines,
 				FilePath: st.filePath, Line: line,
 			})
+			// A nested module belongs to its parent just as any other
+			// resident does; without the edge, a traversal from Outer
+			// stops at functions and types and never reaches Inner.
+			if scope.moduleID != "" {
+				st.result.Edges = append(st.result.Edges, &graph.Edge{
+					From: id, To: scope.moduleID, Kind: graph.EdgeMemberOf,
+					FilePath: st.filePath, Line: line,
+				})
+			}
 		}
 		inner.moduleID = id
 		inner.modulePath = name
@@ -538,30 +654,181 @@ func (e *JuliaExtractor) handleType(n *sitter.Node, src []byte, scope juliaScope
 	e.walk(n, src, inner, st)
 }
 
-// juliaCalleeName decodes a call callee: bare identifier or qualified
-// field_expression (`Base.show`, `Base.:+`). Returns name, receiver.
+// juliaUnwrappedName decodes a single possibly-wrapped name down to its
+// plain spelling. An operator callee can wear two wrappers: `:+` is a
+// quote_expression around the operator and `:(==)` a quote_expression
+// around a parenthesized_expression around it, while a bare `(==)` callee
+// wears only the parenthesized one. Returns "" when the node is not a
+// name in any of these shapes.
+func juliaUnwrappedName(n *sitter.Node, src []byte) string {
+	for n != nil {
+		switch n.Type() {
+		case "identifier", "operator":
+			return n.Content(src)
+		case "quote_expression", "parenthesized_expression":
+			n = n.NamedChild(0)
+		default:
+			return ""
+		}
+	}
+	return ""
+}
+
+// juliaCalleeName decodes a call callee: bare identifiers, qualified
+// field_expressions (`Base.show`, `A.B.c`), quoted operators (`:+`,
+// `:(==)`), and parametrized constructors (`Vector{Int}`). The
+// field_expression is decoded from its base and property CHILDREN, never
+// from source text: text split on the last dot dragged a chained
+// callee's arguments (`get(cfg).run`) and even a line break inside a
+// multi-line chain into the call target. A base that is not itself a
+// dotted name leaves only the property decodable, so the callee degrades
+// to its bare method name — the only part a resolver could ever match.
+// Returns name, receiver.
 func juliaCalleeName(n *sitter.Node, src []byte) (name, receiver string) {
 	if n == nil {
 		return "", ""
 	}
 	switch n.Type() {
-	case "identifier":
+	case "identifier", "operator":
 		return n.Content(src), ""
+	case "quote_expression", "parenthesized_expression": // bare `:+` / `(==)` callee
+		return juliaUnwrappedName(n, src), ""
+	case "parametrized_type_expression": // `Vector{Int}(xs)`
+		return juliaParametrizedCallee(n, src)
 	case "field_expression":
-		full := n.Content(src)
-		idx := strings.LastIndex(full, ".")
-		if idx <= 0 {
-			return strings.TrimPrefix(full, ":"), ""
+		count := int(n.NamedChildCount())
+		if count < 2 {
+			return "", ""
 		}
-		receiver = full[:idx]
-		name = strings.TrimPrefix(full[idx+1:], ":") // Base.:+ → +
-		return name, receiver
-	case "quote_expression": // bare operator callee, e.g. `:+`
-		if inner := n.NamedChild(0); inner != nil {
-			return inner.Content(src), ""
+		name = juliaUnwrappedName(n.NamedChild(count-1), src)
+		if name == "" {
+			return "", ""
+		}
+		switch base := n.NamedChild(0); base.Type() {
+		case "identifier":
+			return name, base.Content(src)
+		case "field_expression":
+			inner, recv := juliaCalleeName(base, src)
+			if inner == "" {
+				return "", ""
+			}
+			if recv == "" {
+				return name, inner
+			}
+			return name, recv + "." + inner
+		default:
+			// `get(cfg).run(x)` — the base is a call, not a name, so
+			// only the method name is decodable.
+			return name, ""
 		}
 	}
 	return "", ""
+}
+
+// juliaParametrizedCallee decodes a `Vector{Int}(xs)`-style constructor
+// callee: the head name — possibly qualified, as `Base.Vector{Int}` —
+// followed by the literal type parameters, which are part of the
+// constructor's name the way Julia prints it. The curly list is rebuilt
+// from its children so a parameter list broken across lines cannot leak
+// a newline into the target.
+func juliaParametrizedCallee(n *sitter.Node, src []byte) (name, receiver string) {
+	head := n.NamedChild(0)
+	if head == nil {
+		return "", ""
+	}
+	switch head.Type() {
+	case "identifier":
+		name = head.Content(src)
+	case "field_expression":
+		inner, recv := juliaCalleeName(head, src)
+		if inner == "" {
+			return "", ""
+		}
+		name, receiver = inner, recv
+	default:
+		return "", ""
+	}
+	var params []string
+	for i, count := 1, int(n.NamedChildCount()); i < count; i++ {
+		if c := n.NamedChild(i); c != nil && c.Type() == "curly_expression" {
+			for j, jcount := 0, int(c.NamedChildCount()); j < jcount; j++ {
+				if p := c.NamedChild(j); p != nil {
+					// Canonicalise nested type parameters so a nested `{…}`
+					// split across lines cannot leak a newline into the
+					// target.
+					params = append(params, juliaCanonType(p, src))
+				}
+			}
+		}
+	}
+	if len(params) > 0 {
+		name += "{" + strings.Join(params, ",") + "}"
+	}
+	return name, receiver
+}
+
+// juliaMacroReceiver decodes the receiver of a module-qualified macro
+// call (`Base.@time`, `Base.Threads.@threads`) into its dotted spelling,
+// from children rather than source text so a chain of any depth keeps its
+// full qualification. Returns "" when the receiver is not a name.
+func juliaMacroReceiver(n *sitter.Node, src []byte) string {
+	switch n.Type() {
+	case "identifier":
+		return n.Content(src)
+	case "field_expression":
+		name, recv := juliaCalleeName(n, src)
+		if name == "" {
+			return ""
+		}
+		if recv == "" {
+			return name
+		}
+		return recv + "." + name
+	}
+	return ""
+}
+
+// juliaCanonType renders a type expression to a single-line canonical
+// spelling, rebuilding any nested `{…}` parameter list from its children
+// so source formatting — inner spaces, or a parameter list split across
+// lines — cannot leak into a constructor-callee target.
+func juliaCanonType(n *sitter.Node, src []byte) string {
+	if n == nil {
+		return ""
+	}
+	switch n.Type() {
+	case "parametrized_type_expression":
+		head := juliaCanonType(n.NamedChild(0), src)
+		var params []string
+		for i, count := 1, int(n.NamedChildCount()); i < count; i++ {
+			c := n.NamedChild(i)
+			if c == nil || c.Type() != "curly_expression" {
+				continue
+			}
+			for j, jcount := 0, int(c.NamedChildCount()); j < jcount; j++ {
+				if p := c.NamedChild(j); p != nil {
+					params = append(params, juliaCanonType(p, src))
+				}
+			}
+		}
+		if len(params) > 0 {
+			return head + "{" + strings.Join(params, ",") + "}"
+		}
+		return head
+	case "field_expression":
+		name, recv := juliaCalleeName(n, src)
+		if name == "" {
+			return strings.Join(strings.Fields(n.Content(src)), "")
+		}
+		if recv == "" {
+			return name
+		}
+		return recv + "." + name
+	default:
+		// identifier, operator, a literal type parameter — collapse any
+		// internal whitespace so a line break cannot survive.
+		return strings.Join(strings.Fields(n.Content(src)), "")
+	}
 }
 
 // juliaSignatureCall peels the wrappers a definition head can carry until
@@ -673,6 +940,15 @@ func (e *JuliaExtractor) handleAssignment(n *sitter.Node, src []byte, scope juli
 				From: st.fileNode.ID, To: id, Kind: graph.EdgeDefines,
 				FilePath: st.filePath, Line: line,
 			})
+			// A constant inside a module belongs to it the same way a
+			// function does — the edge is what a traversal from the
+			// module reaches; scope_mod on Meta is not traversable.
+			if scope.moduleID != "" {
+				st.result.Edges = append(st.result.Edges, &graph.Edge{
+					From: id, To: scope.moduleID, Kind: graph.EdgeMemberOf,
+					FilePath: st.filePath, Line: line,
+				})
+			}
 		}
 	}
 
@@ -712,13 +988,27 @@ func (e *JuliaExtractor) emitCallable(
 	kind := graph.KindMethod
 	nodeName := name
 	isCtor := false
-	var baseID, ownerID, ownerName string
+	var baseID, ownerID, ownerTarget, ownerName string
 
 	switch {
 	case receiver != "":
-		ownerID, ownerName = st.filePath+"::"+receiver, receiver
+		ownerName = receiver
 		if id, _, ok := st.lookupType(scope.modulePath, receiver); ok {
-			ownerID = id
+			ownerID, ownerTarget = id, id
+		} else if id, ok := st.modules[juliaTypeKey(scope.modulePath, receiver)]; ok {
+			// `module M … end; function M.f() … end` — the receiver names
+			// a module this file declares, so member_of reaches the real
+			// module node instead of an invented unresolved::M.
+			ownerID, ownerTarget = id, id
+		} else {
+			// `function Base.show` extends a module this file does not
+			// declare, so no node carries the receiver's name — a
+			// member_of to the node-shaped id would claim a resident
+			// of the graph that does not exist. The method's own id
+			// stays flat; the edge target becomes self-describing, the
+			// same honesty extends and call edges already carry.
+			ownerID = st.filePath + "::" + receiver
+			ownerTarget = "unresolved::" + receiver
 		}
 		baseID = ownerID + "." + name
 
@@ -745,7 +1035,7 @@ func (e *JuliaExtractor) emitCallable(
 		}
 		if typeID != "" {
 			baseID = typeID + ".<init>"
-			ownerID, ownerName = typeID, typeName
+			ownerID, ownerTarget, ownerName = typeID, typeID, typeName
 			nodeName = typeName + ".<init>"
 			isCtor = true
 		} else {
@@ -803,7 +1093,7 @@ func (e *JuliaExtractor) emitCallable(
 	})
 	if ownerID != "" {
 		st.result.Edges = append(st.result.Edges, &graph.Edge{
-			From: id, To: ownerID, Kind: graph.EdgeMemberOf,
+			From: id, To: ownerTarget, Kind: graph.EdgeMemberOf,
 			FilePath: st.filePath, Line: line,
 		})
 	}
@@ -1037,6 +1327,19 @@ func (e *JuliaExtractor) handleImport(n *sitter.Node, src []byte, st *juliaWalkS
 // module node's Meta (Julia export lists are only meaningful inside
 // modules).
 func (e *JuliaExtractor) handleExport(n *sitter.Node, src []byte, scope juliaScope, st *juliaWalkState) {
+	e.recordModuleNames(n, src, scope, st, "exports")
+}
+
+// handlePublic records a Julia 1.11 `public` list the same way. Public
+// names are visible API WITHOUT being re-exported, so they ride on their
+// own Meta key next to the export list.
+func (e *JuliaExtractor) handlePublic(n *sitter.Node, src []byte, scope juliaScope, st *juliaWalkState) {
+	e.recordModuleNames(n, src, scope, st, "public")
+}
+
+// recordModuleNames collects the names named by an export or public
+// statement onto the enclosing module node's Meta under key.
+func (e *JuliaExtractor) recordModuleNames(n *sitter.Node, src []byte, scope juliaScope, st *juliaWalkState, key string) {
 	if scope.moduleID == "" {
 		return
 	}
@@ -1046,7 +1349,14 @@ func (e *JuliaExtractor) handleExport(n *sitter.Node, src []byte, scope juliaSco
 	}
 	names := []string{}
 	for c := range n.NamedChildren() {
-		if c.Type() == "identifier" {
+		// `export apply, @m, ⊗` exports a function, a macro and an
+		// operator: a macro name is a macro_identifier node and an
+		// operator an operator node — the same distinction import
+		// lists already decode (`using Base: @time, +`). Record them
+		// verbatim (@m, ⊗) so the module's public surface keeps its
+		// macro and operator names.
+		switch c.Type() {
+		case "identifier", "operator", "macro_identifier":
 			names = append(names, c.Content(src))
 		}
 	}
@@ -1056,8 +1366,8 @@ func (e *JuliaExtractor) handleExport(n *sitter.Node, src []byte, scope juliaSco
 	if node.Meta == nil {
 		node.Meta = map[string]any{}
 	}
-	prev, _ := node.Meta["exports"].([]string)
-	node.Meta["exports"] = append(prev, names...)
+	prev, _ := node.Meta[key].([]string)
+	node.Meta[key] = append(prev, names...)
 }
 
 // handleCall emits EdgeCalls from the enclosing function to the callee
@@ -1121,25 +1431,72 @@ func (e *JuliaExtractor) handleCall(n *sitter.Node, src []byte, scope juliaScope
 	st.result.Edges = append(st.result.Edges, edge)
 }
 
-// handleMacroCall attributes `@macroname ...` invocations to the
-// enclosing function as calls to the bare macro name.
+// handleMacroCall attributes `@macroname ...` and `Mod.@macroname ...`
+// invocations to the enclosing function as EdgeCalls with macro:true
+// meta. The macro's name lives in a disjoint namespace from types and
+// functions, so the target carries the bare name (time, not @time) with
+// the module as receiver — the same receiver.name spelling qualified
+// call callees use.
 func (e *JuliaExtractor) handleMacroCall(n *sitter.Node, src []byte, scope juliaScope, st *juliaWalkState) {
 	if scope.functionID == "" {
 		return
 	}
+	emit := func(target string) {
+		st.result.Edges = append(st.result.Edges, &graph.Edge{
+			From: scope.functionID, To: "unresolved::" + target,
+			Kind:     graph.EdgeCalls,
+			Meta:     map[string]any{"macro": true},
+			FilePath: st.filePath, Line: int(n.StartPoint().Row) + 1,
+		})
+	}
 	for c := range n.NamedChildren() {
-		if c.Type() != "macro_identifier" {
-			continue
-		}
-		for m := range c.NamedChildren() {
-			if m.Type() == "identifier" {
-				st.result.Edges = append(st.result.Edges, &graph.Edge{
-					From: scope.functionID, To: "unresolved::" + m.Content(src),
-					Kind:     graph.EdgeCalls,
-					Meta:     map[string]any{"macro": true},
-					FilePath: st.filePath, Line: int(n.StartPoint().Row) + 1,
-				})
+		switch c.Type() {
+		case "macro_identifier": // `@time x`
+			for m := range c.NamedChildren() {
+				if m.Type() == "identifier" {
+					emit(m.Content(src))
+				}
 			}
+		case "field_expression": // `Base.@time x`, `Base.Threads.@threads x`
+			count := int(c.NamedChildCount())
+			if count < 2 {
+				continue
+			}
+			prop, base := c.NamedChild(count-1), c.NamedChild(0)
+			if prop.Type() != "macro_identifier" {
+				continue
+			}
+			// The receiver can be a bare module (`Base`) or a dotted
+			// chain (`Base.Threads`), decoded from its children to any
+			// depth so a multi-segment qualifier keeps its module instead
+			// of losing the edge.
+			receiver := juliaMacroReceiver(base, src)
+			if receiver == "" {
+				continue
+			}
+			name := ""
+			for m := range prop.NamedChildren() {
+				if m.Type() == "identifier" {
+					name = m.Content(src)
+				}
+			}
+			if name == "" {
+				continue
+			}
+			// `import Foo as F` then `F.@spawn ...`: name the module, not
+			// the file-local nickname, exactly as a qualified call callee
+			// does. An alias binds a single name, so only the leading
+			// segment of a dotted receiver can be one.
+			head, rest, dotted := strings.Cut(receiver, ".")
+			if module, ok := st.importAliases[juliaTypeKey(scope.modulePath, head)]; ok {
+				head = module
+			}
+			if dotted {
+				receiver = head + "." + rest
+			} else {
+				receiver = head
+			}
+			emit(receiver + "." + name)
 		}
 	}
 }
