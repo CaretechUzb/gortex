@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/assert"
@@ -16,6 +17,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
 	gortexmcp "github.com/zzet/gortex/internal/mcp"
@@ -92,6 +94,39 @@ func TestToolCall_OverlayHeaderDoesNotOverridePolicySession(t *testing.T) {
 	require.Len(t, resp.Content, 1)
 	assert.Contains(t, resp.Content[0].Text, "tool_blocked_by_mode",
 		"expected the structured block error from restricted's policy, not overlay-open's unrestricted one")
+}
+
+// TestToolCall_OverlayHeaderScopesOverlayState is the positive
+// counterpart to the test above: it proves X-Gortex-Overlay-Session
+// actually does something, rather than only proving it doesn't leak
+// into policy. Without this, WithOverlayCohortID could be deleted
+// entirely and the negative test would still pass (the header would
+// simply be ignored). Pushes an overlay file under cohort
+// "overlay-open" via the real overlay_push tool while authenticating
+// as a different Mcp-Session-Id, then confirms the file landed under
+// the cohort id, not the caller's own session id.
+func TestToolCall_OverlayHeaderScopesOverlayState(t *testing.T) {
+	h, srv := realServerTestHandler(t)
+	srv.SetOverlayManager(daemon.NewOverlayManager(30 * time.Minute))
+
+	body := `{"arguments":{"path":"scratch.go","content":"package main\n"}}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/tools/overlay_push", strings.NewReader(body))
+	req.Header.Set("Mcp-Session-Id", "caller-session")
+	req.Header.Set("X-Gortex-Overlay-Session", "overlay-open")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	var resp ToolResponse
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	require.False(t, resp.IsError, "overlay_push must succeed: %+v", resp)
+
+	files, err := srv.OverlayManager().Files("overlay-open")
+	require.NoError(t, err, "the push must land under the overlay-cohort id")
+	require.Contains(t, files, "scratch.go")
+
+	_, err = srv.OverlayManager().Files("caller-session")
+	assert.Error(t, err, "the push must NOT land under the caller's own session id")
 }
 
 // TestToolCall_SessionCWDReachesHandler pins the other local half of the

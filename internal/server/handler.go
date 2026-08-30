@@ -250,7 +250,10 @@ func (h *Handler) peekRouteContext(body []byte, r *http.Request) (scope, cwd str
 	if cwd == "" {
 		// HTTP clients without an explicit cwd in the body can pass
 		// it via header — matches the daemon's session-cwd plumbing.
-		cwd = r.Header.Get("X-Gortex-Cwd")
+		// Streamable HTTP transport trims this same header at every
+		// read site; match that so a padded value doesn't silently
+		// become the session's workspace boundary.
+		cwd = strings.TrimSpace(r.Header.Get("X-Gortex-Cwd"))
 	}
 	return scope, cwd
 }

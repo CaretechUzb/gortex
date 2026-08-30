@@ -217,10 +217,12 @@ func (h *Handler) handleRepos(w http.ResponseWriter, _ *http.Request) {
 // When `session_id` is supplied, the session is registered under that
 // ID instead of a freshly minted one — this is how an MCP client binds
 // its overlay session to its MCP session ID, so subsequent tools/call
-// frames from the same MCP session automatically see the overlay
-// (the MCP tool middleware reads SessionIDFromContext and resolves the
-// overlay by that ID). Idempotent: registering twice with the same
-// (id, workspace) tuple is a no-op; mismatched workspaces return 409.
+// frames from the same MCP session automatically see the overlay (the
+// MCP tool middleware reads OverlayCohortIDFromContext, which resolves
+// to the real session id unless a caller explicitly overrides it via
+// X-Gortex-Overlay-Session). Idempotent: registering twice with the
+// same (id, workspace) tuple is a no-op; mismatched workspaces return
+// 409.
 //
 // Response: {"session_id": "...", "workspace_id": "..."}.
 func (h *Handler) handleOverlayRegister(w http.ResponseWriter, r *http.Request) {
