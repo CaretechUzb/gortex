@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/parser"
 )
 
 // Member-level C# interface-dispatch synthesis: the implements-family cascade.
@@ -727,57 +728,22 @@ func csharpMemberMethodsAllByTypeFromEdges(edges []*graph.Edge, nodes map[string
 // csharpAliasComparableForms returns every form of a global-alias
 // identifier a type-argument stamp could carry: the canonical name
 // (verbatim prefix stripped — pre-normalization stores stamped it raw)
-// and, for an alias legally shadowing a BCL type name, the keyword the
-// extractor's canonicalization folds arguments onto. `global using
-// Int32 = App.Crate` makes a stamped "int" ambiguous — it may spell the
-// genuine keyword or the folded alias — and an ambiguous stamp must
-// refuse (never filter). The fold mirrors the parser's
-// csharpCanonicalTypeArg table; the packages stay independent, so keep
-// the two in sync.
+// and, for an alias legally shadowing a BCL type name (or `dynamic`),
+// the keyword the extractor's canonicalization folds arguments onto.
+// `global using Int32 = App.Crate` makes a stamped "int" ambiguous — it
+// may spell the genuine keyword or the folded alias — and an ambiguous
+// stamp must refuse (never filter). The folds come from the parser's
+// shared declarative table (parser.CSharpBCLKeywordFolds), so the two
+// sides of the gate can never drift again: a fold the refusal does not
+// know suppresses a whole fan-out (round-5 finding 8, the
+// @dynamic → object hop).
 func csharpAliasComparableForms(alias string) []string {
 	name := strings.TrimPrefix(alias, "@")
 	if name == "" {
 		return nil
 	}
 	forms := []string{name}
-	folded := ""
-	switch name {
-	case "String":
-		folded = "string"
-	case "Boolean":
-		folded = "bool"
-	case "Byte":
-		folded = "byte"
-	case "SByte":
-		folded = "sbyte"
-	case "Char":
-		folded = "char"
-	case "Decimal":
-		folded = "decimal"
-	case "Double":
-		folded = "double"
-	case "Single":
-		folded = "float"
-	case "Int16":
-		folded = "short"
-	case "UInt16":
-		folded = "ushort"
-	case "Int32":
-		folded = "int"
-	case "UInt32":
-		folded = "uint"
-	case "Int64":
-		folded = "long"
-	case "UInt64":
-		folded = "ulong"
-	case "Object":
-		folded = "object"
-	case "IntPtr":
-		folded = "nint"
-	case "UIntPtr":
-		folded = "nuint"
-	}
-	if folded != "" {
+	if folded, ok := parser.CSharpBCLKeywordFolds[name]; ok {
 		forms = append(forms, folded)
 	}
 	return forms

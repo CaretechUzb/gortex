@@ -4,6 +4,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/zzet/gortex/internal/parser"
 	sitter "github.com/zzet/gortex/internal/parser/tsitter"
 )
 
@@ -241,48 +242,9 @@ func csharpUsingAliasName(n *sitter.Node, src []byte) string {
 // csharpCanonicalTypeArg folds the BCL alias spellings of the C# built-in
 // types onto their keyword form, so `System.Int32`, `Int32` and `int` —
 // the SAME constructed type — compare equal on both sides of the gate.
-// Mirrors the resolver's own csharpTypeSuffixTrim fold; kept local
-// because the parser package must not depend on the resolver.
 func csharpCanonicalTypeArg(t string) string {
-	switch t {
-	case "String":
-		return "string"
-	case "Boolean":
-		return "bool"
-	case "Byte":
-		return "byte"
-	case "SByte":
-		return "sbyte"
-	case "Char":
-		return "char"
-	case "Decimal":
-		return "decimal"
-	case "Double":
-		return "double"
-	case "Single":
-		return "float"
-	case "Int16":
-		return "short"
-	case "UInt16":
-		return "ushort"
-	case "Int32":
-		return "int"
-	case "UInt32":
-		return "uint"
-	case "Int64":
-		return "long"
-	case "UInt64":
-		return "ulong"
-	case "Object":
-		return "object"
-	case "dynamic":
-		// dynamic erases to object — the two spellings construct over the
-		// same underlying type, and folding can only CREATE matches.
-		return "object"
-	case "IntPtr":
-		return "nint"
-	case "UIntPtr":
-		return "nuint"
+	if folded, ok := parser.CSharpBCLKeywordFolds[t]; ok {
+		return folded
 	}
 	return t
 }
