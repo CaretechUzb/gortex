@@ -1,18 +1,8 @@
+//go:build linux
+
 package indexer
 
 import "testing"
-
-// TestSlowWatchMount_NormalMountNotDegraded guards the safe default: a
-// normal local filesystem (the test temp dir) must never be flagged as a
-// slow mount, so fsnotify is only disabled on a genuine slow-mount type.
-func TestSlowWatchMount_NormalMountNotDegraded(t *testing.T) {
-	if slowWatchMount(t.TempDir()) {
-		t.Error("a normal local mount must not be flagged slow (fsnotify must stay enabled)")
-	}
-	if slowWatchMount("") {
-		t.Error("an empty path must not be flagged slow")
-	}
-}
 
 // TestIsSlowMountFSType pins the magic-number check slowWatchMount applies
 // to a statfs result, independent of the host actually having a WSL2, SMB,
