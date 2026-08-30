@@ -1687,7 +1687,9 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 	// calls parked for those repos are already served - discard them, or
 	// the first later incremental save drains the entire test corpus into
 	// a scoped re-projection under ResolveMutex.
-	mi.discardRetargetedTestCallFiles(scanPrefixes)
+	if scanPrefixes == nil {
+		mi.discardRetargetedTestCallFiles(nil)
+    }
 	passStart("entrypoint_hierarchy")
 	ctrlStart := time.Now()
 	// Seeds from already-stamped entry points, so cost is O(seed
