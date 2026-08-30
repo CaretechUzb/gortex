@@ -22,6 +22,29 @@ Nothing errors in the middle row. Locate-intent tools default to "current repo",
 so they answer confidently out of a 63-file graph while the user believes they
 are querying a 120k-node one.
 
+**Reproduced 2026-08-30 on this repository, in three commands** — the original
+table's workspace no longer exists (`docker-env` is not tracked today), and this
+shape needs no Odoo checkout at all:
+
+```bash
+git worktree add --no-checkout --detach .probe-wt HEAD   # untracked worktree
+cd .probe-wt && gortex call get_active_project           # {"bound": true, "project": "gortex"}
+gortex call search_symbols --arg query=readyVerdict      # answers, from the PARENT checkout
+```
+
+The cwd holds **zero** `.go` files, and `search_symbols` still returns
+`gortex/cmd/gortex/repos_ready.go::readyVerdict` with an `absolute_file_path`
+pointing outside the cwd — so an agent that follows the path silently reads the
+parent's file instead of failing. `bound: true`, no warning. The control is the
+asymmetry that makes this a bug rather than a policy: an *empty directory*
+outside every root is refused outright (`the gortex daemon does not track …`),
+while a genuine git worktree at a different commit is accepted as its parent.
+
+Note the readiness note (`internal/mcp/readiness_note.go`) does **not** cover
+this. It qualifies answers from a repo whose derived passes are behind; here the
+repo is fully derived and the answer is complete — it is simply about a different
+checkout than the one the caller is standing in.
+
 **Context:** `MultiIndexer.ScopeForCWD` (`internal/indexer/workspace_resolve.go:97-138`)
 selects the longest tracked `RootPath` containing the cwd, which is what makes
 the nested case bind to the parent. The safe behaviour already exists for the
