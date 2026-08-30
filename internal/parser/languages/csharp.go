@@ -275,11 +275,16 @@ func (s csharpLocalScopes) shadowsAnywhere(owner, name string) bool {
 // `if_statement` is deliberately absent: a pattern variable declared in
 // an `if` condition escapes to the ENCLOSING block (definite-assignment
 // scoping), so stopping at the `if` would under-refuse. Loop headers do
-// not leak their pattern variables past the statement, and a switch
-// section is its own declaration space.
+// not leak their pattern variables past the statement. The switch BODY
+// is one declaration space shared by every section — that is exactly
+// why redeclaring a name in a sibling section is CS0128 — so the extent
+// stops at `switch_body`, never at a single section (round-6 finding
+// B1: stopping at the section read a sibling-section local as expired,
+// dropping its receiver evidence and re-minting its assignments as
+// field writes).
 var csharpScopeFormers = map[string]bool{
 	"block":                       true,
-	"switch_section":              true,
+	"switch_body":                 true,
 	"switch_expression_arm":       true,
 	"lambda_expression":           true,
 	"anonymous_method_expression": true,
