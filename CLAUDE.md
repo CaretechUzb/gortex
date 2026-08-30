@@ -5,9 +5,16 @@ Code intelligence engine written in Go. Indexes repositories into a knowledge gr
 ## Build & Test
 
 ```bash
-go build -o gortex ./cmd/gortex/   # requires CGO (tree-sitter C bindings)
-go test -race ./...                 # all test packages must pass
+go build -o gortex ./cmd/gortex/        # requires CGO (tree-sitter C bindings)
+go test -race -timeout=30m ./...        # all test packages must pass
 ```
+
+`-timeout` is not optional: `internal/graph/store_sqlite` runs right at Go's 600s
+default — 587s idle, 602s and 624s under load on the same machine — so whether the
+documented sweep passes depends on machine load, and when it fails it fails on the
+timeout rather than on an assertion. That is worse than being clearly over: it is
+green until CI is busy. The flag applies per test binary, so 30m is headroom for
+the one slow package, not a budget for the whole run. `make test` passes it.
 
 ## Codebase Overview
 
