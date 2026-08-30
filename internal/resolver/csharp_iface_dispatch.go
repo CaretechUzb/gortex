@@ -3,10 +3,8 @@ package resolver
 import (
 	"sort"
 	"strconv"
-	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
-	"github.com/zzet/gortex/internal/parser"
 )
 
 // Member-level C# interface-dispatch synthesis: the implements-family cascade.
@@ -137,22 +135,6 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 	hierarchySources := g.GetNodesByIDs(hierarchySourceIDs)
 	hierarchyByName := g.FindNodesByNames(hierarchyNames)
 	children := map[string][]string{}
-	// Every hierarchy edge, carrying whatever CLOSED type arguments the
-	// extractor stamped on it (target_type_args on generic base-list
-	// entries) — the evidence half of the G9 gate: an IBoxStore<Crate>
-	// receiver never dispatches into the IBoxStore<Widget> implementor.
-	// Absent for non-generic bases, open generics and non-simple
-	// arguments — absence always means "do not filter".
-	//
-	// UNSTAMPED edges are recorded too, as the empty string. A type can
-	// implement several constructions of one erased interface, and those
-	// constructions can arrive through an inherited interface or a base
-	// class rather than the type's own base list. Deciding whether one
-	// closure describes a type means walking every path it has to that
-	// interface, and a path carrying no closure is exactly as
-	// disqualifying as two different ones.
-	implEdges := map[string]map[string][]string{}
-	anyStamps := false
 	for _, e := range hierarchyEdges {
 		if e == nil || e.From == "" || e.To == "" {
 			continue
@@ -168,71 +150,9 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 			}
 		}
 		children[toID] = append(children[toID], e.From)
-		args := ""
-		if e.Meta != nil {
-			args, _ = e.Meta["target_type_args"].(string)
-		}
-		if args != "" {
-			anyStamps = true
-		}
-		m := implEdges[e.From]
-		if m == nil {
-			m = map[string][]string{}
-			implEdges[e.From] = m
-		}
-		m[toID] = append(m[toID], args)
 	}
 	if len(children) == 0 {
 		return 0
-	}
-
-	// Project-global using aliases (`global using Entity = App.Crate;`)
-	// make their identifier opaque to the string-compared stamps in EVERY
-	// file of the project — the extractor's ancestor scan only sees the
-	// declaring file, so a receiver spelled IBox<Entity> and an implementor
-	// spelled IBox<Crate> stamp unequal spellings of one constructed
-	// interface. Any stamp naming such an alias is refused (never filter).
-	// Collected once per pass from the file nodes' extractor stamps, and
-	// only when stamps exist to gate with; the union across repos is
-	// deliberate — over-refusing can only PRESERVE edges.
-	globalAliasNames := map[string]bool{}
-	if anyStamps {
-		for n := range graph.NodesByKindsSeq(g, graph.KindFile) {
-			if n == nil || n.Meta == nil {
-				continue
-			}
-			for _, a := range csharpMetaStrings(n.Meta["global_using_aliases"]) {
-				for _, form := range csharpAliasComparableForms(a) {
-					globalAliasNames[form] = true
-				}
-			}
-		}
-	}
-
-	// A type whose base list names a PROJECT-GLOBAL alias has a hierarchy
-	// path this pass cannot read: the per-file alias scan never saw the
-	// alias, the base target stayed unresolved, and the resolution above
-	// dropped it - so the type's remaining stamps describe SOME of its
-	// constructions, not all of them. Such a type can never prove a
-	// unique closure; the closure walk refuses for it and for everything
-	// that inherits through it (round-5 finding 6). Same refusal shape as
-	// the stamp-side alias guard: over-refusing only preserves edges.
-	aliasBaseTypes := map[string]bool{}
-	if len(globalAliasNames) > 0 {
-		for _, e := range hierarchyEdges {
-			if e == nil || e.From == "" || !graph.IsUnresolvedTarget(e.To) {
-				continue
-			}
-			if e.Meta != nil && e.Meta["via"] == MetaViaMethodSetInference {
-				continue
-			}
-			if csharpResolveHierarchyTargetPrefetched(hierarchySources[e.From], e.To, hierarchyByName) != "" {
-				continue // resolved after all - a real type, not an alias spelling
-			}
-			if name := graph.UnresolvedName(e.To); name != "" && globalAliasNames[name] {
-				aliasBaseTypes[e.From] = true
-			}
-		}
 	}
 
 	// implementation/interface type node id → member name → method nodes.
@@ -303,30 +223,6 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 		return 0
 	}
 
-	// A variance-declaring interface (ISource<out T> / ISink<in T>) makes
-	// differently-closed constructions assignable across the family, so the
-	// closed-and-unequal equality gate — which models invariant parameters
-	// only — must never arm for it: its families carry no stamped args at
-	// all, and every site keeps the full fan-out.
-	ifaceIDs := make([]string, 0, len(anchorGroups))
-	seenIfaceIDs := map[string]bool{}
-	for _, key := range anchorOrder {
-		id := anchorGroups[key].ifaceID
-		if !seenIfaceIDs[id] {
-			seenIfaceIDs[id] = true
-			ifaceIDs = append(ifaceIDs, id)
-		}
-	}
-	variantIface := map[string]bool{}
-	for id, n := range g.GetNodesByIDs(ifaceIDs) {
-		if n == nil || n.Meta == nil {
-			continue
-		}
-		if v, _ := n.Meta["variant_type_params"].(bool); v {
-			variantIface[id] = true
-		}
-	}
-
 	// Descendant closure per interface, computed once and shared across that
 	// interface's anchors (one per member name).
 	descCache := map[string][]string{}
@@ -351,29 +247,10 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 		return out
 	}
 
-	// The single closure by which each descendant reaches an interface,
-	// or "" where that is not unique. Computed once per interface and
-	// shared across its anchors, like descCache — an interface with many
-	// members would otherwise re-walk the same hierarchy per member.
-	closureCache := map[string]map[string]string{}
-	closuresFor := func(ifaceID string) map[string]string {
-		if c, ok := closureCache[ifaceID]; ok {
-			return c
-		}
-		out := map[string]string{}
-		for _, sub := range descendants(ifaceID) {
-			out[sub] = csharpUniqueClosureToIface(sub, ifaceID, implEdges, aliasBaseTypes)
-		}
-		closureCache[ifaceID] = out
-		return out
-	}
-
 	// Build families and the member → families index.
 	type family struct {
-		ifaceID   string
-		ifaceName string // short interface name, for matching a receiver's declared field type
-		members   []string
-		implArgs  map[string]string // member method ID → its DIRECT implementor's stamped type args ("" absent = never filter)
+		ifaceID string
+		members []string
 	}
 	var families []family
 	famsOfMember := map[string][]int{}
@@ -384,20 +261,11 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 		for _, id := range ag.nodeIDs {
 			anchorSet[id] = true
 		}
-		memberArgs := map[string]string{}
 		implCount := 0
-		variant := variantIface[ag.ifaceID]
 		for _, sub := range descendants(ag.ifaceID) {
 			byName := membersByType[sub]
 			if byName == nil {
 				continue
-			}
-			subArgs := ""
-			if !variant {
-				subArgs = closuresFor(ag.ifaceID)[sub]
-				if csharpArgsNameGlobalAlias(subArgs, globalAliasNames) {
-					subArgs = ""
-				}
 			}
 			for _, m := range byName[ag.name] {
 				if m == nil || anchorSet[m.ID] {
@@ -408,9 +276,6 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 					continue
 				}
 				memberIDs = append(memberIDs, m.ID)
-				if subArgs != "" {
-					memberArgs[m.ID] = subArgs
-				}
 				implCount++
 			}
 		}
@@ -420,10 +285,7 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 			continue
 		}
 		idx := len(families)
-		families = append(families, family{
-			ifaceID: ag.ifaceID, ifaceName: csharpShortTypeName(ag.ifaceID),
-			members: memberIDs, implArgs: memberArgs,
-		})
+		families = append(families, family{ifaceID: ag.ifaceID, members: memberIDs})
 		for _, id := range memberIDs {
 			famsOfMember[id] = append(famsOfMember[id], idx)
 		}
@@ -464,7 +326,6 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 
 	var batch []*graph.Edge
 	seen := map[string]bool{}
-	receiverLookups := newCSharpReceiverLookupCtx()
 	for _, e := range callEdges {
 		if e == nil || e.IsSpeculative() || graph.IsUnresolvedTarget(e.To) {
 			continue
@@ -500,21 +361,6 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 				continue
 			}
 			f := families[fi]
-			// Constructed-interface gate (G9): the source site's own type
-			// arguments — a sibling site bound to a stamped implementor
-			// carries that implementor's args; a through-interface site
-			// carries its receiver FIELD's declared args when the receiver
-			// evidence names one. "" means unknown — never filter. A
-			// family with no stamps at all (every non-generic interface,
-			// and the whole graph until a reindex) can never filter, so
-			// it never pays the receiver lookup either.
-			srcArgs := f.implArgs[e.To]
-			if srcArgs == "" && len(f.implArgs) > 0 {
-				srcArgs = csharpReceiverDeclaredArgs(g, e, f.ifaceID, f.ifaceName, receiverLookups)
-				if csharpArgsNameGlobalAlias(srcArgs, globalAliasNames) {
-					srcArgs = ""
-				}
-			}
 			for _, member := range f.members {
 				// Skip the member the call already reaches — and the CALLER
 				// itself: a family member forwarding through its own
@@ -524,16 +370,6 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 				// binder's edge to mint, never this synthesizer's.
 				if member == e.To || member == e.From {
 					continue
-				}
-				// A site with known constructed args never fans into an
-				// implementor stamped with DIFFERENT args — they implement
-				// different constructed interfaces. Members without a stamp
-				// (the interface member itself, open generics, transitive
-				// implementors) always stay in.
-				if srcArgs != "" {
-					if ma := f.implArgs[member]; ma != "" && ma != srcArgs {
-						continue
-					}
 				}
 				k := csharpCallSiteKey(e.From, member, e.FilePath, e.Line)
 				if existing[k] || seen[k] {
@@ -725,129 +561,6 @@ func csharpMemberMethodsAllByTypeFromEdges(edges []*graph.Edge, nodes map[string
 	return out
 }
 
-// csharpAliasComparableForms returns every form of a global-alias
-// identifier a type-argument stamp could carry: the canonical name
-// (verbatim prefix stripped — pre-normalization stores stamped it raw)
-// and, for an alias legally shadowing a BCL type name (or `dynamic`),
-// the keyword the extractor's canonicalization folds arguments onto.
-// `global using Int32 = App.Crate` makes a stamped "int" ambiguous — it
-// may spell the genuine keyword or the folded alias — and an ambiguous
-// stamp must refuse (never filter). The folds come from the parser's
-// shared declarative table (parser.CSharpBCLKeywordFolds), so the two
-// sides of the gate can never drift again: a fold the refusal does not
-// know suppresses a whole fan-out (round-5 finding 8, the
-// @dynamic → object hop).
-func csharpAliasComparableForms(alias string) []string {
-	name := strings.TrimPrefix(alias, "@")
-	if name == "" {
-		return nil
-	}
-	forms := []string{name}
-	if folded, ok := parser.CSharpBCLKeywordFolds[name]; ok {
-		forms = append(forms, folded)
-	}
-	return forms
-}
-
-// csharpArgsNameGlobalAlias reports whether any comma-separated argument in
-// a type-argument stamp names a project-global using alias — a spelling the
-// string comparison cannot resolve, so the stamp must be refused.
-// csharpUniqueClosureToIface returns the closed type arguments by which
-// sub reaches ifaceID, or "" when that is not a single known closure.
-//
-// A stamp describes one construction, but the gate applies it to every
-// same-named member of the implementor, so it is only sound when the
-// implementor reaches the interface exactly one way. C# permits several:
-// `class C : IEnumerable<int>, IEnumerable<string>` is legal whenever
-// the arguments cannot unify (CS0695 fires only when they could), and a
-// construction can also arrive through an inherited interface or a base
-// class instead of the type's own base list.
-//
-// The rule is deliberately asymmetric: only the implementor's OWN direct
-// closure can qualify it for filtering, while evidence found anywhere up
-// the hierarchy can disqualify it. A transitive descendant has never
-// been filterable — the closure belongs to an intermediate type, not to
-// this one — and this walk does not change that. What it adds is the
-// ability to NOTICE a second construction arriving through an inherited
-// interface or a base class, and to refuse on it.
-//
-// The precise guarantee is that the TARGET filter is monotonically
-// weakened: this function returns either the same string the old
-// direct-stamp read produced or "". The END-TO-END edge set is not a
-// strict superset, because the family loop also reads a bound member's
-// stamp as the SOURCE side's receiver construction — a member whose
-// stamp is refused here sends its sites to the receiver-declared
-// fallback instead, whose verdict can differ. In the shapes measured
-// the fallback is the more correct one: the old source-side read
-// painted one arbitrary closure over a multi-closure type, the same
-// defect this walk fixes on the target side.
-func csharpUniqueClosureToIface(sub, ifaceID string, implEdges map[string]map[string][]string, aliasBaseTypes map[string]bool) string {
-	// A hierarchy path spelled through a project-global alias is a path
-	// this walk cannot see - the type (or an ancestor it inherits
-	// through) may construct the interface a second way, so no stamp of
-	// its can prove uniqueness (round-5 finding 6).
-	if aliasBaseTypes[sub] {
-		return ""
-	}
-	// The implementor's own base list. Absent, ambiguous, or unstamped
-	// means there is nothing to filter on, exactly as before.
-	direct := ""
-	for _, c := range implEdges[sub][ifaceID] {
-		if c == "" || (direct != "" && direct != c) {
-			return ""
-		}
-		direct = c
-	}
-	if direct == "" {
-		return ""
-	}
-
-	// Any OTHER path to the same interface that disagrees — including one
-	// carrying no closure at all, which means a construction we cannot
-	// read — proves no single closure describes this type.
-	visited := map[string]bool{sub: true}
-	queue := []string{sub}
-	for len(queue) > 0 {
-		cur := queue[0]
-		queue = queue[1:]
-		if aliasBaseTypes[cur] {
-			return ""
-		}
-		for to, closures := range implEdges[cur] {
-			if to == ifaceID {
-				if cur != sub {
-					for _, c := range closures {
-						if c != direct {
-							return ""
-						}
-					}
-				}
-				// Never walk THROUGH the interface: its supertypes are
-				// not paths to it, and a collision-merged cycle above it
-				// would otherwise read as a disagreeing second path.
-				continue
-			}
-			if !visited[to] {
-				visited[to] = true
-				queue = append(queue, to)
-			}
-		}
-	}
-	return direct
-}
-
-func csharpArgsNameGlobalAlias(args string, aliases map[string]bool) bool {
-	if args == "" || len(aliases) == 0 {
-		return false
-	}
-	for _, a := range strings.Split(args, ",") {
-		if aliases[a] {
-			return true
-		}
-	}
-	return false
-}
-
 // containsInt reports whether xs contains v. Family lists are tiny (a method
 // belongs to one or two families), so a linear scan beats a map.
 func containsInt(xs []int, v int) bool {
@@ -857,254 +570,6 @@ func containsInt(xs []int, v int) bool {
 		}
 	}
 	return false
-}
-
-// csharpShortTypeName reduces a type node ID to its bare type name:
-// `file.cs::Ns.IBoxStore` → IBoxStore.
-func csharpShortTypeName(id string) string {
-	if i := strings.LastIndex(id, "::"); i >= 0 {
-		id = id[i+2:]
-	}
-	if i := strings.LastIndex(id, "."); i >= 0 {
-		id = id[i+1:]
-	}
-	return id
-}
-
-// csharpReceiverDeclaredArgs recovers the CLOSED type arguments a
-// through-interface call site's receiver declares, for the G9 gate:
-// `_store.Fetch(...)` on a field declared `IBoxStore<Crate> _store`
-// answers "Crate". Evidence-gated at every step — any absence answers ""
-// (never filter):
-//
-//   - the receiver name comes from the bound edge's own receiver_name
-//     meta, or from the extraction's unresolved companion edge for the
-//     SAME member name at the same site (the enrichment/LSP tiers bind a
-//     NEW edge and leave the companion, receiver evidence and all,
-//     alongside); a site the extractor marked receiver_ambiguous — two
-//     same-named calls on one line — contributes nothing;
-//   - the field is looked up on the caller's own type (bare receivers
-//     only — the exact shape the field-identifier emitter covers) and
-//     must actually be a field/constant node;
-//   - the arguments come from the extractor's field_type_args stamp,
-//     which already applied the open/closed rules (enclosing-chain type
-//     parameters, non-simple arguments) at the one place the full
-//     syntax context is visible — this pass never re-parses type text;
-//   - the field's declared type must still name THIS family's interface
-//     (short-name comparison against field_type — the one remaining
-//     name-based trust, see the caller).
-//
-// Typed LOCALS are a named remainder: the tenv strips generics before
-// receiver_type is stamped, so local-receiver sites keep the full
-// fan-out until the extractor carries local type arguments too.
-// csharpReceiverLookupCtx carries the per-pass receiver-evidence caches:
-// declared args per (caller, member, site, interface), each caller's
-// out-edge adjacency read ONCE and served to every site (the companion
-// scan and the field-read evidence scan both consume it), and nodes by
-// ID - fields, their owner types, and caller methods, since the
-// ownership span check reads all three.
-type csharpReceiverLookupCtx struct {
-	args     map[string]string
-	evidence map[string]*csharpCallerEvidence
-	nodes    map[string]*graph.Node
-	nodeSeen map[string]bool
-}
-
-func newCSharpReceiverLookupCtx() *csharpReceiverLookupCtx {
-	return &csharpReceiverLookupCtx{
-		args:     map[string]string{},
-		evidence: map[string]*csharpCallerEvidence{},
-		nodes:    map[string]*graph.Node{},
-		nodeSeen: map[string]bool{},
-	}
-}
-
-// csharpEvidenceSite addresses one piece of a caller's evidence: an edge
-// target at an exact file position.
-type csharpEvidenceSite struct {
-	to   string
-	file string
-	line int
-}
-
-// csharpCallerEvidence is one caller's out-edge evidence bucketed by
-// exact site. Caching the adjacency READ per caller still left every
-// site rescanning the whole slice - twice, for the companion join and
-// the field-read proof - which is quadratic in the caller's site count.
-// Bucketing once makes each site's consultation two map probes plus a
-// walk of its own (almost always single-edge) companion bucket.
-type csharpCallerEvidence struct {
-	calls map[csharpEvidenceSite][]*graph.Edge
-	reads map[csharpEvidenceSite]bool
-}
-
-func (c *csharpReceiverLookupCtx) siteEvidence(g graph.Store, caller string) *csharpCallerEvidence {
-	if ev, ok := c.evidence[caller]; ok {
-		return ev
-	}
-	ev := &csharpCallerEvidence{
-		calls: map[csharpEvidenceSite][]*graph.Edge{},
-		reads: map[csharpEvidenceSite]bool{},
-	}
-	for _, out := range g.GetOutEdges(caller) {
-		if out == nil {
-			continue
-		}
-		key := csharpEvidenceSite{out.To, out.FilePath, out.Line}
-		switch out.Kind {
-		case graph.EdgeCalls:
-			// Adjacency order is preserved within a bucket, so the
-			// companion walk sees edges exactly as the slice scan did.
-			ev.calls[key] = append(ev.calls[key], out)
-		case graph.EdgeReads:
-			ev.reads[key] = true
-		}
-	}
-	c.evidence[caller] = ev
-	return ev
-}
-
-func (c *csharpReceiverLookupCtx) nodeByID(g graph.Store, id string) *graph.Node {
-	if c.nodeSeen[id] {
-		return c.nodes[id]
-	}
-	c.nodeSeen[id] = true
-	n := g.GetNodesByIDs([]string{id})[id]
-	c.nodes[id] = n
-	return n
-}
-
-func csharpReceiverDeclaredArgs(g graph.Store, e *graph.Edge, ifaceID, ifaceName string, lookups *csharpReceiverLookupCtx) string {
-	if e == nil || e.From == "" {
-		return ""
-	}
-	// The member (e.To) selects WHICH companion edge lends its receiver, so
-	// two different member calls sharing a line resolve different fields —
-	// a key without it lets the first call's arguments poison the second.
-	// The full interface ID keeps short-name twins from distinct families
-	// apart for the same reason.
-	cacheKey := e.From + "\x00" + e.To + "\x00" + e.FilePath + "\x00" + strconv.Itoa(e.Line) + "\x00" + ifaceID
-	if v, ok := lookups.args[cacheKey]; ok {
-		return v
-	}
-	args := ""
-	if field := csharpReceiverField(g, e, lookups); field != nil {
-		ft, _ := field.Meta["field_type"].(string)
-		prefix := strings.TrimSpace(ft)
-		if lt := strings.Index(prefix, "<"); lt > 0 {
-			prefix = prefix[:lt]
-		}
-		if i := strings.LastIndex(prefix, "."); i >= 0 {
-			prefix = prefix[i+1:]
-		}
-		if prefix == ifaceName {
-			args, _ = field.Meta["field_type_args"].(string)
-		}
-	}
-	lookups.args[cacheKey] = args
-	return args
-}
-
-// csharpReceiverField resolves the call site's receiver to a field (or
-// constant) node of the caller's own type, or nil when the receiver is
-// not an unambiguous bare same-type field.
-func csharpReceiverField(g graph.Store, e *graph.Edge, lookups *csharpReceiverLookupCtx) *graph.Node {
-	name := ""
-	if e.Meta != nil {
-		if amb, _ := e.Meta["receiver_ambiguous"].(bool); amb {
-			return nil
-		}
-		name, _ = e.Meta["receiver_name"].(string)
-	}
-	ev := lookups.siteEvidence(g, e.From)
-	if name == "" {
-		// The bound edge (enrichment/LSP tiers) carries no receiver
-		// evidence; the extraction's unresolved companion for the same
-		// member name at the same site does. Match the member name so a
-		// different call sharing the line can never lend its receiver.
-		companionTo := "unresolved::*." + csharpShortTypeName(e.To)
-		for _, out := range ev.calls[csharpEvidenceSite{companionTo, e.FilePath, e.Line}] {
-			if out.Meta == nil {
-				continue
-			}
-			if amb, _ := out.Meta["receiver_ambiguous"].(bool); amb {
-				return nil
-			}
-			if rn, _ := out.Meta["receiver_name"].(string); rn != "" {
-				name = rn
-				break
-			}
-		}
-	}
-	if name == "" || strings.ContainsAny(name, ".(") {
-		return nil
-	}
-	ownerID := csharpEnclosingTypeID(e.From)
-	if ownerID == "" {
-		return nil
-	}
-	fieldID := ownerID + "." + name
-	// Binding evidence: the field-identifier emitter refuses shadowed
-	// identifiers (a parameter or local with the field's name owns the
-	// identifier inside that method), so an EdgeReads at this exact site
-	// naming the field is proof the bare receiver really is the enclosing
-	// type's field. A name-only lookup would bind a shadowed identifier to
-	// the field it shadows and gate on the wrong declared arguments —
-	// without the read edge the receiver stays unknown (never filter).
-	if !ev.reads[csharpEvidenceSite{"unresolved::*." + name, e.FilePath, e.Line}] &&
-		!ev.reads[csharpEvidenceSite{fieldID, e.FilePath, e.Line}] {
-		return nil
-	}
-	field := lookups.nodeByID(g, fieldID)
-	if field == nil || field.Meta == nil ||
-		(field.Kind != graph.KindField && field.Kind != graph.KindConstant) {
-		return nil
-	}
-	// Ownership proof. The field ID was assembled from the caller's type
-	// ID, but type node IDs carry no arity and no namespace, so an arity
-	// twin (Result / Result<T>) or a same-file namespace twin mints the
-	// same field ID and only one field node survives - possibly the OTHER
-	// declaration's, whose declared type says nothing about this caller's
-	// receiver. Require the caller and the field to both sit inside the
-	// owner type node's line span; any mismatch, or a missing span, means
-	// the ownership cannot be proven and the receiver stays unknown.
-	// (The surviving type node spans one declaration, so a caller in the
-	// twin fails the check from either side - as does a field the twin
-	// contributed. Refusal only ever preserves fan-out.)
-	owner := lookups.nodeByID(g, ownerID)
-	caller := lookups.nodeByID(g, e.From)
-	if owner == nil || caller == nil ||
-		(owner.Kind != graph.KindType && owner.Kind != graph.KindInterface) ||
-		owner.StartLine <= 0 || owner.EndLine < owner.StartLine ||
-		caller.StartLine < owner.StartLine || caller.StartLine > owner.EndLine ||
-		field.StartLine < owner.StartLine || field.StartLine > owner.EndLine {
-		return nil
-	}
-	// The positive collision signal: the extractor stamps duplicate_decl
-	// on a type node whose ID a second declaration collided with. The
-	// span check above cannot prove ownership for a twin declared INSIDE
-	// the survivor (a nested same-named type), and no span heuristic
-	// can - whichever declaration's evidence survived, a collided owner
-	// proves nothing about which field the receiver names.
-	if dup, _ := owner.Meta["duplicate_decl"].(bool); dup {
-		return nil
-	}
-	return field
-}
-
-// csharpEnclosingTypeID strips the member segment off a method node ID:
-// `file.cs::Flow.Pull` → `file.cs::Flow`. Empty when the ID carries no
-// member segment after the symbol separator.
-func csharpEnclosingTypeID(methodID string) string {
-	sep := strings.LastIndex(methodID, "::")
-	if sep < 0 {
-		return ""
-	}
-	dot := strings.LastIndex(methodID, ".")
-	if dot <= sep+2 {
-		return ""
-	}
-	return methodID[:dot]
 }
 
 func csharpResolveHierarchyTargetPrefetched(from *graph.Node, unresolvedTo string, byName map[string][]*graph.Node) string {
