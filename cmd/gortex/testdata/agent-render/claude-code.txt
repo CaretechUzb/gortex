@@ -269,8 +269,9 @@ Return the answer first, then symbol IDs and file:line evidence, then caveats. D
 1. Confirm tracked repositories with `workspace({operation: "repos"})`.
 2. Resolve the provider symbol with `search({operation: "symbols", query: "<name>", options: {repo: "<provider>"}})`.
 3. Call `relations({operation: "usages", target: {symbol: "<id>"}})` and group results by repository.
-4. Add `analyze({kind: "cross_repo", options: {repo: "<provider>"}})` for repository boundaries and `analyze({kind: "contracts", options: {action: "bridge", mode: "impact", symbol: "<id>"}})` for wire-level consumers.
-5. Report indexed coverage and name any untracked repositories as an explicit gap.
+4. Add `analyze({kind: "contracts", options: {action: "bridge", mode: "impact", symbol: "<id>"}})` for wire-level consumers.
+5. `analyze({kind: "cross_repo", options: {repo: "<provider>"}})` counts resolver-promoted relations only (calls / implements / extends). It is NOT a boundary census: framework-synthesized edges — ORM model references, JS module imports — carry no cross_repo_* mirror and are excluded, so it can under-report coupling by 10x. Treat the step-3 grouping as the coupling answer.
+6. Report indexed coverage and name any untracked repositories as an explicit gap.
 
 ## Required behavior
 
@@ -768,8 +769,9 @@ description: "Find who uses a symbol across all consumer repos."
 1. Confirm tracked repositories with `workspace({operation: "repos"})`.
 2. Resolve the provider symbol with `search({operation: "symbols", query: "<name>", options: {repo: "<provider>"}})`.
 3. Call `relations({operation: "usages", target: {symbol: "<id>"}})` and group results by repository.
-4. Add `analyze({kind: "cross_repo", options: {repo: "<provider>"}})` for repository boundaries and `analyze({kind: "contracts", options: {action: "bridge", mode: "impact", symbol: "<id>"}})` for wire-level consumers.
-5. Report indexed coverage and name any untracked repositories as an explicit gap.
+4. Add `analyze({kind: "contracts", options: {action: "bridge", mode: "impact", symbol: "<id>"}})` for wire-level consumers.
+5. `analyze({kind: "cross_repo", options: {repo: "<provider>"}})` counts resolver-promoted relations only (calls / implements / extends). It is NOT a boundary census: framework-synthesized edges — ORM model references, JS module imports — carry no cross_repo_* mirror and are excluded, so it can under-report coupling by 10x. Treat the step-3 grouping as the coupling answer.
+6. Report indexed coverage and name any untracked repositories as an explicit gap.
 
 ## Required behavior
 
