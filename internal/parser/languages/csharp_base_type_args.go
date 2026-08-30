@@ -19,6 +19,17 @@ import (
 // a hundred-plus implementors) that inflates every data-access usage
 // answer.
 //
+// The consumer - the type-argument dispatch gate in the resolver - is
+// DEFERRED until type node identity is unique (a receiver that can
+// carry a resolved field node ID, an implements edge that carries its
+// own construction); five review rounds showed the gate approximating
+// that identity from spellings and line numbers, each approximation
+// opening new recall regressions. The stamps stay: they are pure
+// additive evidence, comments across this package that name "the
+// dispatch gate" name this deferred consumer, and the extractor version
+// bump means stores extracted today already carry what the gate will
+// need when it returns.
+//
 // Two stamps carry the CLOSED arguments as evidence:
 //
 //   - implements/extends edges: Meta["target_type_args"] from the
