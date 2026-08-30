@@ -517,7 +517,7 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 			e.emitConstructor(m, filePath, fileID, src, result, seen, funcBytes)
 
 		case m.Captures["field.def"] != nil:
-			e.emitField(m, filePath, fileID, src, result, seen, fileAliases)
+			e.emitField(m, filePath, fileID, src, result, seen, fileAliases, funcBytes)
 
 		case m.Captures["prop.def"] != nil:
 			e.emitProperty(m, filePath, fileID, src, result, seen, fileAliases, funcBytes)
@@ -1825,18 +1825,44 @@ func (e *CSharpExtractor) emitConstructor(m parser.QueryResult, filePath, fileID
 	emitCSharpFunctionShape(id, def.Node, src, filePath, startLine1, result)
 }
 
-func (e *CSharpExtractor) emitField(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool, fileAliases map[string]bool) {
+func (e *CSharpExtractor) emitField(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool, fileAliases map[string]bool, funcBytes map[string][2]int) {
 	def := m.Captures["field.def"]
 	owner := csharpDirectMemberOwner(def.Node, src, "class_declaration", "struct_declaration", "interface_declaration", "record_declaration")
 	if owner.kind == "" {
 		return
 	}
-	name := m.Captures["field.name"].Text
+	nameCap := m.Captures["field.name"]
+	name := nameCap.Text
 	id := filePath + "::" + owner.name + "." + name
 	if seen[id] {
 		return
 	}
 	seen[id] = true
+	// An initializer is executable code with no method around it, so the
+	// declaring field owns its calls (round-23 catch AC1's field lane).
+	// The extent is the DECLARATOR, not the whole declaration: on a
+	// multi-declarator line (`int a = F(), b = G();`) each call must land
+	// on the field it actually initializes. Initializer-less declarators
+	// record nothing — they contain no code, and keeping them out of the
+	// owner set avoids needless one-line ambiguity ties.
+	if nameCap.Node != nil {
+		if decl := nameCap.Node.Parent(); decl != nil && decl.Type() == "variable_declarator" {
+			// Grammar revisions disagree on the wrapper (equals_value_clause
+			// vs the expression hanging directly under the declarator — the
+			// await-tier walk above tolerates both), so "has an initializer"
+			// is: any named child besides the name and a fixed-size-buffer
+			// bracketed_argument_list.
+			for i := 0; i < int(decl.NamedChildCount()); i++ {
+				c := decl.NamedChild(i)
+				if c == nil || c.StartByte() == nameCap.Node.StartByte() ||
+					c.Type() == "bracketed_argument_list" {
+					continue
+				}
+				funcBytes[id] = [2]int{int(decl.StartByte()), int(decl.EndByte())}
+				break
+			}
+		}
+	}
 	// Interface fields (C# 8+ static/const members) are implicitly public.
 	isIface := owner.kind == "interface_declaration"
 	defaultVis := VisibilityPrivate

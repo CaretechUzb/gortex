@@ -131,3 +131,38 @@ func TestCSharpExtractor_PropertyInitializerCallAttributesToTheProperty(t *testi
 	assert.Len(t, callEdgesFrom(result.Edges, "App.cs::Config.Seeded", "SeedValue"), 1,
 		"property-initializer call must attribute to the property node")
 }
+
+// A field initializer is executable code with no method around it. The
+// field declarator's own byte span owns the call — per DECLARATOR, so a
+// multi-declarator line (`int a = F(), b = G();`) hands each call to
+// the field it actually initializes.
+func TestCSharpExtractor_FieldInitializerCallAttributesToItsField(t *testing.T) {
+	src := []byte(`namespace App {
+    public class Seeder {
+        public static int A() { return 1; }
+        public static int B() { return 2; }
+    }
+    public class Config {
+        private int _lone = Seeder.A();
+        private int _first = Seeder.A(), _second = Seeder.B();
+        private static readonly int Shared = Seeder.B();
+        private int _bare;
+    }
+}
+`)
+	e := NewCSharpExtractor()
+	result, err := e.Extract("App.cs", src)
+	require.NoError(t, err)
+
+	for _, row := range []struct{ shape, owner, method string }{
+		{"single declarator", "App.cs::Config._lone", "A"},
+		{"first of two declarators", "App.cs::Config._first", "A"},
+		{"second of two declarators", "App.cs::Config._second", "B"},
+		{"static readonly", "App.cs::Config.Shared", "B"},
+	} {
+		t.Run(row.shape, func(t *testing.T) {
+			assert.Len(t, callEdgesFrom(result.Edges, row.owner, row.method), 1,
+				"initializer call must attribute to its own field node")
+		})
+	}
+}
