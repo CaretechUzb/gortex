@@ -190,7 +190,7 @@ type csharpDeferredCall struct {
 	// say which side of a block boundary a call falls on, and cannot
 	// separate two sites that share one physical line; a scope test
 	// needs a coordinate that can.
-	offset int
+	offset   int
 	isMember bool
 	// returnUsage is how the call site consumes the return value
 	// (graph.ReturnUsage* label), classified at capture time and
