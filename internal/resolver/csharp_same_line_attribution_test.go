@@ -1,10 +1,55 @@
 package resolver
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+
+	"github.com/zzet/gortex/internal/graph"
 )
+
+// Byte extents are recorded only for methods and constructors. When a
+// member kind WITHOUT extents (property, indexer, field initializer)
+// shares a source line with one that has them, the offset matches no
+// recorded extent - and answering "" there erased the call outright
+// instead of falling back to the line answer (round-6 finding B3). The
+// call must survive; which member carries it can stay line-keyed until
+// every member kind records extents.
+func TestResolveCSharp_ExtentlessMemberSharingALineKeepsItsCall(t *testing.T) {
+	cases := map[string]string{
+		"property_shares_line": `namespace App {
+ public class BLBag { public int Take() { return 1; } }
+ public class BLProp { private BLBag _b = new BLBag();
+  public int Q => _b.Take(); public void M() { }
+ } }`,
+		"indexer_shares_line": `namespace App {
+ public class BLBag { public int Take() { return 1; } }
+ public class BLIdx { private BLBag _b = new BLBag();
+  public int this[int i] => _b.Take(); public void M() { }
+ } }`,
+		"field_init_shares_line": `namespace App {
+ public class BLBag { public int Take() { return 1; } }
+ public class BLInit { private BLBag _b = new BLBag();
+  private int _n = new BLBag().Take(); public void M() { }
+ } }`,
+		"ctor_and_property_same_line": `namespace App {
+ public class BLBag { public int Take() { return 1; } }
+ public class BLCtor { private BLBag _b = new BLBag();
+  public BLCtor() { } public int Q => _b.Take();
+ } }`,
+	}
+	for name, src := range cases {
+		g := buildCSharpResolverGraph(t, map[string]string{"X.cs": src})
+		found := false
+		for _, e := range g.AllEdges() {
+			if e != nil && e.Kind == graph.EdgeCalls && strings.Contains(e.To, "Take") {
+				found = true
+			}
+		}
+		assert.True(t, found, "[%s] the extentless member's call must fall back to line attribution, not vanish", name)
+	}
+}
 
 // Two methods with UNEQUAL line spans can share a physical line - a
 // zero-span `public int B(){return 0;}` followed on the same line by the

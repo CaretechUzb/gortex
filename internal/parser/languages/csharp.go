@@ -2072,9 +2072,11 @@ func newCSharpFuncLookup(ranges []funcRange, bytes map[string][2]int) *csharpFun
 // ambiguousAt cannot refuse there (it requires EQUAL spans), so B
 // carried A's call and every consumer of the attribution read the wrong
 // member's evidence (round-5 finding 4). Falls back to the line answer
-// when no candidate carries a byte extent; answers "" when byte extents
-// exist for every line-covering candidate and none contains the offset
-// - attributing such a site by line would be a guess.
+// whenever no recorded byte extent contains the offset: extents are
+// recorded only for methods and constructors, so a member kind without
+// them (property, indexer, field initializer) sharing a line with one
+// that has them would otherwise lose its call outright rather than
+// degrade to line attribution (round-6 finding B3).
 func (l *csharpFuncLookup) enclosingAt(line, offset int) string {
 	if offset < 0 || len(l.bytes) == 0 {
 		return l.enclosing(line)
@@ -2083,7 +2085,6 @@ func (l *csharpFuncLookup) enclosingAt(line, offset int) string {
 	best := ""
 	bestSpan := math.MaxInt
 	bestOrd := math.MaxInt
-	anyBytes := false
 	for ; i >= 0; i-- {
 		if l.maxEnd[i] < line {
 			break
@@ -2096,7 +2097,6 @@ func (l *csharpFuncLookup) enclosingAt(line, offset int) string {
 		if !ok {
 			continue
 		}
-		anyBytes = true
 		if offset < b[0] || offset >= b[1] {
 			continue
 		}
@@ -2106,9 +2106,6 @@ func (l *csharpFuncLookup) enclosingAt(line, offset int) string {
 	}
 	if best != "" {
 		return best
-	}
-	if anyBytes {
-		return ""
 	}
 	return l.enclosing(line)
 }
