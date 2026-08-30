@@ -145,3 +145,64 @@ first home. This complements that rather than replacing it.
 **Effort:** M
 **Priority:** P3
 **Depends on:** the `READY` column, for the verdict and its vocabulary.
+
+## Analysis
+
+### Report the true cross-repo boundary, not just promoted relations
+
+**What:** Give `analyze kind=cross_repo` a second section counting every edge
+whose endpoints sit in different repos, beside the resolver-promoted rows it
+reports today. `get_architecture` should read the same rollup.
+
+**Why:** The number it reports is not the boundary, and on a framework-heavy
+workspace it is off by an order of magnitude. Measured 2026-08-30 against the
+5-repo `docker-env` (Odoo) workspace:
+
+| pair | distinct relations | reported | sees |
+|---|---|---|---|
+| `local` -> `odoo` | 108,614 | 13,230 | 12.2% |
+| `odoo` -> `local` | 108,697 | 1,038 | 1.0% |
+
+`handleAnalyzeCrossRepo` (`internal/mcp/tools_analyze_edges.go:1569-1699`)
+enumerates three hardcoded kinds — `EdgeCrossRepoCalls`, `EdgeCrossRepoImplements`,
+`EdgeCrossRepoExtends` — and applies no boundary predicate at all; `fromRepo` /
+`toRepo` are resolved afterwards and used only as grouping keys. The Odoo
+synthesizer emits `references` / `imports` / `composes` / `overrides` / `tests`,
+none of which has a `cross_repo_*` mirror, so ~95k real crossings never reach the
+rollup. On an Odoo codebase `references via=odoo-model` *is* the dominant coupling
+relation — `fields.Many2one('hr.department')` binding a local field to the class
+behind the model — so what survives the filter is the plain-Python slice that
+would exist even with the framework pass switched off.
+
+The clean proof that the kind list and not the `cross_repo` column is the gate:
+2,401 `imports` and 119 `instantiates` on `local` -> `odoo` already carry
+`cross_repo = 1` and still do not appear.
+
+The misleading-answer path is already closed — `commandCrossRepoUsage`
+(`internal/agents/claudecode/content.go`) demotes the call to step 5 and states
+it is not a boundary census — so this entry is about making the real number
+*available*, not about stopping a wrong one being believed.
+
+**Context:** Four measurements constrain the implementation:
+
+- The authoritative query (`edges` joined to `nodes` twice, filtering
+  `nf.repo_prefix <> nt.repo_prefix`) takes **45s** on the 8 GB store and returns
+  only 143 rows. That does not fit the ~59s handler deadline — `get_architecture`
+  already times out on this workspace — so it belongs in the generation-keyed
+  `PutAnalysisBlob` / `LoadAnalysisBlob` cache
+  (`internal/graph/store_sqlite/analysis_generation_{read,write}.go`), which
+  `invalidateAnalysisGenerationTx` already invalidates on mutation. Return
+  `boundary: {status: "not_computed"}` when cold rather than blocking a caller.
+- Deriving the repo prefix from the node id instead of joining is not a
+  shortcut: it is both slower (33s) *and* wrong, missing 572 edges whose node
+  carries a repo prefix that its id does not.
+- The census must skip kinds for which `graph.BaseKindForCrossRepo` returns ok.
+  The resolver stores a mirror beside every edge it promotes, so a raw row count
+  double-counts exactly the promoted set (121,844 rows -> 108,614 relations).
+- `edges.tier` is empty in the column — tier is derived at read time via
+  `graph.ResolvedBy(origin)`. Group by `origin` and map it in Go.
+
+**Effort:** L
+**Priority:** P3
+**Depends on:** None. P3 rather than P2 only because the agent-facing warning
+shipped first; without that warning this is a silent wrong answer.
