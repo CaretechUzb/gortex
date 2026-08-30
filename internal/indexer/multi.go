@@ -924,6 +924,7 @@ func (mi *MultiIndexer) runMasterResolveHookedContext(ctx context.Context, scope
 		zap.Int("pending_scanned", stats.PendingBefore),
 		zap.Int("pending_admitted", stats.PendingAfter),
 		zap.Error(err))
+	mi.reconcileRetargetedTestCalls(master.TakeRetargetedTestCallFiles())
 	return err
 }
 

@@ -528,3 +528,48 @@ func TestCrossRepoResolveReconcilesRetargetedTestCall(t *testing.T) {
 		t.Fatalf("cross-repo resolved test call has no EdgeTests projection")
 	}
 }
+
+// The whole-graph master lane: runMasterResolveHookedContext runs
+// master.ResolveAllContext and is the funnel for every whole-graph master
+// pass, including resolveDeferredMutations' fail-closed fullFallback taken
+// whenever a mutation receipt comes back incomplete. newMasterResolver
+// returns a fresh resolver per call, so a frontier left undrained there is
+// garbage-collected unread - the file-scoped lane (the control) drains,
+// the whole-graph lane must too.
+func TestMasterResolveWholeGraphReconcilesRetargetedTestCalls(t *testing.T) {
+	build := func() (*MultiIndexer, *graph.Edge, graph.Store) {
+		g := graph.New()
+		g.AddNode(&graph.Node{ID: "repoA/pkg/foo_test.go", Kind: graph.KindFile, Name: "foo_test.go", FilePath: "repoA/pkg/foo_test.go", Language: "go", RepoPrefix: "repoA", WorkspaceID: "ws"})
+		g.AddNode(&graph.Node{ID: "repoA/pkg/foo_test.go::TestFoo", Kind: graph.KindFunction, Name: "TestFoo", FilePath: "repoA/pkg/foo_test.go", Language: "go", RepoPrefix: "repoA", WorkspaceID: "ws"})
+		g.AddNode(&graph.Node{ID: "repoA/pkg/foo.go", Kind: graph.KindFile, Name: "foo.go", FilePath: "repoA/pkg/foo.go", Language: "go", RepoPrefix: "repoA", WorkspaceID: "ws"})
+		g.AddNode(&graph.Node{ID: "repoA/pkg/foo.go::Foo", Kind: graph.KindFunction, Name: "Foo", FilePath: "repoA/pkg/foo.go", Language: "go", RepoPrefix: "repoA", WorkspaceID: "ws"})
+		call := &graph.Edge{From: "repoA/pkg/foo_test.go::TestFoo", To: graph.UnresolvedMarker + "Foo", Kind: graph.EdgeCalls, FilePath: "repoA/pkg/foo_test.go", Line: 5}
+		g.AddEdge(call)
+		if _, emitted := markTestSymbolsAndEmitEdges(g); emitted != 0 {
+			t.Fatalf("fixture: unresolved call must not project, emitted %d", emitted)
+		}
+		return NewMultiIndexer(g, newTestRegistry(), search.NewNull(), nil, zap.NewNop()), call, g
+	}
+
+	t.Run("control_runMasterResolveFiles", func(t *testing.T) {
+		mi, call, g := build()
+		mi.runMasterResolveFiles([]string{"repoA/pkg/foo.go"}, false)
+		if call.To != "repoA/pkg/foo.go::Foo" {
+			t.Fatalf("fixture: call must bind, got %q", call.To)
+		}
+		if e := findEdge(g, graph.EdgeTests, "repoA/pkg/foo_test.go::TestFoo", "repoA/pkg/foo.go::Foo"); e == nil {
+			t.Fatalf("control: expected EdgeTests projection")
+		}
+	})
+
+	t.Run("subject_runMasterResolve_wholegraph", func(t *testing.T) {
+		mi, call, g := build()
+		mi.runMasterResolve(nil, false) // the fullFallback lane
+		if call.To != "repoA/pkg/foo.go::Foo" {
+			t.Fatalf("fixture: call must bind, got %q", call.To)
+		}
+		if e := findEdge(g, graph.EdgeTests, "repoA/pkg/foo_test.go::TestFoo", "repoA/pkg/foo.go::Foo"); e == nil {
+			t.Fatalf("master ResolveAll bound the test call but no EdgeTests was reconciled")
+		}
+	})
+}
