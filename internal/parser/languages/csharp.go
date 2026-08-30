@@ -453,7 +453,7 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 	// Type IDs whose FIRST declaration spelled `partial` — the gate for
 	// preserving a later same-file fragment's base list (round-5
 	// finding 5).
-	partialSeen := make(map[string]bool)
+	partialSeen := make(map[string]*csharpPartialIdentity)
 
 	// Pre-scan the file's own interface declarations. A base type that
 	// names one of these is definitively an interface, even when its name
@@ -1125,7 +1125,7 @@ func csharpOrTypeMeta(result *parser.ExtractionResult, id, key string) {
 // emitContainer collapses the per-kind class/interface/struct/enum
 // node emission. The capture-name prefix selects which capture set to
 // read from (the legacy code repeated this body four times).
-func (e *CSharpExtractor) emitContainer(m parser.QueryResult, kind string, nodeKind graph.NodeKind, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen, annotationSeen map[string]bool, localInterfaces, fileAliases map[string]bool, baseNameCounts map[string]map[string]int, partialSeen map[string]bool) {
+func (e *CSharpExtractor) emitContainer(m parser.QueryResult, kind string, nodeKind graph.NodeKind, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen, annotationSeen map[string]bool, localInterfaces, fileAliases map[string]bool, baseNameCounts map[string]map[string]int, partialSeen map[string]*csharpPartialIdentity) {
 	// The declaration side lives in the same canonical identifier domain
 	// as the base-list side: a verbatim-declared type (`@event` is the
 	// only legal spelling of a keyword-named type) must mint the node ID
@@ -1159,23 +1159,30 @@ func (e *CSharpExtractor) emitContainer(m parser.QueryResult, kind string, nodeK
 		// second declaration's interface paths must reach the graph even
 		// though its node is dropped, or the surviving fragment's stamp
 		// reads as the type's unique closure and the family fan-out
-		// filters the whole type (round-5 finding 5). Gated on BOTH
-		// declarations spelling `partial` - arity twins, nested
-		// same-named types and other short-ID collisions never merge
-		// bases. The cross-declaration baseNameCounts prescan already
-		// spans every fragment, so a type closing one erased interface
-		// twice across parts still stamps nothing.
+		// filters the whole type (round-5 finding 5). `partial` on both
+		// declarations proves only a keyword; the merge additionally
+		// requires the type-identity key to match - namespace, enclosing
+		// type chain, and generic arity - because arity twins, namespace
+		// twins, and nested twins can all be partial while being two
+		// distinct types (round-6 finding B4). Any mismatch keeps the
+		// old drop-the-bases behaviour. The shared extends budget rides
+		// the record so two fragments cannot mint two base classes. The
+		// cross-declaration baseNameCounts prescan already spans every
+		// fragment, so a type closing one erased interface twice across
+		// parts still stamps nothing.
 		switch kind {
 		case "class", "struct", "record", "iface":
-			if partialSeen[id] && csharpHasModifier(def.Node, src, "partial") {
-				emitCSharpBaseList(id, def.Node, src, filePath, localInterfaces, fileAliases, baseNameCounts, result)
+			if pi := partialSeen[id]; pi != nil && csharpHasModifier(def.Node, src, "partial") &&
+				pi.sameType(csharpPartialIdentityOf(def.Node, src)) {
+				pi.extendsTaken = emitCSharpBaseList(id, def.Node, src, filePath, localInterfaces, fileAliases, baseNameCounts, result, pi.extendsTaken)
 			}
 		}
 		return
 	}
 	seen[id] = true
 	if csharpHasModifier(def.Node, src, "partial") {
-		partialSeen[id] = true
+		pi := csharpPartialIdentityOf(def.Node, src)
+		partialSeen[id] = &pi
 	}
 	meta := map[string]any{"visibility": csharpVisibility(def.Node, src, VisibilityInternal)}
 	// A struct is a value type; record struct too. Surfacing it lets a
@@ -1236,7 +1243,10 @@ func (e *CSharpExtractor) emitContainer(m parser.QueryResult, kind string, nodeK
 	// for structs and records, inheritance for interfaces).
 	switch kind {
 	case "class", "struct", "record", "iface":
-		emitCSharpBaseList(id, def.Node, src, filePath, localInterfaces, fileAliases, baseNameCounts, result)
+		took := emitCSharpBaseList(id, def.Node, src, filePath, localInterfaces, fileAliases, baseNameCounts, result, false)
+		if pi := partialSeen[id]; pi != nil {
+			pi.extendsTaken = took
+		}
 	case "enum":
 		e.emitCSharpEnumMembers(def.Node, src, filePath, id, name, result, seen)
 	}
@@ -2339,9 +2349,77 @@ func collectCSharpInterfaceNames(root *sitter.Node, src []byte) map[string]bool 
 // the resolver binds them like every other C# reference. A base that
 // resolves to a same-file class still flows through unchanged — it is
 // neither a known interface nor I-prefixed, so it lands as EdgeExtends.
-func emitCSharpBaseList(typeID string, decl *sitter.Node, src []byte, filePath string, localInterfaces, fileAliases map[string]bool, baseNameCounts map[string]map[string]int, result *parser.ExtractionResult) {
+// csharpPartialIdentity records, for the first partial declaration on a
+// node ID, the type-identity key later same-ID fragments must match
+// before their base lists merge - `partial` alone proves a keyword, not
+// an identity (round-6 finding B4) - and whether a fragment has already
+// minted the type's single base class, so the merge cannot mint a
+// second one (a type node ID carries neither namespace nor arity, so
+// arity twins, namespace twins, and nested twins all share an ID with
+// a genuinely-partial type's fragments).
+type csharpPartialIdentity struct {
+	ns           string
+	outerChain   string
+	arity        int
+	extendsTaken bool
+}
+
+func csharpPartialIdentityOf(decl *sitter.Node, src []byte) csharpPartialIdentity {
+	return csharpPartialIdentity{
+		ns:         csharpEnclosingNamespace(decl, src),
+		outerChain: csharpEnclosingTypeChain(decl, src),
+		arity:      csharpTypeParamArity(decl),
+	}
+}
+
+// sameType reports whether a later fragment's identity key matches -
+// extendsTaken is bookkeeping, not identity, so it stays out.
+func (p csharpPartialIdentity) sameType(o csharpPartialIdentity) bool {
+	return p.ns == o.ns && p.outerChain == o.outerChain && p.arity == o.arity
+}
+
+// csharpEnclosingTypeChain joins the names of every enclosing type
+// declaration, innermost first. Only equality is consumed, so the
+// direction just needs to be deterministic.
+func csharpEnclosingTypeChain(decl *sitter.Node, src []byte) string {
+	var parts []string
+	for n := decl.Parent(); n != nil; n = n.Parent() {
+		switch n.Type() {
+		case "class_declaration", "struct_declaration", "record_declaration", "interface_declaration":
+			if nm := n.ChildByFieldName("name"); nm != nil {
+				parts = append(parts, nm.Content(src))
+			}
+		}
+	}
+	return strings.Join(parts, ".")
+}
+
+// csharpTypeParamArity counts the declaration's type parameters (0 for
+// a non-generic type). `type_parameters` is not a named field in every
+// grammar revision - same fallback scan as the method-level lookup.
+func csharpTypeParamArity(decl *sitter.Node) int {
+	tp := decl.ChildByFieldName("type_parameters")
+	if tp == nil {
+		for i, _nc := 0, int(decl.ChildCount()); i < _nc; i++ {
+			if c := decl.Child(i); c != nil && c.Type() == "type_parameter_list" {
+				tp = c
+				break
+			}
+		}
+	}
+	if tp == nil {
+		return 0
+	}
+	return int(tp.NamedChildCount())
+}
+
+// emitCSharpBaseList emits the declaration's base-list edges. It
+// receives whether an earlier fragment of the same type already minted
+// the base class and reports the state back, so partial fragments share
+// ONE extends budget the way entries within one base list always have.
+func emitCSharpBaseList(typeID string, decl *sitter.Node, src []byte, filePath string, localInterfaces, fileAliases map[string]bool, baseNameCounts map[string]map[string]int, result *parser.ExtractionResult, extendsAlready bool) bool {
 	if decl == nil {
-		return
+		return extendsAlready
 	}
 	baseList := decl.ChildByFieldName("bases")
 	if baseList == nil {
@@ -2356,7 +2434,7 @@ func emitCSharpBaseList(typeID string, decl *sitter.Node, src []byte, filePath s
 		}
 	}
 	if baseList == nil {
-		return
+		return extendsAlready
 	}
 	// Structs and `record struct` cannot derive from a base class — the
 	// CLR forbids it — so every entry in their base list is an interface
@@ -2384,7 +2462,7 @@ func emitCSharpBaseList(typeID string, decl *sitter.Node, src []byte, filePath s
 	// the winner's stamp. An absent entry counts as 0 and stamps nothing,
 	// so a shape the prescan cannot attribute keeps the full fan-out.
 	baseNameCount := baseNameCounts[typeID]
-	extendsTaken := false
+	extendsTaken := extendsAlready
 	for i, _nc := 0, int(baseList.NamedChildCount()); i < _nc; i++ {
 		entry := baseList.NamedChild(i)
 		if entry == nil {
@@ -2441,6 +2519,7 @@ func emitCSharpBaseList(typeID string, decl *sitter.Node, src []byte, filePath s
 		}
 		result.Edges = append(result.Edges, edge)
 	}
+	return extendsTaken
 }
 
 // csharpQualifiedReceiverType resolves the type a `this.` or `base.`
