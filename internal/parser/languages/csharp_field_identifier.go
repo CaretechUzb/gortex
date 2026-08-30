@@ -112,7 +112,7 @@ func emitCSharpFieldIdentifierUses(
 	// function-wide questions, which can only withhold a use, never
 	// invent one.
 	eligible := func(line, offset int, name string) (owner, ownerType string, ok bool) {
-		owner = funcRanges.enclosing(line)
+		owner = funcRanges.enclosingAt(line, offset)
 		if owner == "" {
 			return "", "", false
 		}

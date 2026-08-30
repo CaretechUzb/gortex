@@ -34,7 +34,7 @@ func csharpCollectExtraBindingScopes(root *sitter.Node, src []byte, funcRanges *
 		if name == "" {
 			return
 		}
-		owner := funcRanges.enclosing(int(nameNode.StartPoint().Row) + 1)
+		owner := funcRanges.enclosingAt(int(nameNode.StartPoint().Row)+1, int(nameNode.StartByte()))
 		if owner == "" {
 			return
 		}

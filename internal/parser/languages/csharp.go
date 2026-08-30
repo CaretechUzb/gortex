@@ -441,6 +441,10 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 	seen := make(map[string]bool)
 	annotationSeen := make(map[string]bool)
 	ifaceMethods := make(map[string][]string) // interface name → method names
+	// Function/ctor BYTE extents, recorded at emission: a line number
+	// cannot say which of two members sharing a physical line owns a
+	// call site; the byte interval can (round-5 finding 4).
+	funcBytes := make(map[string][2]int)
 
 	// Pre-scan the file's own interface declarations. A base type that
 	// names one of these is definitively an interface, even when its name
@@ -490,10 +494,10 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 			e.emitAnonymousType(m, filePath, fileID, result, seen)
 
 		case m.Captures["method.def"] != nil:
-			e.emitMethod(m, filePath, fileID, src, result, seen, annotationSeen, ifaceMethods)
+			e.emitMethod(m, filePath, fileID, src, result, seen, annotationSeen, ifaceMethods, funcBytes)
 
 		case m.Captures["ctor.def"] != nil:
-			e.emitConstructor(m, filePath, fileID, src, result, seen)
+			e.emitConstructor(m, filePath, fileID, src, result, seen, funcBytes)
 
 		case m.Captures["field.def"] != nil:
 			e.emitField(m, filePath, fileID, src, result, seen, fileAliases)
@@ -609,7 +613,7 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 	// type environments. Owner attribution runs once per local, call and
 	// type use — the sorted lookup keeps that from multiplying into an
 	// O(locals×functions) linear-scan product on member-heavy files.
-	funcRanges := newCSharpFuncLookup(buildFuncRanges(result))
+	funcRanges := newCSharpFuncLookup(buildFuncRanges(result), funcBytes)
 
 	// Build type environments in legacy precedence, scoped per enclosing
 	// method — a same-named local of a different type in a sibling method
@@ -623,7 +627,7 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 		if l.defNode == nil {
 			return ""
 		}
-		return funcRanges.enclosing(int(l.defNode.StartPoint().Row) + 1)
+		return funcRanges.enclosingAt(int(l.defNode.StartPoint().Row)+1, int(l.defNode.StartByte()))
 	}
 	tenvByOwner := map[string]typeEnv{}
 	// The offset-aware mirror of the tenv/shape/builtin maps: one
@@ -791,7 +795,7 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 		if bt == "" {
 			continue
 		}
-		owner := funcRanges.enclosing(int(l.defNode.StartPoint().Row) + 1)
+		owner := funcRanges.enclosingAt(int(l.defNode.StartPoint().Row)+1, int(l.defNode.StartByte()))
 		if owner == "" {
 			continue
 		}
@@ -881,7 +885,7 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 	csharpCollectExtraBindingScopes(root, src, funcRanges, localScopes)
 
 	for _, c := range calls {
-		callerID := funcRanges.enclosing(c.line)
+		callerID := funcRanges.enclosingAt(c.line, c.offset)
 		if callerID == "" {
 			continue
 		}
@@ -1556,7 +1560,7 @@ func extractCSharpDoc(src []byte, startRow int) string {
 	return ExtractDocAbove(src, startRow, DocLangBlockStar)
 }
 
-func (e *CSharpExtractor) emitMethod(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen, annotationSeen map[string]bool, ifaceMethods map[string][]string) {
+func (e *CSharpExtractor) emitMethod(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen, annotationSeen map[string]bool, ifaceMethods map[string][]string, funcBytes map[string][2]int) {
 	name := m.Captures["method.name"].Text
 	def := m.Captures["method.def"]
 	startLine1 := def.StartLine + 1
@@ -1589,6 +1593,9 @@ func (e *CSharpExtractor) emitMethod(m parser.QueryResult, filePath, fileID stri
 		return
 	}
 	seen[id] = true
+	if def.Node != nil {
+		funcBytes[id] = [2]int{int(def.Node.StartByte()), int(def.Node.EndByte())}
+	}
 	// Interface members are implicitly public; an explicit modifier (a C# 8
 	// default member marked private/protected) still wins via csharpVisibility.
 	defaultVis := VisibilityPrivate
@@ -1695,7 +1702,7 @@ func (e *CSharpExtractor) emitMethod(m parser.QueryResult, filePath, fileID stri
 	emitCSharpFunctionShape(id, def.Node, src, filePath, startLine1, result)
 }
 
-func (e *CSharpExtractor) emitConstructor(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool) {
+func (e *CSharpExtractor) emitConstructor(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool, funcBytes map[string][2]int) {
 	def := m.Captures["ctor.def"]
 	startLine1 := def.StartLine + 1
 	owner := csharpDirectMemberOwner(def.Node, src, "class_declaration", "struct_declaration", "record_declaration")
@@ -1710,6 +1717,9 @@ func (e *CSharpExtractor) emitConstructor(m parser.QueryResult, filePath, fileID
 		return
 	}
 	seen[id] = true
+	if def.Node != nil {
+		funcBytes[id] = [2]int{int(def.Node.StartByte()), int(def.Node.EndByte())}
+	}
 	// Ctors own call edges the same way methods do — without the scope
 	// stamp the resolver's namespace walk would read a ctor caller as
 	// global-namespace code.
@@ -1999,9 +2009,14 @@ type csharpFuncLookup struct {
 	ranges []funcRange
 	maxEnd []int
 	ord    []int // original extraction order — the deterministic tie-break
+	// bytes carries each function's BYTE extent (keyed by node ID) when
+	// the extractor recorded one. Line ranges cannot separate two members
+	// declared on one physical line; byte intervals can, so consumers
+	// with a real coordinate attribute through enclosingAt.
+	bytes map[string][2]int
 }
 
-func newCSharpFuncLookup(ranges []funcRange) *csharpFuncLookup {
+func newCSharpFuncLookup(ranges []funcRange, bytes map[string][2]int) *csharpFuncLookup {
 	sorted := append([]funcRange(nil), ranges...)
 	ord := make([]int, len(sorted))
 	for i := range ord {
@@ -2019,7 +2034,55 @@ func newCSharpFuncLookup(ranges []funcRange) *csharpFuncLookup {
 		}
 		maxEnd[i] = running
 	}
-	return &csharpFuncLookup{ranges: sorted, maxEnd: maxEnd, ord: ord}
+	return &csharpFuncLookup{ranges: sorted, maxEnd: maxEnd, ord: ord, bytes: bytes}
+}
+
+// enclosingAt returns the function whose BYTE extent contains offset,
+// innermost byte-span first. Line-keyed attribution hands a call to the
+// smaller LINE span when two members with unequal spans share a physical
+// line - `public int B(){return 0;} public T A(...) {` - and
+// ambiguousAt cannot refuse there (it requires EQUAL spans), so B
+// carried A's call and every consumer of the attribution read the wrong
+// member's evidence (round-5 finding 4). Falls back to the line answer
+// when no candidate carries a byte extent; answers "" when byte extents
+// exist for every line-covering candidate and none contains the offset
+// - attributing such a site by line would be a guess.
+func (l *csharpFuncLookup) enclosingAt(line, offset int) string {
+	if offset < 0 || len(l.bytes) == 0 {
+		return l.enclosing(line)
+	}
+	i := sort.Search(len(l.ranges), func(j int) bool { return l.ranges[j].startLine > line }) - 1
+	best := ""
+	bestSpan := math.MaxInt
+	bestOrd := math.MaxInt
+	anyBytes := false
+	for ; i >= 0; i-- {
+		if l.maxEnd[i] < line {
+			break
+		}
+		r := l.ranges[i]
+		if line > r.endLine {
+			continue
+		}
+		b, ok := l.bytes[r.id]
+		if !ok {
+			continue
+		}
+		anyBytes = true
+		if offset < b[0] || offset >= b[1] {
+			continue
+		}
+		if span := b[1] - b[0]; span < bestSpan || (span == bestSpan && l.ord[i] < bestOrd) {
+			best, bestSpan, bestOrd = r.id, span, l.ord[i]
+		}
+	}
+	if best != "" {
+		return best
+	}
+	if anyBytes {
+		return ""
+	}
+	return l.enclosing(line)
 }
 
 func (l *csharpFuncLookup) enclosing(line int) string {

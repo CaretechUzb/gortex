@@ -205,16 +205,14 @@ func TestResolveCSharpInterfaceDispatch_ImplicitThisNeverStealsSiblingReceiver(t
 		"a receiverless implicit-this call marks its line ambiguous rather than borrowing the sibling's receiver")
 }
 
-// Two members declared on one source line tie for the innermost func
-// range, and the tie-break is extraction order - so the call inside A
-// is attributed to B. The shadow refusal then consults B's EMPTY
-// parameter set, receiver_name stamps for what is actually A's
-// parameter, and the gate filters on the same-named FIELD's closure
-// instead of the parameter's.
-//
-// The misattribution itself predates the gate; what is new is that it
-// removes a target. A line two members tie on is unattributable, and
-// evidence keyed on that attribution must refuse.
+// Two members declared on one source line used to tie for the innermost
+// func range with an extraction-order tie-break, handing A's call to B.
+// Byte-interval attribution (round-5 finding 4) resolves the tie: the
+// call's offset lies inside A's extent, so A owns it. What this test
+// still pins is the EVIDENCE story on such a line: the receiver spells
+// A's shadowing parameter, receiver_name is refused, the line stays
+// marked ambiguous for the same-name-site index - so nothing at the
+// site may filter and the fan-out keeps every implementor.
 func TestResolveCSharpInterfaceDispatch_TwoMembersOnOneLineRefuseReceiverEvidence(t *testing.T) {
 	g := buildCSharpResolverGraph(t, map[string]string{
 		"F.cs": `namespace App {
@@ -232,9 +230,12 @@ func TestResolveCSharpInterfaceDispatch_TwoMembersOnOneLineRefuseReceiverEvidenc
 	})
 	New(g).ResolveAll()
 
-	// The line-keyed attribution hands the call to B - the production
-	// state this pins, not an artifact of the test setup.
-	const callerID = "F.cs::Flow.B"
+	// Byte attribution hands the call to its real owner, A; B owns no
+	// call at all.
+	assert.Empty(t, callsFrom(g, "F.cs::Flow.B"),
+		"B's body is `return 0;` - byte attribution leaves it no call")
+
+	const callerID = "F.cs::Flow.A"
 	bindMemberCallAtLine(t, g, callerID, "Get", "F.cs::IBox.Get")
 	ResolveCSharpInterfaceDispatch(g)
 
@@ -242,5 +243,16 @@ func TestResolveCSharpInterfaceDispatch_TwoMembersOnOneLineRefuseReceiverEvidenc
 		"F.cs::CrateBox.Get",
 		"F.cs::WidgetBox.Get",
 	}, dispatchTargets(g, callerID),
-		"a line two members tie on carries no usable receiver evidence, so the full fan-out stays")
+		"the receiver spells A's shadowing parameter - no usable receiver evidence, so the full fan-out stays")
+}
+
+// callsFrom returns the EdgeCalls targets leaving fromID.
+func callsFrom(g graph.Store, fromID string) []string {
+	var out []string
+	for _, e := range g.GetOutEdges(fromID) {
+		if e != nil && e.Kind == graph.EdgeCalls {
+			out = append(out, e.To)
+		}
+	}
+	return out
 }
