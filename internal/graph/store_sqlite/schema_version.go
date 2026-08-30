@@ -90,6 +90,14 @@ var schemaMigrations = []schemaMigration{
 	// they both claim rather than renumbering ours to 14, which would have left
 	// main's purge permanently unrun on every store this branch built.
 	//
+	// Standing rule, and the reason renumbering was rejected in both
+	// directions: this branch's currentSchemaVersion must stay EQUAL to main's.
+	// Our work lives inside the number main already shipped, so whatever main
+	// numbers next (14) is strictly greater than what stores built here are
+	// stamped, and pendingBetween selects it. Stamping our stores 14/15 would
+	// carry them past main's next migration, which pendingBetween would then
+	// skip permanently.
+	//
 	// Consequence, accepted deliberately: planSchemaMigrationWith treats
 	// `stored > current` as "written by a newer build" and WIPES the store, so a
 	// store this branch already stamped 14 is rebuilt from source on first open
@@ -102,7 +110,11 @@ var schemaMigrations = []schemaMigration{
 	// runs before the registry), so such a store is structurally sound, but its
 	// repositories read "never derived" until their next real derive, and any
 	// synthetic-namespace ownership the old graph.StubRepoPrefix wrote is left
-	// standing. Rebuilding those stores, or a future v14, is what closes it.
+	// standing. Waiting does not close it either: pendingBetween(13, 14) selects
+	// v14 alone, so main's next migration reconciles nothing here. A rebuild
+	// closes both halves; the repo's next real derive closes the readiness rows
+	// only, and the unstamp stays unrun. Do not mint a v14 to close it — see the
+	// standing rule above.
 	{version: 13, name: "purge legacy coverage spellings and add per-repo readiness state", inPlace: migrateV13},
 }
 
@@ -168,12 +180,12 @@ func unstampReservedRepoPrefixes(tx *sql.Tx) error {
 	return nil
 }
 
-// createReadinessStateTables is the explicit v14 migration. schemaSQL owns the
-// canonical fresh-store definitions; this idempotent step brings an existing
-// store forward and seeds the rows readiness needs to tell "never derived"
-// apart from "derived before anything recorded derives".
+// createReadinessStateTables is the readiness half of the merged v13 step.
+// schemaSQL owns the canonical fresh-store definitions; this idempotent step
+// brings an existing store forward and seeds the rows readiness needs to tell
+// "never derived" apart from "derived before anything recorded derives".
 //
-// Every pre-v14 repo is seeded legacy=1. Derive completion was not persisted
+// Every pre-v13 repo is seeded legacy=1. Derive completion was not persisted
 // anywhere before this table -- the passes only logged -- so stamping a
 // completion here would be inventing data about work this store cannot
 // confirm happened. Legacy rows deliberately render "unknown" until the next
@@ -205,14 +217,16 @@ func createReadinessStateTables(tx *sql.Tx) error {
 	// The three content_gen columns are added inside this step rather than as a
 	// migration of their own: they correct this step's own anchor, and the only
 	// stores carrying the earlier shape are development builds of this branch.
-	// Those are stamped user_version 13 or 14 and will never re-run this step,
-	// which is exactly why each ADD is guarded individually and why schemaSQL's
-	// CREATE TABLE IF NOT EXISTS cannot be relied on to deliver them.
+	// A dev store stamped 14 is not the problem — `stored > current` now wipes
+	// it on open. A dev store stamped 13 is `stored == current`, re-runs
+	// nothing, and is exactly why each ADD is guarded individually and why
+	// schemaSQL's CREATE TABLE IF NOT EXISTS cannot be relied on to deliver
+	// them.
 	//
 	// This reasoning originally read "before v13 has shipped". That premise
 	// died in the merge: main shipped its OWN v13 (the coverage-spelling purge)
-	// while this branch was out, so this step is v14 now. See the renumbering
-	// note on the migration table.
+	// while this branch was out, and the two were folded into one v13 rather
+	// than renumbered. See the note on the migration table.
 	for _, col := range []struct{ table, name, ddl string }{
 		{"enrichment_state", "gen", "gen INTEGER NOT NULL DEFAULT 0"},
 		{"enrichment_state", "content_gen", "content_gen INTEGER NOT NULL DEFAULT 0"},
