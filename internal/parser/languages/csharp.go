@@ -2463,19 +2463,34 @@ func csharpDeclAllowsBaseClass(decl *sitter.Node) bool {
 // `I`-prefix test sees IList rather than IList<int> or System.IList. The
 // bool return reports whether the entry is a primary_constructor_base_type
 // (`Base(args)`), which can only ever be a base class.
+// csharpCanonBaseIdent reduces one base-entry identifier SPELLING to the
+// identifier it denotes: the verbatim `@` prefix drops and unicode
+// escapes decode, so `@IRack` and the escaped spelling compare equal to
+// IRack everywhere the name is used — the alias-sentinel lookup, the
+// duplicate count, the I-prefix interface test, and the
+// unresolved-target name (round-5 finding 7: the raw spelling bypassed
+// all four). A malformed escape keeps the raw spelling, which every
+// consumer treats conservatively.
+func csharpCanonBaseIdent(s string) string {
+	if c := csharpCanonicalIdentifier(s); c != "" {
+		return c
+	}
+	return s
+}
+
 func csharpBaseTypeName(entry *sitter.Node, src []byte) (string, bool) {
 	switch entry.Type() {
 	case "identifier":
-		return entry.Content(src), false
+		return csharpCanonBaseIdent(entry.Content(src)), false
 	case "generic_name":
 		// First child is the base identifier; the type_argument_list
 		// follows. IList<int> → IList.
 		if id := entry.ChildByFieldName("name"); id != nil {
-			return id.Content(src), false
+			return csharpCanonBaseIdent(id.Content(src)), false
 		}
 		for i, _nc := 0, int(entry.ChildCount()); i < _nc; i++ {
 			if c := entry.Child(i); c != nil && c.Type() == "identifier" {
-				return c.Content(src), false
+				return csharpCanonBaseIdent(c.Content(src)), false
 			}
 		}
 	case "qualified_name":
@@ -2497,11 +2512,11 @@ func csharpBaseTypeName(entry *sitter.Node, src []byte) (string, bool) {
 				last = c.Content(src)
 			}
 		}
-		return last, false
+		return csharpCanonBaseIdent(last), false
 	case "primary_constructor_base_type":
 		// `: Base(args)` — record base-constructor call; always a class.
 		if id := entry.ChildByFieldName("type"); id != nil {
-			return normalizeCSharpBaseName(id.Content(src)), true
+			return csharpCanonBaseIdent(normalizeCSharpBaseName(id.Content(src))), true
 		}
 		for i, _nc := 0, int(entry.ChildCount()); i < _nc; i++ {
 			c := entry.Child(i)
@@ -2509,7 +2524,7 @@ func csharpBaseTypeName(entry *sitter.Node, src []byte) (string, bool) {
 				continue
 			}
 			if c.Type() == "identifier" || c.Type() == "generic_name" || c.Type() == "qualified_name" {
-				return normalizeCSharpBaseName(c.Content(src)), true
+				return csharpCanonBaseIdent(normalizeCSharpBaseName(c.Content(src))), true
 			}
 		}
 	}
