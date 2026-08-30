@@ -208,6 +208,32 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 		}
 	}
 
+	// A type whose base list names a PROJECT-GLOBAL alias has a hierarchy
+	// path this pass cannot read: the per-file alias scan never saw the
+	// alias, the base target stayed unresolved, and the resolution above
+	// dropped it - so the type's remaining stamps describe SOME of its
+	// constructions, not all of them. Such a type can never prove a
+	// unique closure; the closure walk refuses for it and for everything
+	// that inherits through it (round-5 finding 6). Same refusal shape as
+	// the stamp-side alias guard: over-refusing only preserves edges.
+	aliasBaseTypes := map[string]bool{}
+	if len(globalAliasNames) > 0 {
+		for _, e := range hierarchyEdges {
+			if e == nil || e.From == "" || !graph.IsUnresolvedTarget(e.To) {
+				continue
+			}
+			if e.Meta != nil && e.Meta["via"] == MetaViaMethodSetInference {
+				continue
+			}
+			if csharpResolveHierarchyTargetPrefetched(hierarchySources[e.From], e.To, hierarchyByName) != "" {
+				continue // resolved after all - a real type, not an alias spelling
+			}
+			if name := graph.UnresolvedName(e.To); name != "" && globalAliasNames[name] {
+				aliasBaseTypes[e.From] = true
+			}
+		}
+	}
+
 	// implementation/interface type node id → member name → method nodes.
 	// Every overload matters: C# overloads mint one node each (Convert,
 	// Convert_L39, ...) sharing the same Name, and real call sites bind to any
@@ -335,7 +361,7 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 		}
 		out := map[string]string{}
 		for _, sub := range descendants(ifaceID) {
-			out[sub] = csharpUniqueClosureToIface(sub, ifaceID, implEdges)
+			out[sub] = csharpUniqueClosureToIface(sub, ifaceID, implEdges, aliasBaseTypes)
 		}
 		closureCache[ifaceID] = out
 		return out
@@ -789,7 +815,14 @@ func csharpAliasComparableForms(alias string) []string {
 // the fallback is the more correct one: the old source-side read
 // painted one arbitrary closure over a multi-closure type, the same
 // defect this walk fixes on the target side.
-func csharpUniqueClosureToIface(sub, ifaceID string, implEdges map[string]map[string][]string) string {
+func csharpUniqueClosureToIface(sub, ifaceID string, implEdges map[string]map[string][]string, aliasBaseTypes map[string]bool) string {
+	// A hierarchy path spelled through a project-global alias is a path
+	// this walk cannot see - the type (or an ancestor it inherits
+	// through) may construct the interface a second way, so no stamp of
+	// its can prove uniqueness (round-5 finding 6).
+	if aliasBaseTypes[sub] {
+		return ""
+	}
 	// The implementor's own base list. Absent, ambiguous, or unstamped
 	// means there is nothing to filter on, exactly as before.
 	direct := ""
@@ -811,6 +844,9 @@ func csharpUniqueClosureToIface(sub, ifaceID string, implEdges map[string]map[st
 	for len(queue) > 0 {
 		cur := queue[0]
 		queue = queue[1:]
+		if aliasBaseTypes[cur] {
+			return ""
+		}
 		for to, closures := range implEdges[cur] {
 			if to == ifaceID {
 				if cur != sub {
