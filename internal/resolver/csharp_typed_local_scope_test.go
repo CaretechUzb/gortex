@@ -55,6 +55,38 @@ func TestResolveCSharpTypedLocal_AliveAcrossSwitchSections(t *testing.T) {
 	}
 }
 
+// The var-tier passes skipped a declaration when the FUNCTION-WIDE tenv
+// already knew the name - so a second same-named `var` in a SIBLING
+// scope never minted its own offset record, csharpTypedLocalAt answered
+// Expired at the second site, and the receiver evidence vanished
+// (round-6 finding B5). The guard must be per-record: every declaration
+// mints its own record and the offset lookup never sees a name it only
+// half-knows.
+func TestResolveCSharpTypedLocal_SiblingScopeRedeclarationKeepsItsRecord(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Sibling.cs": `namespace App {
+    public class SbConverter { public string Convert(int n) { return "en"; } }
+    public class SbOther { public string Convert(int n) { return "uk"; } }
+    public class SbRunner {
+        public void Run(bool flag) {
+            if (flag) { var conv = new SbConverter(); conv.Convert(1); }
+            else      { var conv = new SbConverter(); conv.Convert(2); }
+        }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	resolved := 0
+	for _, to := range callsFrom(g, "Sibling.cs::SbRunner.Run") {
+		if to == "Sibling.cs::SbConverter.Convert" {
+			resolved++
+		}
+	}
+	assert.Equal(t, 2, resolved,
+		"each sibling-scope `var conv` declares its own receiver - both Convert sites must resolve")
+}
+
 func TestResolveCSharpExtension_ExpiredTypedLocalKeepsStaticForm(t *testing.T) {
 	g := buildCSharpResolverGraph(t, map[string]string{
 		"Ext.cs": `using System.Collections.Generic;

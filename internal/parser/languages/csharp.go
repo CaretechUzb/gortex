@@ -663,6 +663,23 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 		m[l.name] = append(m[l.name], b)
 		return b
 	}
+	// typedRecordAt is the lookup-only twin of typedRecord: it never
+	// mints a record, so a guard can ask "does THIS declaration's scope
+	// already carry evidence" without converting an Absent name into a
+	// Found-but-empty record that would block the function-wide
+	// fallbacks.
+	typedRecordAt := func(owner string, l csharpDeferredLocal) *csharpTypedBinding {
+		if l.defNode == nil {
+			return nil
+		}
+		sc := csharpLocalScopeOf(l.defNode)
+		for _, b := range typedLocalsByOwner[owner][l.name] {
+			if b.scope == sc {
+				return b
+			}
+		}
+		return nil
+	}
 	setLocalType := func(owner string, l csharpDeferredLocal, typeName string) {
 		env := tenvByOwner[owner]
 		if env == nil {
@@ -689,7 +706,11 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 		if owner == "" || l.rawType != "var" || l.defNode == nil {
 			continue
 		}
-		if _, exists := tenvByOwner[owner][l.name]; exists {
+		// Per-record, not per-function: a second same-named `var` in a
+		// SIBLING scope must mint its own offset record, or the offset
+		// lookup answers Expired at its sites and drops the receiver
+		// evidence entirely (round-6 finding B5).
+		if b := typedRecordAt(owner, l); b != nil && b.typ != "" {
 			continue
 		}
 		// First creation in document order = the outermost one; a
@@ -714,7 +735,8 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 		if owner == "" || l.rawType != "var" || l.defNode == nil {
 			continue
 		}
-		if _, exists := tenvByOwner[owner][l.name]; exists {
+		// Same per-record guard as tier 1 (round-6 finding B5).
+		if b := typedRecordAt(owner, l); b != nil && b.typ != "" {
 			continue
 		}
 		done := false
@@ -769,7 +791,11 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 		if owner == "" {
 			continue
 		}
-		if _, exists := shapesByOwner[owner][l.name]; exists {
+		// Per-record like the type tiers: a sibling-scope redeclaration
+		// carries its own shape, and skipping it on the function-wide
+		// map starved the record that the generic-extension veto reads
+		// (round-6 finding B5).
+		if b := typedRecordAt(owner, l); b != nil && b.shape != "" {
 			continue
 		}
 		if shape := csharpCanonTypeShape(l.rawType); shape != "" {
