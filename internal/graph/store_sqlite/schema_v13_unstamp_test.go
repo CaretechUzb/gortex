@@ -9,7 +9,11 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 )
 
-// The v14 repair, against the rows a live store actually held.
+// The unstamp repair, against the rows a live store actually held.
+//
+// It shipped as v14 on this branch and is now folded into the merged v13,
+// alongside main's coverage purge and the readiness setup — so these tests
+// rewind to 12 to make Open reconcile through it.
 //
 // `external-call::module::go:odoo` was stamped repo_prefix `external-call` —
 // graph.StubRepoPrefix read the synthetic namespace as a repository, and the
@@ -26,9 +30,10 @@ func TestReopeningUnstampsASyntheticNamespaceClaimedAsARepo(t *testing.T) {
 	store, err := Open(path)
 	require.NoError(t, err)
 	seedPoisonedOwnership(t, store)
-	// Rewind past the repair so reopening has to run it. The rest of the
-	// schema is already current, which is what an upgrading store looks like.
-	rewindSchemaVersion(t, store, 13)
+	// Rewind past the repair so reopening has to run it. 12 rather than 13:
+	// the repair lives INSIDE v13 now, and a store already stamped 13 is
+	// stored == current, which reconciles nothing.
+	rewindSchemaVersion(t, store, 12)
 	require.NoError(t, store.Close())
 
 	reopened, err := Open(path)
@@ -60,7 +65,7 @@ func TestTheRepairCoversEveryReservedNamespace(t *testing.T) {
 		insertNode(t, store, ns+"::module::go:x", ns)
 		insertAnchor(t, store, ns)
 	}
-	rewindSchemaVersion(t, store, 13)
+	rewindSchemaVersion(t, store, 12)
 	require.NoError(t, store.Close())
 
 	reopened, err := Open(path)

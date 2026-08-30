@@ -34,7 +34,7 @@ import (
 // index changes in a way an old on-disk DB would not already have, and append a
 // matching schemaMigrations entry describing how to bring an older store
 // forward (in place, or by rebuild).
-const currentSchemaVersion = 14
+const currentSchemaVersion = 13
 
 // schemaMigration is one forward step. Exactly one strategy applies:
 //   - rebuild=true: the change introduces structure/data that can only come
@@ -82,17 +82,48 @@ var schemaMigrations = []schemaMigration{
 	{version: 10, name: "rebuild vector corpus ownership and parents", inPlace: rebuildVectorCorpusSchema},
 	{version: 11, name: "add symbol FTS normalization state", inPlace: createSymbolFTSNormalizationStateTable},
 	{version: 12, name: "normalize dir column separators", inPlace: normalizeDirColumnSeparators},
-	// Nothing recorded per-repo derive completion before v13, and both
-	// readiness stages need an anchor an incremental reindex actually moves.
-	// Purely additive and mechanically seedable, so in-place rather than a
-	// rebuild: no existing row has to be re-derived from source.
-	{version: 13, name: "add per-repo graph generation and derive state", inPlace: createReadinessStateTables},
-	// A synthetic namespace was being read as a repository (see
-	// graph.reservedIDNamespaces), so nodes nested inside a placeholder were
-	// stamped as owned by one — and an owned node is exactly how a prefix earns
-	// a repo_graph_gen anchor row. graph.StubRepoPrefix no longer produces the
-	// stamp; this clears what it already wrote.
-	{version: 14, name: "unstamp synthetic namespaces claimed as repo owners", inPlace: unstampReservedRepoPrefixes},
+	// v13 carries BOTH sides' work, because both sides minted a v13.
+	//
+	// This branch developed its readiness migration as v13 in parallel with
+	// main's coverage-spelling purge, so the merge had to reconcile two
+	// different steps claiming one number. They are merged into the single v13
+	// they both claim rather than renumbering ours to 14, which would have left
+	// main's purge permanently unrun on every store this branch built.
+	//
+	// Consequence, accepted deliberately: planSchemaMigrationWith treats
+	// `stored > current` as "written by a newer build" and WIPES the store, so a
+	// store this branch already stamped 14 is rebuilt from source on first open
+	// after the merge. That is the cost of collapsing the number, and it is
+	// correct — such a store carries a schema this registry no longer describes.
+	//
+	// Known gap, recorded rather than hidden: a store MAIN stamped 13 is
+	// `stored == current` and runs nothing, so it never receives the readiness
+	// seeding or the unstamp. schemaSQL still creates the readiness tables (it
+	// runs before the registry), so such a store is structurally sound, but its
+	// repositories read "never derived" until their next real derive, and any
+	// synthetic-namespace ownership the old graph.StubRepoPrefix wrote is left
+	// standing. Rebuilding those stores, or a future v14, is what closes it.
+	{version: 13, name: "purge legacy coverage spellings and add per-repo readiness state", inPlace: migrateV13},
+}
+
+// migrateV13 runs main's coverage purge and this branch's readiness setup as
+// one step, in dependency order.
+//
+// Purge first: it deletes legacy artifact rows, and the readiness seed reads
+// repo_index_state to decide which repositories get a legacy=1 row, so seeding
+// first would anchor rows the purge then strips.
+//
+// Unstamp last: it DELETEs from repo_graph_gen, which createReadinessStateTables
+// is what creates and seeds. Reversing them would delete from a table that does
+// not exist yet on a pre-v13 store.
+func migrateV13(tx *sql.Tx) error {
+	if err := purgeLegacyCoverageSpellings(tx); err != nil {
+		return err
+	}
+	if err := createReadinessStateTables(tx); err != nil {
+		return err
+	}
+	return unstampReservedRepoPrefixes(tx)
 }
 
 // unstampReservedRepoPrefixes clears the repo ownership that was stamped onto
@@ -137,12 +168,12 @@ func unstampReservedRepoPrefixes(tx *sql.Tx) error {
 	return nil
 }
 
-// createReadinessStateTables is the explicit v13 migration. schemaSQL owns the
+// createReadinessStateTables is the explicit v14 migration. schemaSQL owns the
 // canonical fresh-store definitions; this idempotent step brings an existing
 // store forward and seeds the rows readiness needs to tell "never derived"
 // apart from "derived before anything recorded derives".
 //
-// Every pre-v13 repo is seeded legacy=1. Derive completion was not persisted
+// Every pre-v14 repo is seeded legacy=1. Derive completion was not persisted
 // anywhere before this table -- the passes only logged -- so stamping a
 // completion here would be inventing data about work this store cannot
 // confirm happened. Legacy rows deliberately render "unknown" until the next
@@ -171,14 +202,17 @@ func createReadinessStateTables(tx *sql.Tx) error {
 	// SQLite has no ADD COLUMN IF NOT EXISTS, and a duplicate ADD is a hard
 	// error that would roll the entire migration transaction back on a re-run.
 	//
-	// The three content_gen columns are added here rather than in a v14 for a
-	// specific reason: they correct v13's own anchor before v13 has shipped, so
-	// the only stores carrying the earlier shape are development builds of this
-	// branch. Those are already stamped user_version 13 and would never see a
-	// v13 step re-run -- which is exactly why each ADD is guarded individually
-	// and why schemaSQL's CREATE TABLE IF NOT EXISTS cannot be relied on to
-	// deliver them. Stacking a migration onto an unreleased version would buy
-	// nothing and cost a second test matrix.
+	// The three content_gen columns are added inside this step rather than as a
+	// migration of their own: they correct this step's own anchor, and the only
+	// stores carrying the earlier shape are development builds of this branch.
+	// Those are stamped user_version 13 or 14 and will never re-run this step,
+	// which is exactly why each ADD is guarded individually and why schemaSQL's
+	// CREATE TABLE IF NOT EXISTS cannot be relied on to deliver them.
+	//
+	// This reasoning originally read "before v13 has shipped". That premise
+	// died in the merge: main shipped its OWN v13 (the coverage-spelling purge)
+	// while this branch was out, so this step is v14 now. See the renumbering
+	// note on the migration table.
 	for _, col := range []struct{ table, name, ddl string }{
 		{"enrichment_state", "gen", "gen INTEGER NOT NULL DEFAULT 0"},
 		{"enrichment_state", "content_gen", "content_gen INTEGER NOT NULL DEFAULT 0"},
