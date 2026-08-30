@@ -1126,7 +1126,12 @@ func csharpOrTypeMeta(result *parser.ExtractionResult, id, key string) {
 // node emission. The capture-name prefix selects which capture set to
 // read from (the legacy code repeated this body four times).
 func (e *CSharpExtractor) emitContainer(m parser.QueryResult, kind string, nodeKind graph.NodeKind, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen, annotationSeen map[string]bool, localInterfaces, fileAliases map[string]bool, baseNameCounts map[string]map[string]int, partialSeen map[string]bool) {
-	name := m.Captures[kind+".name"].Text
+	// The declaration side lives in the same canonical identifier domain
+	// as the base-list side: a verbatim-declared type (`@event` is the
+	// only legal spelling of a keyword-named type) must mint the node ID
+	// its base-list uses look up, or it is unreachable from every base
+	// list in the file (round-6 finding B2).
+	name := csharpCanonBaseIdent(m.Captures[kind+".name"].Text)
 	def := m.Captures[kind+".def"]
 	id := filePath + "::" + name
 	if seen[id] {
@@ -2215,7 +2220,11 @@ func csharpDirectMemberOwner(member *sitter.Node, src []byte, allowed ...string)
 			if nameNode == nil {
 				return csharpOwner{}
 			}
-			return csharpOwner{kind: gtype, name: nameNode.Content(src)}
+			// Same canonical domain as the node ID the owner mints
+			// (round-6 finding B2): members of a verbatim-declared type
+			// must hang off the canonical owner or the type resolves
+			// while its member fan-out stays empty.
+			return csharpOwner{kind: gtype, name: csharpCanonBaseIdent(nameNode.Content(src))}
 		}
 	}
 	return csharpOwner{}
@@ -2294,7 +2303,10 @@ func collectCSharpInterfaceNames(root *sitter.Node, src []byte) map[string]bool 
 			return
 		}
 		if nameNode := n.ChildByFieldName("name"); nameNode != nil {
-			names[nameNode.Content(src)] = true
+			// Canonical, like the base-list lookups that consult this
+			// set: a verbatim-declared interface must still classify its
+			// implementors' edges as implements (round-6 finding B2).
+			names[csharpCanonBaseIdent(nameNode.Content(src))] = true
 		}
 	})
 	return names
