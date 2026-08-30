@@ -450,6 +450,48 @@ func TestCSharpExtractor_SameLineSameNameCallsMarkReceiverAmbiguous(t *testing.T
 	}
 }
 
+// Two members with EQUAL spans declared on one source line: line-keyed
+// attribution breaks the tie by extraction order, which is arbitrary,
+// so any evidence keyed on the attribution must refuse there. The
+// stamp is the refusal; this pin is the assertion the round-5 test of
+// the same name carried before its rewrite lost it (round-6
+// non-blocking finding 7).
+func TestCSharpExtractor_TwoMembersOnOneLineMarkReceiverAmbiguous(t *testing.T) {
+	src := []byte(`namespace App {
+    public class Store { public int Fetch(int id) { return id; } }
+    public class Flow {
+        private readonly Store _crates;
+        public int B(Store s) { return s.Fetch(1); } public int A(Store t) { return t.Fetch(2); }
+        public int Lone(Store s) { return s.Fetch(3); }
+    }
+}
+`)
+	result, err := NewCSharpExtractor().Extract("Tie.cs", src)
+	require.NoError(t, err)
+
+	tied, lone := 0, 0
+	for _, ed := range result.Edges {
+		if ed == nil || ed.Kind != graph.EdgeCalls || ed.To != "unresolved::*.Fetch" {
+			continue
+		}
+		switch ed.From {
+		case "Tie.cs::Flow.B", "Tie.cs::Flow.A":
+			tied++
+			require.NotNil(t, ed.Meta)
+			assert.Equal(t, true, ed.Meta["receiver_ambiguous"],
+				"equal-span members tie on the line - the attribution is arbitrary and the evidence must say so")
+		case "Tie.cs::Flow.Lone":
+			lone++
+			if ed.Meta != nil {
+				assert.NotContains(t, ed.Meta, "receiver_ambiguous",
+					"a line owned by one member stays unmarked")
+			}
+		}
+	}
+	require.NotZero(t, tied, "fixture: the tied line must emit member calls")
+	require.NotZero(t, lone, "fixture: the control line must emit a member call")
+}
+
 // The 2,000-sibling shape from the review: one namespace whose declaration
 // list holds thousands of types, each with a generic base entry and a
 // generic field. A per-declaration alias scan that re-walks the namespace's
