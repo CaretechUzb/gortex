@@ -3,7 +3,6 @@ package store_sqlite
 import (
 	"database/sql"
 	"fmt"
-	"os"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -12,16 +11,10 @@ import (
 // ReadRepoIndexStates opens the SQLite store at path read-only and returns
 // every repo_index_state freshness row keyed by repo_prefix.
 //
-// It is a deliberately lightweight side door for read-only callers (notably
-// `gortex repos`) that must inspect index freshness WITHOUT going through
-// Open — which runs schema migrations, alters columns, starts a checkpoint
-// goroutine, and (on a version mismatch) can refuse to open or rebuild the
-// file. None of that is appropriate for a status command that may run while
-// a daemon holds the same store open.
-//
-// The connection is query-only and inherits the database's existing journal
-// mode, so it reads safely alongside a running daemon (WAL permits concurrent
-// readers).
+// It is a deliberately lightweight side door for read-only callers that must
+// inspect index freshness WITHOUT going through Open — see openReadOnlyStore
+// for why, and for the pragma choice this shares with every other read-only
+// reader.
 //
 // Exactly two conditions mean "nothing recorded yet" and yield an empty map
 // with a nil error: no store file at all, and a store that predates the
@@ -31,26 +24,21 @@ import (
 // indistinguishable from an unindexed one, so `gortex repos` reported success
 // and told the user their repos had never been indexed.
 func ReadRepoIndexStates(path string) (map[string]graph.RepoIndexState, error) {
-	if _, err := os.Stat(path); err != nil {
-		if os.IsNotExist(err) {
-			return map[string]graph.RepoIndexState{}, nil
-		}
-		return nil, fmt.Errorf("stat sqlite store %q: %w", path, err)
-	}
-
-	// query_only blocks accidental writes; busy_timeout keeps a brief read
-	// from erroring out if the daemon happens to hold the write lock for a
-	// moment. We deliberately do NOT set journal_mode — forcing it could try
-	// to switch the live database's mode; inheriting the on-disk WAL mode is
-	// exactly what a concurrent reader wants.
-	dsn := path + "?_pragma=busy_timeout(2000)&_pragma=query_only(1)"
-	db, err := sql.Open("sqlite", dsn)
+	db, found, err := openReadOnlyStore(path)
 	if err != nil {
-		return nil, fmt.Errorf("open sqlite store %q: %w", path, err)
+		return nil, err
 	}
-	defer db.Close()
-	db.SetMaxOpenConns(1)
+	if !found {
+		return map[string]graph.RepoIndexState{}, nil
+	}
+	defer db.Close() //nolint:errcheck // read-only handle
+	return scanIndexStates(db, path)
+}
 
+// scanIndexStates reads every repo_index_state row from an already-open
+// read-only handle, so the single-table reader and the combined readiness
+// reader cannot drift in what "fresh" is read from.
+func scanIndexStates(db *sql.DB, path string) (map[string]graph.RepoIndexState, error) {
 	rows, err := db.Query(`
 SELECT repo_prefix, indexed_sha, dirty, indexed_at, workspace_fp, node_count, edge_count, extractor_versions
   FROM repo_index_state`)
@@ -63,7 +51,7 @@ SELECT repo_prefix, indexed_sha, dirty, indexed_at, workspace_fp, node_count, ed
 		}
 		return nil, fmt.Errorf("read repo_index_state from %q: %w", path, err)
 	}
-	defer rows.Close()
+	defer rows.Close() //nolint:errcheck // read-only cursor
 
 	out := map[string]graph.RepoIndexState{}
 	for rows.Next() {

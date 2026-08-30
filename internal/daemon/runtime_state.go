@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/zzet/gortex/internal/platform"
 )
@@ -22,6 +23,91 @@ type RuntimeState struct {
 	// --backend-path expanded to an absolute path, or the platform default
 	// when the flag was not given.
 	BackendPath string `json:"backend_path"`
+
+	// DerivingSince and DerivingScope name a derived-pass run in flight, so a
+	// reader can say "deriving…" for a repo whose stamp has not landed yet
+	// instead of "never derived". A whole-workspace derive takes tens of
+	// minutes on a large workspace, and reporting every repo as underived for
+	// its duration would train the reader to ignore the column.
+	//
+	// DerivingScope is the covered set the passes reported, NOT "all repos".
+	// A scoped post-track derive covers only the newly-tracked sibling
+	// checkouts; marking the other six repos as deriving would hide their real
+	// verdict behind a run that has nothing to do with them.
+	DerivingSince int64    `json:"deriving_since,omitempty"`
+	DerivingScope []string `json:"deriving_scope,omitempty"`
+
+	// DerivePending names the repos a derived-pass run is OWED but has not
+	// opened yet. DerivingSince covers the run itself; this covers everything
+	// before it, and that gap is not small: the scheduler debounces for two
+	// seconds, republishes the checkout grouping, runs a whole-workspace
+	// cross-repo resolve and then waits on the batch-mutation gate, all before
+	// the passes call DeriveBegan. A repo tracked into that window has no
+	// derive_state row yet and no in-flight marker either, so it reads "never
+	// derived" — the one verdict that tells a reader the graph is silently
+	// wrong — while `gortex daemon status`, which asks the scheduler directly,
+	// says a derive is pending for it. Two surfaces disagreeing about repo
+	// health is worse than one of them being incomplete.
+	//
+	// Only the owed repos are listed, never the whole workspace. The set a
+	// pending pass will actually cover is not decided until it starts
+	// (rederiveScope reads a checkout grouping that is republished on the way
+	// in), and the repos this exists to rescue are precisely the newly tracked
+	// ones. Marking the others would hide their real verdict behind a run that
+	// has nothing to say about them.
+	DerivePending []string `json:"derive_pending,omitempty"`
+
+	// EnrichingRepos names the repos with a semantic-enrichment pass running.
+	// Symmetric with the derive markers, and needed for the same reason:
+	// enrichment counts toward readiness and is long-running.
+	EnrichingRepos []string `json:"enriching_repos,omitempty"`
+
+	// DeriveConfigHash is what this daemon's derive-relevant configuration
+	// hashes to right now — the framework allow-list and the external-call
+	// synthesis flags, which change derived output with no code change.
+	//
+	// Published here rather than recomputed by the reader because resolving it
+	// means merging the global config with every repo's own .gortex.yaml, and a
+	// second implementation of that merge would drift. A reader with no live
+	// daemon sees an empty string and skips the comparison instead of guessing.
+	DeriveConfigHash string `json:"derive_config_hash,omitempty"`
+}
+
+// IsDeriving reports whether a derived-pass run currently covers repoPrefix.
+// An in-flight run with no recorded scope is a whole-workspace one and covers
+// everything; that is the historical unscoped shape, not a missing value.
+func (st RuntimeState) IsDeriving(repoPrefix string) bool {
+	if st.DerivingSince == 0 {
+		return false
+	}
+	if len(st.DerivingScope) == 0 {
+		return true
+	}
+	return containsPrefix(st.DerivingScope, repoPrefix)
+}
+
+// IsDerivePending reports whether a derived-pass run is owed to repoPrefix but
+// has not opened yet. Unlike IsDeriving, an empty list means nothing is owed:
+// the set is always explicit here, because a pending pass has not yet decided
+// what it will cover and an absent value must not be read as "everything".
+func (st RuntimeState) IsDerivePending(repoPrefix string) bool {
+	return containsPrefix(st.DerivePending, repoPrefix)
+}
+
+// IsEnriching reports whether a semantic-enrichment pass is running for
+// repoPrefix. Unlike a derive, an absent list means nothing is enriching —
+// enrichment is always per-repo, so it has no whole-workspace form.
+func (st RuntimeState) IsEnriching(repoPrefix string) bool {
+	return containsPrefix(st.EnrichingRepos, repoPrefix)
+}
+
+func containsPrefix(list []string, want string) bool {
+	for _, p := range list {
+		if p == want {
+			return true
+		}
+	}
+	return false
 }
 
 // RuntimeStatePath returns the file the daemon records its resolved runtime
@@ -53,6 +139,32 @@ func WriteRuntimeState(st RuntimeState) error {
 	return os.WriteFile(path, blob, 0o600)
 }
 
+// UpdateRuntimeState rewrites the running daemon's record through mutate,
+// preserving every field mutate does not touch. It is how the in-flight derive
+// and enrichment markers reach a reader that cannot see this process.
+//
+// This is what makes the file mutable mid-run rather than write-once at daemon
+// start, and it is the accepted cost of the markers: `gortex repos` reads the
+// store directly precisely because the control socket is unavailable when the
+// daemon is busy, which is exactly when a derive is in flight and readiness
+// matters most. A lost update is cosmetic and self-correcting — the record is
+// discarded wholesale when the PID dies, and the next transition rewrites it.
+//
+// Serialised process-wide: derive and enrichment transitions arrive from
+// different goroutines and would otherwise interleave read-modify-write.
+func UpdateRuntimeState(mutate func(*RuntimeState)) error {
+	if mutate == nil {
+		return nil
+	}
+	runtimeStateMu.Lock()
+	defer runtimeStateMu.Unlock()
+	st, _ := readRuntimeStateFile()
+	mutate(&st)
+	return WriteRuntimeState(st)
+}
+
+var runtimeStateMu sync.Mutex
+
 // RemoveRuntimeState deletes the record. Called on the shutdown path alongside
 // the PID file; an already-absent file is not an error.
 func RemoveRuntimeState() {
@@ -65,15 +177,29 @@ func RemoveRuntimeState() {
 // store nothing is using, and routing a reader there is worse than falling
 // back to the default.
 func ReadRuntimeState() (RuntimeState, bool) {
+	st, ok := readRuntimeStateFile()
+	if !ok {
+		return RuntimeState{}, false
+	}
+	// The liveness gate is also what makes the in-flight markers crash-safe: a
+	// daemon killed mid-derive leaves DerivingSince set forever, and discarding
+	// the whole record here is what stops a reader believing it.
+	if st.PID <= 0 || !platform.ProcessAlive(st.PID) {
+		return RuntimeState{}, false
+	}
+	return st, true
+}
+
+// readRuntimeStateFile parses the record without the liveness gate. Only the
+// read-modify-write path uses it: a daemon updating its own record must not
+// have to prove to itself that it is alive.
+func readRuntimeStateFile() (RuntimeState, bool) {
 	var st RuntimeState
 	blob, err := os.ReadFile(RuntimeStatePath())
 	if err != nil {
 		return RuntimeState{}, false
 	}
 	if err := json.Unmarshal(blob, &st); err != nil {
-		return RuntimeState{}, false
-	}
-	if st.PID <= 0 || !platform.ProcessAlive(st.PID) {
 		return RuntimeState{}, false
 	}
 	return st, true

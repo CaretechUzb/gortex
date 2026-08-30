@@ -1,7 +1,6 @@
 package store_sqlite
 
 import (
-	"context"
 	"database/sql"
 	"path/filepath"
 
@@ -43,16 +42,15 @@ LIMIT ?`
 const mtimeChunk = 300
 
 // SetFileMtime records one file's modification time (nanoseconds since
-// the epoch) for a repo prefix, replacing any prior value. It is a
-// convenience single-row form of BulkSetFileMtimes.
+// the epoch) for a repo prefix, replacing any prior value.
+//
+// It delegates rather than issuing its own statement. Writing a file mtime is
+// what advances repo_graph_gen.content_gen, and that bump has to share the
+// write's transaction; a second single-statement path here would either
+// duplicate the bookkeeping or quietly skip it. The extra transaction costs
+// nothing that matters — every hot caller uses the bulk form.
 func (s *Store) SetFileMtime(repoPrefix, filePath string, mtimeNs int64) error {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	_, err := s.execActiveWriteLocked(context.Background(),
-		`INSERT OR REPLACE INTO file_mtimes (repo_prefix, file_path, mtime_ns) VALUES (?, ?, ?)`,
-		repoPrefix, filePath, mtimeNs,
-	)
-	return err
+	return s.BulkSetFileMtimes(repoPrefix, map[string]int64{filePath: mtimeNs})
 }
 
 // BulkSetFileMtimes persists every (filePath -> mtimeNs) entry for one
@@ -74,7 +72,11 @@ func (s *Store) BulkSetFileMtimes(repoPrefix string, mtimes map[string]int64) er
 	}
 	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
 
-	if err := insertMtimesTx(tx, repoPrefix, mtimes); err != nil {
+	changed, err := insertMtimesTx(tx, repoPrefix, mtimes)
+	if err != nil {
+		return err
+	}
+	if err := bumpContentGenTx(tx, changed > 0, repoPrefix); err != nil {
 		return err
 	}
 
@@ -105,14 +107,61 @@ func (s *Store) ReplaceFileMtimes(repoPrefix string, mtimes map[string]int64) er
 	}
 	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
 
+	// Read the stored set before replacing it. The delete-then-insert shape
+	// makes every row look new, so the upsert's change count cannot tell an
+	// authoritative re-persist of identical content from a real reindex — and
+	// a full index re-persists the whole snapshot on every warm start. Bumping
+	// content_gen there would stale every stage on every daemon restart. The
+	// extra indexed scan is one read per full index, against minutes of work.
+	prior, err := loadMtimesTx(tx, repoPrefix)
+	if err != nil {
+		return err
+	}
 	if _, err := tx.Exec(`DELETE FROM file_mtimes WHERE repo_prefix = ?`, repoPrefix); err != nil {
 		return err
 	}
-	if err := insertMtimesTx(tx, repoPrefix, mtimes); err != nil {
+	if _, err := insertMtimesTx(tx, repoPrefix, mtimes); err != nil {
+		return err
+	}
+	if err := bumpContentGenTx(tx, !sameMtimes(prior, mtimes), repoPrefix); err != nil {
 		return err
 	}
 
 	return tx.Commit()
+}
+
+// loadMtimesTx reads one repo's persisted mtime set inside a transaction.
+func loadMtimesTx(tx *sql.Tx, repoPrefix string) (map[string]int64, error) {
+	rows, err := tx.Query(`SELECT file_path, mtime_ns FROM file_mtimes WHERE repo_prefix = ?`, repoPrefix)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close() //nolint:errcheck // read-only cursor
+	out := make(map[string]int64)
+	for rows.Next() {
+		var path string
+		var ns int64
+		if err := rows.Scan(&path, &ns); err != nil {
+			return nil, err
+		}
+		out[path] = ns
+	}
+	return out, rows.Err()
+}
+
+// sameMtimes reports whether two mtime sets are identical — same paths, same
+// nanoseconds. A file added, removed, or re-stamped makes them differ, which is
+// exactly the definition of "this repo's content moved".
+func sameMtimes(a, b map[string]int64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for path, ns := range a {
+		if other, ok := b[path]; !ok || other != ns {
+			return false
+		}
+	}
+	return true
 }
 
 // DeleteFileMtimes drops the rows for a set of repo-relative file paths
@@ -137,6 +186,7 @@ func (s *Store) DeleteFileMtimes(repoPrefix string, paths []string) error {
 
 	// Chunk so the IN-list never exceeds SQLite's host-parameter limit:
 	// one leading repo_prefix arg + up to mtimeChunk path args per stmt.
+	var deleted int64
 	for start := 0; start < len(paths); start += mtimeChunk {
 		end := min(start+mtimeChunk, len(paths))
 		batch := paths[start:end]
@@ -153,19 +203,27 @@ func (s *Store) DeleteFileMtimes(repoPrefix string, paths []string) error {
 			args = append(args, batch[i])
 		}
 		stmt = append(stmt, ')')
-		if _, err := tx.Exec(string(stmt), args...); err != nil {
+		res, err := tx.Exec(string(stmt), args...)
+		if err != nil {
 			return err
 		}
+		if n, err := res.RowsAffected(); err == nil {
+			deleted += n
+		}
+	}
+
+	if err := bumpContentGenTx(tx, deleted > 0, repoPrefix); err != nil {
+		return err
 	}
 
 	return tx.Commit()
 }
 
 // insertMtimesTx writes every (path -> ns) entry for repoPrefix into the
-// given transaction with chunked multi-row INSERT OR REPLACE statements,
-// each kept under SQLite's host-parameter limit. The caller owns the tx
-// lifecycle (Begin/Commit/Rollback) and the write lock.
-func insertMtimesTx(tx *sql.Tx, repoPrefix string, mtimes map[string]int64) error {
+// given transaction with chunked multi-row upserts, each kept under SQLite's
+// host-parameter limit, and returns how many rows genuinely moved. The caller
+// owns the tx lifecycle (Begin/Commit/Rollback) and the write lock.
+func insertMtimesTx(tx *sql.Tx, repoPrefix string, mtimes map[string]int64) (int64, error) {
 	// Stable ordering is not required for correctness, but iterating the
 	// map directly is fine — we only chunk by count.
 	type kv struct {
@@ -177,6 +235,8 @@ func insertMtimesTx(tx *sql.Tx, repoPrefix string, mtimes map[string]int64) erro
 		pending = append(pending, kv{path: p, ns: ns})
 	}
 
+	var changed int64
+
 	for start := 0; start < len(pending); start += mtimeChunk {
 		end := min(start+mtimeChunk, len(pending))
 		batch := pending[start:end]
@@ -184,7 +244,7 @@ func insertMtimesTx(tx *sql.Tx, repoPrefix string, mtimes map[string]int64) erro
 		// Build a multi-row INSERT OR REPLACE: (?, ?, ?), (?, ?, ?), ...
 		args := make([]any, 0, len(batch)*3)
 		stmt := make([]byte, 0, 64+len(batch)*16)
-		stmt = append(stmt, "INSERT OR REPLACE INTO file_mtimes (repo_prefix, file_path, mtime_ns) VALUES "...)
+		stmt = append(stmt, "INSERT INTO file_mtimes (repo_prefix, file_path, mtime_ns) VALUES "...)
 		for i, e := range batch {
 			if i > 0 {
 				stmt = append(stmt, ',')
@@ -192,12 +252,21 @@ func insertMtimesTx(tx *sql.Tx, repoPrefix string, mtimes map[string]int64) erro
 			stmt = append(stmt, "(?, ?, ?)"...)
 			args = append(args, repoPrefix, e.path, e.ns)
 		}
-		if _, err := tx.Exec(string(stmt), args...); err != nil {
-			return err
+		// An upsert with a change predicate rather than INSERT OR REPLACE, so
+		// the reported row count means "rows that actually moved". Rewriting an
+		// unchanged mtime must not advance content_gen — see bumpContentGenTx.
+		stmt = append(stmt, ` ON CONFLICT(repo_prefix, file_path) DO UPDATE SET mtime_ns = excluded.mtime_ns`...)
+		stmt = append(stmt, ` WHERE file_mtimes.mtime_ns <> excluded.mtime_ns`...)
+		res, err := tx.Exec(string(stmt), args...)
+		if err != nil {
+			return 0, err
+		}
+		if n, err := res.RowsAffected(); err == nil {
+			changed += n
 		}
 	}
 
-	return nil
+	return changed, nil
 }
 
 // LoadFileMtimes returns the recorded mtimes for one repo prefix as a

@@ -172,13 +172,14 @@ SET to_id = (
 WHERE id IN (SELECT edge_id FROM temp.go_receiver_rebind_candidates)`); err != nil {
 		return 0, fmt.Errorf("sqlite receiver batch update targets: %w", err)
 	}
-	if err = tx.Commit(); err != nil {
+	if err = s.commitGraphMutation(
+		tx, true, repoPrefixesOfIDs(paths), false,
+	); err != nil {
 		return 0, fmt.Errorf("sqlite receiver batch commit: %w", err)
 	}
 	committed = true
 	if analysisInvalidated {
 		s.analysisGenerationPresent = false
 	}
-	s.finishAnalysisMutationLocked(true)
 	return int(candidates), nil
 }

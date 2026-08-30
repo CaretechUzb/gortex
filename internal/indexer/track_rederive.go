@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -87,6 +88,12 @@ type workspaceRederiveScheduler struct {
 	// a burst of tracks would derive one repository and silently skip
 	// the rest.
 	pending map[string]struct{}
+	// inflight is the frontier the RUNNING pass took out of pending. It is
+	// tracked separately only so the owed set stays whole across the hand-off:
+	// a prefix moved out of pending is still owed a derivation until the pass
+	// that took it returns, and publishing pending alone would blink it out of
+	// the marker for the whole run.
+	inflight map[string]struct{}
 	// deferred holds repositories tracked while a batch was suppressing
 	// the global passes. Whoever ends that batch decides their fate: a
 	// real EndBatch derives them and clears the set, while the warm
@@ -98,6 +105,41 @@ type workspaceRederiveScheduler struct {
 	deferred map[string]struct{}
 }
 
+// owedLocked renders every repository a derivation is owed to but has not
+// been opened for: queued in pending, taken by a pass that has not reached
+// DeriveBegan yet, or deferred behind a batch. s.mu must be held.
+//
+// All three populations read "never derived" without it, because that verdict
+// is reached by the absence of a derive_state row and none of these repos has
+// one yet. The union is what makes the marker agree with
+// WorkspaceRederivePending instead of covering only part of what it reports.
+func (s *workspaceRederiveScheduler) owedLocked() []string {
+	var out []string
+	for _, set := range []map[string]struct{}{s.pending, s.inflight, s.deferred} {
+		for prefix := range set {
+			out = append(out, prefix)
+		}
+	}
+	sort.Strings(out)
+	return slices.Compact(out)
+}
+
+// publishOwedLocked pushes the owed set to the runtime marker. s.mu must be
+// held and marker must have been resolved BEFORE it was taken: runtimeMarkerRef
+// reads the indexer's own lock, and taking that underneath the scheduler's
+// would introduce the only nesting between the two.
+//
+// The write itself happens under s.mu so publications cannot be reordered
+// against the transitions that caused them. The lock guards a handful of map
+// operations and never a pass, so a small file write inside it costs nothing a
+// caller can observe.
+func (s *workspaceRederiveScheduler) publishOwedLocked(marker RuntimeMarker) {
+	if marker == nil {
+		return
+	}
+	marker.DerivePendingChanged(s.owedLocked())
+}
+
 // scheduleWorkspaceRederive queues one workspace-wide derivation pass for
 // a repository indexed outside a batch. It returns immediately; reason
 // names the repo prefix that triggered it, for the log breadcrumb.
@@ -106,6 +148,7 @@ func (mi *MultiIndexer) scheduleWorkspaceRederive(reason string) {
 		return
 	}
 	s := &mi.rederive
+	marker := mi.runtimeMarkerRef()
 
 	s.mu.Lock()
 	if s.closed {
@@ -124,12 +167,14 @@ func (mi *MultiIndexer) scheduleWorkspaceRederive(reason string) {
 		// the queue and let the running goroutine loop once more.
 		// The prefix is already in pending, so the next pass covers it.
 		s.queued = true
+		s.publishOwedLocked(marker)
 		s.mu.Unlock()
 		return
 	}
 	s.running = true
 	debounce := s.debounce
 	s.wg.Add(1)
+	s.publishOwedLocked(marker)
 	s.mu.Unlock()
 
 	go func() {
@@ -139,10 +184,17 @@ func (mi *MultiIndexer) scheduleWorkspaceRederive(reason string) {
 				time.Sleep(debounce)
 			}
 
+			marker := mi.runtimeMarkerRef()
 			ctx, cancel := context.WithCancel(context.Background())
 			s.mu.Lock()
 			if s.closed {
 				s.running = false
+				// Publish empty rather than the owed set. Nothing will
+				// ever run these now, so reporting them as pending would
+				// strand a reader on a promise the scheduler has retired.
+				if marker != nil {
+					marker.DerivePendingChanged(nil)
+				}
 				s.mu.Unlock()
 				cancel()
 				return
@@ -156,13 +208,21 @@ func (mi *MultiIndexer) scheduleWorkspaceRederive(reason string) {
 			s.queued = false
 			frontier := s.pending
 			s.pending = map[string]struct{}{}
+			// The frontier leaves pending here but is not derived yet —
+			// DeriveBegan is minutes away, behind the checkout-group
+			// republish, the cross-repo resolve and the batch-mutation
+			// gate. Holding it in inflight is what keeps it in the owed
+			// set across that whole gap.
+			s.inflight = frontier
 			s.cancel = cancel
+			s.publishOwedLocked(marker)
 			s.mu.Unlock()
 
 			mi.runWorkspaceRederive(ctx, frontier)
 
 			s.mu.Lock()
 			s.cancel = nil
+			s.inflight = nil
 			cancel()
 			if ctx.Err() != nil {
 				// Preempted. The frontier this pass abandoned is
@@ -177,10 +237,12 @@ func (mi *MultiIndexer) scheduleWorkspaceRederive(reason string) {
 				}
 			}
 			if s.queued && !s.closed {
+				s.publishOwedLocked(marker)
 				s.mu.Unlock()
 				continue
 			}
 			s.running = false
+			s.publishOwedLocked(marker)
 			s.mu.Unlock()
 			return
 		}
@@ -195,6 +257,7 @@ func (mi *MultiIndexer) deferWorkspaceRederive(prefix string) {
 		return
 	}
 	s := &mi.rederive
+	marker := mi.runtimeMarkerRef()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
@@ -204,6 +267,11 @@ func (mi *MultiIndexer) deferWorkspaceRederive(prefix string) {
 		s.deferred = map[string]struct{}{}
 	}
 	s.deferred[prefix] = struct{}{}
+	// A deferred repo is owed a derivation for the whole life of the batch
+	// that suppressed it, and has no derive_state row for any of it. Leaving
+	// it out of the marker is what let a repo tracked during warmup read
+	// "never derived" while the daemon was, correctly, holding it for EndBatch.
+	s.publishOwedLocked(marker)
 }
 
 // ClearDeferredWorkspaceRederive discards the deferred set. EndBatch calls
@@ -214,8 +282,10 @@ func (mi *MultiIndexer) ClearDeferredWorkspaceRederive() {
 		return
 	}
 	s := &mi.rederive
+	marker := mi.runtimeMarkerRef()
 	s.mu.Lock()
 	s.deferred = nil
+	s.publishOwedLocked(marker)
 	s.mu.Unlock()
 }
 
@@ -242,6 +312,14 @@ func (mi *MultiIndexer) FlushDeferredWorkspaceRederive() []string {
 	for _, prefix := range prefixes {
 		mi.scheduleWorkspaceRederive(prefix)
 	}
+	// Each schedule republishes, so the marker is already right in the normal
+	// case. This covers the one path that does not: scheduleWorkspaceRederive
+	// returns without publishing when there is no graph, and these prefixes
+	// have just left the deferred set, so nothing else would retire them.
+	marker := mi.runtimeMarkerRef()
+	s.mu.Lock()
+	s.publishOwedLocked(marker)
+	s.mu.Unlock()
 	return prefixes
 }
 
@@ -283,11 +361,16 @@ func (mi *MultiIndexer) stopWorkspaceRederive() {
 		return
 	}
 	s := &mi.rederive
+	marker := mi.runtimeMarkerRef()
 	s.mu.Lock()
 	s.closed = true
 	s.queued = false
 	s.pending = nil
 	s.deferred = nil
+	// inflight is deliberately left alone: the pass holding it is still
+	// unwinding, and its own exit publishes. Retiring the set here covers the
+	// case where no pass was running at all, which has no other publisher.
+	s.publishOwedLocked(marker)
 	if s.cancel != nil {
 		s.cancel()
 	}
@@ -327,17 +410,25 @@ func (mi *MultiIndexer) runWorkspaceRederive(ctx context.Context, frontier map[s
 	// running them first would derive from a half-bound graph.
 	mi.RunGlobalResolve()
 
+	var covered []string
+	var passErr error
 	if ctx.Err() == nil {
 		mi.batchMutationGate.Lock()
-		mi.runGlobalGraphPasses(ctx, scope, false)
+		covered, passErr = mi.runGlobalGraphPasses(ctx, scope, false)
 		mi.batchMutationGate.Unlock()
 	}
+	// A preempted run leaves passErr non-nil and stamps nothing, so the repos
+	// keep reading partial until the scheduler's re-run completes. The gate
+	// above is held for the whole pass, which is what lets the stamp record the
+	// generation the passes themselves left the graph at.
+	mi.completeDerive(covered, scope != nil, passErr)
 
 	if mi.logger != nil {
 		mi.logger.Info("workspace derivation complete (post-track)",
 			zap.String("triggered_by", reason),
 			zap.Bool("scoped", scope != nil),
 			zap.Bool("preempted", ctx.Err() != nil),
+			zap.Int("derived_repos", len(covered)),
 			zap.Duration("elapsed", time.Since(start)))
 	}
 }

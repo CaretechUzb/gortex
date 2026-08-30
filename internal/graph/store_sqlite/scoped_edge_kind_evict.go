@@ -84,12 +84,11 @@ WHERE from_id IN (SELECT CAST(value AS TEXT) FROM json_each(?))
 		panicOnFatal(err)
 		return 0, err
 	}
-	if err := tx.Commit(); err != nil {
+	changed := removed64 > 0
+	if err := s.commitGraphMutation(tx, changed, repoPrefixesOfIDs(sourceIDs), false); err != nil {
 		panicOnFatal(err)
 		return 0, err
 	}
-	changed := removed64 > 0
-	s.finishAnalysisMutationLocked(changed)
 	if changed {
 		s.markMutationReceiptsIncompleteLocked()
 	}

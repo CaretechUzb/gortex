@@ -111,6 +111,11 @@ type Manager struct {
 	// failed) so index_health can surface an un-enriched graph instead
 	// of reporting green. Keyed by repo + "\x00" + provider name.
 	enrichStatus map[string]*EnrichmentStatus
+	// activityHook, when installed, is fired with the set of repos holding a
+	// running pass every time that set could have changed. The daemon uses it
+	// to publish "enriching…" to an out-of-band reader that cannot see this
+	// process. Nil for every other caller.
+	activityHook func(repos []string)
 
 	// lifecycleCtx is cancelled before providers are closed. activePasses
 	// covers the whole manager-owned pass (including terminal marker writes),
@@ -306,6 +311,18 @@ func EnrichmentAdmissionFloor() int {
 func (m *Manager) EnrichAll(g graph.Store, roots map[string]string, opts EnrichOptions) ([]*EnrichResult, map[string]bool, error) {
 	partial := make(map[string]bool)
 	if !m.config.Enabled {
+		// Enrichment being switched off is a genuine "no provider applies", not
+		// an absence of information, and saying so is what keeps every repo on
+		// such an install from reading "unknown" forever.
+		//
+		// The ADDITIVE form, though. A config toggle is reversible, and the
+		// authoritative form would delete every completion — including each
+		// provider's indexed_sha — so flipping enrichment off and on again
+		// would cost a full re-enrichment of every repo for a setting that
+		// ended where it started.
+		for repoPrefix := range roots {
+			DeclareNoApplicableProviders(g, repoPrefix)
+		}
 		return nil, partial, nil
 	}
 
@@ -327,13 +344,16 @@ func (m *Manager) EnrichAll(g graph.Store, roots map[string]string, opts EnrichO
 	// gate — providers fall through to their own per-pass gate as before.
 	// nodeCounts (enrichable nodes per repo) feeds the size-scaled per-repo
 	// deadline — see enrichRepoTimeout.
-	present, nodeCounts, langCounts := m.repoLanguages(g, roots)
+	present, nodeCounts, langCounts, repoLangs := m.repoLanguages(g, roots)
 	if floor := opts.MinLanguageNodes; floor > 0 {
 		below := make(map[string]int)
 		for lang, count := range langCounts {
 			if count < floor {
 				below[lang] = count
 				delete(present, lang)
+				for _, langs := range repoLangs {
+					delete(langs, lang)
+				}
 			}
 		}
 		if len(below) > 0 {
@@ -346,6 +366,14 @@ func (m *Manager) EnrichAll(g graph.Store, roots map[string]string, opts EnrichO
 	// rows but the floor rejected every language, providers must still be
 	// gated off rather than falling through to their own per-pass gates.
 	gateOnPresence := len(langCounts) > 0
+	// Record which providers apply to each repo BEFORE any of them runs, so a
+	// provider that applies but never completes is a visible gen-0 row rather
+	// than an absent one. Gated on the same positive evidence as the run gate:
+	// with no language census at all (an empty or unindexed graph) we have not
+	// learned that nothing applies, and declaring an empty set would assert it.
+	if gateOnPresence {
+		m.declareApplicableProviders(g, roots, langProviders, repoLangs)
+	}
 	if len(present) > 0 {
 		langs := make([]string, 0, len(present))
 		for l := range present {
@@ -501,9 +529,15 @@ func (m *Manager) EnrichAll(g graph.Store, roots map[string]string, opts EnrichO
 // filters), which sizes the per-repo enrichment deadline — see
 // enrichRepoTimeout. The third counts them per language across all repos — the
 // composition signal EnrichAll orders providers by (primary language first).
-func (m *Manager) repoLanguages(g graph.Store, roots map[string]string) (map[string]bool, map[string]int, map[string]int) {
+func (m *Manager) repoLanguages(g graph.Store, roots map[string]string) (map[string]bool, map[string]int, map[string]int, map[string]map[string]bool) {
 	present := make(map[string]bool)
 	counts := make(map[string]int, len(roots))
+	// repoLangs is the same evidence keyed per repo. Applicability is a
+	// per-repo question -- a Go monorepo beside a Python service must not
+	// declare python-types applicable to the Go one just because the workspace
+	// as a whole contains Python -- and the row scan already has the repo in
+	// hand, so this costs a map write per row and no extra query.
+	repoLangs := make(map[string]map[string]bool, len(roots))
 	// langCounts is the enrichable-node count per language across all repos —
 	// the composition signal EnrichAll ranks providers by so the dominant
 	// language enriches first.
@@ -536,8 +570,291 @@ func (m *Manager) repoLanguages(g graph.Store, roots map[string]string) (map[str
 		present[row.Language] = true
 		counts[row.RepoPrefix] += row.Count
 		langCounts[row.Language] += row.Count
+		if repoLangs[row.RepoPrefix] == nil {
+			repoLangs[row.RepoPrefix] = make(map[string]bool)
+		}
+		repoLangs[row.RepoPrefix][row.Language] = true
 	}
-	return present, counts, langCounts
+	return present, counts, langCounts, repoLangs
+}
+
+// declareApplicableProviders writes each repo's applicable-provider set.
+//
+// "Applicable" means: a provider this configuration would actually run, whose
+// binary is present, for a language THIS repo contains. All three clauses
+// matter and each was wrong in an earlier draft. Declaring by language alone
+// would mark every router-backed LSP spec applicable, and EagerLSP is off by
+// default, so every repo with a supported language would read "partial"
+// forever. Declaring by the workspace's languages rather than the repo's would
+// hang python-types on a pure-Go sibling checkout. Ignoring Available() would
+// hold a repo permanently short of ready for a server that is not installed and
+// that this daemon will never spawn.
+//
+// The consequence of the third clause is worth stating plainly: a repo whose
+// provider binary is missing declares fewer providers and can therefore read
+// ready. That is the honest reading of readiness as "as enriched as this
+// installation can make it", and the alternative -- an unclearable "partial" on
+// a machine without gopls -- is a column users would learn to ignore.
+func (m *Manager) declareApplicableProviders(
+	g graph.Store,
+	roots map[string]string,
+	langProviders map[string]Provider,
+	repoLangs map[string]map[string]bool,
+) {
+	if len(langProviders) == 0 {
+		// No provider is registered at all. That is a weaker claim than "this
+		// repo's languages match none of them" — a registry can be empty
+		// because it has not been populated yet — and the authoritative form
+		// below would delete every completion on the strength of it, with
+		// nothing left to restore them. Record only what an unrecorded repo is
+		// missing.
+		for repoPrefix := range roots {
+			DeclareNoApplicableProviders(g, repoPrefix)
+		}
+		if m.logger != nil {
+			m.logger.Info("semantic: no enrichment provider is registered; "+
+				"recorded the no-provider sentinel where nothing was recorded yet",
+				zap.Int("repos", len(roots)),
+				zap.String("graph_type", fmt.Sprintf("%T", g)),
+			)
+		}
+		return
+	}
+	for repoPrefix := range roots {
+		langs := repoLangs[repoPrefix]
+		seen := make(map[string]bool)
+		var applicable []string
+		for lang, provider := range langProviders {
+			if !langs[lang] || !provider.Available() {
+				continue
+			}
+			if name := provider.Name(); !seen[name] {
+				seen[name] = true
+				applicable = append(applicable, name)
+			}
+		}
+		sort.Strings(applicable)
+		// Authoritative: providers exist and this repo's languages match these
+		// ones, so a row for anything else is out of date and must go. This is
+		// the case the downward authority was written for.
+		m.declareProviders(g, repoPrefix, applicable)
+	}
+}
+
+// applicabilityMissOnce keeps the report below to one line per process. The
+// miss repeats on every repo of every pass, and a warning per occurrence would
+// bury the signal it exists to raise.
+var applicabilityMissOnce sync.Once
+
+// applicabilityStore resolves the durable applicability writer behind g.
+//
+// A miss is not always a defect: the in-memory graph and every test double
+// legitimately model no applicability. Inside the daemon it is one, and a
+// silent one -- the three call sites below each returned early and logged
+// nothing, so a store that never received a single row was indistinguishable
+// from a workspace where no provider applied. Readiness then reports the
+// enrichment half as "unknown" forever, which does not block "ready", so the
+// column keeps answering while the half that motivated it is inert.
+//
+// Naming the concrete type is the whole point: the indexer rebinds idx.graph
+// to an in-memory shadow and back while it works, so WHICH graph reaches a
+// pass is a real question with a real answer, and one worth printing.
+// durableStore resolves the store that outlives the graph this pass is running
+// against.
+//
+// The indexer mounts an in-memory shadow over the real store while it indexes
+// (graph.ShadowedStore), and enrichment runs inside that window. Content
+// written to the shadow is drained into the owner afterwards, so the edges a
+// provider adds do survive — but the per-repo bookkeeping tables have no
+// in-memory form at all. A state write addressed to the shadow is not merged
+// later; it is dropped when the shadow is, silently, because every writer
+// below type-asserts and returns on failure. That is exactly how a repo
+// enriched at track time came to report "enriched: unknown" forever.
+//
+// Shadows nest (a chunk shadow over a streaming disk target), so walk rather
+// than unwrap once. The bound is paranoia about a cycle, not a real case: a
+// pass must not hang here.
+func durableStore(g graph.Store) graph.Store {
+	for i := 0; i < 8; i++ {
+		shadow, ok := g.(graph.ShadowedStore)
+		if !ok {
+			return g
+		}
+		owner := shadow.ShadowOwner()
+		if owner == nil {
+			return g
+		}
+		g = owner
+	}
+	return g
+}
+
+func (m *Manager) applicabilityStore(g graph.Store) (graph.EnrichmentApplicabilityStore, bool) {
+	resolved := durableStore(g)
+	store, ok := resolved.(graph.EnrichmentApplicabilityStore)
+	if !ok && m.logger != nil {
+		applicabilityMissOnce.Do(func() {
+			m.logger.Warn("semantic: this graph does not model enrichment applicability; "+
+				"readiness will report enrichment as unknown",
+				zap.String("graph_type", fmt.Sprintf("%T", g)),
+				zap.String("durable_type", fmt.Sprintf("%T", resolved)))
+		})
+	}
+	return store, ok
+}
+
+// enrichmentStateStore is applicabilityStore's sibling for the sha-keyed
+// completion marker. It resolves through the same owner walk so the marker is
+// read back from the store it was written to — a reader that stops at the
+// shadow would find nothing and re-run every provider on every pass.
+func (m *Manager) enrichmentStateStore(g graph.Store) (graph.EnrichmentStateStore, bool) {
+	store, ok := durableStore(g).(graph.EnrichmentStateStore)
+	return store, ok
+}
+
+// declareProviders persists one repo's applicable set, tolerating a backend
+// that does not model applicability (the in-memory graph, and every test double
+// that only implements graph.Store).
+func (m *Manager) declareProviders(g graph.Store, repoPrefix string, providers []string) {
+	store, ok := m.applicabilityStore(g)
+	if !ok {
+		return
+	}
+	if err := store.DeclareEnrichmentProviders(repoPrefix, providers); err != nil {
+		m.logger.Warn("record applicable enrichment providers failed",
+			zap.String("repo", repoPrefix),
+			zap.Strings("providers", providers),
+			zap.Error(err),
+		)
+		return
+	}
+	if m.logger != nil {
+		// The positive half of applicabilityStore's report, and the reason it
+		// is per repo rather than once per process: a repo stuck on
+		// "enriched: unknown" has either no line here at all — nothing on its
+		// path ever declared applicability for it — or a line naming a graph
+		// that is not the durable store. Those are different faults with
+		// different fixes, and only the successful write tells them apart.
+		m.logger.Info("semantic: applicable enrichment providers declared",
+			zap.String("repo", repoPrefix),
+			zap.Strings("providers", providers),
+			zap.String("graph_type", fmt.Sprintf("%T", g)),
+		)
+	}
+}
+
+// DeclareNoApplicableProviders records that no semantic provider will run for a
+// repo in this configuration — the indexer's path for a build or config with no
+// providers registered at all, which never reaches EnrichAll and so would
+// otherwise leave the repo's enrichment permanently unrecorded rather than
+// knowably not-applicable.
+//
+// Additive only. An empty provider registry is a weaker claim than the
+// enrichment pass's own language census (it may simply not be populated yet),
+// so this must not be able to delete a completion the pass recorded earlier.
+func DeclareNoApplicableProviders(g graph.Store, repoPrefix string) {
+	store, ok := durableStore(g).(graph.EnrichmentApplicabilityStore)
+	if !ok {
+		return
+	}
+	_ = store.DeclareNoEnrichmentProvidersIfUnrecorded(repoPrefix)
+}
+
+// EnrichmentOwed reports whether the store shows this repo owed an enrichment
+// pass that nothing has ever run, and whether the backend could answer at all.
+//
+// It exists for the warm-restart gate, which otherwise has no way to see the
+// hole. That gate settles the common cases from git — the completion marker is
+// current, or it is stale on a clean tree — and falls through to the per-file
+// ledger for everything else. On a DIRTY tree the marker is not trustworthy and
+// the ledger is the only evidence left, so a repo whose ledger was drained
+// while its completions never landed had nothing to re-arm it: not the marker,
+// not the ledger, and not a daemon restart. It stayed unenriched permanently.
+//
+// The question asked here is deliberately the narrow one. "Is enrichment behind
+// the current content" would also re-arm a repo that is merely being edited,
+// which on a large workspace is minutes of hover work on every daemon start,
+// forever. "Has a pass ever completed" is monotone: acting on it discharges it
+// and it cannot come back.
+func EnrichmentOwed(g graph.Store, repoPrefix string) (owed, known bool) {
+	store, ok := durableStore(g).(graph.EnrichmentApplicabilityStore)
+	if !ok {
+		return false, false
+	}
+	// A repo with no indexed content owes nothing. Without this, a prefix that
+	// has been tracked but not yet indexed re-arms a pass over an empty graph.
+	content, err := store.RepoContentGen(repoPrefix)
+	if err != nil || content == 0 {
+		return false, err == nil
+	}
+	owed, err = store.EnrichmentNeverRan(repoPrefix)
+	if err != nil {
+		return false, false
+	}
+	return owed, true
+}
+
+// RefreshCompletedProviders records that a repo whose whole-repo completion
+// marker is already current needs no enrichment pass — so the providers that
+// completed one are current for its content too.
+//
+// The caller is the indexer's warm-restart gate, which declines to schedule
+// enrichment on exactly that evidence. Nothing downstream of that decline ever
+// reaches a provider, so this is the only place the assertion can be recorded,
+// and without it a store carrying pre-content-stamp enrichment rows reads
+// "partial" permanently.
+func RefreshCompletedProviders(g graph.Store, repoPrefix string) {
+	store, ok := durableStore(g).(graph.EnrichmentApplicabilityStore)
+	if !ok {
+		return
+	}
+	_, _ = store.RefreshEnrichmentProviders(repoPrefix)
+}
+
+// observeContentGen reads the repo's content counter before a pass starts.
+//
+// Before, not after: enrichment runs with no write gate held, so the watcher
+// can reindex a file while a provider is still hovering. Stamping the counter
+// as it stands at COMPLETION would claim the pass covered an edit it never saw
+// -- fail-open, and permanently so, since nothing later re-examines it. Reading
+// first is fail-closed instead: the repo reads "partial" until the next pass,
+// which is the correct answer.
+func (m *Manager) observeContentGen(g graph.Store, repoPrefix string) int64 {
+	store, ok := m.applicabilityStore(g)
+	if !ok {
+		return 0
+	}
+	gen, err := store.RepoContentGen(repoPrefix)
+	if err != nil {
+		m.logger.Debug("read repo content generation failed",
+			zap.String("repo", repoPrefix), zap.Error(err))
+		return 0
+	}
+	return gen
+}
+
+// completeProvider records that a provider covered this repo's content as of
+// contentGen. Separate from recordEnrichMarker's sha marker on purpose: the two
+// answer different questions and obey different rules. The sha marker claims
+// "this repo's COMMITTED state at SHA is enriched", which a dirty tree makes a
+// lie, so recordEnrichMarker refuses to write one. The content stamp claims
+// "these edges were built from the graph as of counter N", which is true
+// whatever the working tree looks like -- and a later edit advances the counter
+// and re-stales the row on its own. Gating it on a clean tree would leave every
+// repo with uncommitted work reading "partial" forever, contradicting the
+// decision that working-tree dirtiness is not a readiness input.
+func (m *Manager) completeProvider(g graph.Store, repoPrefix, provider string, contentGen int64) {
+	store, ok := m.applicabilityStore(g)
+	if !ok {
+		return
+	}
+	if err := store.CompleteEnrichmentProvider(repoPrefix, provider, contentGen); err != nil {
+		m.logger.Warn("record enrichment content generation failed",
+			zap.String("repo", repoPrefix),
+			zap.String("provider", provider),
+			zap.Error(err),
+		)
+	}
 }
 
 // anyLangPresent reports whether any of langs is in the present set.
@@ -754,7 +1071,47 @@ func (m *Manager) setEnrichStatus(repo, provider, lang, state string, deadline t
 		st.StartedAt = prev.StartedAt
 	}
 	m.enrichStatus[key] = st
+	// Snapshot under the lock, notify outside it. This fires on every
+	// (repo, provider) transition and the daemon's hook writes a file; holding
+	// m.mu across that would put disk I/O on the enrichment status path, which
+	// every provider walks several times per repo.
+	hook := m.activityHook
+	var active []string
+	if hook != nil {
+		active = m.activeEnrichReposLocked()
+	}
 	m.mu.Unlock()
+	if hook != nil {
+		hook(active)
+	}
+}
+
+// SetActivityHook installs a callback fired with the repos holding a running
+// enrichment pass, whenever that set could have changed. Installed by the
+// daemon so an out-of-band reader can render "enriching…" instead of reporting
+// a repo not-ready for the length of a pass that is doing exactly the work
+// readiness is waiting on.
+func (m *Manager) SetActivityHook(fn func(repos []string)) {
+	m.mu.Lock()
+	m.activityHook = fn
+	m.mu.Unlock()
+}
+
+// activeEnrichReposLocked lists the repos with a pass in flight, using the same
+// definition of "in flight" as EnrichmentActive. m.mu must be held.
+func (m *Manager) activeEnrichReposLocked() []string {
+	seen := make(map[string]struct{})
+	for _, st := range m.enrichStatus {
+		if st.State == EnrichStateRunning || st.State == EnrichStateDraining {
+			seen[st.Repo] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for repo := range seen {
+		out = append(out, repo)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // enrichBoundReason classifies why the add-phase stopped: a cut pass is
@@ -830,7 +1187,7 @@ func (m *Manager) enrichMarkerCurrent(g graph.Store, repoPrefix, provider string
 	if rs.SHA == "" || rs.Dirty {
 		return false
 	}
-	store, ok := g.(graph.EnrichmentStateStore)
+	store, ok := m.enrichmentStateStore(g)
 	if !ok {
 		return false
 	}
@@ -854,7 +1211,7 @@ func (m *Manager) recordEnrichMarker(g graph.Store, repoPrefix, provider string,
 	if rs.SHA == "" || rs.Dirty {
 		return
 	}
-	store, ok := g.(graph.EnrichmentStateStore)
+	store, ok := m.enrichmentStateStore(g)
 	if !ok {
 		return
 	}
@@ -881,7 +1238,7 @@ func (m *Manager) recordEnrichMarker(g graph.Store, repoPrefix, provider string,
 // warm restart decide — with a single keyed lookup, without re-deriving which
 // providers apply — whether the persisted graph's enrichment is complete or was
 // cut short (partial / abandoned) and must be resumed.
-const repoEnrichMarkerProvider = "__repo__"
+const repoEnrichMarkerProvider = graph.EnrichProviderRepoMarker
 
 // RecordRepoEnrichmentComplete persists the whole-repo enrichment completion
 // marker at sha. The deferred-enrichment driver calls it once a repo's pass
@@ -903,7 +1260,7 @@ func (m *Manager) RecordRepoEnrichmentComplete(g graph.Store, repoPrefix, sha st
 // yields (false, true): no positive evidence of completeness, but the backend
 // does persist state.
 func (m *Manager) RepoEnrichmentMarkerState(g graph.Store, repoPrefix, sha string) (current, persisted bool) {
-	store, ok := g.(graph.EnrichmentStateStore)
+	store, ok := m.enrichmentStateStore(g)
 	if !ok {
 		return false, false
 	}
@@ -959,6 +1316,11 @@ func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, p
 	// deferred-enrichment caller supplies a marker sha; every other caller
 	// passes a zero RepoEnrichState, so enrichMarkerCurrent returns false and
 	// nothing is gated.
+	// Observed before anything runs, including before the skip gate: a pass
+	// that starts here covers the content as it stands now, and anything the
+	// watcher writes from this point on belongs to the NEXT pass.
+	contentGen := m.observeContentGen(g, repoName)
+
 	if m.enrichMarkerCurrent(g, repoName, provider.Name(), rs) {
 		m.logger.Info("semantic enrichment skipped: completion marker current",
 			zap.String("provider", provider.Name()),
@@ -966,6 +1328,13 @@ func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, p
 			zap.String("repo", repoName),
 			zap.String("sha", shortSHA(rs.SHA)),
 		)
+		// A skip is an assertion, not an absence of work: the gate has just
+		// decided this provider's edges already describe the repo at this clean
+		// sha. Stamping it is what that decision means. Without this, a warm
+		// restart that correctly skips every provider would leave the repo
+		// reading "partial" against content the skip gate just certified — and
+		// a daemon restart is the most common event in the system.
+		m.completeProvider(g, repoName, provider.Name(), contentGen)
 		return results
 	}
 
@@ -1199,6 +1568,7 @@ func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, p
 		// supplied no sha or the backend does not persist enrichment state.
 		if !result.Partial {
 			m.recordEnrichMarker(g, repoName, provider.Name(), rs, result.CoveragePercent)
+			m.completeProvider(g, repoName, provider.Name(), contentGen)
 		}
 
 		m.logger.Info("semantic enrichment complete",

@@ -74,6 +74,11 @@ func (s *Store) evictByPredicateResult(predicate string, arg any, exactReceipt b
 	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
 
 	ctx := context.Background()
+	// Ownership lives only on the rows about to be deleted, so read it first.
+	touched, err := evictionTouchedPrefixesTx(ctx, tx, predicate, arg)
+	if err != nil {
+		return 0, 0, err
+	}
 	// A failure in this receipt-only read degrades the receipt to incomplete
 	// (receiptDelta stays nil, the post-commit branch marks the fallback)
 	// rather than blocking the eviction itself - the same choice
@@ -146,14 +151,13 @@ func (s *Store) evictByPredicateResult(predicate string, arg any, exactReceipt b
 		}
 		invalidatedAnalysis = true
 	}
-	if err := tx.Commit(); err != nil {
+	if err := s.commitGraphMutation(tx, changed, touched, false); err != nil {
 		return 0, 0, err
 	}
 
 	if invalidatedAnalysis {
 		s.analysisGenerationPresent = false
 	}
-	s.finishAnalysisMutationLocked(changed)
 	if changed {
 		if receiptDelta != nil {
 			s.mergeMutationReceiptLocked(receiptDelta)

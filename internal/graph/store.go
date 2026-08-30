@@ -1376,6 +1376,135 @@ type EnrichmentStateStore interface {
 	SetEnrichmentState(state EnrichmentState) error
 }
 
+// Reserved provider keys in enrichment_state. Neither names a real semantic
+// provider, so neither can collide with one, and readiness excludes both from
+// its per-provider verdict.
+const (
+	// EnrichProviderRepoMarker records that EVERY applicable provider finished
+	// for a repo, so a warm restart can decide with one keyed lookup whether to
+	// resume. It is a rollup of the provider rows, not one of them.
+	EnrichProviderRepoMarker = "__repo__"
+
+	// EnrichProviderNone records that NO semantic provider applies to a repo --
+	// it has no supported languages, or enrichment is switched off. Without it,
+	// "nothing applies" and "nothing has been recorded yet" are the same empty
+	// row set, and readiness cannot tell a repo that needs no enrichment from
+	// one whose enrichment has never been looked at.
+	EnrichProviderNone = "__none__"
+)
+
+// EnrichmentApplicabilityStore records WHICH providers apply to a repo and how
+// far each has got, which is what lets readiness take the MINIMUM across them.
+//
+// Absence cannot carry that meaning on its own. If a missing row meant "does
+// not apply", a repo where python-types is current and go-types has never run
+// would look fully enriched -- one fresh provider masking a sibling that never
+// started. So the applicable set is written down before any of them runs, and a
+// provider that applies but has not completed is a visible gen-0 row.
+// CopiedReadinessRestamper declares a subgraph copy's carried stage stamps
+// current for the destination checkout, once that checkout's own file
+// bookkeeping has been written. See store_sqlite.RestampCopiedReadiness.
+type CopiedReadinessRestamper interface {
+	RestampCopiedReadiness(dstPrefix string) error
+}
+
+type EnrichmentApplicabilityStore interface {
+	// DeclareEnrichmentProviders makes providers the authoritative applicable
+	// set for a repo: each gains a row at content_gen 0 if it has none, rows
+	// for providers no longer in the set are dropped, and the EnrichProviderNone
+	// sentinel is written or cleared to match. An empty set means none apply.
+	DeclareEnrichmentProviders(repoPrefix string, providers []string) error
+
+	// CompleteEnrichmentProvider records that one provider finished a pass over
+	// content as of contentGen -- the value the caller observed BEFORE the pass
+	// started, because enrichment runs with no write gate and the watcher can
+	// reindex underneath it. The store clamps to the current counter and never
+	// moves a row backwards, so a caller cannot claim content it did not see.
+	CompleteEnrichmentProvider(repoPrefix, provider string, contentGen int64) error
+
+	// RepoContentGen reads the repo's content counter. Call it before a pass;
+	// pass what it returned to CompleteEnrichmentProvider after.
+	RepoContentGen(repoPrefix string) (int64, error)
+
+	// RefreshEnrichmentProviders renews the content stamp on providers that
+	// have already completed a pass, and creates nothing. For the warm-restart
+	// gate that skips a repo whose whole-repo completion marker is current: the
+	// skip is that assertion, and recording it is what stops an upgraded store
+	// from reading "partial" forever.
+	RefreshEnrichmentProviders(repoPrefix string) (int, error)
+
+	// DeclareNoEnrichmentProvidersIfUnrecorded is the additive-only form, for
+	// callers whose "nothing applies" is a weaker signal than the enrichment
+	// pass's own language census and so must never delete a real completion.
+	DeclareNoEnrichmentProvidersIfUnrecorded(repoPrefix string) error
+
+	// EnrichmentNeverRan reports whether this repo is owed a pass that nothing
+	// has ever run: a provider declared applicable whose completion generation
+	// is still zero, or no enrichment record at all.
+	//
+	// Deliberately NOT "is enrichment behind the current content". That
+	// question belongs to the readiness column, and a caller that re-armed on
+	// it would re-enrich an actively-edited repo on every daemon start --
+	// minutes of hover work, every time, to chase a number the next edit moves
+	// again. Never-ran is the monotone half: a provider that completes once can
+	// never return to zero, so acting on it discharges it for good.
+	EnrichmentNeverRan(repoPrefix string) (bool, error)
+}
+
+// DeriveState is the per-repo completion marker for the derived-pass tier:
+// implements/overrides inference, test edges, entry-point hierarchy,
+// capability edges, framework-dispatch synthesis, external-call placeholders
+// and cross-repo edges. Before this row existed those passes emitted log lines
+// and nothing else, so a repo the daemon never derived was indistinguishable
+// from one it derived a second ago -- and every query against it silently
+// returned a subset.
+//
+// DerivedGen is the anchor; DerivedSHA and DerivedAt are provenance for
+// humans and are never compared. Legacy marks a row planted by the v13
+// migration for a repo derived before the table existed: its true state is
+// unknowable, so it renders "unknown" rather than claiming a completion that
+// was never recorded.
+type DeriveState struct {
+	RepoPrefix string
+	DerivedGen int64
+	// DerivedContentGen is the comparand: the content_gen this derive covered.
+	// DerivedGen is the graph-wide counter at the same moment, provenance only.
+	DerivedContentGen int64
+	DerivedSHA        string
+	DerivedAt         int64 // unix seconds
+	PassVersion       int64
+	ConfigHash        string
+	Scoped            bool
+	Legacy            bool
+}
+
+// DeriveCompletion is one repo's half of a derive that finished successfully.
+//
+// It deliberately carries no generation. A caller cannot supply one correctly:
+// the derived passes emit edges themselves, so their own writes advance the
+// repo's generation while they run, and any value read before the last pass
+// committed is already behind. StampDeriveState reads each repo's current
+// generation inside the transaction that writes the row, which is the only
+// place the two can be observed together.
+type DeriveCompletion struct {
+	RepoPrefix  string
+	DerivedSHA  string
+	PassVersion int64
+	ConfigHash  string
+	Scoped      bool
+}
+
+// DeriveStateStore is an optional capability backends MAY implement to persist
+// and read back per-repo derived-pass completion. GetDeriveState's bool is
+// false when no row has been recorded yet -- a repo tracked since the feature
+// landed that has genuinely never been derived, which readiness must report
+// rather than excuse.
+type DeriveStateStore interface {
+	GetDeriveState(repoPrefix string) (DeriveState, bool, error)
+	StampDeriveState(completions []DeriveCompletion, derivedAt int64) error
+	RefreshDeriveState(prefixes []string, derivedAt int64) (int, error)
+}
+
 // ContractState is the per-repo completion marker for the contract tier: the
 // git revision the whole-repo contract pass last committed at, when it
 // finished, and how many contracts it wrote.

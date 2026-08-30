@@ -169,6 +169,19 @@ func (mi *MultiIndexer) trackWorktreeByCopy(
 		return nil, false, nil
 	}
 
+	// The restat above just advanced this checkout's content counter — a
+	// worktree's on-disk mtimes differ from its source's even at the identical
+	// commit — which strands every stage stamp the copy carried. Declare them
+	// current for the destination now that its own file set is recorded;
+	// without it a copied worktree reads "partial" forever, since the whole
+	// point of the copy is that nothing will re-derive it.
+	if restamper, ok := mi.graph.(graph.CopiedReadinessRestamper); ok {
+		if err := restamper.RestampCopiedReadiness(prefix); err != nil && mi.logger != nil {
+			mi.logger.Warn("worktree copy: could not declare carried stage stamps current",
+				zap.String("repo", prefix), zap.Error(err))
+		}
+	}
+
 	if mi.logger != nil {
 		mi.logger.Info("worktree installed by subgraph copy",
 			zap.String("repo", prefix),

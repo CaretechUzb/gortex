@@ -238,6 +238,22 @@ func (mi *MultiIndexer) runIncrementalDerivedPassesTopologyHeld(
 
 	report.DurationMs = time.Since(started).Milliseconds()
 	mi.logIncrementalDerived(report, merged)
+	// Refreshing here is what keeps an ordinary file save from marking its
+	// repo permanently stale. The save's reindex advances the repo's graph
+	// generation, and no whole-graph derive is ever scheduled for a single
+	// edit — this pass IS the repair, re-deriving exactly the families the
+	// edit invalidated.
+	//
+	// Refresh, emphatically not stamp. This pass runs only the families the
+	// edit touched; it never runs implements inference, framework synthesis or
+	// cross-repo detection over the whole repo. So it can renew a completion
+	// that already exists, but it must never create one — a repo tracked
+	// during daemon warmup is never globally derived at all, and letting one
+	// saved file promote it from "never derived" to "ready" would put the
+	// column's blessing on exactly the silent-subset case it exists to catch.
+	// Only the tail refreshes: both early returns above (no work, and the
+	// cancellation check) leave the row untouched.
+	mi.refreshDeriveState(sortedPrefixes(prefixSet))
 	return report
 }
 

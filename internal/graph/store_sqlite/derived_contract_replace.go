@@ -149,12 +149,16 @@ DELETE FROM nodes WHERE id IN (SELECT id FROM orphan)`,
 		result.NodesRemoved += int(rows)
 	}
 
-	if err := tx.Commit(); err != nil {
+	changed := result.EdgesRemoved > 0 || result.NodesRemoved > 0 || result.NodesChanged > 0 || result.EdgesAdded > 0
+	// A derived-contract replacement carries no single owning repo: it adds and
+	// removes edges across whichever repos the topic spans.
+	touched := append(repoPrefixesOfEdges(replacement.Edges), repoPrefixesOfEdges(replacement.RemoveEdges)...)
+	touched = append(touched, repoPrefixesOfNodes(replacement.Nodes)...)
+	touched = append(touched, repoPrefixesOfIDs(replacement.RemoveBridgeNodeIDs)...)
+	if err := s.commitGraphMutation(tx, changed, touched, false); err != nil {
 		return graph.DerivedContractReplaceResult{}, err
 	}
 	committed = true
-	changed := result.EdgesRemoved > 0 || result.NodesRemoved > 0 || result.NodesChanged > 0 || result.EdgesAdded > 0
-	s.finishAnalysisMutationLocked(changed)
 	if changed {
 		s.markMutationReceiptsIncompleteLocked()
 	}

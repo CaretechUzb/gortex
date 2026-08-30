@@ -16,6 +16,15 @@ import (
 // corpora are handled separately by copyFTSCorpora, which has to rewrite ids
 // and re-map docids.
 //
+// repo_graph_gen and derive_state ride along so a copied checkout does not read
+// "never derived" — the state readiness reserves for a repo whose queries
+// really do return a subset. Their values are then re-asserted for the
+// destination once its own file bookkeeping lands; see RestampCopiedReadiness.
+// They are deliberately NOT in orphanScanTables: a repo_graph_gen row can
+// legitimately exist before any node does (a cold index bumps the anchor before
+// it stamps repo_index_state), so scanning them for orphans would name a repo
+// that is merely mid-index.
+//
 // The id-keyed sidecars and the FTS vtables are deliberately NOT copied.
 // Their rows carry the source's node ids, and an FTS5 corpus cannot be
 // row-copied under new ids; they rebuild on demand. A freshly copied
@@ -26,6 +35,8 @@ var repoSubgraphSidecarTables = []string{
 	"repo_index_state",
 	"enrichment_state",
 	"contract_state",
+	"repo_graph_gen",
+	"derive_state",
 }
 
 // repoSubgraphSidecarPathColumns names, per sidecar table, the columns holding
@@ -442,4 +453,68 @@ func (s *Store) repoPrefixOccupied(prefix string) (bool, error) {
 		return false, fmt.Errorf("store_sqlite: CopyRepoSubgraph destination probe: %w", err)
 	}
 	return n != 0, nil
+}
+
+// RestampCopiedReadiness declares the carried stage stamps current for a
+// destination checkout, AFTER its own file bookkeeping has been written.
+//
+// This is a semantic assertion, not metadata tidying. The copy carries the
+// source's derive_state and enrichment_state rows verbatim along with its
+// counters, so at the instant the copy commits the two already agree and there
+// is nothing to do. What breaks them apart comes next: registering the copied
+// checkout restats its files and calls ReplaceFileMtimes, and a worktree's
+// on-disk mtimes differ from the source's even at the identical commit. That
+// spurious content change advances the destination's content_gen past every
+// carried stamp, and a copied worktree would then read "partial" from the
+// moment it lands and stay there permanently — nothing re-derives it, because
+// avoiding that derive is the entire reason the copy exists.
+//
+// So it must run after registration, not inside the copy transaction. The cost
+// is a window: a crash between the two leaves the destination reading partial.
+// That is a false alarm, which is the safe direction, and re-tracking clears it.
+//
+// What makes the assertion true is the exact-copy invariant: the destination
+// holds the same nodes and edges as the source, at the same commit, so the
+// derived and enriched edges carried across describe it exactly as well as they
+// describe the source. If that invariant ever has a blind spot, this re-stamp
+// hides it — which is why it is tied to a test that asserts the invariant
+// rather than the re-stamp.
+//
+// Rows still at content_gen 0 are left alone: those are providers declared
+// applicable that have never run, and laundering them into current would be the
+// one thing the applicability model exists to prevent.
+func (s *Store) RestampCopiedReadiness(dstPrefix string) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	tx, err := s.beginWrite()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
+	if err := restampCopiedReadiness(tx, dstPrefix); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func restampCopiedReadiness(tx *sql.Tx, dstPrefix string) error {
+	for _, stmt := range []string{
+		`UPDATE derive_state
+		    SET derived_content_gen = COALESCE(
+		          (SELECT content_gen FROM repo_graph_gen WHERE repo_prefix = ?1), 0),
+		        derived_gen         = COALESCE(
+		          (SELECT gen         FROM repo_graph_gen WHERE repo_prefix = ?1), 0)
+		  WHERE repo_prefix = ?1 AND legacy = 0`,
+		`UPDATE enrichment_state
+		    SET content_gen = COALESCE(
+		          (SELECT content_gen FROM repo_graph_gen WHERE repo_prefix = ?1), 0),
+		        gen         = COALESCE(
+		          (SELECT gen         FROM repo_graph_gen WHERE repo_prefix = ?1), 0)
+		  WHERE repo_prefix = ?1 AND content_gen > 0`,
+	} {
+		if _, err := tx.Exec(stmt, dstPrefix); err != nil {
+			return fmt.Errorf("store_sqlite: CopyRepoSubgraph re-stamp readiness: %w", err)
+		}
+	}
+	return nil
 }

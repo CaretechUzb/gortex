@@ -33,8 +33,13 @@ build-gomlx: deps-gomlx
 build-hugot: deps-hugot
 	go build -ldflags '$(LDFLAGS)' -o $(BINARY) ./cmd/gortex/
 
+# -timeout=30m because internal/graph/store_sqlite alone runs right at Go's 600s
+# default (587s idle, 602-624s under load), so the sweep is load-dependently red
+# and fails on the timeout rather than on an assertion. The flag is per test
+# BINARY, not per sweep, so this is the same value ci.yml already passes and not
+# a budget for the whole run.
 test:
-	go test -race ./...
+	go test -race -timeout=30m ./...
 
 bench:
 	go test -bench=. -benchmem -count=1 -benchtime=1s \

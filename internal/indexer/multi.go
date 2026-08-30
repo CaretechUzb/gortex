@@ -66,7 +66,11 @@ type MultiIndexer struct {
 	// failure without publishing the candidate Indexer. Production instances set
 	// it to New; every per-repository construction flows through this factory.
 	newIndexer func(graph.Store, *parser.Registry, config.IndexConfig, *zap.Logger) *Indexer
-	mu         sync.RWMutex
+	// runtimeMarker publishes long-running derive / enrichment work to a
+	// surface an out-of-band reader can see. Guarded by mu; nil outside the
+	// daemon. See RuntimeMarker.
+	runtimeMarker RuntimeMarker
+	mu            sync.RWMutex
 
 	// repositoryMutations owns one stable mutation lane per repository prefix.
 	// The slot survives Indexer replacement so an explicit re-index cannot race
@@ -416,6 +420,7 @@ func (mi *MultiIndexer) SetEmbeddingAPIConcurrency(n int) {
 func (mi *MultiIndexer) SetSemanticManager(m *semantic.Manager) {
 	mi.mu.Lock()
 	mi.semanticMgr = m
+	marker := mi.runtimeMarker
 	live := make([]*Indexer, 0, len(mi.indexers))
 	for _, idx := range mi.indexers {
 		live = append(live, idx)
@@ -423,6 +428,11 @@ func (mi *MultiIndexer) SetSemanticManager(m *semantic.Manager) {
 	mi.mu.Unlock()
 	for _, idx := range live {
 		idx.SetSemanticManager(m)
+	}
+	// The two installers arrive in either order at daemon start, so each
+	// re-establishes the link rather than assuming the other went first.
+	if m != nil && marker != nil {
+		m.SetActivityHook(marker.EnrichingChanged)
 	}
 }
 
@@ -1494,7 +1504,14 @@ func (mi *MultiIndexer) EndBatch() {
 
 	// Keep the transition write side through the complete global pass: a
 	// watcher admitted before or during EndBatch runs wholly before or after it.
-	mi.runGlobalGraphPasses(context.Background(), state.scope, state.censusEligible)
+	// That exclusion is also what makes the derive stamp below exact — no
+	// content write can land between the passes reading the graph and
+	// completeDerive recording the generation they left it at.
+	covered, passErr := mi.runGlobalGraphPasses(context.Background(), state.scope, state.censusEligible)
+	// scoped follows the coverage the passes actually had, not merely whether a
+	// scope was armed: a census-attested batch carries an explicit scope and
+	// still runs whole-graph.
+	mi.completeDerive(covered, !fullCoverageGlobalPass(state.scope, state.censusEligible), passErr)
 	// This pass IS the derivation any repository tracked during the batch
 	// was waiting for. Scheduling another would double every cold index.
 	mi.ClearDeferredWorkspaceRederive()
@@ -1533,10 +1550,10 @@ func (mi *MultiIndexer) runGlobalGraphPasses(
 	ctx context.Context,
 	scope map[string]struct{},
 	censusEligible bool,
-) {
+) ([]string, error) {
 	finishTopologyMutation := reach.BeginTopologyMutation(mi.graph)
 	defer finishTopologyMutation(true)
-	mi.runGlobalGraphPassesTopologyHeld(ctx, scope, censusEligible)
+	return mi.runGlobalGraphPassesTopologyHeld(ctx, scope, censusEligible)
 }
 
 // fullCoverageGlobalPass reports whether the pass frontier covers the complete
@@ -1550,15 +1567,28 @@ func fullCoverageGlobalPass(scope map[string]struct{}, censusEligible bool) bool
 // runGlobalGraphPassesTopologyHeld runs with caller-owned topology and
 // scope/census state. It never reads or consumes armed batch fields; EndBatch
 // is their sole consumer.
+//
+// It returns the repos it covered, and on any early exit why it stopped. Both
+// halves are the caller's licence to stamp derive_state, and a caller must
+// stamp only when the error is nil: that row asserts "these repos ARE
+// derived", and a run that returned from the middle derived some unknown
+// prefix of its work.
+//
+// This used to return nothing at all, which made three outcomes look
+// identical to every caller -- a complete run, a run preempted halfway by a
+// queued mutation, and the nil-graph early return below, which does no work
+// whatsoever and leaves ctx.Err() nil while doing it. Any "stamp unless
+// cancelled" rule written against the old signature would have recorded that
+// last one as a successful derivation.
 func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 	ctx context.Context,
 	scope map[string]struct{},
 	censusEligible bool,
-) {
+) ([]string, error) {
 	mi.globalPassMu.Lock()
 	defer mi.globalPassMu.Unlock()
 	if mi.graph == nil {
-		return
+		return nil, errDeriveNoGraph
 	}
 
 	// Republish the checkout grouping before any pass consults it. A
@@ -1648,6 +1678,42 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 		scanRepoPrefixes = nil
 	}
 
+	// The coverage claim, decided here beside the scope it is derived from.
+	//
+	// This function deliberately reads no generation. What the completion is
+	// stamped against is repo_graph_gen.content_gen, which only the indexer's
+	// file bookkeeping advances — never the derived passes' own edges, and never
+	// the semantic enrichment that follows them:
+	//
+	//	files indexed                 content_gen 3
+	//	these passes emit edges       content_gen 3   (gen moves; this does not)
+	//	completion stamped        ->  derived_content_gen 3
+	//	enrichment emits edges        content_gen 3   (gen moves; this does not)
+	//	readiness: 3 >= 3         ->  READY
+	//
+	// StampDeriveState reads it inside the transaction that writes the row, so
+	// no number travels from here and none can be supplied wrongly. See the
+	// repo_graph_gen block in store_sqlite/schema.go for why a single
+	// any-mutation counter cannot do this job.
+	// Returning it rather than letting each caller recompute it is the point:
+	// the scope rules live in this function, and a caller re-deriving them
+	// from the same inputs would stop agreeing the first time either moved,
+	// silently stamping the wrong set of repos as derived.
+	covered := mi.derivedCoverage(scope, fullCoverage)
+	// Publish the run so an out-of-band reader can say "deriving…" rather than
+	// "never derived" for a repo whose stamp has not landed yet. A whole-
+	// workspace derive runs for tens of minutes; reporting every repo in it as
+	// underived for that whole span is the false alarm that teaches a reader to
+	// ignore the column.
+	//
+	// Cleared by defer, not at the tail: every abort below returns from the
+	// middle, and a marker left set would freeze the column on "deriving…"
+	// until the daemon exits.
+	if marker := mi.runtimeMarkerRef(); marker != nil {
+		marker.DeriveBegan(covered, mi.DeriveConfigHash())
+		defer marker.DeriveEnded()
+	}
+
 	// Start breadcrumb per pass: completion-only logging left every slow pass
 	// silent until it finished, which is exactly when a breadcrumb is useless.
 	passStart := func(pass string) {
@@ -1672,7 +1738,7 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 	}
 
 	if abort("infer_implements") {
-		return
+		return nil, ctx.Err()
 	}
 	passStart("infer_implements")
 	implStart := time.Now()
@@ -1690,7 +1756,7 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 		zap.Bool("scoped", scope != nil),
 		zap.Duration("elapsed", time.Since(implStart)))
 	if abort("infer_overrides") {
-		return
+		return nil, ctx.Err()
 	}
 	passStart("infer_overrides")
 	overStart := time.Now()
@@ -1706,7 +1772,7 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 		zap.Bool("scoped", scope != nil),
 		zap.Duration("elapsed", time.Since(overStart)))
 	if abort("test_edges") {
-		return
+		return nil, ctx.Err()
 	}
 	passStart("test_edges")
 	testStart := time.Now()
@@ -1716,7 +1782,7 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 		zap.Int("edges", emitted),
 		zap.Duration("elapsed", time.Since(testStart)))
 	if abort("entrypoint_hierarchy") {
-		return
+		return nil, ctx.Err()
 	}
 	passStart("entrypoint_hierarchy")
 	ctrlStart := time.Now()
@@ -1729,7 +1795,7 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 			zap.Duration("elapsed", time.Since(ctrlStart)))
 	}
 	if abort("capability_edges") {
-		return
+		return nil, ctx.Err()
 	}
 	passStart("capability_edges")
 	capStart := time.Now()
@@ -1769,7 +1835,7 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 		return ok
 	}
 	if abort("clone_detect") {
-		return
+		return nil, ctx.Err()
 	}
 	passStart("clone_detect")
 	clonePassStart := time.Now()
@@ -1786,7 +1852,7 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 		// as well as before, so a preempting mutation waits for one
 		// repository rather than all of them.
 		if abort("clone_detect:" + idx.repoPrefix) {
-			return
+			return nil, ctx.Err()
 		}
 		clonesDetected++
 		// Per-repo threshold, NOT a max-over-repos value: the batch must use
@@ -1838,7 +1904,7 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 	// edge.
 	reporter.Report("framework dispatch synthesis (global)", 0, 0)
 	if abort("framework_synthesis") {
-		return
+		return nil, ctx.Err()
 	}
 	passStart("framework_synthesis")
 	// A full-coverage batch (cold index / full-workspace reconciliation)
@@ -1868,7 +1934,7 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 	// left to materialise into call-chain terminals.
 	reporter.Report("external-call synthesis (global)", 0, 0)
 	if abort("external_call_synthesis") {
-		return
+		return nil, ctx.Err()
 	}
 	passStart("external_call_synthesis")
 	extStart := time.Now()
@@ -1888,7 +1954,7 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 	// boundaries pick up their parallel cross_repo_* edges.
 	reporter.Report("cross-repo edges (global)", 0, 0)
 	if abort("cross_repo_edges") {
-		return
+		return nil, ctx.Err()
 	}
 	passStart("cross_repo_edges")
 	crStart := time.Now()
@@ -1902,7 +1968,9 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 		zap.Int("edges", crossRepoEdges),
 		zap.Duration("elapsed", time.Since(crStart)))
 	mi.logger.Info("global passes complete",
+		zap.Int("covered_repos", len(covered)),
 		zap.Duration("total", time.Since(globalStart)))
+	return covered, nil
 }
 
 // externalCallSynthesisEnabled resolves whether external-call placeholder
@@ -2300,7 +2368,13 @@ func (mi *MultiIndexer) indexMultiRepo(repos []config.RepoEntry) (map[string]*In
 			// placeholder edges, and contract bridges are in place. RunDeferredPasses
 			// intentionally skips these so we don't pay an O(global) walk per
 			// repo (was the dominant cost at R≈100+).
-			mi.runGlobalGraphPassesTopologyHeld(context.Background(), nil, false)
+			covered, passErr := mi.runGlobalGraphPassesTopologyHeld(context.Background(), nil, false)
+			// Claim only the repos whose mutation lane this batch holds. The
+			// passes themselves run whole-graph, but this path takes the batch
+			// gate's READ side, so a repo outside the lane set could be written
+			// by a watcher while they run — and stamping it would assert a
+			// currency nothing here established.
+			mi.completeDerive(intersectPrefixes(covered, successfulPrefixes), false, passErr)
 
 			return results, nil
 		}()

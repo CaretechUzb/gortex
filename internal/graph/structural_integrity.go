@@ -498,7 +498,29 @@ func NewStructuralIntegrityShadow(owner Store, repo string, path StructuralDropP
 	if sink, ok := owner.(StructuralIntegrityEventRecorder); ok {
 		g.structuralIntegritySink = sink
 	}
+	g.structuralIntegrityOwner = owner
 	g.structuralIntegrityRepo = normalizeStructuralRepo(repo)
 	g.structuralIntegrityPath = normalizeStructuralPath(path)
 	return g
 }
+
+// ShadowedStore is implemented by a graph that stands in front of a durable
+// store. Content written to such a graph reaches the owner later, in a drain;
+// state that has no in-memory form never reaches it at all unless the writer
+// resolves through here first.
+//
+//	indexCtxRaw:  idx.graph = shadow ──drain──▶ owner (*store_sqlite.Store)
+//	                   │                          ▲
+//	                   │ nodes + edges            │ enrichment_state,
+//	                   ▼                          │ repo_graph_gen, …
+//	                (batched)  ──ShadowOwner()────┘
+//
+// A plain in-memory graph reports nil, so a caller that walks to the owner and
+// then type-asserts still fails closed on a backend that models nothing.
+type ShadowedStore interface {
+	ShadowOwner() Store
+}
+
+// ShadowOwner reports the durable store this graph shadows, or nil when the
+// graph stands alone (every Graph not built by NewStructuralIntegrityShadow).
+func (g *Graph) ShadowOwner() Store { return g.structuralIntegrityOwner }

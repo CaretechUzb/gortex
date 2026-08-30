@@ -35,10 +35,18 @@ func TestManagerRepoLanguagesUsesOneCompactProjection(t *testing.T) {
 		},
 	}
 	manager := &Manager{}
-	present, repoCounts, languageCounts := manager.repoLanguages(store, map[string]string{
+	present, repoCounts, languageCounts, repoLangs := manager.repoLanguages(store, map[string]string{
 		"b": "/repos/b",
 		"a": "/repos/a",
 	})
+
+	// Applicability is per-repo: the workspace contains Python, but repo "a"
+	// does not, and declaring python-types applicable to "a" would peg a pure-Go
+	// checkout below ready forever.
+	wantRepoLangs := map[string]map[string]bool{"a": {"go": true}, "b": {"python": true}}
+	if !reflect.DeepEqual(repoLangs, wantRepoLangs) {
+		t.Fatalf("repoLangs = %#v, want %#v", repoLangs, wantRepoLangs)
+	}
 
 	if store.calls != 1 {
 		t.Fatalf("projection calls = %d, want 1", store.calls)

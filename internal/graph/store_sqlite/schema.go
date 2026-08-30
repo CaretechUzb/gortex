@@ -583,12 +583,30 @@ CREATE TABLE IF NOT EXISTS repo_index_state (
 -- provider whose IndexedSHA still matches HEAD on a clean tree. One row per
 -- (repo_prefix, provider); WITHOUT ROWID — the PK index IS the table, like
 -- file_mtimes / repo_index_state.
+--
+-- content_gen is the repo_graph_gen.content_gen value this provider last
+-- enriched at, and it is what readiness compares -- see repo_graph_gen for why
+-- neither a timestamp nor the graph-wide gen can do this job. Unlike the
+-- derive, an enrichment pass runs with NO write gate held: the watcher can
+-- reindex a file while gopls is still hovering. So the value stamped here is
+-- the one observed BEFORE the pass started, and the store clamps it to the
+-- current counter so a caller can never claim to have covered content it did
+-- not see. gen is the graph-wide counter at completion, provenance only.
+--
+-- Rows are ALSO the applicability model: the admission gate writes
+-- one row per APPLICABLE provider with gen 0 before any of them runs, so a
+-- provider that applies but has never completed is a visible gen-0 row rather
+-- than an absent one. That distinction matters because readiness takes the
+-- MINIMUM gen across a repo's rows: with absence meaning "not applicable", a
+-- single fresh provider would otherwise mask a sibling that never ran.
 CREATE TABLE IF NOT EXISTS enrichment_state (
     repo_prefix  TEXT NOT NULL,
     provider     TEXT NOT NULL,
     indexed_sha  TEXT NOT NULL DEFAULT '',
     completed_at INTEGER NOT NULL DEFAULT 0,
     coverage     REAL NOT NULL DEFAULT 0,
+    gen          INTEGER NOT NULL DEFAULT 0,
+    content_gen  INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (repo_prefix, provider)
 ) WITHOUT ROWID;
 
@@ -607,6 +625,121 @@ CREATE TABLE IF NOT EXISTS contract_state (
     indexed_sha    TEXT NOT NULL DEFAULT '',
     completed_at   INTEGER NOT NULL DEFAULT 0,
     contract_count INTEGER NOT NULL DEFAULT 0
+) WITHOUT ROWID;
+
+-- repo_graph_gen carries the two per-repo counters readiness is built on.
+-- They answer different questions and confusing them is the single easiest way
+-- to get this feature wrong.
+--
+--   gen          advances on ANY committed mutation of this repo's nodes or
+--                edges, whoever caused it -- an extraction batch, a derived
+--                pass, a semantic provider, an eviction at the far end of a
+--                cross-repo edge. It answers "has this repo's graph moved?"
+--                and is the honest invalidation signal for anything cached
+--                off the graph. It is provenance for readiness, never its
+--                comparand.
+--
+--   content_gen  advances ONLY when the indexer records that it parsed or
+--                dropped this repo's files -- the four file_mtimes writers
+--                (SetFileMtime, BulkSetFileMtimes, ReplaceFileMtimes,
+--                DeleteFileMtimes) and nothing else. It answers "has this
+--                repo's CONTENT moved?", which is the only question a stage
+--                stamp can usefully be compared against.
+--
+-- Why two. Both the derived passes and the semantic providers write to the
+-- graph, so both advance gen as they run. A stage compared against gen is
+-- therefore compared against a value its own successors keep pushing away:
+--
+--   index                         gen 10   content_gen 3
+--   derive runs, emits edges      gen 25   content_gen 3   stamp 3
+--   enrich runs, emits edges      gen 40   content_gen 3   stamp 3
+--   compared against gen:      25 < 40  -> the derive reads PARTIAL forever
+--   compared against content:   3 >= 3  -> both stages READY          <-- right
+--
+--   file saved, batch commits     gen 41   content_gen 4
+--   compared against content:   3 <  4  -> both stages PARTIAL        <-- right
+--
+-- The same asymmetry sinks gen from the other side: repoPrefixesOfEdges bumps
+-- BOTH endpoints of a cross-repo edge, so repoB's anchor moves whenever repoA
+-- derives -- and repoB's clearing derive moves repoA's in turn. Two repos that
+-- reference each other would sit permanently stale against gen. Neither the
+-- derive nor an enrichment provider ever writes a file mtime, so neither can
+-- move content_gen; a stage stamp is immune to its own output by construction
+-- rather than by everyone remembering.
+--
+-- Why a counter and not a snapshot of gen. The mtime write and the node write
+-- for one file land in separate transactions, in an order this table must not
+-- depend on. A snapshot taken in the wrong order records a value the stage has
+-- already stamped and reads "current" across a real edit. An independent
+-- counter is order-free: any content write moves it past every stamp taken
+-- before it.
+--
+-- Why indexed_at cannot do content_gen's job: it has exactly two writers (a
+-- full reindex, and the git watcher on a HEAD transition), so the most common
+-- mutation of all -- an incremental single-file reindex -- leaves it untouched.
+-- Two integers also cannot collide the way two same-second timestamps can.
+--
+-- Both bumps are written INSIDE the mutating transaction, never after it.
+-- Bumping after the commit would leave a crash window in which the graph has
+-- moved but the counter has not, and a stage stamped at the old value would
+-- read "current" against a graph it no longer describes -- the exact silent
+-- wrong answer readiness exists to catch.
+--
+-- One row per repo_prefix; WITHOUT ROWID -- the PK index IS the table, like
+-- file_mtimes / repo_index_state.
+CREATE TABLE IF NOT EXISTS repo_graph_gen (
+    repo_prefix TEXT    PRIMARY KEY,
+    gen         INTEGER NOT NULL DEFAULT 0,
+    content_gen INTEGER NOT NULL DEFAULT 0
+) WITHOUT ROWID;
+
+-- derive_state records that the global derived passes (implements, overrides,
+-- test edges, entrypoint hierarchy, capability edges, framework-dispatch
+-- synthesis, external-call placeholders, cross-repo edges) completed for one
+-- repo, and what they ran against. Nothing persisted derive completion before
+-- this table: the passes emitted log lines only, so a repo tracked during
+-- daemon warmup could silently never be derived while every query against it
+-- returned a subset with no signal that anything was missing.
+--
+-- derived_content_gen is THE comparand: the repo_graph_gen.content_gen value
+-- this derive covered. Readiness reads the derive as current while
+-- derived_content_gen >= the repo's content_gen, i.e. while no file has been
+-- parsed or dropped since the passes ran. See repo_graph_gen for why the
+-- graph-wide gen cannot serve here -- the derive's own edges, and every
+-- enrichment pass that follows it, push gen past any stamp the derive could
+-- take.
+--
+-- Reading content_gen at COMPLETION is exact rather than a concession, because
+-- a derive holds the batch-mutation write gate for its whole run (EndBatch,
+-- runWorkspaceRederive and RunIncrementalDerivedPasses all take it; the cold
+-- multi-repo index holds a per-repo mutation lane for every repo it stamps).
+-- No content write can interleave, so content_gen cannot move between start
+-- and completion. If that gate is ever weakened, this read must move to derive
+-- START -- stamping a completion value the passes never saw is fail-OPEN.
+--
+-- derived_gen records repo_graph_gen.gen at the same moment. It is provenance
+-- only, never compared: it is what tells a human reading gortex repos --json
+-- whether the graph has moved at all since the derive, as against whether the
+-- CONTENT has.
+--
+-- derived_sha and derived_at are likewise provenance for humans and are never
+-- compared. pass_version invalidates a store derived by a build whose
+-- synthesis has since changed semantics; config_hash does the same for
+-- derive-relevant CONFIG changes (the framework allow-list), which alter
+-- derived output with no code change. legacy marks rows planted by the v13
+-- migration for repos derived before this table existed: their true state is
+-- unknowable, so they render "unknown" rather than claim a completion that was
+-- never recorded.
+CREATE TABLE IF NOT EXISTS derive_state (
+    repo_prefix         TEXT PRIMARY KEY,
+    derived_gen         INTEGER NOT NULL DEFAULT 0,
+    derived_content_gen INTEGER NOT NULL DEFAULT 0,
+    derived_sha         TEXT    NOT NULL DEFAULT '',
+    derived_at          INTEGER NOT NULL DEFAULT 0,
+    pass_version        INTEGER NOT NULL DEFAULT 0,
+    config_hash         TEXT    NOT NULL DEFAULT '',
+    scoped              INTEGER NOT NULL DEFAULT 0,
+    legacy              INTEGER NOT NULL DEFAULT 0
 ) WITHOUT ROWID;
 
 -- clone_shingles is the per-symbol MinHash shingle-set sidecar. Each

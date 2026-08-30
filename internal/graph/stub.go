@@ -297,8 +297,67 @@ func UnresolvedRepoPrefix(id string) string {
 	return id[:idx]
 }
 
+// reservedIDNamespaces are the first `::`-separated segments that name a
+// synthetic namespace rather than a repository. A repo prefix is a real
+// repository's name; none of these is one, and none can become one — they are
+// the namespaces the extractor and resolver mint their own placeholders under.
+//
+// The list is load-bearing because two spellings drifted. The external-call
+// synthesizer mints its ids with a HYPHEN (`external-call::`) while
+// StubKindExternalCall is spelled with an UNDERSCORE, so
+// `external-call::stdlib::odoo` slips past the bare-kind check in StubKind and
+// matches the `<repo>::<kind>::…` branch instead. Everything downstream then
+// reads `external-call` as a repository. On a live workspace that produced
+// `external-call::module::go:odoo` stamped RepoPrefix `external-call`; the node
+// owned the prefix, the prefix earned a repo_graph_gen anchor row on the
+// strength of owning it, and every store-wide mutation advanced that row from
+// then on.
+//
+// Adding the hyphen to stubKinds would fix this one id and change what
+// StubKind, StubRest and every caller return for the whole external-call
+// population, which is a much larger claim than the defect warrants. Naming the
+// namespaces is the narrow statement: these are not repositories.
+// Sorted, because the store's repair migration encodes the same set into SQL
+// and reads it from here rather than restating it; a drifting second copy is
+// how the repair would stop matching what the parser rejects.
+var reservedIDNamespaceList = []string{
+	"builtin",
+	"dep",
+	"external",
+	"external-call",
+	"external_call",
+	"module",
+	"stdlib",
+	"unresolved",
+}
+
+var reservedIDNamespaces = func() map[string]struct{} {
+	m := make(map[string]struct{}, len(reservedIDNamespaceList))
+	for _, ns := range reservedIDNamespaceList {
+		m[ns] = struct{}{}
+	}
+	return m
+}()
+
+// IsReservedIDNamespace reports whether seg, an id's first `::`-separated
+// segment, names a synthetic namespace rather than a repository.
+func IsReservedIDNamespace(seg string) bool {
+	_, ok := reservedIDNamespaces[seg]
+	return ok
+}
+
+// ReservedIDNamespaces returns the reserved segments in sorted order.
+func ReservedIDNamespaces() []string {
+	return append([]string(nil), reservedIDNamespaceList...)
+}
+
 // StubRepoPrefix returns the per-repo prefix of a stub id, or
 // "" if the id has no prefix or isn't a stub.
+//
+// A synthetic namespace in the leading position yields "" as well: the id is
+// nested inside another placeholder, not owned by a repository. Returning the
+// namespace instead is how a repo prefix gets invented out of nothing — see
+// reservedIDNamespaces.
 func StubRepoPrefix(id string) string {
 	kind := StubKind(id)
 	if kind == "" {
@@ -309,6 +368,9 @@ func StubRepoPrefix(id string) string {
 		return ""
 	}
 	if idx := strings.Index(id, "::"); idx > 0 {
+		if IsReservedIDNamespace(id[:idx]) {
+			return ""
+		}
 		return id[:idx]
 	}
 	return ""

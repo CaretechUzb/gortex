@@ -37,7 +37,13 @@ func (s *Server) handleAnalyzeSynthesizers(ctx context.Context, req mcp.CallTool
 	if wsRepos, bound := s.sessionWorkspaceRepoSet(ctx); bound {
 		opts = append(opts, analyzer.WithSynthesizerRepoScope(wsRepos))
 	}
-	result := analyzer.AnalyzeSynthesizers(s.graph, opts...)
+	result, err := analyzer.AnalyzeSynthesizers(s.graph, opts...)
+	// An aborted census must surface as an error on BOTH response paths. The
+	// compact branch below would otherwise print "no synthesized edges", which
+	// is the specific false statement this tool was fixed to stop making.
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
 
 	if isCompact(req) {
 		var b strings.Builder

@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"strings"
+
+	"github.com/zzet/gortex/internal/graph"
 )
 
 // Schema versioning for the graph store.
@@ -80,7 +82,182 @@ var schemaMigrations = []schemaMigration{
 	{version: 10, name: "rebuild vector corpus ownership and parents", inPlace: rebuildVectorCorpusSchema},
 	{version: 11, name: "add symbol FTS normalization state", inPlace: createSymbolFTSNormalizationStateTable},
 	{version: 12, name: "normalize dir column separators", inPlace: normalizeDirColumnSeparators},
-	{version: 13, name: "purge legacy slash-spelled coverage artifacts", inPlace: purgeLegacyCoverageSpellings},
+	// v13 carries BOTH sides' work, because both sides minted a v13.
+	//
+	// This branch developed its readiness migration as v13 in parallel with
+	// main's coverage-spelling purge, so the merge had to reconcile two
+	// different steps claiming one number. They are merged into the single v13
+	// they both claim rather than renumbering ours to 14, which would have left
+	// main's purge permanently unrun on every store this branch built.
+	//
+	// Standing rule, and the reason renumbering was rejected in both
+	// directions: this branch's currentSchemaVersion must stay EQUAL to main's.
+	// Our work lives inside the number main already shipped, so whatever main
+	// numbers next (14) is strictly greater than what stores built here are
+	// stamped, and pendingBetween selects it. Stamping our stores 14/15 would
+	// carry them past main's next migration, which pendingBetween would then
+	// skip permanently.
+	//
+	// Consequence, accepted deliberately: planSchemaMigrationWith treats
+	// `stored > current` as "written by a newer build" and WIPES the store, so a
+	// store this branch already stamped 14 is rebuilt from source on first open
+	// after the merge. That is the cost of collapsing the number, and it is
+	// correct — such a store carries a schema this registry no longer describes.
+	//
+	// Known gap, recorded rather than hidden: a store MAIN stamped 13 is
+	// `stored == current` and runs nothing, so it never receives the readiness
+	// seeding or the unstamp. schemaSQL still creates the readiness tables (it
+	// runs before the registry), so such a store is structurally sound, but its
+	// repositories read "never derived" until their next real derive, and any
+	// synthetic-namespace ownership the old graph.StubRepoPrefix wrote is left
+	// standing. Waiting does not close it either: pendingBetween(13, 14) selects
+	// v14 alone, so main's next migration reconciles nothing here. A rebuild
+	// closes both halves; the repo's next real derive closes the readiness rows
+	// only, and the unstamp stays unrun. Do not mint a v14 to close it — see the
+	// standing rule above.
+	{version: 13, name: "purge legacy coverage spellings and add per-repo readiness state", inPlace: migrateV13},
+}
+
+// migrateV13 runs main's coverage purge and this branch's readiness setup as
+// one step, in dependency order.
+//
+// Purge first: it deletes legacy artifact rows, and the readiness seed reads
+// repo_index_state to decide which repositories get a legacy=1 row, so seeding
+// first would anchor rows the purge then strips.
+//
+// Unstamp last: it DELETEs from repo_graph_gen, which createReadinessStateTables
+// is what creates and seeds. Reversing them would delete from a table that does
+// not exist yet on a pre-v13 store.
+func migrateV13(tx *sql.Tx) error {
+	if err := purgeLegacyCoverageSpellings(tx); err != nil {
+		return err
+	}
+	if err := createReadinessStateTables(tx); err != nil {
+		return err
+	}
+	return unstampReservedRepoPrefixes(tx)
+}
+
+// unstampReservedRepoPrefixes clears the repo ownership that was stamped onto
+// nodes living inside a synthetic namespace, and drops the anchor rows those
+// nodes earned.
+//
+// The two statements are ordered, not independent. A prefix earns its
+// repo_graph_gen row by OWNING A NODE (see bumpRepoGensTx), so deleting the row
+// while a node still claimed the prefix would let the next mutation recreate
+// it. Clearing ownership first is what makes the delete final.
+//
+// Dropping an anchor row is safe here in a way it is not in general —
+// bumpRepoGensTx deliberately keeps advancing a real repo's row after its last
+// file is evicted, because that eviction is precisely when the anchor must
+// move. These prefixes are not repositories and never were, so there is no
+// later mutation whose readiness verdict the row could have carried.
+//
+// Both statements seek: nodes_by_repo covers the UPDATE's predicate and
+// repo_graph_gen is keyed by prefix. Neither scans, which matters — this runs
+// inside Open, and a scan of a multi-gigabyte nodes table would stall every
+// daemon start behind it.
+//
+// Idempotent: a second run matches nothing. Deliberately narrow, too — it says
+// nothing about a node whose prefix is a real repository, including the
+// `<repo>::module::…` rows the v5 backfill wrote correctly.
+func unstampReservedRepoPrefixes(tx *sql.Tx) error {
+	reserved := graph.ReservedIDNamespaces()
+	args := make([]any, 0, len(reserved))
+	for _, ns := range reserved {
+		args = append(args, ns)
+	}
+	list := "(?" + strings.Repeat(", ?", len(reserved)-1) + ")"
+
+	if _, err := tx.Exec(
+		`UPDATE nodes SET repo_prefix = '' WHERE repo_prefix IN `+list, args...); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(
+		`DELETE FROM repo_graph_gen WHERE repo_prefix IN `+list, args...); err != nil {
+		return err
+	}
+	return nil
+}
+
+// createReadinessStateTables is the readiness half of the merged v13 step.
+// schemaSQL owns the canonical fresh-store definitions; this idempotent step
+// brings an existing store forward and seeds the rows readiness needs to tell
+// "never derived" apart from "derived before anything recorded derives".
+//
+// Every pre-v13 repo is seeded legacy=1. Derive completion was not persisted
+// anywhere before this table -- the passes only logged -- so stamping a
+// completion here would be inventing data about work this store cannot
+// confirm happened. Legacy rows deliberately render "unknown" until the next
+// real derive overwrites them.
+func createReadinessStateTables(tx *sql.Tx) error {
+	if _, err := tx.Exec(`CREATE TABLE IF NOT EXISTS repo_graph_gen (
+		repo_prefix TEXT    PRIMARY KEY,
+		gen         INTEGER NOT NULL DEFAULT 0,
+		content_gen INTEGER NOT NULL DEFAULT 0
+	) WITHOUT ROWID`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`CREATE TABLE IF NOT EXISTS derive_state (
+		repo_prefix         TEXT PRIMARY KEY,
+		derived_gen         INTEGER NOT NULL DEFAULT 0,
+		derived_content_gen INTEGER NOT NULL DEFAULT 0,
+		derived_sha         TEXT    NOT NULL DEFAULT '',
+		derived_at          INTEGER NOT NULL DEFAULT 0,
+		pass_version        INTEGER NOT NULL DEFAULT 0,
+		config_hash         TEXT    NOT NULL DEFAULT '',
+		scoped              INTEGER NOT NULL DEFAULT 0,
+		legacy              INTEGER NOT NULL DEFAULT 0
+	) WITHOUT ROWID`); err != nil {
+		return err
+	}
+	// SQLite has no ADD COLUMN IF NOT EXISTS, and a duplicate ADD is a hard
+	// error that would roll the entire migration transaction back on a re-run.
+	//
+	// The three content_gen columns are added inside this step rather than as a
+	// migration of their own: they correct this step's own anchor, and the only
+	// stores carrying the earlier shape are development builds of this branch.
+	// A dev store stamped 14 is not the problem — `stored > current` now wipes
+	// it on open. A dev store stamped 13 is `stored == current`, re-runs
+	// nothing, and is exactly why each ADD is guarded individually and why
+	// schemaSQL's CREATE TABLE IF NOT EXISTS cannot be relied on to deliver
+	// them.
+	//
+	// This reasoning originally read "before v13 has shipped". That premise
+	// died in the merge: main shipped its OWN v13 (the coverage-spelling purge)
+	// while this branch was out, and the two were folded into one v13 rather
+	// than renumbered. See the note on the migration table.
+	for _, col := range []struct{ table, name, ddl string }{
+		{"enrichment_state", "gen", "gen INTEGER NOT NULL DEFAULT 0"},
+		{"enrichment_state", "content_gen", "content_gen INTEGER NOT NULL DEFAULT 0"},
+		{"repo_graph_gen", "content_gen", "content_gen INTEGER NOT NULL DEFAULT 0"},
+		{"derive_state", "derived_content_gen", "derived_content_gen INTEGER NOT NULL DEFAULT 0"},
+	} {
+		var present int
+		if err := tx.QueryRow(
+			`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, col.table, col.name,
+		).Scan(&present); err != nil {
+			return err
+		}
+		if present > 0 {
+			continue
+		}
+		if _, err := tx.Exec(
+			`ALTER TABLE ` + col.table + ` ADD COLUMN ` + col.ddl,
+		); err != nil {
+			return err
+		}
+	}
+	// OR IGNORE, not a bare INSERT: schemaSQL runs before the migration steps,
+	// so on a fresh store both tables already exist, and a re-run must not
+	// collide with -- or overwrite -- rows a real derive has since written.
+	if _, err := tx.Exec(`INSERT OR IGNORE INTO repo_graph_gen (repo_prefix, gen)
+		SELECT repo_prefix, 1 FROM repo_index_state`); err != nil {
+		return err
+	}
+	_, err := tx.Exec(`INSERT OR IGNORE INTO derive_state (repo_prefix, legacy)
+		SELECT repo_prefix, 1 FROM repo_index_state`)
+	return err
 }
 
 // normalizeDirColumnSeparators rebuilds the two generated dir columns whose

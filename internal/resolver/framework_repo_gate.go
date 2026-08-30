@@ -182,6 +182,37 @@ func (v *frameworkRepoGateStore) DanglingEdgeTargets(idPrefixes []string, kinds 
 	return graph.DanglingEdgeTargets(v.Store, idPrefixes, kinds)
 }
 
+// ConstantValuesByNodeIDs republishes the constant sidecar read, for the same
+// reason as the two capabilities above and with a worse consequence than
+// either: this one returns a wrong ANSWER, not a slow one.
+//
+// graph.ConstantValueReader is not part of graph.Store, so embedding promotes
+// nothing and the backend's sidecar vanishes behind this wrapper. The chain is
+//
+//	pass -> frameworkEdgeBatchStore -> frameworkRepoGateStore -> backend
+//
+// and the facade in the middle satisfies graph.ConstantValueReader itself, so a
+// pass's own assertion succeeds and nothing looks wrong. The facade then asks
+// its embedded store — this one — takes its "adapter has no constant values"
+// fallback, and hands back an EMPTY map with a NIL error. buildConstDerefMap
+// tests exactly `reader != nil && err == nil`, both of which hold, so it
+// ingests nothing and reports success. Every Go string-constant dereference in
+// the Temporal pass is lost. Java constants survive, because they ride on
+// Meta["value"] rather than the sidecar, so the loss is partial and asymmetric
+// — which is what kept it invisible.
+//
+// Forwarding is safe because this is a pure read: the gate exists to refuse
+// writes and has never filtered what a pass may look at. A backend that
+// genuinely has no sidecar keeps the previous empty-but-successful answer, so
+// this closes the hole without inventing a failure mode for stores that never
+// had the capability.
+func (v *frameworkRepoGateStore) ConstantValuesByNodeIDs(nodeIDs []string) (map[string]string, error) {
+	if reader, ok := v.Store.(graph.ConstantValueReader); ok {
+		return reader.ConstantValuesByNodeIDs(nodeIDs)
+	}
+	return make(map[string]string), nil
+}
+
 // refuses reports whether this pass may not write the edge, recording
 // which of the two rules refused it.
 //

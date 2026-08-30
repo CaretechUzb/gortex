@@ -38,6 +38,8 @@ var purgeSidecarTables = []string{
 	"symbol_fts_state",
 	"enrichment_state",
 	"contract_state",
+	"repo_graph_gen",
+	"derive_state",
 	"semantic_binding_types",
 	"clone_shingles",
 	"clone_corpus_state",
@@ -105,6 +107,15 @@ func (s *Store) PurgeRepo(prefix string) error {
 		return fmt.Errorf("store_sqlite: PurgeRepo edges: %w", err)
 	}
 	changed := len(ids) > 0
+	// Purging a repo also deletes every cross-repo edge that pointed INTO it,
+	// which mutates the graph of each repo those edges came from: their "who
+	// uses this" answers just changed. Advance every anchor before the loop
+	// below drops this repo's own repo_graph_gen row.
+	if changed {
+		if err := bumpAllRepoGensTx(tx); err != nil {
+			return fmt.Errorf("store_sqlite: PurgeRepo graph generation: %w", err)
+		}
+	}
 	for _, table := range purgeSidecarTables {
 		res, err := tx.Exec(`DELETE FROM `+table+` WHERE repo_prefix = ?`, prefix)
 		if err != nil {
@@ -123,10 +134,11 @@ func (s *Store) PurgeRepo(prefix string) error {
 		changed = true
 	}
 
-	if err := tx.Commit(); err != nil {
+	// Anchors were advanced above, ahead of the sidecar deletes, so this
+	// commit names no prefixes of its own.
+	if err := s.commitGraphMutation(tx, len(ids) > 0, nil, false); err != nil {
 		return err
 	}
-	s.finishAnalysisMutationLocked(len(ids) > 0)
 	if changed {
 		s.markMutationReceiptsIncompleteLocked()
 	}
@@ -211,7 +223,10 @@ func (s *Store) OrphanRepoPrefixes(known []string) []string {
 // to new. Every one is keyed by repo_prefix (+ file_path or provider), NOT
 // by node_id, so its row content survives a node-id change: file_mtimes /
 // files by (repo_prefix, file_path); repo_index_state / contract_state /
-// enrichment_state by repo_prefix (+ provider). At a solo->multi migration
+// enrichment_state / repo_graph_gen / derive_state by repo_prefix (+ provider).
+// The last two travel for the same reason the copy carries them: leaving them
+// behind would make a renamed repo read "never derived", sending a user to
+// re-run work that is already done. At a solo->multi migration
 // every ” row in these belongs to the one migrating repo — global externals
 // live in the NODES table and hold NO rows here — so moving them wholesale
 // is safe. UPDATE OR REPLACE folds any row the re-mint re-index already wrote
@@ -223,6 +238,8 @@ var rekeyMoveTables = []string{
 	"repo_index_state",
 	"enrichment_state",
 	"contract_state",
+	"repo_graph_gen",
+	"derive_state",
 }
 
 // rekeyDropTables are the sidecar tables RekeyRepoPrefix DROPS (rather than

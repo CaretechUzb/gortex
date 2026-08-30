@@ -214,6 +214,13 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		if hErr == nil {
 			res = s.maybeAttachMomentumNote(ctx, req.Params.Name, res)
 		}
+		// Readiness caveat: when this session's answers come from a repo
+		// whose derived passes have not finished, say so in the answer
+		// itself (readiness_note.go). `gortex repos` has carried the
+		// verdict for a while; nothing a querying agent sees ever did.
+		if hErr == nil {
+			res = s.maybeAttachReadinessNote(ctx, req.Params.Name, res)
+		}
 		return res, hErr
 	})
 }

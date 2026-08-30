@@ -569,8 +569,16 @@ type Graph struct {
 	// from guessing ownership from unprefixed node IDs.
 	structuralIntegrity     StructuralIntegrityMeter
 	structuralIntegritySink StructuralIntegrityEventRecorder
-	structuralIntegrityRepo string
-	structuralIntegrityPath StructuralDropPath
+	// structuralIntegrityOwner is the durable store this graph shadows, nil
+	// for a graph that stands alone. Nodes and edges accumulate here and are
+	// drained into the owner in batches, but the per-repo bookkeeping tables
+	// (enrichment applicability and completion state) have no in-memory
+	// representation at all: a write addressed to the shadow is not merged
+	// later, it is simply lost when the shadow is dropped. Anything that must
+	// outlive the shadow resolves through ShadowOwner and writes to the owner.
+	structuralIntegrityOwner Store
+	structuralIntegrityRepo  string
+	structuralIntegrityPath  StructuralDropPath
 }
 
 // cloneShingleEntry is one in-memory clone_shingles row: the owning

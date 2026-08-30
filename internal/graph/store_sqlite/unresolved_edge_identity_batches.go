@@ -232,6 +232,17 @@ func (s *Store) reindexUnresolvedEdgeTargetsTransactionLocked(
 		}
 		invalidatedAnalysis = true
 	}
+	// This helper owns the transaction, so the durable anchor bump belongs
+	// here rather than at the caller's post-commit hook.
+	var touched []string
+	for _, m := range mutations {
+		touched = addPrefix(touched, graph.RepoPrefixOfID(m.oldKey.fromID))
+		touched = addPrefix(touched, graph.RepoPrefixOfID(m.oldKey.toID))
+		touched = addPrefix(touched, graph.RepoPrefixOfID(m.newTo))
+	}
+	if err := bumpRepoGensTx(tx, touched); err != nil {
+		return stats, false, false, err
+	}
 	if err := tx.Commit(); err != nil {
 		return stats, false, false, err
 	}

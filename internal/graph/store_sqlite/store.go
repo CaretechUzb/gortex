@@ -1295,7 +1295,11 @@ func (s *Store) SetEdgeProvenance(e *graph.Edge, newOrigin string) bool {
 		e.Tier = newTier
 	}
 	s.edgeIdentityRevs.Add(1)
-	s.finishAnalysisMutationLocked(true)
+	if err := s.noteGraphMutation(context.Background(), true,
+		[]string{graph.RepoPrefixOfID(e.From), graph.RepoPrefixOfID(e.To)}); err != nil {
+		panicOnFatal(err)
+		return false
+	}
 	return true
 }
 
@@ -1336,7 +1340,10 @@ func (s *Store) PersistEdgeAttributes(e *graph.Edge) {
 		panicOnFatal(err)
 		return
 	}
-	s.finishAnalysisMutationLocked(changed > 0)
+	if err := s.noteGraphMutation(context.Background(), changed > 0,
+		[]string{graph.RepoPrefixOfID(e.From), graph.RepoPrefixOfID(e.To)}); err != nil {
+		panicOnFatal(err)
+	}
 }
 
 // Compile-time assertion: *Store satisfies the batched meta persister.
@@ -1418,13 +1425,14 @@ func (s *Store) persistEdgeAttributesBatch(edges []*graph.Edge) (statements int,
 			}
 			invalidatedAnalysis = true
 		}
-		if err := tx.Commit(); err != nil {
+		if err := s.commitGraphMutation(
+			tx, chunkChanged, repoPrefixesOfEdges(edges[i:end]), false,
+		); err != nil {
 			return statements, err
 		}
 		if invalidatedAnalysis {
 			s.analysisGenerationPresent = false
 		}
-		s.finishAnalysisMutationLocked(chunkChanged)
 	}
 	return statements, nil
 }
@@ -1560,13 +1568,16 @@ func (s *Store) ReindexEdge(e *graph.Edge, oldTo string) {
 		return
 	}
 	receipt.recordInserted(e, inserted)
-	if err := tx.Commit(); err != nil {
+	changed := deleted > 0 || inserted
+	// oldTo is included: moving an edge off a node mutates the repo it left as
+	// much as the one it now points at.
+	if err := s.commitGraphMutation(tx, changed, []string{
+		graph.RepoPrefixOfID(e.From), graph.RepoPrefixOfID(e.To), graph.RepoPrefixOfID(oldTo),
+	}, false); err != nil {
 		panicOnFatal(err)
 		return
 	}
 	committed = true
-	changed := deleted > 0 || inserted
-	s.finishAnalysisMutationLocked(changed)
 	if changed {
 		s.publishSQLiteReindexReceiptLocked(receipt)
 	}
@@ -1648,7 +1659,11 @@ func (s *Store) RemoveEdge(from, to string, kind graph.EdgeKind) bool {
 		return false
 	}
 	changed := n > 0
-	s.finishAnalysisMutationLocked(changed)
+	if err := s.noteGraphMutation(context.Background(), changed,
+		[]string{graph.RepoPrefixOfID(from), graph.RepoPrefixOfID(to)}); err != nil {
+		panicOnFatal(err)
+		return false
+	}
 	if changed {
 		s.markMutationReceiptsIncompleteLocked()
 	}
