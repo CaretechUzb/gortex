@@ -419,14 +419,15 @@ func (w *Watcher) Start(paths []string) (retErr error) {
 	}
 
 	// WatchConfig.Enabled is the repo's opt-in to being watched at all —
-	// by fsnotify or by the adaptive poller. Every fallback below already
-	// assumed this (each one is itself gated on Enabled), but nothing
-	// actually stopped a disabled repo from still attempting raw native
-	// fsnotify first: config.Default() ships Enabled: false, which was
-	// silently attempting fsnotify unconditionally, racing
-	// confirmWatchActive's 5s timeout with no safety net and no
-	// fallback on either success or failure. Make the flag mean what its
-	// name and every comment below already claim it means.
+	// by fsnotify or by the adaptive poller. Every fallback below was
+	// already WRITTEN as if this were true (each one is itself gated on
+	// Enabled) — but until this early return, nothing actually enforced
+	// it: a disabled repo still attempted raw native fsnotify first.
+	// config.Default() ships Enabled: false, so that unconditional
+	// attempt was the common case, silently racing confirmWatchActive's
+	// 5s timeout with no safety net and no fallback on either success
+	// or failure. This return makes the flag mean what its name and
+	// every comment below already claimed it meant.
 	//
 	// degradedNoFsnotify must be set here too: Stop() skips waiting on
 	// w.stopped only in degraded mode, because that channel is closed by
