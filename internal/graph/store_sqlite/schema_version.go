@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"strings"
+
+	"github.com/zzet/gortex/internal/graph"
 )
 
 // Schema versioning for the graph store.
@@ -32,7 +34,7 @@ import (
 // index changes in a way an old on-disk DB would not already have, and append a
 // matching schemaMigrations entry describing how to bring an older store
 // forward (in place, or by rebuild).
-const currentSchemaVersion = 13
+const currentSchemaVersion = 14
 
 // schemaMigration is one forward step. Exactly one strategy applies:
 //   - rebuild=true: the change introduces structure/data that can only come
@@ -85,6 +87,54 @@ var schemaMigrations = []schemaMigration{
 	// Purely additive and mechanically seedable, so in-place rather than a
 	// rebuild: no existing row has to be re-derived from source.
 	{version: 13, name: "add per-repo graph generation and derive state", inPlace: createReadinessStateTables},
+	// A synthetic namespace was being read as a repository (see
+	// graph.reservedIDNamespaces), so nodes nested inside a placeholder were
+	// stamped as owned by one — and an owned node is exactly how a prefix earns
+	// a repo_graph_gen anchor row. graph.StubRepoPrefix no longer produces the
+	// stamp; this clears what it already wrote.
+	{version: 14, name: "unstamp synthetic namespaces claimed as repo owners", inPlace: unstampReservedRepoPrefixes},
+}
+
+// unstampReservedRepoPrefixes clears the repo ownership that was stamped onto
+// nodes living inside a synthetic namespace, and drops the anchor rows those
+// nodes earned.
+//
+// The two statements are ordered, not independent. A prefix earns its
+// repo_graph_gen row by OWNING A NODE (see bumpRepoGensTx), so deleting the row
+// while a node still claimed the prefix would let the next mutation recreate
+// it. Clearing ownership first is what makes the delete final.
+//
+// Dropping an anchor row is safe here in a way it is not in general —
+// bumpRepoGensTx deliberately keeps advancing a real repo's row after its last
+// file is evicted, because that eviction is precisely when the anchor must
+// move. These prefixes are not repositories and never were, so there is no
+// later mutation whose readiness verdict the row could have carried.
+//
+// Both statements seek: nodes_by_repo covers the UPDATE's predicate and
+// repo_graph_gen is keyed by prefix. Neither scans, which matters — this runs
+// inside Open, and a scan of a multi-gigabyte nodes table would stall every
+// daemon start behind it.
+//
+// Idempotent: a second run matches nothing. Deliberately narrow, too — it says
+// nothing about a node whose prefix is a real repository, including the
+// `<repo>::module::…` rows the v5 backfill wrote correctly.
+func unstampReservedRepoPrefixes(tx *sql.Tx) error {
+	reserved := graph.ReservedIDNamespaces()
+	args := make([]any, 0, len(reserved))
+	for _, ns := range reserved {
+		args = append(args, ns)
+	}
+	list := "(?" + strings.Repeat(", ?", len(reserved)-1) + ")"
+
+	if _, err := tx.Exec(
+		`UPDATE nodes SET repo_prefix = '' WHERE repo_prefix IN `+list, args...); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(
+		`DELETE FROM repo_graph_gen WHERE repo_prefix IN `+list, args...); err != nil {
+		return err
+	}
+	return nil
 }
 
 // createReadinessStateTables is the explicit v13 migration. schemaSQL owns the

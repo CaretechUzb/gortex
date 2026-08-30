@@ -17,7 +17,8 @@ func TestFreshStoreOpensAtCurrentSchemaVersionWithReadinessTables(t *testing.T) 
 	var v int
 	require.NoError(t, store.db.QueryRow(`PRAGMA user_version`).Scan(&v))
 	require.Equal(t, currentSchemaVersion, v)
-	require.Equal(t, 13, v, "the readiness migration must be the shipped head")
+	require.GreaterOrEqual(t, v, 13,
+		"the readiness tables arrived in v13; a store below it is not reconciled")
 
 	for _, table := range []string{"repo_graph_gen", "derive_state"} {
 		var n int
