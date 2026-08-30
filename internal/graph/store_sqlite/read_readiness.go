@@ -107,10 +107,7 @@ type ReadinessStates struct {
 // every repo, which reads as a fact about the repos rather than a failure to
 // look.
 func ReadReadinessStates(path string) (ReadinessStates, error) {
-	out := ReadinessStates{
-		Index: map[string]graph.RepoIndexState{},
-		Repos: map[string]RepoReadiness{},
-	}
+	out := emptyReadinessStates()
 
 	db, found, err := openReadOnlyStore(path)
 	if err != nil {
@@ -120,8 +117,51 @@ func ReadReadinessStates(path string) (ReadinessStates, error) {
 		return out, nil
 	}
 	defer db.Close() //nolint:errcheck // read-only handle
+
+	return readReadinessFromDB(db, path)
+}
+
+// ReadinessStates answers the same question as ReadReadinessStates, through the
+// handle this Store already holds.
+//
+// It exists because readiness gained a second consumer. `gortex repos` has no
+// open store and must not disturb the daemon's, so it opens its own read-only
+// handle; the MCP server is the daemon and already has one, and re-opening the
+// file per tool call would be both wasteful and a second reader of a database
+// it is itself writing.
+//
+// The two share readReadinessFromDB rather than each spelling the queries out.
+// Four queries duplicated across two readers is four chances for one of them to
+// be updated and the other not — and the symptom would be two surfaces
+// disagreeing about whether a repo is ready, which is precisely what having one
+// verdict is supposed to prevent.
+//
+// s.db is the read-dedicated pool; nothing here writes.
+func (s *Store) ReadinessStates() (ReadinessStates, error) {
+	if s == nil || s.db == nil {
+		return emptyReadinessStates(), nil
+	}
+	return readReadinessFromDB(s.db, s.Path())
+}
+
+// emptyReadinessStates is the zero result both readers start from: maps made,
+// StoreFound false. Returned as-is when there is nothing to read, so a caller
+// never has to nil-check the maps.
+func emptyReadinessStates() ReadinessStates {
+	return ReadinessStates{
+		Index: map[string]graph.RepoIndexState{},
+		Repos: map[string]RepoReadiness{},
+	}
+}
+
+// readReadinessFromDB is the shared body: one index-state scan and three
+// tolerant queries against an already-open handle. path is used only to build
+// error messages.
+func readReadinessFromDB(db *sql.DB, path string) (ReadinessStates, error) {
+	out := emptyReadinessStates()
 	out.StoreFound = true
 
+	var err error
 	if out.Index, err = scanIndexStates(db, path); err != nil {
 		return out, err
 	}

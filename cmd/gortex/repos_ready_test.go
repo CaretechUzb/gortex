@@ -21,189 +21,6 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// derivedRepo is the shape of a repo that has been indexed, derived and
-// enriched and has nothing outstanding — the baseline every case below varies
-// one field of.
-func derivedRepo() (repoStatus, readinessInputs) {
-	entry := repoStatus{Name: "r", Path: "/tmp/r", Indexed: true}
-	in := readinessInputs{
-		deriveTable: true,
-		enrichTable: true,
-		passVersion: indexer.DerivePassVersion,
-		repo: store_sqlite.RepoReadiness{
-			ContentGen:  7,
-			DeriveFound: true,
-			Derive: graph.DeriveState{
-				DerivedContentGen: 7,
-				PassVersion:       indexer.DerivePassVersion,
-			},
-			EnrichProviders:     2,
-			EnrichMinContentGen: 7,
-			EnrichRows:          2,
-		},
-	}
-	return entry, in
-}
-
-// The verdict ladder, one case per rung, in the order they outrank each other.
-// Keeping it pure is what makes this table possible: no git, no sqlite, no
-// daemon, and every state reachable from a struct literal.
-func TestReadyVerdictLadder(t *testing.T) {
-	t.Parallel()
-	for _, tc := range []struct {
-		name   string
-		mutate func(*repoStatus, *readinessInputs)
-		want   string
-	}{
-		{"a settled repo", func(*repoStatus, *readinessInputs) {}, readyLabelReady},
-
-		{"a deleted checkout outranks everything — it can never be ready again",
-			func(e *repoStatus, _ *readinessInputs) { e.Missing = true }, readyLabelMissing},
-
-		{"never indexed outranks a derive verdict; there is nothing to derive from",
-			func(e *repoStatus, _ *readinessInputs) { e.Indexed = false }, readyLabelNotIndexed},
-
-		{"a stale index outranks a stale derive: fix the first and the second follows",
-			func(e *repoStatus, _ *readinessInputs) { e.Stale = true }, readyLabelStale},
-
-		{"work in flight is named, not accused",
-			func(_ *repoStatus, in *readinessInputs) {
-				in.deriving = true
-				in.repo.DeriveFound = false
-			}, readyLabelDeriving},
-
-		{"work the daemon owes but has not opened is named too — the same rows " +
-			"that read never-derived without the marker",
-			func(_ *repoStatus, in *readinessInputs) {
-				in.derivePending = true
-				in.repo.DeriveFound = false
-			}, readyLabelDeriving},
-
-		{"enrichment in flight, same",
-			func(_ *repoStatus, in *readinessInputs) {
-				in.enriching = true
-				in.repo.EnrichMinContentGen = 0
-			}, readyLabelEnriching},
-
-		{"a store older than this binary is unknown, not a missing derive",
-			func(_ *repoStatus, in *readinessInputs) { in.deriveTable = false }, readyLabelUnknown},
-
-		{"THE bug: a repo the derived passes never ran for",
-			func(_ *repoStatus, in *readinessInputs) { in.repo.DeriveFound = false },
-			readyLabelNeverDerived},
-
-		{"a v13 legacy row asserts nothing and must not be laundered into ready",
-			func(_ *repoStatus, in *readinessInputs) { in.repo.Derive.Legacy = true }, readyLabelUnknown},
-
-		{"content moved since the derive",
-			func(_ *repoStatus, in *readinessInputs) { in.repo.ContentGen = 8 }, readyLabelPartial},
-
-		{"derived by an older synthesis version",
-			func(_ *repoStatus, in *readinessInputs) { in.repo.Derive.PassVersion = 0 }, readyLabelPartial},
-
-		{"derive-relevant config changed under it",
-			func(_ *repoStatus, in *readinessInputs) {
-				in.configHash = "beef"
-				in.repo.Derive.ConfigHash = "cafe"
-			}, readyLabelPartial},
-
-		{"one enrichment provider is behind",
-			func(_ *repoStatus, in *readinessInputs) { in.repo.EnrichMinContentGen = 6 },
-			readyLabelPartial},
-
-		{"no provider applies — n/a never blocks ready",
-			func(_ *repoStatus, in *readinessInputs) {
-				in.repo.EnrichProviders = 0
-				in.repo.EnrichMinContentGen = 0
-				in.repo.EnrichNoneDeclared = true
-				in.repo.EnrichRows = 1
-			}, readyLabelReady},
-
-		{"no config hash published means no comparison, not a failed one",
-			func(_ *repoStatus, in *readinessInputs) {
-				in.configHash = ""
-				in.repo.Derive.ConfigHash = "whatever"
-			}, readyLabelReady},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			entry, in := derivedRepo()
-			tc.mutate(&entry, &in)
-			label, reason := readyVerdict(entry, in)
-			require.Equal(t, tc.want, label)
-			if label == readyLabelReady {
-				require.Empty(t, reason, "a ready repo needs no remediation")
-			} else {
-				require.NotEmpty(t, reason, "every not-ready state must say what to do")
-			}
-		})
-	}
-}
-
-// The enrichment sub-verdict, and the distinction the __none__ sentinel exists
-// to draw. "Nothing applies" is an answer; "nothing recorded" is the absence of
-// one, and only the first can be trusted to let a repo through.
-// Running and owed share a label — a reader needs "the daemon is on it", and a
-// second label would ripple through readyCell, the summary buckets and the
-// JSON contract for no gain. They must not share a reason: the two differ by
-// minutes of cross-repo resolve, and "running now" against a pass that has not
-// opened is the kind of small lie that makes someone stop believing the column.
-func TestAnOwedDeriveIsNamedAsQueuedNotAsRunning(t *testing.T) {
-	t.Parallel()
-	entry, in := derivedRepo()
-	in.repo.DeriveFound = false
-
-	in.deriving, in.derivePending = true, false
-	runningLabel, runningReason := readyVerdict(entry, in)
-
-	in.deriving, in.derivePending = false, true
-	owedLabel, owedReason := readyVerdict(entry, in)
-
-	require.Equal(t, readyLabelDeriving, runningLabel)
-	require.Equal(t, readyLabelDeriving, owedLabel)
-	require.NotEqual(t, runningReason, owedReason)
-	require.Contains(t, owedReason, "queued")
-
-	// The control: the same store rows with no marker at all are the verdict
-	// this fix exists to stop being reported.
-	in.derivePending = false
-	bareLabel, _ := readyVerdict(entry, in)
-	require.Equal(t, readyLabelNeverDerived, bareLabel)
-}
-
-func TestEnrichVerdict(t *testing.T) {
-	t.Parallel()
-	base := store_sqlite.RepoReadiness{ContentGen: 5}
-
-	for _, tc := range []struct {
-		name  string
-		table bool
-		repo  store_sqlite.RepoReadiness
-		want  string
-	}{
-		{"table absent", false, base, enrichLabelUnknown},
-		{"no rows at all — nobody has looked", true, base, enrichLabelUnknown},
-		{"only the __none__ sentinel — looked, nothing applies", true,
-			store_sqlite.RepoReadiness{ContentGen: 5, EnrichRows: 1, EnrichNoneDeclared: true},
-			enrichLabelNA},
-		{"every provider current", true,
-			store_sqlite.RepoReadiness{ContentGen: 5, EnrichRows: 2, EnrichProviders: 2, EnrichMinContentGen: 5},
-			enrichLabelCurrent},
-		{"the MINIMUM decides: one fresh provider cannot speak for a sibling that never ran", true,
-			store_sqlite.RepoReadiness{ContentGen: 5, EnrichRows: 2, EnrichProviders: 2, EnrichMinContentGen: 0},
-			enrichLabelStale},
-		{"a provider ahead of the counter is still current", true,
-			store_sqlite.RepoReadiness{ContentGen: 5, EnrichRows: 1, EnrichProviders: 1, EnrichMinContentGen: 9},
-			enrichLabelCurrent},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			require.Equal(t, tc.want,
-				enrichVerdict(readinessInputs{enrichTable: tc.table, repo: tc.repo}))
-		})
-	}
-}
-
 // Scripts grep these values out of a pipe, so the non-TTY cell must be the bare
 // label with no escape bytes in it.
 func TestReadyCellIsBareOffATTY(t *testing.T) {
@@ -216,21 +33,6 @@ func TestReadyCellIsBareOffATTY(t *testing.T) {
 		cell := readyCell(repoStatus{Ready: label}, false)
 		require.Equal(t, label, cell)
 		require.NotContains(t, cell, "\x1b", "no ANSI on a non-TTY")
-	}
-}
-
-// The remediation hint is deliberately narrow: only the states where an answer
-// is incomplete right now and nothing is already fixing it. Listing the
-// self-resolving ones too would bury the actionable ones.
-func TestOnlyIncompleteAnswersEarnARemediationHint(t *testing.T) {
-	t.Parallel()
-	require.True(t, readyBlocksQueries(readyLabelNeverDerived))
-	require.True(t, readyBlocksQueries(readyLabelPartial))
-	for _, label := range []string{
-		readyLabelReady, readyLabelStale, readyLabelUnknown,
-		readyLabelDeriving, readyLabelEnriching, readyLabelMissing, readyLabelNotIndexed,
-	} {
-		require.False(t, readyBlocksQueries(label), label)
 	}
 }
 
@@ -405,4 +207,30 @@ func dropTable(t *testing.T, path, table string) {
 	defer db.Close() //nolint:errcheck // test cleanup
 	_, err = db.Exec("DROP TABLE IF EXISTS " + table)
 	require.NoError(t, err)
+}
+
+// The projection is the only logic this file still owns: readyVerdict lowers a
+// repoStatus onto readiness.RepoState. A field dropped there is invisible —
+// the verdict stays plausible and simply stops reacting to that column — so
+// each of the four is pinned by the label it alone can produce, and Path by
+// the remediation command it has to appear in.
+func TestReadyVerdictProjectsEveryCheckoutFactItIsGiven(t *testing.T) {
+	t.Parallel()
+	base := readinessInputs{DeriveTable: true, EnrichTable: true}
+
+	label, reason := readyVerdict(repoStatus{Path: "/tmp/gone", Missing: true}, base)
+	require.Equal(t, readyLabelMissing, label)
+	require.Contains(t, reason, "/tmp/gone", "Path must reach the remediation command")
+
+	label, reason = readyVerdict(repoStatus{Path: "/tmp/fresh"}, base)
+	require.Equal(t, readyLabelNotIndexed, label, "Indexed=false must survive the projection")
+	require.Contains(t, reason, "/tmp/fresh")
+
+	label, _ = readyVerdict(repoStatus{Path: "/tmp/r", Indexed: true, Stale: true}, base)
+	require.Equal(t, readyLabelStale, label, "Stale must survive the projection")
+
+	// The control: none of the three set, so the ladder falls past them.
+	label, _ = readyVerdict(repoStatus{Path: "/tmp/r", Indexed: true}, base)
+	require.NotContains(t,
+		[]string{readyLabelMissing, readyLabelNotIndexed, readyLabelStale}, label)
 }

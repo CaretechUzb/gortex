@@ -24,6 +24,7 @@ import (
 	"github.com/zzet/gortex/internal/contracts"
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/llm"
 	"github.com/zzet/gortex/internal/llm/registry"
@@ -759,6 +760,19 @@ type sessionState struct {
 	momentumStreak      int
 	momentumEscalated   bool
 	momentumExploreUsed bool
+
+	// readinessCache is the last readiness read taken for this session and
+	// readinessAt is when it was taken; readinessNoted latches the repos this
+	// session has already been warned about (readiness_note.go).
+	//
+	// Cached with a short TTL rather than latched once per session: a repo
+	// goes partial the moment a file changes under it, so a session that
+	// resolved "ready" at its first call and never looked again would go
+	// silent exactly when the warning became true. The TTL bounds the cost
+	// (four small queries) without making the answer stale enough to matter.
+	readinessCache store_sqlite.ReadinessStates
+	readinessAt    time.Time
+	readinessNoted map[string]bool
 
 	// cursor is the per-session stateful navigation cursor used by the
 	// nav tool — a current symbol plus a back-history. Allocated lazily

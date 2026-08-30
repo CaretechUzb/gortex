@@ -225,16 +225,16 @@ func applyReadiness(
 	}
 
 	in := readinessInputs{
-		deriveTable: states.DeriveTable,
-		enrichTable: states.EnrichTable,
-		repo:        repo,
-		passVersion: indexer.DerivePassVersion,
+		DeriveTable: states.DeriveTable,
+		EnrichTable: states.EnrichTable,
+		Repo:        repo,
+		PassVersion: indexer.DerivePassVersion,
 	}
 	if runtimeLive {
-		in.deriving = runtime.IsDeriving(prefix)
-		in.derivePending = runtime.IsDerivePending(prefix)
-		in.enriching = runtime.IsEnriching(prefix)
-		in.configHash = runtime.DeriveConfigHash
+		in.Deriving = runtime.IsDeriving(prefix)
+		in.DerivePending = runtime.IsDerivePending(prefix)
+		in.Enriching = runtime.IsEnriching(prefix)
+		in.ConfigHash = runtime.DeriveConfigHash
 	}
 
 	entry.Derived = repo.DeriveFound

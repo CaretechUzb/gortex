@@ -73,28 +73,34 @@ this barely matters.
 
 ## Readiness
 
-### Warn on queries against a not-ready repo
+### Refuse, not just warn, on queries against a not-ready repo
 
-**What:** MCP and CLI query paths consult the readiness verdict and warn, or
-refuse under a flag.
+**What:** An opt-in strict mode that makes a query against a repo whose derived
+passes have not finished fail rather than answer with a caveat.
 
-**Why:** "who uses this" returns a silent subset against an underived repo
-today. The `READY` column on `gortex repos` makes that detectable for the first
-time, but the column is advisory — a user has to know to run `repos` first, and
-an agent asking the graph a question has no reason to. The real fix is for the
-answer itself to carry the caveat.
+**Why:** The warning shipped — `internal/mcp/readiness_note.go` attaches a
+readiness note to the answer itself, so an agent no longer has to know to run
+`gortex repos` first. Warning was deliberately chosen over refusing because it
+is strictly additive and cannot break a working session. Refusing is a real
+behaviour change for everyone currently querying a partial repo, so it wants to
+be opt-in and decided on its own.
 
-**Context:** The verdict is `readyVerdict` in `cmd/gortex/repos_ready.go`. It is
-pure, and its inputs come from `store_sqlite.ReadReadinessStates` plus the
-daemon runtime record — one read-only open, no control socket — so the same
-inputs are available to any surface. Open design questions: warn always, or
-refuse under a flag; per-tool or global; and how an agent surfaces the warning
-through the response envelope without it being ignored like every other
-advisory field.
+**Context:** The verdict now lives in `internal/readiness` (moved out of
+`cmd/gortex/repos_ready.go`, which keeps thin aliases) so both surfaces share
+one ladder. `readiness.BlocksQueries` is the trigger, deliberately narrow —
+`never derived` and `partial` only. The MCP note reads readiness through
+`(*store_sqlite.Store).ReadinessStates`, cached per session behind a short TTL.
 
-**Effort:** M
-**Priority:** P2
-**Depends on:** the `READY` column, which supplies the verdict.
+Two known coarsenesses a strict mode would have to tighten first: the note
+leaves `Missing` and `Stale` unset (both need a filesystem or git probe the
+request path does not pay for), and it uses the workspace-wide
+`WorkspaceRederivePending()` as a blanket suppressor rather than the CLI's
+per-repo deriving / pending markers, which live on the daemon runtime record.
+Both err toward silence, which is right for a warning and wrong for a refusal.
+
+**Effort:** S
+**Priority:** P3
+**Depends on:** the readiness note, which shipped.
 
 ### Surface readiness in `gortex daemon status`
 
