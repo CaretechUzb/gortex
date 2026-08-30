@@ -1,24 +1,21 @@
 package analyzer
 
-// PURPOSE — pure computation core for the synthesizers analyzer: groups
-// every synthesized edge by the framework-dispatch pass that produced it,
-// returning a structured result the MCP layer and CLI can both consume
-// without duplicating logic.
+// PURPOSE — computation core for the synthesizers analyzer: groups every
+// synthesized edge by the framework-dispatch pass that produced it, returning a
+// structured result the MCP layer and CLI can both consume without duplicating
+// logic.
 // RATIONALE — extracted from the MCP handler so the aggregation is
 // independently testable and reusable across surfaces (MCP, CLI, etc.).
-// KEYWORDS — synthesizers, framework-dispatch, pure, calculation
+// KEYWORDS — synthesizers, framework-dispatch, census, calculation
 
 import (
+	"fmt"
 	"sort"
 
 	"github.com/zzet/gortex/internal/graph"
 )
 
 const (
-	// metaSynthesizedByKey is the Edge.Meta key stamped by the synthesizer engine.
-	metaSynthesizedByKey = "synthesized_by"
-	// metaProvenanceKey is the Edge.Meta key carrying provenance info.
-	metaProvenanceKey = "provenance"
 	// maxSamples is the maximum number of edge samples kept per synthesizer group.
 	maxSamples = 5
 )
@@ -73,48 +70,59 @@ func WithSynthesizerRepoScope(repos map[string]bool) SynthesizersOption {
 
 // AnalyzeSynthesizers groups every synthesized edge in the graph by the
 // synthesizer that produced it and returns a sorted, structured result.
-// It is a pure Calculation: no side effects, no I/O.
-func AnalyzeSynthesizers(g graph.Store, opts ...SynthesizersOption) SynthesizersResult {
+//
+// It streams the census rather than materialising the edge set, and it returns
+// an error when the underlying scan was cut short. Both properties exist for
+// the same reason: on a multi-million-edge store the old AllEdges() walk could
+// not finish inside the tool deadline, and when a store swap aborted it
+// mid-read the store handed back nil — which this function then reported as "no
+// synthesizer fired", indistinguishable from the truth, and the precise
+// question the tool exists to answer.
+func AnalyzeSynthesizers(g graph.Store, opts ...SynthesizersOption) (SynthesizersResult, error) {
 	cfg := &synthConfig{}
 	for _, o := range opts {
 		o(cfg)
 	}
 
 	rows := map[string]*SynthesizerRow{}
-	for _, e := range g.AllEdges() {
-		if e == nil || e.Meta == nil {
-			continue
-		}
-		by, _ := e.Meta[metaSynthesizedByKey].(string)
-		if by == "" {
-			continue
-		}
-		if cfg.nameFilter != "" && by != cfg.nameFilter {
+	seq, scanErr := graph.SynthesizedEdgesSeq(g)
+	for e := range seq {
+		if cfg.nameFilter != "" && e.SynthesizedBy != cfg.nameFilter {
 			continue
 		}
 		// Workspace clamp: drop edges whose source node is outside the
 		// caller's workspace repos so the count, by-kind tally, and
 		// samples never span sibling workspaces.
+		//
+		// Kept in Go, and kept on the parsed id, so this change alters
+		// nothing about WHICH edges land in scope. Pushing it into SQL via
+		// edges.from_repo would look equivalent and is not: that generated
+		// column understands only the <prefix>/ id grammar and yields ""
+		// for a synthetic one, silently dropping every edge sourced at a
+		// stdlib or builtin node.
 		if len(cfg.repoScope) > 0 && !cfg.repoScope[graph.RepoPrefixOfID(e.From)] {
 			continue
 		}
-		row, ok := rows[by]
+		row, ok := rows[e.SynthesizedBy]
 		if !ok {
-			prov, _ := e.Meta[metaProvenanceKey].(string)
-			row = &SynthesizerRow{Name: by, Provenance: prov, ByKind: map[string]int{}}
-			rows[by] = row
+			row = &SynthesizerRow{Name: e.SynthesizedBy, Provenance: e.Provenance, ByKind: map[string]int{}}
+			rows[e.SynthesizedBy] = row
 		}
 		row.Edges++
 		row.ByKind[string(e.Kind)]++
 		if len(row.Samples) < maxSamples {
-			via, _ := e.Meta["via"].(string)
 			row.Samples = append(row.Samples, SynthesizerSample{
 				From: e.From,
 				To:   e.To,
 				Kind: string(e.Kind),
-				Via:  via,
+				Via:  e.Via,
 			})
 		}
+	}
+	// Checked before the tally is assembled, never after it is returned: a
+	// truncated census must not reach a caller in a shape that looks complete.
+	if err := scanErr(); err != nil {
+		return SynthesizersResult{}, fmt.Errorf("synthesizer census aborted mid-scan: %w", err)
 	}
 
 	out := make([]*SynthesizerRow, 0, len(rows))
@@ -130,5 +138,5 @@ func AnalyzeSynthesizers(g graph.Store, opts ...SynthesizersOption) Synthesizers
 		return out[i].Name < out[j].Name
 	})
 
-	return SynthesizersResult{Synthesizers: out, TotalEdges: total}
+	return SynthesizersResult{Synthesizers: out, TotalEdges: total}, nil
 }

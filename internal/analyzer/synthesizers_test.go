@@ -35,7 +35,7 @@ func TestAnalyzeSynthesizers_Shape(t *testing.T) {
 	addSynthEdge(g, "a.go::A", "c.go::C", "event-channel", "event.channel")
 	addSynthEdge(g, "cli.go::run", "svc.go::Handle", "grpc-stub", "grpc.stub")
 
-	res := analyzer.AnalyzeSynthesizers(g)
+	res := mustAnalyzeSynthesizers(t, g)
 	if res.TotalEdges != 3 {
 		t.Fatalf("expected TotalEdges=3, got %d", res.TotalEdges)
 	}
@@ -60,7 +60,7 @@ func TestAnalyzeSynthesizers_NameFilter(t *testing.T) {
 	addSynthEdge(g, "a.go::A", "b.go::B", "event-channel", "event.channel")
 	addSynthEdge(g, "cli.go::run", "svc.go::Handle", "grpc-stub", "grpc.stub")
 
-	res := analyzer.AnalyzeSynthesizers(g, analyzer.WithSynthesizerNameFilter("grpc-stub"))
+	res := mustAnalyzeSynthesizers(t, g, analyzer.WithSynthesizerNameFilter("grpc-stub"))
 	if len(res.Synthesizers) != 1 {
 		t.Fatalf("expected 1 group with name filter, got %d", len(res.Synthesizers))
 	}
@@ -74,7 +74,7 @@ func TestAnalyzeSynthesizers_NoSynthEdges(t *testing.T) {
 	// plain non-synthesized edge
 	g.AddEdge(&graph.Edge{From: "x.go::X", To: "y.go::Y", Kind: graph.EdgeCalls})
 
-	res := analyzer.AnalyzeSynthesizers(g)
+	res := mustAnalyzeSynthesizers(t, g)
 	if res.TotalEdges != 0 {
 		t.Fatalf("expected 0 total_edges, got %d", res.TotalEdges)
 	}

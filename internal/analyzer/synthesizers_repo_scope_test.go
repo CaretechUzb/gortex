@@ -22,16 +22,16 @@ func TestAnalyzeSynthesizers_RepoScope(t *testing.T) {
 	addSynthEdge(g, "repo-b/cli.go::run", "repo-b/svc.go::Handle", "grpc-stub", "grpc.stub")
 
 	// No clamp (and an empty set) is a no-op: every edge counts.
-	if res := analyzer.AnalyzeSynthesizers(g); res.TotalEdges != 4 {
+	if res := mustAnalyzeSynthesizers(t, g); res.TotalEdges != 4 {
 		t.Fatalf("unclamped: expected TotalEdges=4, got %d", res.TotalEdges)
 	}
-	if res := analyzer.AnalyzeSynthesizers(g, analyzer.WithSynthesizerRepoScope(nil)); res.TotalEdges != 4 {
+	if res := mustAnalyzeSynthesizers(t, g, analyzer.WithSynthesizerRepoScope(nil)); res.TotalEdges != 4 {
 		t.Fatalf("nil clamp: expected TotalEdges=4, got %d", res.TotalEdges)
 	}
 
 	// Clamp to repo-a: only the two repo-a edges survive, and the
 	// repo-b-only grpc-stub group disappears entirely.
-	res := analyzer.AnalyzeSynthesizers(g, analyzer.WithSynthesizerRepoScope(map[string]bool{"repo-a": true}))
+	res := mustAnalyzeSynthesizers(t, g, analyzer.WithSynthesizerRepoScope(map[string]bool{"repo-a": true}))
 	if res.TotalEdges != 2 {
 		t.Fatalf("clamped: expected TotalEdges=2, got %d", res.TotalEdges)
 	}
