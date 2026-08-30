@@ -1689,7 +1689,7 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 	// a scoped re-projection under ResolveMutex.
 	if scanPrefixes == nil {
 		mi.discardRetargetedTestCallFiles(nil)
-    }
+	}
 	passStart("entrypoint_hierarchy")
 	ctrlStart := time.Now()
 	// Seeds from already-stamped entry points, so cost is O(seed
