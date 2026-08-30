@@ -32,7 +32,7 @@ import (
 // index changes in a way an old on-disk DB would not already have, and append a
 // matching schemaMigrations entry describing how to bring an older store
 // forward (in place, or by rebuild).
-const currentSchemaVersion = 13
+const currentSchemaVersion = 14
 
 // schemaMigration is one forward step. Exactly one strategy applies:
 //   - rebuild=true: the change introduces structure/data that can only come
@@ -80,7 +80,8 @@ var schemaMigrations = []schemaMigration{
 	{version: 10, name: "rebuild vector corpus ownership and parents", inPlace: rebuildVectorCorpusSchema},
 	{version: 11, name: "add symbol FTS normalization state", inPlace: createSymbolFTSNormalizationStateTable},
 	{version: 12, name: "normalize dir column separators", inPlace: normalizeDirColumnSeparators},
-	{version: 13, name: "purge unresolved derived tests edges", inPlace: purgeUnresolvedTestsEdges},
+	{version: 13, name: "purge legacy slash-spelled coverage artifacts", inPlace: purgeLegacyCoverageSpellings},
+	{version: 14, name: "purge unresolved derived tests edges", inPlace: purgeUnresolvedTestsEdges},
 }
 
 // purgeUnresolvedTestsEdges removes derived EdgeTests rows whose target is

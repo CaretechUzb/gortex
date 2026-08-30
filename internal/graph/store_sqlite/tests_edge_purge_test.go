@@ -37,7 +37,7 @@ func TestOpenPurgesLegacyUnresolvedTestsEdges(t *testing.T) {
 
 	// Simulate a store written before the purge shipped.
 	withRawDB(t, path, func(db *sql.DB) {
-		_, err := db.Exec(`PRAGMA user_version = 12`)
+		_, err := db.Exec(`PRAGMA user_version = 13`)
 		require.NoError(t, err, "reset to the pre-purge version")
 	})
 

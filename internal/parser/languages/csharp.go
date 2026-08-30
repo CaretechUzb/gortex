@@ -304,6 +304,7 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 	fileID := fileNode.ID
 	result.Nodes = append(result.Nodes, fileNode)
 	stampCSharpUsings(root, src, fileNode)
+	stampCSharpEFFluent(root, src, fileNode)
 
 	seen := make(map[string]bool)
 	annotationSeen := make(map[string]bool)
@@ -841,6 +842,13 @@ func (e *CSharpExtractor) emitContainer(m parser.QueryResult, kind string, nodeK
 	if doc := extractCSharpDoc(src, def.StartLine); doc != "" {
 		meta["doc"] = doc
 	}
+	// EF Core fluent mapping: a class implementing
+	// IEntityTypeConfiguration<T> carries facts the resolver joins to
+	// the entity class later — the entity lives in another file.
+	if kind == "class" || kind == "record" {
+		stampCSharpEFAttribute(def.Node, src, meta)
+		stampCSharpEFConfig(def.Node, src, meta)
+	}
 	result.Nodes = append(result.Nodes, &graph.Node{
 		ID: id, Kind: nodeKind, Name: name,
 		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
@@ -851,6 +859,11 @@ func (e *CSharpExtractor) emitContainer(m parser.QueryResult, kind string, nodeK
 		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
 	})
 	emitCSharpAnnotationEdges(csharpCollectAttributes(def.Node, src), id, filePath, result, annotationSeen)
+	// EF Core model attribution: [Table] → EdgeModelsTable. Classes and
+	// records only — EF entities are reference types.
+	if kind == "class" || kind == "record" {
+		emitCSharpORMEdges(def.Node, src, id, filePath, result)
+	}
 	emitCSharpGenericParamNodes(id, def.Node, src, filePath, def.StartLine+1, result)
 	// Classes, structs, records, and interfaces carry a base list;
 	// emitCSharpBaseList derives each entry's edge kind from the
