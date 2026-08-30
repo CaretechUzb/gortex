@@ -445,6 +445,10 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 	// cannot say which of two members sharing a physical line owns a
 	// call site; the byte interval can (round-5 finding 4).
 	funcBytes := make(map[string][2]int)
+	// Type IDs whose FIRST declaration spelled `partial` — the gate for
+	// preserving a later same-file fragment's base list (round-5
+	// finding 5).
+	partialSeen := make(map[string]bool)
 
 	// Pre-scan the file's own interface declarations. A base type that
 	// names one of these is definitively an interface, even when its name
@@ -476,19 +480,19 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 			e.emitNamespace(m, filePath, fileID, result, seen)
 
 		case m.Captures["class.def"] != nil:
-			e.emitContainer(m, "class", graph.KindType, filePath, fileID, src, result, seen, annotationSeen, localInterfaces, fileAliases, baseNameCounts)
+			e.emitContainer(m, "class", graph.KindType, filePath, fileID, src, result, seen, annotationSeen, localInterfaces, fileAliases, baseNameCounts, partialSeen)
 
 		case m.Captures["iface.def"] != nil:
-			e.emitContainer(m, "iface", graph.KindInterface, filePath, fileID, src, result, seen, annotationSeen, localInterfaces, fileAliases, baseNameCounts)
+			e.emitContainer(m, "iface", graph.KindInterface, filePath, fileID, src, result, seen, annotationSeen, localInterfaces, fileAliases, baseNameCounts, partialSeen)
 
 		case m.Captures["struct.def"] != nil:
-			e.emitContainer(m, "struct", graph.KindType, filePath, fileID, src, result, seen, annotationSeen, localInterfaces, fileAliases, baseNameCounts)
+			e.emitContainer(m, "struct", graph.KindType, filePath, fileID, src, result, seen, annotationSeen, localInterfaces, fileAliases, baseNameCounts, partialSeen)
 
 		case m.Captures["record.def"] != nil:
-			e.emitContainer(m, "record", graph.KindType, filePath, fileID, src, result, seen, annotationSeen, localInterfaces, fileAliases, baseNameCounts)
+			e.emitContainer(m, "record", graph.KindType, filePath, fileID, src, result, seen, annotationSeen, localInterfaces, fileAliases, baseNameCounts, partialSeen)
 
 		case m.Captures["enum.def"] != nil:
-			e.emitContainer(m, "enum", graph.KindType, filePath, fileID, src, result, seen, annotationSeen, localInterfaces, fileAliases, baseNameCounts)
+			e.emitContainer(m, "enum", graph.KindType, filePath, fileID, src, result, seen, annotationSeen, localInterfaces, fileAliases, baseNameCounts, partialSeen)
 
 		case m.Captures["anon.def"] != nil:
 			e.emitAnonymousType(m, filePath, fileID, result, seen)
@@ -1090,7 +1094,7 @@ func csharpOrTypeMeta(result *parser.ExtractionResult, id, key string) {
 // emitContainer collapses the per-kind class/interface/struct/enum
 // node emission. The capture-name prefix selects which capture set to
 // read from (the legacy code repeated this body four times).
-func (e *CSharpExtractor) emitContainer(m parser.QueryResult, kind string, nodeKind graph.NodeKind, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen, annotationSeen map[string]bool, localInterfaces, fileAliases map[string]bool, baseNameCounts map[string]map[string]int) {
+func (e *CSharpExtractor) emitContainer(m parser.QueryResult, kind string, nodeKind graph.NodeKind, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen, annotationSeen map[string]bool, localInterfaces, fileAliases map[string]bool, baseNameCounts map[string]map[string]int, partialSeen map[string]bool) {
 	name := m.Captures[kind+".name"].Text
 	def := m.Captures[kind+".def"]
 	id := filePath + "::" + name
@@ -1115,9 +1119,28 @@ func (e *CSharpExtractor) emitContainer(m parser.QueryResult, kind string, nodeK
 		// the dropped declaration's lines inside the survivor's span.
 		// The positive signal closes every collision shape at once.
 		csharpOrTypeMeta(result, id, "duplicate_decl")
+		// A genuine same-file PARTIAL part carries real base facts: the
+		// second declaration's interface paths must reach the graph even
+		// though its node is dropped, or the surviving fragment's stamp
+		// reads as the type's unique closure and the family fan-out
+		// filters the whole type (round-5 finding 5). Gated on BOTH
+		// declarations spelling `partial` - arity twins, nested
+		// same-named types and other short-ID collisions never merge
+		// bases. The cross-declaration baseNameCounts prescan already
+		// spans every fragment, so a type closing one erased interface
+		// twice across parts still stamps nothing.
+		switch kind {
+		case "class", "struct", "record", "iface":
+			if partialSeen[id] && csharpHasModifier(def.Node, src, "partial") {
+				emitCSharpBaseList(id, def.Node, src, filePath, localInterfaces, fileAliases, baseNameCounts, result)
+			}
+		}
 		return
 	}
 	seen[id] = true
+	if csharpHasModifier(def.Node, src, "partial") {
+		partialSeen[id] = true
+	}
 	meta := map[string]any{"visibility": csharpVisibility(def.Node, src, VisibilityInternal)}
 	// A struct is a value type; record struct too. Surfacing it lets a
 	// consumer reason about copy-vs-reference semantics.
