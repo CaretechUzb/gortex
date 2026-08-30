@@ -46,10 +46,10 @@ func TestResolveCSharpInterfaceDispatch_GlobalAliasBaseKeepsTheFamily(t *testing
 	targets := dispatchTargets(g, callerID)
 	hasPlain, hasDual := false, false
 	for _, to := range targets {
-		switch {
-		case to == "global_base_types.cs::PlainCrateBox.Put":
+		switch to {
+		case "global_base_types.cs::PlainCrateBox.Put":
 			hasPlain = true
-		case to == "global_base_types.cs::Dual.Put" || to == "global_base_types.cs::Dual.Put_L9":
+		case "global_base_types.cs::Dual.Put", "global_base_types.cs::Dual.Put_L9":
 			hasDual = true
 		}
 	}

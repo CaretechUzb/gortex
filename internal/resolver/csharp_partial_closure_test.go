@@ -40,10 +40,10 @@ func TestResolveCSharpInterfaceDispatch_PartialSecondPathKeepsTheFamily(t *testi
 	targets := dispatchTargets(g, callerID)
 	hasPlain, hasDual := false, false
 	for _, to := range targets {
-		switch {
-		case to == "partial.cs::PlainCrateBox.Put":
+		switch to {
+		case "partial.cs::PlainCrateBox.Put":
 			hasPlain = true
-		case to == "partial.cs::Dual.Put" || to == "partial.cs::Dual.Put_L8":
+		case "partial.cs::Dual.Put", "partial.cs::Dual.Put_L8":
 			hasDual = true
 		}
 	}
