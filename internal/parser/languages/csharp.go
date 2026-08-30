@@ -520,7 +520,7 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 			e.emitField(m, filePath, fileID, src, result, seen, fileAliases)
 
 		case m.Captures["prop.def"] != nil:
-			e.emitProperty(m, filePath, fileID, src, result, seen, fileAliases)
+			e.emitProperty(m, filePath, fileID, src, result, seen, fileAliases, funcBytes)
 
 		case m.Captures["using.def"] != nil:
 			e.emitUsing(m, filePath, fileID, result)
@@ -630,7 +630,7 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 	// type environments. Owner attribution runs once per local, call and
 	// type use — the sorted lookup keeps that from multiplying into an
 	// O(locals×functions) linear-scan product on member-heavy files.
-	funcRanges := newCSharpFuncLookup(buildFuncRanges(result), funcBytes)
+	funcRanges := newCSharpFuncLookup(csharpOwnerRanges(result, funcBytes), funcBytes)
 
 	// Build type environments in legacy precedence, scoped per enclosing
 	// method — a same-named local of a different type in a sibling method
@@ -1901,7 +1901,7 @@ func (e *CSharpExtractor) emitField(m parser.QueryResult, filePath, fileID strin
 	emitCSharpTypeUseEdges(id, fieldTypeRaw, filePath, def.StartLine+1, result)
 }
 
-func (e *CSharpExtractor) emitProperty(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool, fileAliases map[string]bool) {
+func (e *CSharpExtractor) emitProperty(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool, fileAliases map[string]bool, funcBytes map[string][2]int) {
 	def := m.Captures["prop.def"]
 	owner := csharpDirectMemberOwner(def.Node, src, "class_declaration", "struct_declaration", "interface_declaration", "record_declaration")
 	if owner.kind == "" {
@@ -1913,6 +1913,13 @@ func (e *CSharpExtractor) emitProperty(m parser.QueryResult, filePath, fileID st
 		return
 	}
 	seen[id] = true
+	// Accessor bodies, an expression body, and an initializer all live
+	// inside the declaration span — recording it makes the property a
+	// call owner (round-23 catch AC1: without an owner the funcRanges
+	// gate dropped every accessor-body call outright).
+	if def.Node != nil {
+		funcBytes[id] = [2]int{int(def.Node.StartByte()), int(def.Node.EndByte())}
+	}
 	// Interface properties are implicitly public; explicit modifiers still win.
 	isIface := owner.kind == "interface_declaration"
 	defaultVis := VisibilityPrivate
@@ -2093,6 +2100,28 @@ type csharpFuncLookup struct {
 	bytes map[string][2]int
 }
 
+// csharpOwnerRanges widens the method/constructor owner set with every
+// member that recorded byte extents but is not a KindFunction/KindMethod
+// node — properties today, any extent-carrying member kind tomorrow. A
+// member that can hold executable code must be able to OWN the calls in
+// it: the funcRanges gate drops a call whose enclosing member it cannot
+// name, which is how every accessor-body call vanished (round-23 catch
+// AC1 — 3 of the probe cell's 4 sites, the expression-bodied method
+// being the lone survivor).
+func csharpOwnerRanges(result *parser.ExtractionResult, funcBytes map[string][2]int) []funcRange {
+	ranges := buildFuncRanges(result)
+	for _, n := range result.Nodes {
+		if n.Kind != graph.KindField {
+			continue
+		}
+		if _, ok := funcBytes[n.ID]; !ok {
+			continue
+		}
+		ranges = append(ranges, funcRange{id: n.ID, startLine: n.StartLine, endLine: n.EndLine})
+	}
+	return ranges
+}
+
 func newCSharpFuncLookup(ranges []funcRange, bytes map[string][2]int) *csharpFuncLookup {
 	sorted := append([]funcRange(nil), ranges...)
 	ord := make([]int, len(sorted))
@@ -2122,10 +2151,10 @@ func newCSharpFuncLookup(ranges []funcRange, bytes map[string][2]int) *csharpFun
 // carried A's call and every consumer of the attribution read the wrong
 // member's evidence (round-5 finding 4). Falls back to the line answer
 // whenever no recorded byte extent contains the offset: extents are
-// recorded only for methods and constructors, so a member kind without
-// them (property, indexer, field initializer) sharing a line with one
-// that has them would otherwise lose its call outright rather than
-// degrade to line attribution (round-6 finding B3).
+// recorded for methods, constructors, and properties, so a member kind
+// still without them (indexer, event accessor, field initializer)
+// sharing a line with one that has them would otherwise lose its call
+// outright rather than degrade to line attribution (round-6 finding B3).
 func (l *csharpFuncLookup) enclosingAt(line, offset int) string {
 	if offset < 0 || len(l.bytes) == 0 {
 		return l.enclosing(line)
