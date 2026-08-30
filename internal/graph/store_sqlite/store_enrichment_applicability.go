@@ -176,6 +176,39 @@ func (s *Store) EnrichmentContentGens(repoPrefix string) (map[string]int64, erro
 	return out, rows.Err()
 }
 
+// EnrichmentNeverRan reports whether this repo is owed a pass nothing has ever
+// run. Two arms, both point lookups on the primary key:
+//
+//	no rows at all         nobody has even asked which providers apply
+//	a provider at gen = 0  declared applicable, never completed a pass
+//
+// gen is the right column and content_gen is not. A dirty tree never records a
+// sha, so indexed_sha stays empty on a repo whose providers have completed
+// many times, and content_gen legitimately reads 0 on a repo whose content
+// counter has not moved. gen is written only by CompleteEnrichmentProvider,
+// from the repo's live counter, so a non-zero value means a pass really
+// finished — and it can never go back.
+//
+// The sentinels are excluded because neither is a provider: __none__ is the
+// pass having looked and found nothing applicable, and __repo__ is the
+// whole-repo rollup, which CompleteEnrichmentProvider is never called for.
+func (s *Store) EnrichmentNeverRan(repoPrefix string) (bool, error) {
+	if repoPrefix == "" {
+		return false, nil
+	}
+	var owed bool
+	err := s.db.QueryRow(`
+SELECT NOT EXISTS(SELECT 1 FROM enrichment_state WHERE repo_prefix = ?)
+    OR EXISTS(SELECT 1 FROM enrichment_state
+               WHERE repo_prefix = ? AND provider NOT IN (?, ?) AND gen = 0)`,
+		repoPrefix, repoPrefix,
+		graph.EnrichProviderRepoMarker, graph.EnrichProviderNone).Scan(&owed)
+	if err != nil {
+		return false, err
+	}
+	return owed, nil
+}
+
 // DeclareNoEnrichmentProvidersIfUnrecorded writes the EnrichProviderNone
 // sentinel for a repo that has NO enrichment rows at all, and does nothing for
 // one that has any.

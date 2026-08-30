@@ -760,6 +760,40 @@ func DeclareNoApplicableProviders(g graph.Store, repoPrefix string) {
 	_ = store.DeclareNoEnrichmentProvidersIfUnrecorded(repoPrefix)
 }
 
+// EnrichmentOwed reports whether the store shows this repo owed an enrichment
+// pass that nothing has ever run, and whether the backend could answer at all.
+//
+// It exists for the warm-restart gate, which otherwise has no way to see the
+// hole. That gate settles the common cases from git — the completion marker is
+// current, or it is stale on a clean tree — and falls through to the per-file
+// ledger for everything else. On a DIRTY tree the marker is not trustworthy and
+// the ledger is the only evidence left, so a repo whose ledger was drained
+// while its completions never landed had nothing to re-arm it: not the marker,
+// not the ledger, and not a daemon restart. It stayed unenriched permanently.
+//
+// The question asked here is deliberately the narrow one. "Is enrichment behind
+// the current content" would also re-arm a repo that is merely being edited,
+// which on a large workspace is minutes of hover work on every daemon start,
+// forever. "Has a pass ever completed" is monotone: acting on it discharges it
+// and it cannot come back.
+func EnrichmentOwed(g graph.Store, repoPrefix string) (owed, known bool) {
+	store, ok := durableStore(g).(graph.EnrichmentApplicabilityStore)
+	if !ok {
+		return false, false
+	}
+	// A repo with no indexed content owes nothing. Without this, a prefix that
+	// has been tracked but not yet indexed re-arms a pass over an empty graph.
+	content, err := store.RepoContentGen(repoPrefix)
+	if err != nil || content == 0 {
+		return false, err == nil
+	}
+	owed, err = store.EnrichmentNeverRan(repoPrefix)
+	if err != nil {
+		return false, false
+	}
+	return owed, true
+}
+
 // RefreshCompletedProviders records that a repo whose whole-repo completion
 // marker is already current needs no enrichment pass — so the providers that
 // completed one are current for its content too.

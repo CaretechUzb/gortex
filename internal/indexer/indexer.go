@@ -1247,6 +1247,25 @@ func (idx *Indexer) MaybeSeedPendingEnrich() bool {
 		idx.markPendingEnrichFiles(frontier)
 		return true
 	}
+	// Neither the marker nor the ledger settled it, which on a dirty tree is
+	// the ordinary outcome — and was also the hole. The marker is only
+	// trustworthy against committed content and the ledger is drained by
+	// whoever indexed the files, so a repo whose completions never landed had
+	// nothing left to re-arm it, and no restart ever would. Ask the store what
+	// it actually recorded.
+	//
+	// Narrow on purpose: this fires for a pass that has NEVER run, not one
+	// merely behind the current content. A repo under active edit is behind by
+	// definition, and re-enriching it whole on every daemon start would cost
+	// minutes to chase a number the next save moves again. That repo is the
+	// watcher's to keep current, and the readiness column already says so.
+	if owed, known := semantic.EnrichmentOwed(idx.graph, idx.repoPrefix); known && owed {
+		idx.logger.Info("deferred enrichment re-armed: no provider has ever completed a pass",
+			zap.String("repo", idx.repoPrefix),
+			zap.String("marker", reason))
+		idx.markPendingEnrichFull()
+		return true
+	}
 	idx.logger.Debug("deferred enrichment not re-armed",
 		zap.String("repo", idx.repoPrefix),
 		zap.String("reason", reason))

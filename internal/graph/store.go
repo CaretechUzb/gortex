@@ -1437,6 +1437,18 @@ type EnrichmentApplicabilityStore interface {
 	// callers whose "nothing applies" is a weaker signal than the enrichment
 	// pass's own language census and so must never delete a real completion.
 	DeclareNoEnrichmentProvidersIfUnrecorded(repoPrefix string) error
+
+	// EnrichmentNeverRan reports whether this repo is owed a pass that nothing
+	// has ever run: a provider declared applicable whose completion generation
+	// is still zero, or no enrichment record at all.
+	//
+	// Deliberately NOT "is enrichment behind the current content". That
+	// question belongs to the readiness column, and a caller that re-armed on
+	// it would re-enrich an actively-edited repo on every daemon start --
+	// minutes of hover work, every time, to chase a number the next edit moves
+	// again. Never-ran is the monotone half: a provider that completes once can
+	// never return to zero, so acting on it discharges it for good.
+	EnrichmentNeverRan(repoPrefix string) (bool, error)
 }
 
 // DeriveState is the per-repo completion marker for the derived-pass tier:
