@@ -271,3 +271,37 @@ func TestCSharpExtractor_SetterValueCarriesThePropertyType(t *testing.T) {
 			"the getter's value is the inherited Crank field; stamping the property type is a confident wrong answer")
 	})
 }
+
+// A C# 13 partial property splits declaration and implementation across
+// fragments, and either may extract first. The seen[] dedup mints one
+// node, but the extents (and the value spans) must come from the
+// body-bearing fragment - keyed to the declaring fragment, every
+// accessor call in the implementation died ownerless, byte-for-byte the
+// AC1 failure mode this branch exists to fix.
+func TestCSharpExtractor_PartialPropertyImplementationOwnsItsCalls(t *testing.T) {
+	src := []byte(`namespace App {
+    public class Crank {
+        public int Turn() { return 1; }
+        public void Prime(int v) { }
+    }
+    public partial class KPart {
+        private readonly Crank _crank = new Crank();
+        public partial int P { get; set; }
+    }
+    public partial class KPart {
+        public partial int P {
+            get { return _crank.Turn(); }
+            set { value.ToString(); _crank.Prime(value); }
+        }
+    }
+}
+`)
+	e := NewCSharpExtractor()
+	result, err := e.Extract("App.cs", src)
+	require.NoError(t, err)
+
+	assert.Len(t, callEdgesFrom(result.Edges, "App.cs::KPart.P", "Turn"), 1,
+		"the implementing fragment's get body owns its call")
+	assert.Len(t, callEdgesFrom(result.Edges, "App.cs::KPart.P", "Prime"), 1,
+		"the implementing fragment's set body owns its call")
+}
