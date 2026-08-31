@@ -595,13 +595,49 @@ type fileIndex struct {
 	// spec doesn't widen.
 	superTypes map[string]*graph.Node
 	funcs      []*graph.Node // function/method nodes, for line containment
+	// stubsByLine indexes the file's extracted calls-edges by call line,
+	// snapshotted before any apply mutation. The extractor attributes a
+	// call to its owner precisely (byte extents where the language has
+	// them), so the stub's From is the ground truth a line-keyed caller
+	// lookup can only approximate — and disagree with, when the owner
+	// is a node kind outside idx.funcs (a C# property owning its
+	// accessor-body calls) or shares its line with another member.
+	stubsByLine map[int][]stubRef
+}
+
+// stubRef is one extracted calls-edge under stubsByLine: the owning
+// file node plus the edge's target id at snapshot time (the authored
+// callee name survives there across the unresolved / resolved shapes).
+type stubRef struct {
+	owner *graph.Node
+	to    string
+}
+
+// stubOwnerAt returns the single file node owning an extracted call of
+// the given trailing name at line — the caller the extractor already
+// attributed the site to. Returns nil when no stub matches, or when two
+// owners claim the same (line, name): the engine never guesses among
+// candidates.
+func (idx *fileIndex) stubOwnerAt(line int, method string) *graph.Node {
+	var owner *graph.Node
+	for _, s := range idx.stubsByLine[line] {
+		if !trailingNameMatches(s.to, method) {
+			continue
+		}
+		if owner != nil && owner.ID != s.owner.ID {
+			return nil
+		}
+		owner = s.owner
+	}
+	return owner
 }
 
 func (a *applier) buildIndex(facts *fileFacts) *fileIndex {
 	idx := &fileIndex{
-		facts:   facts,
-		imports: make(map[string]string, len(facts.imports)),
-		types:   make(map[string]*graph.Node),
+		facts:       facts,
+		imports:     make(map[string]string, len(facts.imports)),
+		types:       make(map[string]*graph.Node),
+		stubsByLine: make(map[int][]stubRef),
 	}
 	idx.superTypes = idx.types
 	superKinds := a.supertypeKinds()
@@ -626,6 +662,15 @@ func (a *applier) buildIndex(facts *fileFacts) *fileIndex {
 		}
 		if n.Kind == graph.KindFunction || n.Kind == graph.KindMethod {
 			idx.funcs = append(idx.funcs, n)
+		}
+		for _, e := range a.outEdges(n.ID) {
+			if e.Kind != graph.EdgeCalls || e.Line == 0 {
+				continue
+			}
+			if e.FilePath != "" && e.FilePath != facts.file {
+				continue
+			}
+			idx.stubsByLine[e.Line] = append(idx.stubsByLine[e.Line], stubRef{owner: n, to: e.To})
 		}
 	}
 	return idx
@@ -1064,7 +1109,17 @@ func (a *applier) applyCall(idx *fileIndex, cf callFact, res *semantic.EnrichRes
 	if target == nil {
 		return
 	}
-	caller := idx.enclosingCallable(cf.line)
+	// The extractor already attributed this site to its owner — adopt
+	// that attribution when a stub of the authored name exists at the
+	// call line, so the engine can never land its resolution on a
+	// different node than extraction chose (a shared line would
+	// otherwise mint a duplicate edge nothing dedupes, From being part
+	// of every edge identity). The line-keyed containment lookup stays
+	// as the fallback for sites the extractor recorded no stub for.
+	caller := idx.stubOwnerAt(cf.line, cf.method)
+	if caller == nil {
+		caller = idx.enclosingCallable(cf.line)
+	}
 	if caller == nil {
 		return
 	}
