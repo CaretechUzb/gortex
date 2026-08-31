@@ -1,6 +1,7 @@
 package languages
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -304,4 +305,57 @@ func TestCSharpExtractor_PartialPropertyImplementationOwnsItsCalls(t *testing.T)
 		"the implementing fragment's get body owns its call")
 	assert.Len(t, callEdgesFrom(result.Edges, "App.cs::KPart.P", "Prime"), 1,
 		"the implementing fragment's set body owns its call")
+}
+
+// The reference-form and MediatR lanes attribute by their own ranges
+// lookup; keyed to methods only, an accessor body split its evidence -
+// the calls edge on the property, the instantiates edge on the FILE
+// node, and the MediatR dispatch placeholder dropped outright.
+func TestCSharpExtractor_ReferenceFormsInAccessorsOwnTheProperty(t *testing.T) {
+	src := []byte(`namespace App {
+    public class Crank {
+        public int Turn() { return 1; }
+    }
+    public class PingCmd { }
+    public class Holder {
+        private readonly object _mediator = null;
+        public int Made {
+            get { var c = new Crank(); return c.Turn(); }
+        }
+        public int Kick {
+            get { ((MediatR.IMediator)_mediator).Send(new PingCmd()); return 1; }
+        }
+    }
+}
+`)
+	e := NewCSharpExtractor()
+	result, err := e.Extract("App.cs", src)
+	require.NoError(t, err)
+
+	t.Run("instantiates edge owner", func(t *testing.T) {
+		var fromProp, fromFile bool
+		for _, ed := range result.Edges {
+			if ed.Kind != graph.EdgeInstantiates || !strings.Contains(ed.To, "Crank") {
+				continue
+			}
+			switch ed.From {
+			case "App.cs::Holder.Made":
+				fromProp = true
+			case "App.cs":
+				fromFile = true
+			}
+		}
+		assert.True(t, fromProp, "the accessor body's new Crank() belongs to the property")
+		assert.False(t, fromFile, "the file node is not the owner of code inside a member")
+	})
+
+	t.Run("mediatr dispatch site in an accessor", func(t *testing.T) {
+		var found bool
+		for _, ed := range result.Edges {
+			if ed.From == "App.cs::Holder.Kick" && ed.To == "unresolved::*.Handle" {
+				found = true
+			}
+		}
+		assert.True(t, found, "the Send site inside the accessor must stamp its dispatch placeholder")
+	})
 }

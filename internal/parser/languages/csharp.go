@@ -880,7 +880,7 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 	// `x as Foo`), static / const access (`Foo.Empty`, `typeof(Foo)`,
 	// `nameof(Foo)`), and attribute type names (`[Foo]`). Inheritance is
 	// already covered by emitCSharpBaseList, so it is not re-emitted here.
-	emitCSharpReferenceForms(root, src, filePath, fileID, result)
+	emitCSharpReferenceForms(root, src, filePath, fileID, result, funcBytes, funcLines)
 
 	// Two same-named calls on ONE line whose receivers differ make the
 	// line unattributable: member companions dedupe to a single stored
@@ -1123,7 +1123,7 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 	captureValueRefCandidates(result, root, filePath, src)
 	captureFnValueCandidates(result, root, filePath, src)
 
-	captureMediatRDispatch(result, root, filePath, src)
+	captureMediatRDispatch(result, root, filePath, src, funcBytes, funcLines)
 
 	return result, hadError, nil
 }
