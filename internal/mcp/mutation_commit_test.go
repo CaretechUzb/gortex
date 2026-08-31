@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -468,6 +469,58 @@ func TestMutationStatusRefreshesPendingGraphStatus(t *testing.T) {
 	payload := s.mutationStatusPayload(record)
 	require.Equal(t, mutationGraphFresh, payload["graph_status"])
 	require.Equal(t, mutationDiskCommitted, payload["disk_status"])
+}
+
+// TestMutationStatusMarksTerminalGraphStatus pins the distinction a caller
+// cannot otherwise draw: only "pending" resolves on its own, so every other
+// graph_status must announce itself as terminal or a caller will wait on it
+// forever.
+func TestMutationStatusMarksTerminalGraphStatus(t *testing.T) {
+	cases := []struct {
+		name     string
+		outcome  mutationReindexOutcome
+		graph    string
+		terminal bool
+		noteHas  string
+	}{
+		{"pending is the only value worth waiting on",
+			mutationReindexOutcome{Pending: true, Receipt: "mutation-none", Generation: 1},
+			mutationGraphPending, false, "resolves on its own"},
+		{"fresh is terminal",
+			mutationReindexOutcome{Reindexed: true},
+			mutationGraphFresh, true, "has read these bytes"},
+		{"stale is terminal and says so",
+			mutationReindexOutcome{},
+			mutationGraphStale, true, "will NOT become"},
+		{"failed is terminal and says so",
+			mutationReindexOutcome{Err: errors.New("context deadline exceeded")},
+			mutationGraphFailed, true, "Waiting will not change it"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newMutationServer()
+			record := s.beginMutationCommit(context.Background(), "edit_file", "", "fp", "pkg/a.go", "/abs/pkg/a.go")
+			record.markCommitted("sha", 10)
+			record.recordGraph(tc.outcome)
+
+			payload := s.mutationStatusPayload(record)
+			require.Equal(t, tc.graph, payload["graph_status"])
+			require.Equal(t, tc.terminal, payload["graph_status_terminal"],
+				"graph_status %q reported the wrong terminality", tc.graph)
+			note, _ := payload["graph_note"].(string)
+			require.Contains(t, note, tc.noteHas)
+		})
+	}
+}
+
+// TestMutationStatusGuidanceDoesNotPromiseProgress guards the sentence that
+// sent a caller into an unbounded wait: a committed write must not assert
+// that a non-fresh graph is still catching up, because stale and failed are
+// terminal.
+func TestMutationStatusGuidanceDoesNotPromiseProgress(t *testing.T) {
+	guidance := mutationStatusGuidance(mutationDiskCommitted)
+	require.NotContains(t, guidance, "still catching up")
+	require.Contains(t, guidance, "graph_status_terminal")
 }
 
 func TestMutationLedgerEvictsOldestPastCap(t *testing.T) {

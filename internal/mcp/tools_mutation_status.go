@@ -106,14 +106,47 @@ func (s *Server) mutationStatusPayload(record *mutationCommitRecord) map[string]
 		payload["committed_at"] = snap.CommittedAt
 	}
 	payload["retry_safe"] = snap.DiskStatus == mutationDiskNotApplied || snap.DiskStatus == mutationDiskFailed
+	payload["graph_status_terminal"] = graphStatusTerminal(snap.GraphStatus)
+	if note := graphStatusNote(snap.GraphStatus); note != "" {
+		payload["graph_note"] = note
+	}
 	payload["guidance"] = mutationStatusGuidance(snap.DiskStatus)
 	return payload
+}
+
+// graphStatusTerminal answers the only question a caller actually has about
+// the graph half: is it still worth waiting? Only "pending" resolves on its
+// own — mutationStatusPayload refreshes a record through
+// pendingReindexReceipt, which returns nothing once the record left that
+// state, so every other value is frozen for the life of the entry. Rendering
+// the four values without this flag makes a terminal one look like a stage in
+// a progression, and a caller that waits on it waits forever.
+func graphStatusTerminal(graph string) bool {
+	return graph != mutationGraphPending
+}
+
+// graphStatusNote says what the value means and what would change it. The
+// wording matters most for "stale" and "failed", which are the two a caller
+// is most likely to sit on.
+func graphStatusNote(graph string) string {
+	switch graph {
+	case mutationGraphPending:
+		return "the reindex for this mutation is still running — poll this receipt; this is the one graph_status that resolves on its own"
+	case mutationGraphFresh:
+		return "the graph has read these bytes"
+	case mutationGraphStale:
+		return "the reindex completed without confirming an index write, or no outcome was recorded. This will NOT become \"fresh\" on its own. It also does not gate change.detect — that barrier reads the freshness receipts, not this ledger. The bytes are on disk: verify them and proceed"
+	case mutationGraphFailed:
+		return "the graph ingest failed terminally. Waiting will not change it. A later successful mutation of this path, or a scoped reindex of it, resolves the freshness receipt that does gate change.detect"
+	default:
+		return ""
+	}
 }
 
 func mutationStatusGuidance(disk string) string {
 	switch disk {
 	case mutationDiskCommitted:
-		return "the bytes are on disk — do not re-apply this edit; if graph_status is not \"fresh\" the graph is still catching up"
+		return "the bytes are on disk — do not re-apply this edit; read graph_status_terminal before waiting on graph_status, because only \"pending\" resolves on its own"
 	case mutationDiskNotApplied:
 		return "nothing was written — the file is unchanged and retrying is safe"
 	case mutationDiskFailed:
