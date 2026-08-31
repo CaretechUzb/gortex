@@ -10,29 +10,40 @@ import (
 )
 
 // Byte extents are recorded for methods, constructors, properties, and
-// initialized field declarators. A member kind still WITHOUT them
-// (indexer, event accessor) sharing a source line with one that has
-// them matches no recorded extent - and answering "" there erased the
-// call outright instead of falling back to the line answer (round-6
-// finding B3). The extentless member's call must survive line-keyed;
-// every extent-carrying member must own its call BYTE-precisely, not
-// hand it to whoever shares the line (the pre-owner-widening behavior
-// this test silently tolerated).
-func TestResolveCSharp_ExtentlessMemberSharingALineKeepsItsCall(t *testing.T) {
+// initialized field declarators. Every extent-carrying member must own
+// its call BYTE-precisely, not hand it to whoever shares the line (the
+// pre-owner-widening behavior this test silently tolerated).
+//
+// A member kind still WITHOUT extents (indexer, event accessor) is the
+// hard case: its call matches no recorded extent, and the line fallback
+// answers a same-line neighbour that provably does NOT contain the call
+// - the neighbour's recorded bytes exclude the offset. Handing it the
+// call invents a false edge carrying full receiver evidence and no
+// ambiguity stamp (ambiguousAt counts ranges, and an extent-less member
+// contributes none), indistinguishable downstream from a correct edge.
+// Such calls are REFUSED instead. This deliberately trades the
+// extent-less member's recall for precision; the recall returns when
+// indexers and event accessors are emitted with extents of their own
+// (tracked follow-up). Distinct from the round-6 B3 erasure: there the
+// "" answer dropped calls whose line owner was plausible - here the
+// line owner is provably wrong.
+func TestResolveCSharp_SameLineMemberCallAttribution(t *testing.T) {
 	cases := map[string]struct {
-		src   string
-		owner string // "" = presence only: the owner stays line-keyed
+		src     string
+		call    string // authored call's target name; "" = "Take"
+		owner   string // this member owns the call byte-precisely
+		refused bool   // no member may be handed the call
 	}{
 		"property_shares_line": {src: `namespace App {
  public class BLBag { public int Take() { return 1; } }
  public class BLProp { private BLBag _b = new BLBag();
   public int Q => _b.Take(); public void M() { }
  } }`, owner: "X.cs::BLProp.Q"},
-		"indexer_shares_line": {src: `namespace App {
+		"indexer_beside_method_refused": {src: `namespace App {
  public class BLBag { public int Take() { return 1; } }
  public class BLIdx { private BLBag _b = new BLBag();
   public int this[int i] => _b.Take(); public void M() { }
- } }`},
+ } }`, refused: true},
 		"field_init_shares_line": {src: `namespace App {
  public class BLBag { public int Take() { return 1; } }
  public class BLInit { private BLBag _b = new BLBag();
@@ -43,25 +54,52 @@ func TestResolveCSharp_ExtentlessMemberSharingALineKeepsItsCall(t *testing.T) {
  public class BLCtor { private BLBag _b = new BLBag();
   public BLCtor() { } public int Q => _b.Take();
  } }`, owner: "X.cs::BLCtor.Q"},
+		// The two shapes below are NEW false-edge populations opened by
+		// the owner widening itself: the base emitted nothing for them,
+		// while widened properties made a wrong owner available.
+		"indexer_beside_property_refused": {src: `namespace App {
+ public class QBag { public int Idx() { return 1; } public int Pro() { return 2; } }
+ public class Q01 { private QBag _b = new QBag();
+  public int this[int i] => _b.Idx(); public int Q => _b.Pro();
+ } }`, call: "Idx", refused: true},
+		"indexer_beside_property_neighbour_keeps_own": {src: `namespace App {
+ public class QBag { public int Idx() { return 1; } public int Pro() { return 2; } }
+ public class Q01 { private QBag _b = new QBag();
+  public int this[int i] => _b.Idx(); public int Q => _b.Pro();
+ } }`, call: "Pro", owner: "X.cs::Q01.Q"},
+		"event_accessor_beside_property_refused": {src: `namespace App {
+ public class QBag { public int Ev() { return 1; } public int Pro() { return 2; } }
+ public class Q03 { private QBag _b = new QBag();
+  public event System.EventHandler E { add { _b.Ev(); } remove { } } public int Q => _b.Pro();
+ } }`, call: "Ev", refused: true},
+		"event_accessor_beside_property_neighbour_keeps_own": {src: `namespace App {
+ public class QBag { public int Ev() { return 1; } public int Pro() { return 2; } }
+ public class Q03 { private QBag _b = new QBag();
+  public event System.EventHandler E { add { _b.Ev(); } remove { } } public int Q => _b.Pro();
+ } }`, call: "Pro", owner: "X.cs::Q03.Q"},
 	}
 	for name, tc := range cases {
 		g := buildCSharpResolverGraph(t, map[string]string{"X.cs": tc.src})
-		found := false
+		target := tc.call
+		if target == "" {
+			target = "Take"
+		}
 		owners := map[string]int{}
 		for _, e := range g.AllEdges() {
-			if e != nil && e.Kind == graph.EdgeCalls && strings.Contains(e.To, "Take") {
-				found = true
+			if e != nil && e.Kind == graph.EdgeCalls && strings.Contains(e.To, target) {
 				owners[e.From]++
 			}
 		}
-		assert.True(t, found, "[%s] the member's call must not vanish", name)
-		if tc.owner != "" {
-			assert.NotZero(t, owners[tc.owner],
-				"[%s] the extent-carrying member owns its call byte-precisely, got owners %v", name, owners)
-			delete(owners, tc.owner)
+		if tc.refused {
 			assert.Empty(t, owners,
-				"[%s] no line-sharing member may carry a duplicate of the call", name)
+				"[%s] an extent-less member's call must be refused, not handed to a same-line neighbour, got owners %v", name, owners)
+			continue
 		}
+		assert.NotZero(t, owners[tc.owner],
+			"[%s] the extent-carrying member owns its call byte-precisely, got owners %v", name, owners)
+		delete(owners, tc.owner)
+		assert.Empty(t, owners,
+			"[%s] no line-sharing member may carry a duplicate of the call", name)
 	}
 }
 

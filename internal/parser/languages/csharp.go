@@ -1912,8 +1912,10 @@ func (e *CSharpExtractor) emitField(m parser.QueryResult, filePath, fileID strin
 		"receiver":   owner.name,
 		"visibility": csharpVisibility(def.Node, src, defaultVis),
 	}
-	// Initialized fields are call owners; they carry scope_ns for the
-	// resolver's scoped-usings narrowing like every other owner kind.
+	// Every field carries scope_ns for the resolver's scoped-usings
+	// narrowing, not only the initialized ones that are call owners: a
+	// field's TYPE reference needs the same namespace narrowing whether
+	// or not its declarator authored a call.
 	if ns := csharpEnclosingNamespace(def.Node, src); ns != "" {
 		meta["scope_ns"] = ns
 	}
@@ -1982,7 +1984,13 @@ type csharpValueProp struct {
 // csharpPropertyHasExecutableBody reports whether the fragment carries
 // any accessor block or expression body - the discriminator between a
 // C# 13 partial property's declaring part (`{ get; set; }`) and its
-// implementing part.
+// implementing part. The walk is coarse: an auto-property with a
+// block-lambda INITIALIZER (`public Func<int> F { get; } = () => { … };`)
+// would read as body-bearing because the lambda's block matches. That
+// misread is unreachable today - this predicate runs only on the
+// duplicate-declaration path, and valid C# does not permit two
+// same-name property declarations where one is such an auto-property -
+// so it is documented rather than special-cased.
 func csharpPropertyHasExecutableBody(def *sitter.Node) bool {
 	found := false
 	walkNodes(def, func(n *sitter.Node) {
@@ -2316,7 +2324,8 @@ func newCSharpFuncLookup(ranges []funcRange, bytes map[string][2]int) *csharpFun
 // declarators, so a member kind still without them (indexer, event
 // accessor) sharing a line with one that has them would otherwise lose
 // its call outright rather than degrade to line attribution (round-6
-// finding B3).
+// finding B3) - unless the line answer's own recorded bytes exclude the
+// offset, in which case the fallback is refused (see below).
 func (l *csharpFuncLookup) enclosingAt(line, offset int) string {
 	if offset < 0 || len(l.bytes) == 0 {
 		return l.enclosing(line)
@@ -2347,7 +2356,17 @@ func (l *csharpFuncLookup) enclosingAt(line, offset int) string {
 	if best != "" {
 		return best
 	}
-	return l.enclosing(line)
+	// The line fallback exists for member kinds that record NO extents
+	// at all (indexer, event accessor). If the line answer does have
+	// recorded bytes and the offset sits outside them, the offset is
+	// provably not inside that member, so handing it the call invents a
+	// false edge on a same-line neighbour - strictly worse than the drop
+	// it replaced.
+	fb := l.enclosing(line)
+	if b, ok := l.bytes[fb]; ok && (offset < b[0] || offset >= b[1]) {
+		return ""
+	}
+	return fb
 }
 
 func (l *csharpFuncLookup) enclosing(line int) string {
