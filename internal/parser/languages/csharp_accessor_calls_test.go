@@ -166,3 +166,62 @@ func TestCSharpExtractor_FieldInitializerCallAttributesToItsField(t *testing.T) 
 		})
 	}
 }
+
+// findCallEdge returns the single EdgeCalls from fromID whose unresolved
+// target names method, failing the test on any other cardinality.
+func findCallEdge(t *testing.T, edges []*graph.Edge, fromID, method string) *graph.Edge {
+	t.Helper()
+	found := callEdgesFrom(edges, fromID, method)
+	require.Len(t, found, 1, "expected exactly one %s call from %s", method, fromID)
+	return found[0]
+}
+
+// Inside a set/init accessor `value` is the implicit parameter and its
+// type is DECLARED - it is the property type. Seeding it as typed
+// receiver evidence stamps receiver_type instead of the old
+// receiver_name:value, which invited the resolver to go looking for a
+// FIELD named value the accessor cannot mean. When the enclosing type
+// really does declare a member named value, the seed is withheld and
+// the field evidence stands - same refusal posture as the shadow index.
+func TestCSharpExtractor_SetterValueCarriesThePropertyType(t *testing.T) {
+	src := []byte(`namespace App {
+    public class Crank {
+        public int Turn() { return 1; }
+        public void Prime(int v) { }
+    }
+    public class Sink {
+        public Crank Feed {
+            set { _ = value.Turn(); }
+        }
+        public Crank Boot {
+            get { return null; }
+            init { value.Prime(1); }
+        }
+    }
+    public class Clash {
+        private readonly Crank value = new Crank();
+        public Crank Feed {
+            set { _ = value.Turn(); }
+        }
+    }
+}
+`)
+	e := NewCSharpExtractor()
+	result, err := e.Extract("App.cs", src)
+	require.NoError(t, err)
+
+	t.Run("set accessor", func(t *testing.T) {
+		ed := findCallEdge(t, result.Edges, "App.cs::Sink.Feed", "Turn")
+		assert.Equal(t, "Crank", ed.Meta["receiver_type"], "value is declared Crank by the property")
+		assert.Nil(t, ed.Meta["receiver_name"], "value is a parameter, not field evidence")
+	})
+	t.Run("init accessor", func(t *testing.T) {
+		ed := findCallEdge(t, result.Edges, "App.cs::Sink.Boot", "Prime")
+		assert.Equal(t, "Crank", ed.Meta["receiver_type"])
+	})
+	t.Run("member named value withholds the seed", func(t *testing.T) {
+		ed := findCallEdge(t, result.Edges, "App.cs::Clash.Feed", "Turn")
+		assert.Nil(t, ed.Meta["receiver_type"], "a declared value member makes the name ambiguous evidence")
+		assert.Equal(t, "value", ed.Meta["receiver_name"], "the field evidence stands")
+	})
+}

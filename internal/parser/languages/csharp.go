@@ -458,6 +458,10 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 	// cannot say which of two members sharing a physical line owns a
 	// call site; the byte interval can (round-5 finding 4).
 	funcBytes := make(map[string][2]int)
+	// Properties carrying a set/init accessor, recorded at emission so
+	// the deferred typing pass can seed the accessor's implicit `value`
+	// parameter with the property's declared type.
+	valueProps := make(map[string]csharpValueProp)
 	// Type IDs whose FIRST declaration spelled `partial` — the gate for
 	// preserving a later same-file fragment's base list (round-5
 	// finding 5).
@@ -520,7 +524,7 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 			e.emitField(m, filePath, fileID, src, result, seen, fileAliases, funcBytes)
 
 		case m.Captures["prop.def"] != nil:
-			e.emitProperty(m, filePath, fileID, src, result, seen, fileAliases, funcBytes)
+			e.emitProperty(m, filePath, fileID, src, result, seen, fileAliases, funcBytes, valueProps)
 
 		case m.Captures["using.def"] != nil:
 			e.emitUsing(m, filePath, fileID, result)
@@ -697,6 +701,37 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 		env[l.name] = typeName
 		if b := typedRecord(owner, l); b != nil && b.typ == "" {
 			b.typ = typeName
+		}
+	}
+	// The implicit `value` parameter of a set/init accessor carries the
+	// property's declared type — seed it like a tier-0 typed local, per
+	// accessor owner, BEFORE the local tiers so a real declaration keeps
+	// last-write precedence. Withheld when the enclosing type itself
+	// declares a member named `value`: inside that property's GETTER the
+	// name means the member, a per-owner map cannot split the accessors,
+	// and overwriting legitimate field evidence would hand the resolver
+	// a confident wrong answer — the seed refuses instead.
+	if len(valueProps) > 0 {
+		valueMembers := map[string]bool{}
+		for _, n := range result.Nodes {
+			if (n.Kind == graph.KindField || n.Kind == graph.KindConstant) && n.Name == "value" {
+				if r, _ := n.Meta["receiver"].(string); r != "" {
+					valueMembers[r] = true
+				}
+			}
+		}
+		for id, vp := range valueProps {
+			if valueMembers[vp.receiver] {
+				continue
+			}
+			if t := normalizeCSharpTypeName(vp.typ); t != "" && t != "var" {
+				env := tenvByOwner[id]
+				if env == nil {
+					env = make(typeEnv)
+					tenvByOwner[id] = env
+				}
+				env["value"] = t
+			}
 		}
 	}
 	for _, l := range locals {
@@ -1927,7 +1962,34 @@ func (e *CSharpExtractor) emitField(m parser.QueryResult, filePath, fileID strin
 	emitCSharpTypeUseEdges(id, fieldTypeRaw, filePath, def.StartLine+1, result)
 }
 
-func (e *CSharpExtractor) emitProperty(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool, fileAliases map[string]bool, funcBytes map[string][2]int) {
+// csharpValueProp records a set/init-carrying property so the deferred
+// typing pass can seed the accessor's implicit `value` parameter.
+type csharpValueProp struct {
+	typ      string // raw declared property type
+	receiver string // enclosing type name, for the value-member collision check
+}
+
+// csharpHasSetOrInitAccessor reports whether the property declares a set
+// or init accessor. The keyword is an anonymous child of the
+// accessor_declaration, so every child's Type is scanned, not just the
+// named ones.
+func csharpHasSetOrInitAccessor(def *sitter.Node) bool {
+	found := false
+	walkNodes(def, func(n *sitter.Node) {
+		if found || n.Type() != "accessor_declaration" {
+			return
+		}
+		for i := 0; i < int(n.ChildCount()); i++ {
+			if c := n.Child(i); c != nil && (c.Type() == "set" || c.Type() == "init") {
+				found = true
+				return
+			}
+		}
+	})
+	return found
+}
+
+func (e *CSharpExtractor) emitProperty(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool, fileAliases map[string]bool, funcBytes map[string][2]int, valueProps map[string]csharpValueProp) {
 	def := m.Captures["prop.def"]
 	owner := csharpDirectMemberOwner(def.Node, src, "class_declaration", "struct_declaration", "interface_declaration", "record_declaration")
 	if owner.kind == "" {
@@ -1969,6 +2031,9 @@ func (e *CSharpExtractor) emitProperty(m parser.QueryResult, filePath, fileID st
 		if args := csharpTypeArgsFromTypeNode(t, src, csharpUnstampableArgNames(def.Node, src, fileAliases)); args != "" {
 			meta["field_type_args"] = args
 		}
+	}
+	if propTypeRaw != "" && def.Node != nil && csharpHasSetOrInitAccessor(def.Node) {
+		valueProps[id] = csharpValueProp{typ: propTypeRaw, receiver: owner.name}
 	}
 	if doc := extractCSharpDoc(src, def.StartLine); doc != "" {
 		meta["doc"] = doc
