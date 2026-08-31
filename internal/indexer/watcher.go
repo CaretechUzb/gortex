@@ -418,26 +418,6 @@ func (w *Watcher) Start(paths []string) (retErr error) {
 		return errors.New("watcher: no paths to watch")
 	}
 
-	// WatchConfig.Enabled is the repo's opt-in to being watched at all —
-	// by fsnotify or by the adaptive poller. Every fallback below was
-	// already WRITTEN as if this were true (each one is itself gated on
-	// Enabled) — but until this early return, nothing actually enforced
-	// it: a disabled repo still attempted raw native fsnotify first.
-	// config.Default() ships Enabled: false, so that unconditional
-	// attempt was the common case, silently racing confirmWatchActive's
-	// 5s timeout with no safety net and no fallback on either success
-	// or failure. This return makes the flag mean what its name and
-	// every comment below already claimed it meant.
-	//
-	// degradedNoFsnotify must be set here too: Stop() skips waiting on
-	// w.stopped only in degraded mode, because that channel is closed by
-	// w.loop(), which this early return — like the slow-mount branch
-	// below — never launches.
-	if !w.config.Enabled {
-		w.degradedNoFsnotify = true
-		return nil
-	}
-
 	// WSL2 / slow-mount degradation: on a 9p/drvfs mount (a Windows drive
 	// under WSL2, an SMB share) or an NFS mount, native fsnotify delivers
 	// events late or not at all, and confirmWatchActive would hang ~5s per
@@ -625,12 +605,17 @@ func (w *Watcher) Start(paths []string) (retErr error) {
 		}
 	}
 
-	// Launch the adaptive-interval poller alongside the fsnotify
-	// backend. It is a fallback for the changes fsnotify misses, so
-	// it shares the watcher's lifecycle. Enabled is already guaranteed
-	// true here (see the early return at the top of Start).
-	w.poller = newPoller(w, w.indexer, w.logger)
-	w.poller.Start()
+	// Launch the adaptive-interval poller alongside the fsnotify backend.
+	// It is a fallback for the changes fsnotify misses, so it shares the
+	// watcher's lifecycle. Enabled is the opt-in only here, where
+	// fsnotify is LIVE — there the poller is a belt-and-braces extra for
+	// what fsnotify misses, and a repo may decline it. The degraded
+	// paths above start it unconditionally: fsnotify is dead there, so
+	// declining it means the repo silently goes stale.
+	if w.config.Enabled {
+		w.poller = newPoller(w, w.indexer, w.logger)
+		w.poller.Start()
+	}
 	return nil
 }
 
