@@ -703,37 +703,6 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 			b.typ = typeName
 		}
 	}
-	// The implicit `value` parameter of a set/init accessor carries the
-	// property's declared type — seed it like a tier-0 typed local, per
-	// accessor owner, BEFORE the local tiers so a real declaration keeps
-	// last-write precedence. Withheld when the enclosing type itself
-	// declares a member named `value`: inside that property's GETTER the
-	// name means the member, a per-owner map cannot split the accessors,
-	// and overwriting legitimate field evidence would hand the resolver
-	// a confident wrong answer — the seed refuses instead.
-	if len(valueProps) > 0 {
-		valueMembers := map[string]bool{}
-		for _, n := range result.Nodes {
-			if (n.Kind == graph.KindField || n.Kind == graph.KindConstant) && n.Name == "value" {
-				if r, _ := n.Meta["receiver"].(string); r != "" {
-					valueMembers[r] = true
-				}
-			}
-		}
-		for id, vp := range valueProps {
-			if valueMembers[vp.receiver] {
-				continue
-			}
-			if t := normalizeCSharpTypeName(vp.typ); t != "" && t != "var" {
-				env := tenvByOwner[id]
-				if env == nil {
-					env = make(typeEnv)
-					tenvByOwner[id] = env
-				}
-				env["value"] = t
-			}
-		}
-	}
 	for _, l := range locals {
 		owner := localOwner(l)
 		if owner == "" {
@@ -945,6 +914,34 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 	// The field-identifier emitter reuses both.
 	paramsByOwner := csharpParamNamesByOwner(result)
 	localScopes := csharpLocalScopes{}
+	// The implicit `value` parameter of a set/init accessor carries the
+	// property's declared type, and inside those accessors it is ALWAYS
+	// the parameter - a same-named member is only reachable there via
+	// this.value. Seed it as an offset-scoped record over each accessor
+	// span, never owner-wide: in the GETTER the bare name means a member
+	// (possibly inherited, possibly declared in another partial
+	// fragment), and an owner-wide seed typed those sites with the
+	// property type - a confident wrong answer. The scope registration
+	// keeps the shadow refusal and the field-identifier lane from
+	// reading the parameter as field evidence inside the accessor.
+	for id, vp := range valueProps {
+		t := normalizeCSharpTypeName(vp.typ)
+		if t == "" || t == "var" {
+			continue
+		}
+		recs := typedLocalsByOwner[id]
+		if recs == nil {
+			recs = map[string][]*csharpTypedBinding{}
+			typedLocalsByOwner[id] = recs
+		}
+		if localScopes[id] == nil {
+			localScopes[id] = map[string][]csharpLocalScope{}
+		}
+		for _, sp := range vp.spans {
+			recs["value"] = append(recs["value"], &csharpTypedBinding{typ: t, scope: sp})
+			localScopes[id]["value"] = append(localScopes[id]["value"], sp)
+		}
+	}
 	for _, l := range locals {
 		owner := localOwner(l)
 		if owner == "" {
@@ -1963,30 +1960,34 @@ func (e *CSharpExtractor) emitField(m parser.QueryResult, filePath, fileID strin
 }
 
 // csharpValueProp records a set/init-carrying property so the deferred
-// typing pass can seed the accessor's implicit `value` parameter.
+// typing pass can seed the accessor's implicit `value` parameter as an
+// offset-scoped record over each accessor's own byte extent.
 type csharpValueProp struct {
-	typ      string // raw declared property type
-	receiver string // enclosing type name, for the value-member collision check
+	typ   string // raw declared property type
+	spans []csharpLocalScope
 }
 
-// csharpHasSetOrInitAccessor reports whether the property declares a set
-// or init accessor. The keyword is an anonymous child of the
+// csharpSetInitAccessorSpans returns the byte extents of the property's
+// set and init accessor declarations - the spans where `value` IS the
+// implicit parameter (a same-named member is only reachable there via
+// this.value, so a seed scoped to these spans can never collide with
+// member evidence). The keyword is an anonymous child of the
 // accessor_declaration, so every child's Type is scanned, not just the
 // named ones.
-func csharpHasSetOrInitAccessor(def *sitter.Node) bool {
-	found := false
+func csharpSetInitAccessorSpans(def *sitter.Node) []csharpLocalScope {
+	var spans []csharpLocalScope
 	walkNodes(def, func(n *sitter.Node) {
-		if found || n.Type() != "accessor_declaration" {
+		if n.Type() != "accessor_declaration" {
 			return
 		}
 		for i := 0; i < int(n.ChildCount()); i++ {
 			if c := n.Child(i); c != nil && (c.Type() == "set" || c.Type() == "init") {
-				found = true
+				spans = append(spans, csharpLocalScope{start: int(n.StartByte()), end: int(n.EndByte())})
 				return
 			}
 		}
 	})
-	return found
+	return spans
 }
 
 func (e *CSharpExtractor) emitProperty(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool, fileAliases map[string]bool, funcBytes map[string][2]int, valueProps map[string]csharpValueProp) {
@@ -2032,8 +2033,10 @@ func (e *CSharpExtractor) emitProperty(m parser.QueryResult, filePath, fileID st
 			meta["field_type_args"] = args
 		}
 	}
-	if propTypeRaw != "" && def.Node != nil && csharpHasSetOrInitAccessor(def.Node) {
-		valueProps[id] = csharpValueProp{typ: propTypeRaw, receiver: owner.name}
+	if propTypeRaw != "" && def.Node != nil {
+		if spans := csharpSetInitAccessorSpans(def.Node); len(spans) > 0 {
+			valueProps[id] = csharpValueProp{typ: propTypeRaw, spans: spans}
+		}
 	}
 	if doc := extractCSharpDoc(src, def.StartLine); doc != "" {
 		meta["doc"] = doc

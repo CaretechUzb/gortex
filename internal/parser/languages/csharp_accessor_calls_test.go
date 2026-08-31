@@ -176,18 +176,24 @@ func findCallEdge(t *testing.T, edges []*graph.Edge, fromID, method string) *gra
 	return found[0]
 }
 
-// Inside a set/init accessor `value` is the implicit parameter and its
-// type is DECLARED - it is the property type. Seeding it as typed
-// receiver evidence stamps receiver_type instead of the old
-// receiver_name:value, which invited the resolver to go looking for a
-// FIELD named value the accessor cannot mean. When the enclosing type
-// really does declare a member named value, the seed is withheld and
-// the field evidence stands - same refusal posture as the shadow index.
+// Inside a set/init accessor `value` is ALWAYS the implicit parameter -
+// a same-named member is only reachable via this.value - and its type
+// is DECLARED: it is the property type. The seed is therefore an
+// OFFSET-SCOPED record over each set/init accessor's byte extent, never
+// an owner-wide entry: in the GETTER the bare name means a member
+// (possibly inherited, possibly declared in another partial fragment),
+// and an owner-wide seed typed those sites with the property type - a
+// confident wrong answer. The scope registration also keeps the
+// field-identifier lane from minting a field-use edge for the
+// parameter.
 func TestCSharpExtractor_SetterValueCarriesThePropertyType(t *testing.T) {
 	src := []byte(`namespace App {
     public class Crank {
         public int Turn() { return 1; }
         public void Prime(int v) { }
+    }
+    public class Widget {
+        public int Spin() { return 2; }
     }
     public class Sink {
         public Crank Feed {
@@ -200,8 +206,26 @@ func TestCSharpExtractor_SetterValueCarriesThePropertyType(t *testing.T) {
     }
     public class Clash {
         private readonly Crank value = new Crank();
-        public Crank Feed {
-            set { _ = value.Turn(); }
+        public Widget Feed {
+            set { _ = value.Spin(); }
+        }
+        public Crank Show {
+            get { return value.Turn(); }
+        }
+    }
+    public class Dirty {
+        public Crank Both {
+            get { Crank value = new Crank(); return value; }
+            set { value.Prime(2); }
+        }
+    }
+    public class VBase {
+        protected Crank value = new Crank();
+    }
+    public class VDerived : VBase {
+        public Widget Feed {
+            get { _ = value.Turn(); return null; }
+            set { }
         }
     }
 }
@@ -219,9 +243,31 @@ func TestCSharpExtractor_SetterValueCarriesThePropertyType(t *testing.T) {
 		ed := findCallEdge(t, result.Edges, "App.cs::Sink.Boot", "Prime")
 		assert.Equal(t, "Crank", ed.Meta["receiver_type"])
 	})
-	t.Run("member named value withholds the seed", func(t *testing.T) {
-		ed := findCallEdge(t, result.Edges, "App.cs::Clash.Feed", "Turn")
-		assert.Nil(t, ed.Meta["receiver_type"], "a declared value member makes the name ambiguous evidence")
-		assert.Equal(t, "value", ed.Meta["receiver_name"], "the field evidence stands")
+	t.Run("member named value never beats the setter parameter", func(t *testing.T) {
+		ed := findCallEdge(t, result.Edges, "App.cs::Clash.Feed", "Spin")
+		assert.Equal(t, "Widget", ed.Meta["receiver_type"],
+			"in a set accessor value IS the parameter; the Crank field needs this.value")
+		var reads int
+		for _, r := range result.Edges {
+			if r.From == "App.cs::Clash.Feed" && r.Kind == graph.EdgeReads {
+				reads++
+			}
+		}
+		assert.Zero(t, reads, "the parameter must not mint field-use evidence")
+	})
+	t.Run("getter value means the member", func(t *testing.T) {
+		ed := findCallEdge(t, result.Edges, "App.cs::Clash.Show", "Turn")
+		assert.Nil(t, ed.Meta["receiver_type"],
+			"the seed is set/init-scoped; the getter's value is the field, left to field evidence")
+	})
+	t.Run("typed getter local named value cannot kill the seed", func(t *testing.T) {
+		ed := findCallEdge(t, result.Edges, "App.cs::Dirty.Both", "Prime")
+		assert.Equal(t, "Crank", ed.Meta["receiver_type"],
+			"the setter-span record answers Found at the setter site regardless of getter locals")
+	})
+	t.Run("inherited value member is not property-typed", func(t *testing.T) {
+		ed := findCallEdge(t, result.Edges, "App.cs::VDerived.Feed", "Turn")
+		assert.NotEqual(t, "Widget", ed.Meta["receiver_type"],
+			"the getter's value is the inherited Crank field; stamping the property type is a confident wrong answer")
 	})
 }
