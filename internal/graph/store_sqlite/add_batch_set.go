@@ -543,6 +543,24 @@ func (s *Store) addBatchSetOriented(nodes []*graph.Node, edges []*graph.Edge) (s
 	// generation: the set is shared by every handle over one core, so a stub
 	// the base corpus already holds must not suppress the same stub in a
 	// derived generation that has never had it written.
+	// builtinSeen is shared by every generation handle over one store. Pair its
+	// admission with the writer lock so another batch cannot observe a key whose
+	// transaction later rolls back and omit the corresponding stub.
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if s.bulkTerminalErr != nil && (s.bulkConn != nil || s.bulkTerminalViewGen == s.viewGen) {
+		return stats, s.bulkTerminalErr
+	}
+	var freshBuiltinKeys []string
+	builtinKeysCommitted := false
+	defer func() {
+		if builtinKeysCommitted {
+			return
+		}
+		for _, key := range freshBuiltinKeys {
+			s.builtinSeen.Delete(key)
+		}
+	}()
 	if stubs := graph.BuiltinStubNodes(edges); len(stubs) > 0 {
 		var fresh []*graph.Node
 		for _, stub := range stubs {
@@ -752,5 +770,8 @@ func (s *Store) addBatchSetOriented(nodes []*graph.Node, edges []*graph.Edge) (s
 	// The transaction is durable before index sealing. If the bounded cold
 	// threshold was reached, build the dense indexes now on the same pinned
 	// connection; a failure remains retryable at the repository/final boundary.
-	return stats, s.noteBulkRowsLocked(stats.nodeRowsChanged, stats.edgeRowsInserted)
+	if err := s.noteBulkRowsLocked(stats.nodeRowsChanged, stats.edgeRowsInserted); err != nil {
+		return stats, markStorageErrorCommitted(err)
+	}
+	return stats, nil
 }
