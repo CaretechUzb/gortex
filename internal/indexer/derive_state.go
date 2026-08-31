@@ -58,8 +58,32 @@ func (mi *MultiIndexer) DeriveConfigHash() string {
 	if len(patterns) == 0 {
 		return ""
 	}
-	sorted := make([]string, len(patterns))
-	copy(sorted, patterns)
+	// Sorted AND deduped, so the digest is a function of the allow-list as a
+	// SET. The union folds over a map of tracked repositories, so its order is
+	// whatever this process happened to iterate — the sort is what stops the
+	// hash flipping between daemon restarts. The dedupe covers the other half:
+	// N repositories allowing the same framework contribute that name N times,
+	// and hashing the multiset made "track a sixth repository with an identical
+	// list" look like a config change to the five already derived. Both are
+	// safe to collapse because frameworkgate.Allows consults only the exact
+	// map, the prefix list and the all flag — admission cannot distinguish a
+	// pattern present once from the same pattern present six times, so neither
+	// may the fingerprint that decides whether a derive is still current.
+	// frameworkgate.New now dedupes too; this stays explicit because the
+	// stability of a stamped hash must not rest on a leaf package's internals.
+	sorted := make([]string, 0, len(patterns))
+	seen := make(map[string]bool, len(patterns))
+	for _, p := range patterns {
+		lowered := strings.ToLower(strings.TrimSpace(p))
+		if lowered == "" || seen[lowered] {
+			continue
+		}
+		seen[lowered] = true
+		sorted = append(sorted, lowered)
+	}
+	if len(sorted) == 0 {
+		return ""
+	}
 	sort.Strings(sorted)
 	// NUL-joined: a pattern cannot contain one, so no two distinct lists can
 	// collide by concatenation ("a","bc" vs "ab","c").
@@ -178,6 +202,74 @@ func (mi *MultiIndexer) stampDeriveState(covered []string, scoped bool) {
 				zap.Error(err))
 		}
 	}
+}
+
+// ScheduleDeriveForConfigDrift schedules one workspace derivation when the
+// derive-relevant configuration has moved since the tracked repositories were
+// last stamped, and returns the repositories that were behind.
+//
+// Nothing else closes this gap. DeriveConfigHash is published to the runtime
+// state and stamped onto each completion, and readiness compares the two — but
+// no caller consumed the comparison to schedule work. So a config change put
+// every repository into "partial: derive-relevant config changed" with no path
+// back to ready, and the remedy the CLI prints under that very message did not
+// help: warmup's change detection is file-based, so a restart with no file
+// delta takes the ResetBatch fast path and runs no workspace-wide pass at all.
+// Observed 2026-08-30 — five repositories sat partial from 18:51 through a
+// 22:59 restart and would have survived every future one.
+//
+// Deliberately NOT folded into warmup's anyChanged. That flag also drives the
+// resolve scope, the enrichment overlap and the batch transition; forcing it
+// true with an empty changed set would push a whole-workspace derive down a
+// path built for a file delta. Scheduling instead reuses the post-track
+// scheduler, which is preemptible, publishes its owed set, and already knows
+// how to run a whole-workspace pass.
+//
+// The calls coalesce: the scheduler's debounce is what makes a burst of tracks
+// one pass, and this is the same burst shape, so N repositories cost one
+// derivation rather than N.
+func (mi *MultiIndexer) ScheduleDeriveForConfigDrift() []string {
+	if mi == nil || mi.graph == nil {
+		return nil
+	}
+	current := mi.DeriveConfigHash()
+	if current == "" {
+		// An unconfigured union has no comparison to make — the same reason
+		// the readiness reader skips its config clause rather than guessing.
+		return nil
+	}
+	store, ok := graph.Store(mi.graph).(graph.DeriveStateStore)
+	if !ok {
+		return nil
+	}
+
+	mi.mu.RLock()
+	prefixes := make([]string, 0, len(mi.repos))
+	for prefix := range mi.repos {
+		prefixes = append(prefixes, prefix)
+	}
+	mi.mu.RUnlock()
+	sort.Strings(prefixes)
+
+	var stale []string
+	for _, prefix := range prefixes {
+		st, found, err := store.GetDeriveState(prefix)
+		if err != nil || !found || st.Legacy {
+			// Never derived, or derived before completion was recorded.
+			// Readiness reports both on their own terms and neither is a
+			// config drift, so neither is this function's to diagnose —
+			// claiming them here would hide a genuinely underived repo behind
+			// a config message.
+			continue
+		}
+		if st.ConfigHash != current {
+			stale = append(stale, prefix)
+		}
+	}
+	for _, prefix := range stale {
+		mi.scheduleWorkspaceRederive(prefix)
+	}
+	return stale
 }
 
 // intersectPrefixes keeps only the prefixes present in both sets, preserving

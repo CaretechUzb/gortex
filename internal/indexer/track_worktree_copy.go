@@ -40,28 +40,104 @@ func gitHeadSHA(root string) string {
 	return strings.TrimSpace(string(out))
 }
 
-// worktreeCopySource names a tracked repository this path may be copied from:
-// a different checkout of the same repository, at the same commit.
+// worktreeCopyMaxDivergence caps how far a destination checkout may sit from
+// its copy source and still be installed by copy plus a targeted reconcile.
 //
-// Both conditions are load-bearing. Same checkout group means the two are the
-// same repository, so the destination is entitled to the source's bindings.
-// Same HEAD means the same content — a worktree on another branch shares most
-// files but not all, and copying it would install a graph that describes code
-// that is not on disk.
-func (mi *MultiIndexer) worktreeCopySource(absPath string) (string, bool) {
+// There is no cliff here — the copy saves a whole-repository parse and a
+// whole-repository derive, and the reconcile pays back roughly per changed
+// file, so the crossover is far above any review-sized branch. The cap is
+// deliberately conservative rather than fitted: copy + reconcile is measured
+// only in the tens of files (a 39-path reconcile of this shape took 57.8s
+// against 667s for the cold path), and a bound nobody has measured past should
+// not be set where it looks precise. Above it, indexing is always correct and
+// only slower.
+//
+// Not to be confused with the ~3,800-file ceiling where fsnotify overflows and
+// the WATCHER escalates to a full-tree reconcile. That is a different mechanism
+// on a different path: this reconcile is driven from an explicit file set, not
+// from watch events, so it cannot overflow. The two numbers are unrelated.
+//
+// A var rather than a const only so a test can exercise the boundary without
+// committing a thousand files. Nothing outside tests writes it.
+var worktreeCopyMaxDivergence = 1000
+
+// gitChangedPaths lists the repository-relative paths that differ between two
+// commits, plus anything uncommitted in the destination's working tree.
+//
+// The uncommitted half matters as much as the committed one. The copy installs
+// the SOURCE's graph, so any file the destination has locally modified is a
+// file whose graph describes code that is not on disk — the exact hazard the
+// same-HEAD gate used to exclude wholesale. Reporting them as changed routes
+// them through the same reconcile as a committed difference.
+//
+// Reports false when git cannot answer, which declines the copy rather than
+// guessing at a file set. Guessing low here is the dangerous direction: a path
+// left out of this list is one the reconcile never revisits, so it would keep
+// the source's nodes forever.
+func gitChangedPaths(root, from, to string) ([]string, bool) {
+	seen := map[string]bool{}
+	collect := func(args ...string) bool {
+		out, err := exec.Command("git", append([]string{"-C", root}, args...)...).Output()
+		if err != nil {
+			return false
+		}
+		for _, line := range strings.Split(string(out), "\n") {
+			if rel := strings.TrimSpace(line); rel != "" {
+				seen[rel] = true
+			}
+		}
+		return true
+	}
+	if !collect("diff", "--name-only", from, to) {
+		return nil, false
+	}
+	// Untracked files included: a new file in the worktree is absent from the
+	// copied graph and must still reach the reconcile.
+	if !collect("ls-files", "--modified", "--others", "--deleted", "--exclude-standard") {
+		return nil, false
+	}
+	changed := make([]string, 0, len(seen))
+	for rel := range seen {
+		changed = append(changed, rel)
+	}
+	sort.Strings(changed)
+	return changed, true
+}
+
+// worktreeCopySource names a tracked repository this path may be copied from —
+// a different checkout of the same repository — and the paths on which the two
+// disagree.
+//
+// Same checkout group is absolute: it means the two are the same repository, so
+// the destination is entitled to the source's bindings, and nothing else here
+// substitutes for it.
+//
+// Identical HEADs are the free case and are preferred whenever one is
+// available: the checkouts describe the same code, so the copy stands alone and
+// the returned change set is empty. Otherwise a sibling within
+// worktreeCopyMaxDivergence still qualifies, and the caller reconciles exactly
+// the disagreeing paths afterwards. That covers the case this gate used to
+// refuse and which cost the most: a merge-request worktree branched a few
+// commits off its base is 39 files from it, not 9,634, and re-parsing and
+// re-deriving the whole repository to learn those 39 is what took 667s where
+// copy plus reconcile takes about 200.
+//
+// A larger candidate never displaces a smaller one, and ties break on the
+// sorted prefix, so the choice cannot depend on map iteration order.
+func (mi *MultiIndexer) worktreeCopySource(absPath string) (string, []string, bool) {
 	if mi == nil || mi.graph == nil {
-		return "", false
+		return "", nil, false
 	}
 	if !ResolveWorktree(absPath).IsWorktree {
-		return "", false
+		return "", nil, false
 	}
 	group := resolvedMainRepo(absPath)
 	if group == "" {
-		return "", false
+		return "", nil, false
 	}
 	head := gitHeadSHA(absPath)
 	if head == "" {
-		return "", false
+		return "", nil, false
 	}
 
 	mi.mu.RLock()
@@ -80,21 +156,39 @@ func (mi *MultiIndexer) worktreeCopySource(absPath string) (string, bool) {
 		prefixes = append(prefixes, prefix)
 	}
 	sort.Strings(prefixes)
+
+	var (
+		bestPrefix  string
+		bestChanged []string
+		found       bool
+	)
 	for _, prefix := range prefixes {
 		root := candidates[prefix]
 		if resolvedMainRepo(root) != group {
 			continue
 		}
-		if gitHeadSHA(root) != head {
+		srcHead := gitHeadSHA(root)
+		if srcHead == "" {
 			continue
 		}
-		return prefix, true
+		if srcHead == head {
+			// Nothing beats an identical checkout, and taking it here keeps
+			// the historical path free of any git diff at all.
+			return prefix, nil, true
+		}
+		changed, ok := gitChangedPaths(absPath, srcHead, head)
+		if !ok || len(changed) > worktreeCopyMaxDivergence {
+			continue
+		}
+		if !found || len(changed) < len(bestChanged) {
+			bestPrefix, bestChanged, found = prefix, changed, true
+		}
 	}
-	return "", false
+	return bestPrefix, bestChanged, found
 }
 
 // restatWorktreeMtimes re-reads from disk the mtimes of the files the copy
-// brought over.
+// brought over, and names the ones this checkout does not have.
 //
 // The copied file_mtimes rows carry the SOURCE checkout's mtimes, and
 // `git worktree add` writes fresh ones, so leaving them would make the next
@@ -102,16 +196,69 @@ func (mi *MultiIndexer) worktreeCopySource(absPath string) (string, bool) {
 // giving back exactly what the copy saved. Only paths the copy knows about are
 // stat'd, so this is bounded by the repository and needs none of the indexer's
 // file-discovery rules.
-func restatWorktreeMtimes(root string, copied map[string]int64) map[string]int64 {
+//
+// A path that does not exist KEEPS its entry and is reported as missing.
+// ReconcileRepoCtx derives its deleted set by stat'ing the ledger it is handed
+// (changedSinceMtimesCensus), so a path dropped here is one the reconcile never
+// looks at — and the source's nodes for a file this checkout does not have
+// would then stand under this prefix forever. Measured on a worktree eight
+// files off its copy source: all 20 nodes of the single file that branch
+// deleted survived the reconcile, which reported `deleted: 0`, against zero
+// such ghosts in a cold-tracked control. The retained value is irrelevant and
+// only membership matters — the census stats the path, finds nothing, and
+// evicts.
+//
+// Any other stat error is NOT evidence of deletion. A permissions fault or a
+// transient filesystem error would evict a file that exists, so those paths are
+// dropped as before: that keeps the copied rows, which a later reconcile or
+// watcher event corrects, and wrong-but-present beats confidently-deleted.
+func restatWorktreeMtimes(root string, copied map[string]int64) (map[string]int64, map[string]bool) {
 	out := make(map[string]int64, len(copied))
-	for rel := range copied {
+	missing := map[string]bool{}
+	for rel, prior := range copied {
 		info, err := os.Stat(filepath.Join(root, filepath.FromSlash(rel)))
-		if err != nil {
-			continue // deleted in this worktree; reconcile evicts it
+		switch {
+		case err == nil:
+			out[rel] = info.ModTime().UnixNano()
+		case os.IsNotExist(err):
+			out[rel] = prior
+			missing[rel] = true
 		}
-		out[rel] = info.ModTime().UnixNano()
 	}
-	return out
+	return out, missing
+}
+
+// withholdReconciledPaths edits the copied mtime ledger so that every path the
+// two checkouts disagree on gets reconciled — by reindexing it, or by evicting
+// it — and never silently keeps the source's nodes.
+//
+// The two halves need opposite treatment, and the reason they are decided in
+// one place is that they were once decided in two, each assuming the other
+// handled deletions:
+//
+//   - A path that EXISTS here with different content must lose its entry. The
+//     restat recorded what is on disk now, and ReconcileRepoCtx treats a path
+//     whose recorded mtime matches disk as current — so an entry would announce
+//     that a file the graph holds the SOURCE's nodes for is already up to date.
+//     Absent, it reads as never indexed and is reindexed, which is the work the
+//     copy trades a whole-repository parse for.
+//
+//   - A path that does NOT exist here must KEEP its entry. The reconcile's
+//     deleted set is the subset of the ledger it cannot stat, so that entry is
+//     the only thing telling it there is something to evict. Withholding it
+//     reads as "never indexed" instead — and a file that is neither on disk nor
+//     in the ledger is one nothing reindexes and nothing evicts, so the source's
+//     nodes for it survive under this prefix forever.
+//
+// missing comes from restatWorktreeMtimes rather than a fresh stat, so the two
+// cannot disagree about which paths exist.
+func withholdReconciledPaths(mtimes map[string]int64, changed []string, missing map[string]bool) {
+	for _, rel := range changed {
+		if missing[rel] {
+			continue
+		}
+		delete(mtimes, rel)
+	}
 }
 
 // trackWorktreeByCopy installs prefix by duplicating a sibling checkout's
@@ -123,7 +270,7 @@ func (mi *MultiIndexer) trackWorktreeByCopy(
 	entry config.RepoEntry,
 	absPath, prefix string,
 ) (*IndexResult, bool, error) {
-	src, ok := mi.worktreeCopySource(absPath)
+	src, changed, ok := mi.worktreeCopySource(absPath)
 	if !ok || src == prefix {
 		return nil, false, nil
 	}
@@ -156,7 +303,8 @@ func (mi *MultiIndexer) trackWorktreeByCopy(
 		mi.purgeCopiedPrefix(prefix)
 		return nil, false, nil
 	}
-	mtimes := restatWorktreeMtimes(absPath, reader.LoadFileMtimes(prefix))
+	mtimes, missing := restatWorktreeMtimes(absPath, reader.LoadFileMtimes(prefix))
+	withholdReconciledPaths(mtimes, changed, missing)
 	if len(mtimes) == 0 {
 		// Nothing on disk matched the copied graph. Reconcile would fall back
 		// to a full index anyway, and it would do so against a subgraph this
@@ -175,7 +323,15 @@ func (mi *MultiIndexer) trackWorktreeByCopy(
 	// current for the destination now that its own file set is recorded;
 	// without it a copied worktree reads "partial" forever, since the whole
 	// point of the copy is that nothing will re-derive it.
-	if restamper, ok := mi.graph.(graph.CopiedReadinessRestamper); ok {
+	//
+	// Only for an identical checkout. Once the two disagree that premise is
+	// gone: a derivation IS owed, on the reconciled files, and it is scheduled
+	// below. Declaring the carried stamps current here would report "ready" over
+	// a graph whose changed files have been reindexed but never re-derived —
+	// silent staleness, and the one direction a readiness stamp must never fail
+	// in. Leaving them stranded is the honest state; the repo reads "partial"
+	// for as long as that is true and the scheduled pass clears it.
+	if restamper, ok := mi.graph.(graph.CopiedReadinessRestamper); ok && len(changed) == 0 {
 		if err := restamper.RestampCopiedReadiness(prefix); err != nil && mi.logger != nil {
 			mi.logger.Warn("worktree copy: could not declare carried stage stamps current",
 				zap.String("repo", prefix), zap.Error(err))
@@ -190,7 +346,13 @@ func (mi *MultiIndexer) trackWorktreeByCopy(
 			zap.Int("edges", res.Edges),
 			zap.Int("inbound_edges", res.InboundEdges),
 			zap.Int("sidecar_rows", res.Sidecars),
-			zap.Int("files", len(mtimes)))
+			zap.Int("files", len(mtimes)),
+			zap.Int("reconciled_files", len(changed)),
+			// Files the source holds and this checkout does not. Logged
+			// separately because they are counted in `files` (they must stay in
+			// the ledger for the reconcile to evict them) yet are the opposite
+			// of the others: not reindexed, removed.
+			zap.Int("evicted_files", len(missing)))
 	}
 
 	// ReconcileRepoCtx registers a repository whose nodes are already in the
@@ -202,8 +364,26 @@ func (mi *MultiIndexer) trackWorktreeByCopy(
 		return nil, false, err
 	}
 	// The grouping has to learn about the new checkout before anything reads
-	// it, since the copy deliberately schedules no derivation to republish it.
+	// it, since an identical-checkout copy schedules no derivation to
+	// republish it.
 	mi.publishCheckoutGroups()
+
+	// A diverged copy is the one case that still owes a derivation. The
+	// reconcile above reindexed the changed files, which produces their
+	// extraction edges and nothing else: every derived edge the rest of the
+	// workspace owns into them — framework dispatch, cross-repo, implements,
+	// test and capability edges — comes from the global passes. Skipping this
+	// is precisely the silent under-binding that TrackRepoCtx's own
+	// scheduleWorkspaceRederive exists to prevent, and the copy path returns
+	// before reaching it.
+	//
+	// Scoped, and cheap: rederiveScope sees a frontier that is entirely a
+	// sibling checkout of an already-tracked repository, so the passes run over
+	// the frontier rather than the whole store. Safe to call here — the
+	// ReconcileRepoCtx above has returned, so no topology mutation is open.
+	if len(changed) > 0 {
+		mi.scheduleWorkspaceRederive(prefix)
+	}
 	return result, true, nil
 }
 

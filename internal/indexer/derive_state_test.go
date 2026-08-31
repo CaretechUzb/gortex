@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -48,10 +49,20 @@ func (d *deriveStateGraph) RefreshDeriveState(prefixes []string, _ int64) (int, 
 	return n, nil
 }
 
+// GetDeriveState reads back the LAST stamp for a prefix, as the real store's
+// upsert does, and carries every field the completion recorded. Returning only
+// the SHA made the double silently useless to any caller that reads the config
+// hash or the pass version — both of which readiness compares.
 func (d *deriveStateGraph) GetDeriveState(repoPrefix string) (graph.DeriveState, bool, error) {
-	for _, c := range d.stamped {
-		if c.RepoPrefix == repoPrefix {
-			return graph.DeriveState{RepoPrefix: repoPrefix, DerivedSHA: c.DerivedSHA}, true, nil
+	for i := len(d.stamped) - 1; i >= 0; i-- {
+		if c := d.stamped[i]; c.RepoPrefix == repoPrefix {
+			return graph.DeriveState{
+				RepoPrefix:  repoPrefix,
+				DerivedSHA:  c.DerivedSHA,
+				PassVersion: c.PassVersion,
+				ConfigHash:  c.ConfigHash,
+				Scoped:      c.Scoped,
+			}, true, nil
 		}
 	}
 	return graph.DeriveState{RepoPrefix: repoPrefix}, false, nil
@@ -303,4 +314,98 @@ func TestIntersectPrefixesNarrowsAWholeGraphClaim(t *testing.T) {
 		intersectPrefixes([]string{"repoA", "repoB", "repoC"}, []string{"repoC", "repoA"}))
 	require.Nil(t, intersectPrefixes([]string{"repoA"}, nil))
 	require.Nil(t, intersectPrefixes(nil, []string{"repoA"}))
+}
+
+// driftTestIndexer is deriveTestIndexer with a real allow-list, so
+// DeriveConfigHash returns something to compare against. The zero IndexConfig
+// resolves to the unset Set, which hashes to the empty string and makes every
+// drift check a no-op.
+func driftTestIndexer(g graph.Store, prefixes ...string) *MultiIndexer {
+	mi := deriveTestIndexer(g, prefixes...)
+	for _, prefix := range prefixes {
+		idx := mi.indexers[prefix]
+		idx.config.Frameworks.Allow = []string{"odoo"}
+	}
+	return mi
+}
+
+// Nothing consumed the config-hash comparison before this. DeriveConfigHash was
+// published and stamped, readiness compared the two and reported "partial", and
+// no caller scheduled the work that would clear it — while the message printed
+// under that verdict told the user to restart the daemon. Warmup's change
+// detection is file-based, so a restart with no file delta takes the ResetBatch
+// fast path and derives nothing: the repos stayed partial across every restart.
+//
+// Observed 2026-08-30: five repos sat partial from 18:51 through a 22:59
+// restart, with the CLI advertising that restart as the fix.
+func TestConfigDriftSchedulesADeriveForTheReposLeftBehind(t *testing.T) {
+	g := newDeriveStateGraph()
+	mi := driftTestIndexer(g, "repoA", "repoB")
+	// Long enough that the pass cannot open behind the assertions, short enough
+	// that teardown does not wait on it: time.Sleep in the scheduler loop is not
+	// cancellable, so the debounce is the whole cost of stopping.
+	mi.rederive.debounce = 500 * time.Millisecond
+	t.Cleanup(mi.stopWorkspaceRederive)
+
+	// Both were derived under a configuration that is no longer current.
+	g.stamped = append(g.stamped,
+		graph.DeriveCompletion{RepoPrefix: "repoA", ConfigHash: "stale"},
+		graph.DeriveCompletion{RepoPrefix: "repoB", ConfigHash: "stale"},
+	)
+
+	drifted := mi.ScheduleDeriveForConfigDrift()
+
+	require.Equal(t, []string{"repoA", "repoB"}, drifted)
+	require.True(t, mi.WorkspaceRederivePending(),
+		"reporting the drift without scheduling the derive is the bug, not the fix")
+}
+
+// A repo stamped under the current configuration is current. Re-deriving it
+// would cost a whole-workspace pass to emit identical edges, which is exactly
+// the waste the over-sensitive hash used to cause.
+func TestConfigDriftIgnoresReposAlreadyCurrent(t *testing.T) {
+	g := newDeriveStateGraph()
+	mi := driftTestIndexer(g, "repoA")
+	mi.rederive.debounce = 500 * time.Millisecond
+	t.Cleanup(mi.stopWorkspaceRederive)
+
+	g.stamped = append(g.stamped, graph.DeriveCompletion{
+		RepoPrefix: "repoA",
+		ConfigHash: mi.DeriveConfigHash(),
+	})
+
+	require.Empty(t, mi.ScheduleDeriveForConfigDrift())
+	require.False(t, mi.WorkspaceRederivePending())
+}
+
+// A repo with no completion row has never been derived. Readiness reports that
+// on its own terms — "never derived", the verdict reserved for a graph that is
+// silently wrong — and claiming it here would file a real problem under a
+// config message and schedule the wrong-shaped fix.
+func TestConfigDriftDoesNotClaimANeverDerivedRepo(t *testing.T) {
+	g := newDeriveStateGraph()
+	mi := driftTestIndexer(g, "repoA")
+	mi.rederive.debounce = 500 * time.Millisecond
+	t.Cleanup(mi.stopWorkspaceRederive)
+
+	require.Empty(t, mi.ScheduleDeriveForConfigDrift(),
+		"no derive_state row is not a config drift")
+}
+
+// An unconfigured allow-list hashes to the empty string, which means "no
+// comparison to make" — the same reading the readiness ladder takes. Treating
+// it as a hash would accuse every repo of drifting the moment the last
+// configured repo was untracked.
+func TestConfigDriftSkipsAnUnconfiguredUnion(t *testing.T) {
+	g := newDeriveStateGraph()
+	mi := deriveTestIndexer(g, "repoA") // no allow-list at all
+	mi.rederive.debounce = 500 * time.Millisecond
+	t.Cleanup(mi.stopWorkspaceRederive)
+
+	g.stamped = append(g.stamped,
+		graph.DeriveCompletion{RepoPrefix: "repoA", ConfigHash: "anything"})
+
+	require.Empty(t, mi.DeriveConfigHash())
+	require.Empty(t, mi.ScheduleDeriveForConfigDrift())
+	require.False(t, mi.WorkspaceRederivePending())
 }

@@ -55,16 +55,36 @@ type Set struct {
 // A slice that is nil, empty, or contains only blanks yields the unset
 // Set — which allows everything. Narrowing to nothing is spelled with an
 // explicit sentinel, not by writing an empty list; see AllowNone.
+// Repeated entries collapse to the first spelling seen, compared
+// case-insensitively for the same reason matching is. Union is defined as
+// New(a.Patterns() + b.Patterns()), so folding N repositories that allow the
+// same framework used to yield that name N times in raw. Nothing about
+// ADMISSION noticed — exact is a map, prefix matches by OR, and all is a bool,
+// so Allows is a function of the underlying SET — but Patterns() is the union's
+// only observable, and callers that fingerprint it saw a value that moved with
+// the number of repositories rather than with the allow-list. That cost a real
+// bug: tracking a sixth repository whose list was identical to the other five
+// changed indexer.DeriveConfigHash, and every previously-derived repository
+// then read "partial: derive-relevant config changed" and advertised a
+// whole-workspace re-derive that would have emitted identical edges.
 func New(patterns []string) Set {
 	s := Set{}
+	seen := map[string]bool{}
 	for _, p := range patterns {
 		trimmed := strings.TrimSpace(p)
 		if trimmed == "" {
 			continue
 		}
+		// Set before the dedupe check: a list of nothing but repeats is still
+		// a configured list, and reading it as unset would re-admit the whole
+		// registry — the one direction this package must never drift in.
 		s.configured = true
-		s.raw = append(s.raw, trimmed)
 		lowered := strings.ToLower(trimmed)
+		if seen[lowered] {
+			continue
+		}
+		seen[lowered] = true
+		s.raw = append(s.raw, trimmed)
 		switch {
 		case lowered == "*":
 			s.all = true

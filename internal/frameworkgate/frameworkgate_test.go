@@ -295,3 +295,85 @@ func TestIntersect_MatchesAllowsConjunction(t *testing.T) {
 		}
 	}
 }
+
+// Union is defined as New(a.Patterns() + b.Patterns()), so folding a workspace
+// where every repository allows the same framework used to repeat that name
+// once per repository. Admission never noticed — Allows reads the exact map,
+// the prefix list and the all flag, none of which count copies — but Patterns()
+// is the union's only observable, and indexer.DeriveConfigHash fingerprints it.
+//
+// Cost of the leak, measured 2026-08-30: tracking a sixth repository whose
+// allow-list was identical to the other five moved the derive config hash, and
+// all five previously-derived repositories flipped to "partial: derive-relevant
+// config changed", advertising a whole-workspace re-derive that would have
+// emitted byte-identical edges.
+func TestUnionDoesNotGrowWithTheNumberOfRepositoriesAllowingTheSameThing(t *testing.T) {
+	one := New([]string{"odoo"})
+
+	five := one
+	for i := 0; i < 4; i++ {
+		five = Union(five, New([]string{"odoo"}))
+	}
+	six := Union(five, New([]string{"odoo"}))
+
+	if got := len(six.Patterns()); got != 1 {
+		t.Fatalf("six repositories allowing odoo must union to one pattern, got %d: %v",
+			got, six.Patterns())
+	}
+	if a, b := five.Patterns(), six.Patterns(); len(a) != len(b) {
+		t.Fatalf("adding a repository with an identical list changed the union: %v -> %v", a, b)
+	}
+	if !six.Allows("odoo") || six.Allows("celery-dispatch") {
+		t.Fatalf("dedupe must not alter admission: %v", six.Patterns())
+	}
+}
+
+// The real workspace shape: one repository narrows to its own five passes, the
+// rest all narrow to odoo. The union is the six-name set regardless of how many
+// repositories contribute the odoo half.
+func TestUnionIsTheSetNotTheMultiset(t *testing.T) {
+	gortex := New([]string{
+		"fn-value-callback", "value-ref", "gin-middleware",
+		"fastapi-resolve", "observer-channel",
+	})
+	u := gortex
+	for i := 0; i < 6; i++ {
+		u = Union(u, New([]string{"odoo"}))
+	}
+	if got := len(u.Patterns()); got != 6 {
+		t.Fatalf("want 6 distinct patterns, got %d: %v", got, u.Patterns())
+	}
+	for _, name := range []string{
+		"fn-value-callback", "value-ref", "gin-middleware",
+		"fastapi-resolve", "observer-channel", "odoo",
+	} {
+		if !u.Allows(name) {
+			t.Fatalf("union must still admit %q", name)
+		}
+	}
+}
+
+// Case is not a distinction the matcher makes, so it must not be one the
+// fingerprint makes either.
+func TestRepeatsCollapseCaseInsensitively(t *testing.T) {
+	s := New([]string{"Odoo", "odoo", "ODOO"})
+	if got := len(s.Patterns()); got != 1 {
+		t.Fatalf("want 1 pattern, got %d: %v", got, s.Patterns())
+	}
+	if !s.Allows("odoo") {
+		t.Fatal("collapsing repeats must not change admission")
+	}
+}
+
+// A list of nothing but repeats is still a configured list. Reading it as unset
+// would re-admit the entire registry — the one direction this package must
+// never drift in, and the reason configured is set before the dedupe check.
+func TestARepeatedOnlyListStaysConfigured(t *testing.T) {
+	s := New([]string{"odoo", "odoo"})
+	if !s.Configured() {
+		t.Fatal("a list of repeats is configured, not unset")
+	}
+	if s.Allows("celery-dispatch") {
+		t.Fatal("an unset Set leaked through: everything would be re-admitted")
+	}
+}

@@ -220,11 +220,24 @@ func (mi *MultiIndexer) scheduleWorkspaceRederive(reason string) {
 
 			mi.runWorkspaceRederive(ctx, frontier)
 
+			// Read the preemption verdict BEFORE cancel(). cancel() is this
+			// pass's own context release, so it makes ctx.Err() non-nil
+			// unconditionally — testing it afterwards classified every
+			// COMPLETED pass as preempted and pushed the frontier it had just
+			// finished deriving back into pending. Nothing drains that: the run
+			// which would have is the one that just returned, and s.queued is
+			// false on a clean finish. The repo therefore stayed in the owed set
+			// and read "deriving…" until the daemon exited, hours after its
+			// derive_state row went current — while runWorkspaceRederive's own
+			// log line, which reads ctx.Err() before this cancel, correctly said
+			// preempted=false. Those two disagreeing is the signature.
+			preempted := ctx.Err() != nil
+
 			s.mu.Lock()
 			s.cancel = nil
 			s.inflight = nil
 			cancel()
-			if ctx.Err() != nil {
+			if preempted {
 				// Preempted. The frontier this pass abandoned is
 				// still owed to the graph, and the next pass has to
 				// cover it or a scoped run would derive only

@@ -980,6 +980,16 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		logger.Info("daemon: deriving repositories tracked during warmup",
 			zap.Strings("repos", deferred))
 	}
+	// Same shape, different trigger: the fast paths above also run no
+	// workspace-wide pass when the FILES are unchanged but the derive-relevant
+	// CONFIG has moved. Readiness notices that and reports "partial", and the
+	// remedy it prints is this restart — which, without the line below, does
+	// nothing about it. A drifted repository stayed partial across every
+	// restart, forever.
+	if drifted := state.multiIndexer.ScheduleDeriveForConfigDrift(); len(drifted) > 0 {
+		logger.Info("daemon: deriving repositories whose derive-relevant config changed",
+			zap.Strings("repos", drifted))
+	}
 	postBatchNodes, postBatchContracts, postBatchResolutionAffected := state.multiIndexer.BackfillWorkspaceSlugsWithImpact()
 	if postBatchNodes+postBatchContracts > 0 {
 		logger.Info("daemon: backfilled workspace/project slugs after derived passes",
