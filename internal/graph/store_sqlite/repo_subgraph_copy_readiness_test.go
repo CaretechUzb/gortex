@@ -156,3 +156,49 @@ func TestRestampingLeavesALegacyRowLegacy(t *testing.T) {
 	require.True(t, derive.Legacy, "a legacy row stays unknown; a copy is not evidence")
 	require.Zero(t, derive.DerivedContentGen)
 }
+
+// The premise trackWorktreeByCopy's call ORDER rests on, made executable.
+//
+// That function used to call RestampCopiedReadiness before ReconcileRepoCtx,
+// and the reordering to after it is only correct if a stamp written early is
+// genuinely destroyed by the registering write that follows. Until now that
+// claim lived in a prose comment, so a later change making the stamp survive
+// a subsequent content_gen bump would quietly turn the rationale false and make
+// moving the call back look harmless.
+//
+// The sibling test above proves restamp-AFTER repairs the stranding. This one
+// proves restamp-BEFORE does not survive it, which is the half that makes the
+// ordering load-bearing rather than incidental.
+func TestARestampWrittenBeforeTheRegisteringWriteIsDestroyedByIt(t *testing.T) {
+	t.Parallel()
+	store := copyReadinessFixture(t)
+	_, err := store.CopyRepoSubgraph("src", "dst")
+	require.NoError(t, err)
+
+	// The old order: stamp first, while the copy still looks self-consistent.
+	require.NoError(t, store.RestampCopiedReadiness("dst"))
+	derive, _, err := store.GetDeriveState("dst")
+	require.NoError(t, err)
+	_, stampedAt, _, err := store.GetRepoGraphGen("dst")
+	require.NoError(t, err)
+	require.Equal(t, stampedAt, derive.DerivedContentGen, "current at the moment it was written")
+
+	// Then the write the stamp was supposed to cover. ReplaceFileMtimes is what
+	// registering the checkout does — the restat, and the eviction of files the
+	// source's ledger holds that this checkout lacks.
+	require.NoError(t, store.ReplaceFileMtimes("dst", map[string]int64{"a.go": 555}))
+
+	_, contentGen, _, err := store.GetRepoGraphGen("dst")
+	require.NoError(t, err)
+	require.Greater(t, contentGen, stampedAt, "the registering write advances the counter")
+
+	derive, _, err = store.GetDeriveState("dst")
+	require.NoError(t, err)
+	require.Less(t, derive.DerivedContentGen, contentGen,
+		"stamped before the write it covers, so it is behind again — permanently, "+
+			"because an identical copy schedules no derive to re-stamp it")
+
+	gens, err := store.EnrichmentContentGens("dst")
+	require.NoError(t, err)
+	require.Less(t, gens["go-types"], contentGen, "the enrichment stamp is stranded the same way")
+}

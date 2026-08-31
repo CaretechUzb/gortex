@@ -105,6 +105,28 @@ type Store struct {
 	resolveMu sync.Mutex
 
 	edgeIdentityRevs atomic.Int64
+	// edgeRowsInserted counts edge rows this process actually WROTE, as
+	// distinguished from edge rows a pass produced. Every edge ingest is
+	// `INSERT OR IGNORE`, so a pass that re-derives an edge already in the
+	// store reports it in its own `edges` total and adds nothing here.
+	//
+	// That difference is the only way to answer "did this pass contribute?".
+	// A pass's own count deliberately includes already-persisted idempotent
+	// results (see resolver.SynthCount.Edges), so it cannot distinguish
+	// re-deriving 67,136 carried edges from discovering 67,136 new ones.
+	//
+	// Monotonic for the life of the process; read it as a delta across the
+	// window you care about.
+	//
+	// Counts addBatchSetOriented, which is where BOTH public edge writers land:
+	// AddBatch calls it directly and AddEdge routes through AddBatch rather than
+	// using a prepared statement. Deliberately NOT counted are the three ingest
+	// paths that bypass it — ReindexEdge / reindexEdgesSetTransactionLocked (a
+	// file being reindexed) and CopyRepoSubgraph / copyInboundEdges (a subgraph
+	// being duplicated). Both are correct exclusions for the question this
+	// answers: they run before the derived passes open their window, so counting
+	// them would attribute a reconcile's or a copy's rows to the derive.
+	edgeRowsInserted atomic.Int64
 	// edgeMutationRevision is a coarse monotonic generation for every durable
 	// edge payload/topology mutation, including same-key replacements. Resolver
 	// liveness snapshots use it to reject stale work after watcher interleaves.

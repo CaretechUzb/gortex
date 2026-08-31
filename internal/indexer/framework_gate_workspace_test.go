@@ -9,6 +9,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/frameworkgate"
@@ -349,4 +351,110 @@ func TestWorkspaceScopedUnionIsOutputPreserving(t *testing.T) {
 	assert.Equal(t, frameworkEdgeSet(wide), frameworkEdgeSet(narrow),
 		"narrowing the allow-list by workspace changed the graph: a pass only another "+
 			"workspace asks for landed an edge here that the per-repo gate did not refuse")
+}
+
+// --- The global-pass call site ----------------------------------------------
+
+// globalPassSynthDisabled runs the GLOBAL derived passes over scope and reports
+// which framework synthesizers were admitted.
+//
+// The global pass returns only its covered-repo list, so the per-synthesizer
+// report is read back off its own log line. That is the same signal
+// TestIncrementalDerivedPassesGateFrameworksByWorkspace asserts on —
+// `Disabled` comes straight from the allow-list the call site handed in, so it
+// answers "was this pass admitted for this run" exactly, and no timing is
+// involved.
+func globalPassSynthDisabled(t *testing.T, scope map[string]struct{}) map[string]bool {
+	t.Helper()
+	core, logs := observer.New(zapcore.InfoLevel)
+	mi := &MultiIndexer{
+		graph:  graph.New(),
+		logger: zap.New(core),
+		indexers: map[string]*Indexer{
+			"local":  frameworkGateTestIndexer("his", "odoo"),
+			"gortex": frameworkGateTestIndexer("gortex", "fastapi-resolve", "fn-value-callback"),
+		},
+		repos: map[string]*RepoMetadata{
+			"local":  {RepoPrefix: "local", RootPath: "/nonexistent/local"},
+			"gortex": {RepoPrefix: "gortex", RootPath: "/nonexistent/gortex"},
+		},
+	}
+	if _, err := mi.runGlobalGraphPassesTopologyHeld(context.Background(), scope, false); err != nil {
+		t.Fatalf("global passes: %v", err)
+	}
+
+	entries := logs.FilterMessage("global pass: framework dispatch synthesis").All()
+	if len(entries) != 1 {
+		t.Fatalf("precondition: expected exactly one framework synthesis log line, got %d", len(entries))
+	}
+	per, ok := entries[0].ContextMap()["per_synthesizer"].([]resolver.SynthCount)
+	if !ok {
+		t.Fatalf("precondition: per_synthesizer is %T, not []resolver.SynthCount",
+			entries[0].ContextMap()["per_synthesizer"])
+	}
+	if len(per) == 0 {
+		t.Fatal("precondition: the framework pass reported no synthesizers, so this guards nothing")
+	}
+	disabled := make(map[string]bool, len(per))
+	for _, p := range per {
+		disabled[p.Name] = p.Disabled
+	}
+	for _, name := range []string{"odoo", "fastapi-resolve", "fn-value-callback"} {
+		if _, seen := disabled[name]; !seen {
+			t.Fatalf("precondition: %s is not a registered pass under this name", name)
+		}
+	}
+	return disabled
+}
+
+// The CALL-SITE guard for the global pass, and the reason it exists rather than
+// a gate-set assertion: reverting multi.go's allowedFrameworksForScope back to
+// allowedFrameworks leaves every fold test above green, exactly as it does for
+// the incremental call site.
+//
+// Both directions are asserted, and the second is the load-bearing one. Proving
+// the leak is closed says nothing about whether the narrowing went too far — and
+// a pass that stops running in its OWN workspace loses edges silently, with no
+// error and no log line. That is the only way this change can be wrong.
+func TestGlobalGraphPassesGateFrameworksByWorkspace(t *testing.T) {
+	t.Run("a sibling workspace's passes do not execute here", func(t *testing.T) {
+		disabled := globalPassSynthDisabled(t, map[string]struct{}{"local": {}})
+
+		for _, name := range []string{"fastapi-resolve", "fn-value-callback"} {
+			if !disabled[name] {
+				t.Errorf("%s is asked for only by the gortex workspace but was admitted "+
+					"for a his-workspace derive; measured cost of that leak on one "+
+					"scoped Odoo derive was 178.5s emitting zero edges", name)
+			}
+		}
+		if disabled["odoo"] {
+			t.Error("odoo is allowed by the run's own workspace and must stay admitted")
+		}
+	})
+
+	t.Run("but they still execute in their own", func(t *testing.T) {
+		disabled := globalPassSynthDisabled(t, map[string]struct{}{"gortex": {}})
+
+		for _, name := range []string{"fastapi-resolve", "fn-value-callback"} {
+			if disabled[name] {
+				t.Errorf("%s is asked for by the gortex workspace and this run covers "+
+					"only gortex, so narrowing must not have excluded it — over-narrowing "+
+					"drops edges with no error anywhere", name)
+			}
+		}
+	})
+
+	// The case the exclusion was originally written for. A whole-store run has no
+	// single workspace to resolve, and allowedFrameworksForScope falls back to the
+	// daemon-wide union on an empty scope — which is what makes the call site safe.
+	t.Run("a nil scope falls back to the daemon-wide union", func(t *testing.T) {
+		disabled := globalPassSynthDisabled(t, nil)
+
+		for _, name := range []string{"odoo", "fastapi-resolve", "fn-value-callback"} {
+			if disabled[name] {
+				t.Errorf("%s must stay admitted on a whole-store derive; narrowing there "+
+					"would stop emitting a sibling workspace's edges on a full derive", name)
+			}
+		}
+	})
 }
