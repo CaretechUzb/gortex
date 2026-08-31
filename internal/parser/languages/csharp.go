@@ -458,6 +458,16 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 	// cannot say which of two members sharing a physical line owns a
 	// call site; the byte interval can (round-5 finding 4).
 	funcBytes := make(map[string][2]int)
+	// Line spans matching funcBytes for member kinds whose NODE lines
+	// can differ from the extent that owns their code - a C# 13 partial
+	// property's node keeps the first fragment's lines while the extents
+	// belong to the implementing fragment, and a field's extent is its
+	// declarator, not the whole declaration.
+	funcLines := make(map[string][2]int)
+	// Properties carrying a set/init accessor, recorded at emission so
+	// the deferred typing pass can seed the accessor's implicit `value`
+	// parameter with the property's declared type.
+	valueProps := make(map[string]csharpValueProp)
 	// Type IDs whose FIRST declaration spelled `partial` — the gate for
 	// preserving a later same-file fragment's base list (round-5
 	// finding 5).
@@ -517,10 +527,10 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 			e.emitConstructor(m, filePath, fileID, src, result, seen, funcBytes)
 
 		case m.Captures["field.def"] != nil:
-			e.emitField(m, filePath, fileID, src, result, seen, fileAliases)
+			e.emitField(m, filePath, fileID, src, result, seen, fileAliases, funcBytes, funcLines)
 
 		case m.Captures["prop.def"] != nil:
-			e.emitProperty(m, filePath, fileID, src, result, seen, fileAliases)
+			e.emitProperty(m, filePath, fileID, src, result, seen, fileAliases, funcBytes, funcLines, valueProps)
 
 		case m.Captures["using.def"] != nil:
 			e.emitUsing(m, filePath, fileID, result)
@@ -630,7 +640,7 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 	// type environments. Owner attribution runs once per local, call and
 	// type use — the sorted lookup keeps that from multiplying into an
 	// O(locals×functions) linear-scan product on member-heavy files.
-	funcRanges := newCSharpFuncLookup(buildFuncRanges(result), funcBytes)
+	funcRanges := newCSharpFuncLookup(csharpOwnerRanges(result, funcBytes, funcLines), funcBytes)
 
 	// Build type environments in legacy precedence, scoped per enclosing
 	// method — a same-named local of a different type in a sibling method
@@ -870,7 +880,7 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 	// `x as Foo`), static / const access (`Foo.Empty`, `typeof(Foo)`,
 	// `nameof(Foo)`), and attribute type names (`[Foo]`). Inheritance is
 	// already covered by emitCSharpBaseList, so it is not re-emitted here.
-	emitCSharpReferenceForms(root, src, filePath, fileID, result)
+	emitCSharpReferenceForms(root, src, filePath, fileID, result, funcBytes, funcLines)
 
 	// Two same-named calls on ONE line whose receivers differ make the
 	// line unattributable: member companions dedupe to a single stored
@@ -910,6 +920,34 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 	// The field-identifier emitter reuses both.
 	paramsByOwner := csharpParamNamesByOwner(result)
 	localScopes := csharpLocalScopes{}
+	// The implicit `value` parameter of a set/init accessor carries the
+	// property's declared type, and inside those accessors it is ALWAYS
+	// the parameter - a same-named member is only reachable there via
+	// this.value. Seed it as an offset-scoped record over each accessor
+	// span, never owner-wide: in the GETTER the bare name means a member
+	// (possibly inherited, possibly declared in another partial
+	// fragment), and an owner-wide seed typed those sites with the
+	// property type - a confident wrong answer. The scope registration
+	// keeps the shadow refusal and the field-identifier lane from
+	// reading the parameter as field evidence inside the accessor.
+	for id, vp := range valueProps {
+		t := normalizeCSharpTypeName(vp.typ)
+		if t == "" || t == "var" {
+			continue
+		}
+		recs := typedLocalsByOwner[id]
+		if recs == nil {
+			recs = map[string][]*csharpTypedBinding{}
+			typedLocalsByOwner[id] = recs
+		}
+		if localScopes[id] == nil {
+			localScopes[id] = map[string][]csharpLocalScope{}
+		}
+		for _, sp := range vp.spans {
+			recs["value"] = append(recs["value"], &csharpTypedBinding{typ: t, scope: sp})
+			localScopes[id]["value"] = append(localScopes[id]["value"], sp)
+		}
+	}
 	for _, l := range locals {
 		owner := localOwner(l)
 		if owner == "" {
@@ -1085,7 +1123,7 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 	captureValueRefCandidates(result, root, filePath, src)
 	captureFnValueCandidates(result, root, filePath, src)
 
-	captureMediatRDispatch(result, root, filePath, src)
+	captureMediatRDispatch(result, root, filePath, src, funcBytes, funcLines)
 
 	return result, hadError, nil
 }
@@ -1825,18 +1863,45 @@ func (e *CSharpExtractor) emitConstructor(m parser.QueryResult, filePath, fileID
 	emitCSharpFunctionShape(id, def.Node, src, filePath, startLine1, result)
 }
 
-func (e *CSharpExtractor) emitField(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool, fileAliases map[string]bool) {
+func (e *CSharpExtractor) emitField(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool, fileAliases map[string]bool, funcBytes, funcLines map[string][2]int) {
 	def := m.Captures["field.def"]
 	owner := csharpDirectMemberOwner(def.Node, src, "class_declaration", "struct_declaration", "interface_declaration", "record_declaration")
 	if owner.kind == "" {
 		return
 	}
-	name := m.Captures["field.name"].Text
+	nameCap := m.Captures["field.name"]
+	name := nameCap.Text
 	id := filePath + "::" + owner.name + "." + name
 	if seen[id] {
 		return
 	}
 	seen[id] = true
+	// An initializer is executable code with no method around it, so the
+	// declaring field owns its calls (round-23 catch AC1's field lane).
+	// The extent is the DECLARATOR, not the whole declaration: on a
+	// multi-declarator line (`int a = F(), b = G();`) each call must land
+	// on the field it actually initializes. Initializer-less declarators
+	// record nothing — they contain no code, and keeping them out of the
+	// owner set avoids needless one-line ambiguity ties.
+	if nameCap.Node != nil && !csharpHasModifier(def.Node, src, "const") {
+		if decl := nameCap.Node.Parent(); decl != nil && decl.Type() == "variable_declarator" {
+			// Grammar revisions disagree on the wrapper (equals_value_clause
+			// vs the expression hanging directly under the declarator — the
+			// await-tier walk above tolerates both), so "has an initializer"
+			// is: any named child besides the name and a fixed-size-buffer
+			// bracketed_argument_list.
+			for i := 0; i < int(decl.NamedChildCount()); i++ {
+				c := decl.NamedChild(i)
+				if c == nil || c.StartByte() == nameCap.Node.StartByte() ||
+					c.Type() == "bracketed_argument_list" {
+					continue
+				}
+				funcBytes[id] = [2]int{int(decl.StartByte()), int(decl.EndByte())}
+				funcLines[id] = [2]int{int(decl.StartPoint().Row) + 1, int(decl.EndPoint().Row) + 1}
+				break
+			}
+		}
+	}
 	// Interface fields (C# 8+ static/const members) are implicitly public.
 	isIface := owner.kind == "interface_declaration"
 	defaultVis := VisibilityPrivate
@@ -1846,6 +1911,13 @@ func (e *CSharpExtractor) emitField(m parser.QueryResult, filePath, fileID strin
 	meta := map[string]any{
 		"receiver":   owner.name,
 		"visibility": csharpVisibility(def.Node, src, defaultVis),
+	}
+	// Every field carries scope_ns for the resolver's scoped-usings
+	// narrowing, not only the initialized ones that are call owners: a
+	// field's TYPE reference needs the same namespace narrowing whether
+	// or not its declarator authored a call.
+	if ns := csharpEnclosingNamespace(def.Node, src); ns != "" {
+		meta["scope_ns"] = ns
 	}
 	if isIface {
 		meta["iface_member"] = true
@@ -1901,7 +1973,84 @@ func (e *CSharpExtractor) emitField(m parser.QueryResult, filePath, fileID strin
 	emitCSharpTypeUseEdges(id, fieldTypeRaw, filePath, def.StartLine+1, result)
 }
 
-func (e *CSharpExtractor) emitProperty(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool, fileAliases map[string]bool) {
+// csharpValueProp records a set/init-carrying property so the deferred
+// typing pass can seed the accessor's implicit `value` parameter as an
+// offset-scoped record over each accessor's own byte extent.
+type csharpValueProp struct {
+	typ   string // raw declared property type
+	spans []csharpLocalScope
+}
+
+// csharpPropertyHasExecutableBody reports whether the fragment carries
+// any accessor block or expression body - the discriminator between a
+// C# 13 partial property's declaring part (`{ get; set; }`) and its
+// implementing part. The walk is coarse: an auto-property with a
+// block-lambda INITIALIZER (`public Func<int> F { get; } = () => { … };`)
+// would read as body-bearing because the lambda's block matches. That
+// misread is unreachable today - this predicate runs only on the
+// duplicate-declaration path, and valid C# does not permit two
+// same-name property declarations where one is such an auto-property -
+// so it is documented rather than special-cased.
+func csharpPropertyHasExecutableBody(def *sitter.Node) bool {
+	found := false
+	walkNodes(def, func(n *sitter.Node) {
+		if found {
+			return
+		}
+		switch n.Type() {
+		case "block", "arrow_expression_clause":
+			found = true
+		}
+	})
+	return found
+}
+
+// csharpRecordPropertyOwnership records one fragment's declaration span
+// as the property's call-ownership evidence: byte extents, the line
+// span (the minted node keeps the FIRST fragment's lines, so a partial
+// implementation needs its own), and the set/init spans for the value
+// seed. Re-invoked by the duplicate-declaration path when the
+// body-bearing fragment of a partial property extracts second.
+func csharpRecordPropertyOwnership(id string, node *sitter.Node, startLine, endLine int, src []byte, funcBytes, funcLines map[string][2]int, valueProps map[string]csharpValueProp) {
+	if node == nil {
+		return
+	}
+	funcBytes[id] = [2]int{int(node.StartByte()), int(node.EndByte())}
+	funcLines[id] = [2]int{startLine + 1, endLine + 1}
+	delete(valueProps, id)
+	if t := node.ChildByFieldName("type"); t != nil {
+		if raw := strings.TrimSpace(t.Content(src)); raw != "" {
+			if spans := csharpSetInitAccessorSpans(node); len(spans) > 0 {
+				valueProps[id] = csharpValueProp{typ: raw, spans: spans}
+			}
+		}
+	}
+}
+
+// csharpSetInitAccessorSpans returns the byte extents of the property's
+// set and init accessor declarations - the spans where `value` IS the
+// implicit parameter (a same-named member is only reachable there via
+// this.value, so a seed scoped to these spans can never collide with
+// member evidence). The keyword is an anonymous child of the
+// accessor_declaration, so every child's Type is scanned, not just the
+// named ones.
+func csharpSetInitAccessorSpans(def *sitter.Node) []csharpLocalScope {
+	var spans []csharpLocalScope
+	walkNodes(def, func(n *sitter.Node) {
+		if n.Type() != "accessor_declaration" {
+			return
+		}
+		for i := 0; i < int(n.ChildCount()); i++ {
+			if c := n.Child(i); c != nil && (c.Type() == "set" || c.Type() == "init") {
+				spans = append(spans, csharpLocalScope{start: int(n.StartByte()), end: int(n.EndByte())})
+				return
+			}
+		}
+	})
+	return spans
+}
+
+func (e *CSharpExtractor) emitProperty(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool, fileAliases map[string]bool, funcBytes, funcLines map[string][2]int, valueProps map[string]csharpValueProp) {
 	def := m.Captures["prop.def"]
 	owner := csharpDirectMemberOwner(def.Node, src, "class_declaration", "struct_declaration", "interface_declaration", "record_declaration")
 	if owner.kind == "" {
@@ -1910,9 +2059,23 @@ func (e *CSharpExtractor) emitProperty(m parser.QueryResult, filePath, fileID st
 	name := m.Captures["prop.name"].Text
 	id := filePath + "::" + owner.name + "." + name
 	if seen[id] {
+		// A same-file duplicate declaration mints no second node — but a
+		// C# 13 partial property splits declaration and implementation
+		// across fragments, and either order may extract first. The
+		// body-bearing fragment must own the extents and the value
+		// spans, or every accessor call in the implementation dies
+		// ownerless (the AC1 drop, one level up).
+		if def.Node != nil && csharpPropertyHasExecutableBody(def.Node) {
+			csharpRecordPropertyOwnership(id, def.Node, def.StartLine, def.EndLine, src, funcBytes, funcLines, valueProps)
+		}
 		return
 	}
 	seen[id] = true
+	// Accessor bodies, an expression body, and an initializer all live
+	// inside the declaration span — recording it makes the property a
+	// call owner (round-23 catch AC1: without an owner the funcRanges
+	// gate dropped every accessor-body call outright).
+	csharpRecordPropertyOwnership(id, def.Node, def.StartLine, def.EndLine, src, funcBytes, funcLines, valueProps)
 	// Interface properties are implicitly public; explicit modifiers still win.
 	isIface := owner.kind == "interface_declaration"
 	defaultVis := VisibilityPrivate
@@ -1923,6 +2086,11 @@ func (e *CSharpExtractor) emitProperty(m parser.QueryResult, filePath, fileID st
 		"receiver":   owner.name,
 		"visibility": csharpVisibility(def.Node, src, defaultVis),
 		"kind":       "property",
+	}
+	// Properties are call owners; the resolver's scoped-usings narrowing
+	// reads the caller's scope_ns, so they carry it like methods do.
+	if ns := csharpEnclosingNamespace(def.Node, src); ns != "" {
+		meta["scope_ns"] = ns
 	}
 	if isIface {
 		meta["iface_member"] = true
@@ -2093,6 +2261,36 @@ type csharpFuncLookup struct {
 	bytes map[string][2]int
 }
 
+// csharpOwnerRanges widens the method/constructor owner set with every
+// member that recorded byte extents but is not a KindFunction/KindMethod
+// node — properties today, any extent-carrying member kind tomorrow. A
+// member that can hold executable code must be able to OWN the calls in
+// it: the funcRanges gate drops a call whose enclosing member it cannot
+// name, which is how every accessor-body call vanished (round-23 catch
+// AC1 — 3 of the probe cell's 4 sites, the expression-bodied method
+// being the lone survivor).
+func csharpOwnerRanges(result *parser.ExtractionResult, funcBytes, funcLines map[string][2]int) []funcRange {
+	ranges := buildFuncRanges(result)
+	for _, n := range result.Nodes {
+		if n.Kind != graph.KindField {
+			continue
+		}
+		if _, ok := funcBytes[n.ID]; !ok {
+			continue
+		}
+		start, end := n.StartLine, n.EndLine
+		// The recorded line span wins over the node's: a partial
+		// property's node keeps the declaring fragment's lines while
+		// the code lives in the implementing fragment, and a field's
+		// extent is its declarator.
+		if ln, ok := funcLines[n.ID]; ok {
+			start, end = ln[0], ln[1]
+		}
+		ranges = append(ranges, funcRange{id: n.ID, startLine: start, endLine: end})
+	}
+	return ranges
+}
+
 func newCSharpFuncLookup(ranges []funcRange, bytes map[string][2]int) *csharpFuncLookup {
 	sorted := append([]funcRange(nil), ranges...)
 	ord := make([]int, len(sorted))
@@ -2122,10 +2320,12 @@ func newCSharpFuncLookup(ranges []funcRange, bytes map[string][2]int) *csharpFun
 // carried A's call and every consumer of the attribution read the wrong
 // member's evidence (round-5 finding 4). Falls back to the line answer
 // whenever no recorded byte extent contains the offset: extents are
-// recorded only for methods and constructors, so a member kind without
-// them (property, indexer, field initializer) sharing a line with one
-// that has them would otherwise lose its call outright rather than
-// degrade to line attribution (round-6 finding B3).
+// recorded for methods, constructors, properties, and initialized field
+// declarators, so a member kind still without them (indexer, event
+// accessor) sharing a line with one that has them would otherwise lose
+// its call outright rather than degrade to line attribution (round-6
+// finding B3) - unless the line answer's own recorded bytes exclude the
+// offset, in which case the fallback is refused (see below).
 func (l *csharpFuncLookup) enclosingAt(line, offset int) string {
 	if offset < 0 || len(l.bytes) == 0 {
 		return l.enclosing(line)
@@ -2156,7 +2356,17 @@ func (l *csharpFuncLookup) enclosingAt(line, offset int) string {
 	if best != "" {
 		return best
 	}
-	return l.enclosing(line)
+	// The line fallback exists for member kinds that record NO extents
+	// at all (indexer, event accessor). If the line answer does have
+	// recorded bytes and the offset sits outside them, the offset is
+	// provably not inside that member, so handing it the call invents a
+	// false edge on a same-line neighbour - strictly worse than the drop
+	// it replaced.
+	fb := l.enclosing(line)
+	if b, ok := l.bytes[fb]; ok && (offset < b[0] || offset >= b[1]) {
+		return ""
+	}
+	return fb
 }
 
 func (l *csharpFuncLookup) enclosing(line int) string {
