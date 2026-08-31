@@ -9,45 +9,59 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 )
 
-// Byte extents are recorded only for methods and constructors. When a
-// member kind WITHOUT extents (property, indexer, field initializer)
-// shares a source line with one that has them, the offset matches no
-// recorded extent - and answering "" there erased the call outright
-// instead of falling back to the line answer (round-6 finding B3). The
-// call must survive; which member carries it can stay line-keyed until
-// every member kind records extents.
+// Byte extents are recorded for methods, constructors, properties, and
+// initialized field declarators. A member kind still WITHOUT them
+// (indexer, event accessor) sharing a source line with one that has
+// them matches no recorded extent - and answering "" there erased the
+// call outright instead of falling back to the line answer (round-6
+// finding B3). The extentless member's call must survive line-keyed;
+// every extent-carrying member must own its call BYTE-precisely, not
+// hand it to whoever shares the line (the pre-owner-widening behavior
+// this test silently tolerated).
 func TestResolveCSharp_ExtentlessMemberSharingALineKeepsItsCall(t *testing.T) {
-	cases := map[string]string{
-		"property_shares_line": `namespace App {
+	cases := map[string]struct {
+		src   string
+		owner string // "" = presence only: the owner stays line-keyed
+	}{
+		"property_shares_line": {src: `namespace App {
  public class BLBag { public int Take() { return 1; } }
  public class BLProp { private BLBag _b = new BLBag();
   public int Q => _b.Take(); public void M() { }
- } }`,
-		"indexer_shares_line": `namespace App {
+ } }`, owner: "X.cs::BLProp.Q"},
+		"indexer_shares_line": {src: `namespace App {
  public class BLBag { public int Take() { return 1; } }
  public class BLIdx { private BLBag _b = new BLBag();
   public int this[int i] => _b.Take(); public void M() { }
- } }`,
-		"field_init_shares_line": `namespace App {
+ } }`},
+		"field_init_shares_line": {src: `namespace App {
  public class BLBag { public int Take() { return 1; } }
  public class BLInit { private BLBag _b = new BLBag();
   private int _n = new BLBag().Take(); public void M() { }
- } }`,
-		"ctor_and_property_same_line": `namespace App {
+ } }`, owner: "X.cs::BLInit._n"},
+		"ctor_and_property_same_line": {src: `namespace App {
  public class BLBag { public int Take() { return 1; } }
  public class BLCtor { private BLBag _b = new BLBag();
   public BLCtor() { } public int Q => _b.Take();
- } }`,
+ } }`, owner: "X.cs::BLCtor.Q"},
 	}
-	for name, src := range cases {
-		g := buildCSharpResolverGraph(t, map[string]string{"X.cs": src})
+	for name, tc := range cases {
+		g := buildCSharpResolverGraph(t, map[string]string{"X.cs": tc.src})
 		found := false
+		owners := map[string]int{}
 		for _, e := range g.AllEdges() {
 			if e != nil && e.Kind == graph.EdgeCalls && strings.Contains(e.To, "Take") {
 				found = true
+				owners[e.From]++
 			}
 		}
-		assert.True(t, found, "[%s] the extentless member's call must fall back to line attribution, not vanish", name)
+		assert.True(t, found, "[%s] the member's call must not vanish", name)
+		if tc.owner != "" {
+			assert.NotZero(t, owners[tc.owner],
+				"[%s] the extent-carrying member owns its call byte-precisely, got owners %v", name, owners)
+			delete(owners, tc.owner)
+			assert.Empty(t, owners,
+				"[%s] no line-sharing member may carry a duplicate of the call", name)
+		}
 	}
 }
 

@@ -1883,7 +1883,7 @@ func (e *CSharpExtractor) emitField(m parser.QueryResult, filePath, fileID strin
 	// on the field it actually initializes. Initializer-less declarators
 	// record nothing — they contain no code, and keeping them out of the
 	// owner set avoids needless one-line ambiguity ties.
-	if nameCap.Node != nil {
+	if nameCap.Node != nil && !csharpHasModifier(def.Node, src, "const") {
 		if decl := nameCap.Node.Parent(); decl != nil && decl.Type() == "variable_declarator" {
 			// Grammar revisions disagree on the wrapper (equals_value_clause
 			// vs the expression hanging directly under the declarator — the
@@ -1911,6 +1911,11 @@ func (e *CSharpExtractor) emitField(m parser.QueryResult, filePath, fileID strin
 	meta := map[string]any{
 		"receiver":   owner.name,
 		"visibility": csharpVisibility(def.Node, src, defaultVis),
+	}
+	// Initialized fields are call owners; they carry scope_ns for the
+	// resolver's scoped-usings narrowing like every other owner kind.
+	if ns := csharpEnclosingNamespace(def.Node, src); ns != "" {
+		meta["scope_ns"] = ns
 	}
 	if isIface {
 		meta["iface_member"] = true
@@ -2073,6 +2078,11 @@ func (e *CSharpExtractor) emitProperty(m parser.QueryResult, filePath, fileID st
 		"receiver":   owner.name,
 		"visibility": csharpVisibility(def.Node, src, defaultVis),
 		"kind":       "property",
+	}
+	// Properties are call owners; the resolver's scoped-usings narrowing
+	// reads the caller's scope_ns, so they carry it like methods do.
+	if ns := csharpEnclosingNamespace(def.Node, src); ns != "" {
+		meta["scope_ns"] = ns
 	}
 	if isIface {
 		meta["iface_member"] = true
@@ -2302,10 +2312,11 @@ func newCSharpFuncLookup(ranges []funcRange, bytes map[string][2]int) *csharpFun
 // carried A's call and every consumer of the attribution read the wrong
 // member's evidence (round-5 finding 4). Falls back to the line answer
 // whenever no recorded byte extent contains the offset: extents are
-// recorded for methods, constructors, and properties, so a member kind
-// still without them (indexer, event accessor, field initializer)
-// sharing a line with one that has them would otherwise lose its call
-// outright rather than degrade to line attribution (round-6 finding B3).
+// recorded for methods, constructors, properties, and initialized field
+// declarators, so a member kind still without them (indexer, event
+// accessor) sharing a line with one that has them would otherwise lose
+// its call outright rather than degrade to line attribution (round-6
+// finding B3).
 func (l *csharpFuncLookup) enclosingAt(line, offset int) string {
 	if offset < 0 || len(l.bytes) == 0 {
 		return l.enclosing(line)

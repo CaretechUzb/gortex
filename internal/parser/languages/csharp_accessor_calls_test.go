@@ -359,3 +359,75 @@ func TestCSharpExtractor_ReferenceFormsInAccessorsOwnTheProperty(t *testing.T) {
 		assert.True(t, found, "the Send site inside the accessor must stamp its dispatch placeholder")
 	})
 }
+
+// Property and field nodes are call owners now, and the resolver's
+// scoped-usings narrowing reads the caller's scope_ns - a member kind
+// without the stamp answered the namespace question with an empty
+// scope. Same stamp methods and constructors already carry.
+func TestCSharpExtractor_PropertyAndFieldCarryScopeNS(t *testing.T) {
+	src := []byte(`namespace App.Inner {
+    public class Holder {
+        private int _seed = 1;
+        public int Prop { get; set; }
+    }
+}
+`)
+	e := NewCSharpExtractor()
+	result, err := e.Extract("App.cs", src)
+	require.NoError(t, err)
+
+	for _, id := range []string{"App.cs::Holder.Prop", "App.cs::Holder._seed"} {
+		var found *graph.Node
+		for _, n := range result.Nodes {
+			if n.ID == id {
+				found = n
+			}
+		}
+		require.NotNil(t, found, id)
+		assert.Equal(t, "App.Inner", found.Meta["scope_ns"], "%s must carry its enclosing namespace", id)
+	}
+}
+
+// The discriminating shape for "initializer-less declarators record
+// nothing": a bare field sharing a line with a call-bearing member. If
+// the bare declarator entered the owner set its 1-line range would tie
+// the line; staying out, the expression-bodied property owns its call
+// byte-precisely and the bare field owns nothing. Also pins two
+// expression-bodied properties sharing one line - each owns its own
+// call through its own byte span.
+func TestCSharpExtractor_OneLineNeighborsKeepTheirOwners(t *testing.T) {
+	src := []byte(`namespace App {
+    public class Crank {
+        public int Turn() { return 1; }
+        public int Spin() { return 2; }
+    }
+    public class Tight {
+        private readonly Crank _c = new Crank();
+        private int _bare; public int Q => _c.Turn();
+        public int A => _c.Turn(); public int B => _c.Spin();
+    }
+}
+`)
+	e := NewCSharpExtractor()
+	result, err := e.Extract("App.cs", src)
+	require.NoError(t, err)
+
+	qEdges := callEdgesFrom(result.Edges, "App.cs::Tight.Q", "Turn")
+	require.Len(t, qEdges, 1,
+		"the property owns its call despite the bare field on its line")
+	assert.Nil(t, qEdges[0].Meta["receiver_ambiguous"],
+		"a codeless declarator must not enter the owner set - its 1-line range would tie the line and stamp a refusal on the property's call")
+	var fromBare int
+	for _, ed := range result.Edges {
+		if ed.From == "App.cs::Tight._bare" && ed.Kind == graph.EdgeCalls {
+			fromBare++
+		}
+	}
+	assert.Zero(t, fromBare, "an initializer-less declarator holds no code and owns no calls")
+	assert.Len(t, callEdgesFrom(result.Edges, "App.cs::Tight.A", "Turn"), 1,
+		"first of two same-line properties owns its own call")
+	assert.Len(t, callEdgesFrom(result.Edges, "App.cs::Tight.B", "Spin"), 1,
+		"second of two same-line properties owns its own call")
+	assert.Empty(t, callEdgesFrom(result.Edges, "App.cs::Tight.A", "Spin"),
+		"no cross-theft between same-line properties")
+}
