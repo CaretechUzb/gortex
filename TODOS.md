@@ -94,6 +94,81 @@ so most of the data a merged-branch check needs is already collected.
 **Depends on:** Per-worktree tracking being the adopted workflow — without it
 this barely matters.
 
+### Persist per-path dirty provenance so a dirty checkout can still be copied from
+
+**What:** Record WHICH paths were dirty when a repository was indexed, not just
+that some were, so `worktreeCopySource` can reconcile them instead of refusing
+the whole candidate.
+
+**Why:** `copySourceCommit` (`internal/indexer/track_worktree_copy.go`) now
+declines any source with `RepoIndexState.Dirty`, because the field is a bool and
+no diff can reconstruct the file set. That is correct but blunt: three of the six
+repos in the `docker-env` workspace are dirty at any moment, so a large share of
+worktree tracks lose the copy path and pay a full cold index (~667 s) instead of
+copy plus reconcile (~200 s).
+
+**Context:** The unsound alternative is worth writing down because it looks
+obviously right: unioning the source's CURRENT `git status` into `changed` does
+not work, since a source dirty at index time and committed or reverted since
+reports clean while its graph still holds the uncommitted content. Measured
+consequence of copying a dirty source before the refusal landed: the
+destination's indexed `content_hash` matched its dirty source at 15,642 bytes
+while its own checkout held the committed file at 15,596. The fix is a new column
+or sidecar alongside `RepoIndexState` (`internal/graph/index_state.go`) written by
+`persistRepoIndexState` (`internal/indexer/index_state.go`).
+
+**Effort:** L
+**Priority:** P3
+**Depends on:** A schema version bump — and schema version is kept in lockstep
+with main here, so this cannot be renumbered independently.
+
+### Check the copy source's extractor versions before trusting its subgraph
+
+**What:** Compare a copy candidate's `RepoIndexState.ExtractorVersions` against
+the daemon's current ones, and decline or reindex when they differ.
+
+**Why:** The copy path reads `IndexedSHA` and `Dirty` from `RepoIndexState` but
+never `ExtractorVersions`. Copying from a sibling indexed by an OLDER extractor
+installs that extractor's output — and because `restatWorktreeMtimes` writes the
+destination's real mtimes, the reconcile finds everything current and never
+re-parses. The graph is then silently a version behind, with no signal anywhere.
+
+**Context:** Surfaced by a cross-model review, not by a measurement — nobody has
+observed it firing, and it only bites when an extractor version bumps between
+indexing the source and copying from it. The machinery already exists:
+`extractorVersionStaleLangSet` (`internal/indexer/extractor_version.go:224`)
+performs exactly this comparison on the normal index path and reads
+`GetRepoIndexState` to do it. This is the third freshness field on that struct
+and the only one the copy path still ignores.
+
+**Effort:** S
+**Priority:** P3
+**Depends on:** Nothing.
+
+### Find out why a tracked worktree can sit stale for a day with a GitWatcher running
+
+**What:** Diagnose a tracked worktree whose HEAD moved and which the daemon never
+reindexed.
+
+**Why:** A stale tracked repo answers every query from an old graph, with only a
+column in `gortex repos` to say so. It is also the precondition that made the
+copy-path HEAD-vs-`IndexedSHA` bug bite: without staleness the two agree and the
+bug is dormant.
+
+**Context:** Live and reproducible when written. `local@aurora-redesign` HEAD
+`d7e3d523022a` committed 2026-08-31 14:02; `IndexedSHA b5aea9c7348a` indexed
+2026-08-30 16:50; 262 files between them; `gortex repos` FRESHNESS `stale`.
+`GitWatcher.seedSHA` (`internal/indexer/git_watcher.go:185`) reads
+`GetRepoIndexState`, so the machinery is present and either did not fire or fired
+and the reindex failed quietly. Worth checking against the recorded trap that
+`repo_index_state.indexed_at` has only two writers, so incremental edits mutate
+the graph without advancing it — a freshness check anchored there reports current
+for the commonest staleness case.
+
+**Effort:** M
+**Priority:** P2
+**Depends on:** Nothing.
+
 ## Readiness
 
 ### Refuse, not just warn, on queries against a not-ready repo
@@ -145,6 +220,122 @@ first home. This complements that rather than replacing it.
 **Effort:** M
 **Priority:** P3
 **Depends on:** the `READY` column, for the verdict and its vocabulary.
+
+### Make the derive config hash describe the pass set that actually ran
+
+**What:** Move `DeriveConfigHash` from one daemon-wide value to a per-workspace
+(or per-repo) one, and migrate the four consumers that assume a single hash.
+
+**Why:** The global pass now narrows framework execution to the covered
+workspaces (`allowedFrameworksForScope`), but the fingerprint stamped against
+each repo is still the daemon-wide union. So a repo's recorded hash names
+patterns that never executed for it, and editing an allow-list in an unrelated
+workspace marks every repo `partial` and re-derives it — every time.
+
+**Context:** Deliberately shipped broad, and the rationale is written at
+`DeriveConfigHash` (`internal/indexer/derive_state.go`) so nobody narrows it
+piecemeal. Broad is the safe direction: it can only over-report `partial`, never
+under-report it. The cost of fixing it is that this is a persistence and
+runtime-state migration, not a signature change — `runDaemonStart`
+(`cmd/gortex/daemon.go:509`) stores one hash in runtime state, `stampDeriveState`
+(`derive_state.go:181`) stamps one for ALL covered repos,
+`ScheduleDeriveForConfigDrift` (`:235`) compares every repo against one "current"
+hash, and `applyReadiness` (`cmd/gortex/repos_cmd.go:237`) reads one per CLI row.
+Changing the digest input also forces a one-time re-derive of every tracked repo
+(~36 min measured for the six-repo `docker-env` workspace). Migrate all four
+together or leave it broad; narrowing this function alone reports `ready` over a
+derive that never happened.
+
+**Effort:** L
+**Priority:** P3
+**Depends on:** Nothing, but it only matters now that the gate is workspace-scoped.
+
+### Reconcile the enrichment declared-provider set with the started set
+
+**What:** Find out which of the two provider sets is wrong when semantic
+enrichment declares one provider and then starts four.
+
+**Why:** Same shape as the framework allow-list leak — a gate computes a narrowed
+set and something downstream ignores it. Enrichment was 359 s of a 29-minute
+worktree track, so if the declared set is the correct one and three providers run
+needlessly, that is a real cut on every enrichment, not just copies.
+
+**Context:** Measured on the `local@test` track, 2026-08-31:
+
+    semantic: applicable enrichment providers declared  {"providers":["go-types"]}
+    semantic enrichment starting  {"provider":"go-types"}
+    semantic enrichment starting  {"provider":"python-types"}
+    semantic enrichment starting  {"provider":"typescript-types"}
+    semantic enrichment starting  {"provider":"go-ast-types"}
+
+One declared, four started — and both Go providers reported `confirmed:0 added:0`
+on an Odoo repo with no Go, so at least one of the two sets is wrong. It may be
+the declared half rather than the started half: `python-types` did real work
+(`confirmed:1082`), so declaring only `go-types` for that repo looks incorrect
+too. `semantic/manager.go:738` emits the declared line, `:1399` emits each start;
+the gap between them holds the answer.
+
+**Effort:** S
+**Priority:** P3
+**Depends on:** Nothing.
+
+### An identical copy schedules no derive, so the next file save strands it forever
+
+**What:** `trackWorktreeByCopy` guards both follow-up stages on `len(changed) > 0`:
+a copy whose source was indexed at this checkout's HEAD gets `RestampCopiedReadiness`
+and nothing else. That is right at the instant it commits — the carried stamps
+describe the carried graph exactly. It stops being right on the first write to the
+new checkout: `content_gen` advances past the stamp and no derive is queued to
+re-stamp it, so the repo reads `partial: files changed since the derived passes
+last ran` until an unrelated repo's workspace rederive happens to cover it, or the
+daemon restarts.
+
+**Why:** observed live on 2026-08-31. `local@fix_tier_validation`, an identical
+copy of `local@test` (`reconciled_files=0`), reached `ready` and then flipped to
+`partial`. This is not the ordering bug fixed in `trackWorktreeByCopy` — that one
+is closed, and `TestARestampWrittenBeforeTheRegisteringWriteIsDestroyedByIt`
+(`internal/graph/store_sqlite/repo_subgraph_copy_readiness_test.go`) now pins the
+premise it rests on. It is the same interaction recorded for ordinary saves,
+reaching the copy path through a door the copy path leaves open: the diverged copy
+arms a derive that would re-stamp, the identical copy arms nothing.
+
+**Context:** the fix is not "always schedule a derive" — that reintroduces the full
+post-track derive the copy exists to avoid, for a repo that genuinely owes no
+derivation yet. The candidates are an armed-but-idle derive that only fires once
+`content_gen` moves, or letting the existing watcher-driven incremental derive
+stamp `derive_state` (it already recomputes the frontier; it just does not claim
+completion). Check `readiness.Verdict`'s ladder order first: `Deriving` and
+`DerivePending` both outrank the `DerivedContentGen` clause, so arming is
+sufficient to stop the false alarm even before the pass runs.
+
+**Effort:** M
+**Priority:** P2
+**Depends on:** None.
+
+### Cover `trackWorktreeByCopy`'s call order with an integration test
+
+**What:** the restamp-after-reconcile ordering is guarded at the store layer
+(`repo_subgraph_copy_readiness_test.go`: the stranding, its repair, the
+never-ran-provider and legacy-row refusals, and now the restamp-before failure
+mode) but nothing asserts that `trackWorktreeByCopy` actually calls
+`RestampCopiedReadiness` after `ReconcileRepoCtx`, or skips it when the reconcile
+errors. Moving the call back above the reconcile leaves every existing test green.
+
+**Why:** that ordering is the W1.3 fix. It is the one change in the worktree-copy
+work with no test that can fail if it is reverted.
+
+**Context:** not reachable from the unit fixtures in `track_worktree_copy_test.go`.
+`copyGateGraph` wraps `*graph.Graph`, which does not implement `CopyRepoSubgraph`,
+so `trackWorktreeByCopy` returns `supported=false` before it reaches either call.
+The harness needs a real `store_sqlite` store, a real git worktree on disk (the
+source ranking shells out to git), and `ReconcileRepoCtx`. `internal/indexer` has
+no sqlite-backed test today, so this establishes that pattern; check for an import
+cycle first — `store_sqlite` is a leaf and `internal/readiness` already imports it.
+
+**Effort:** M
+**Priority:** P2
+**Depends on:** None.
+
 
 ## Analysis
 

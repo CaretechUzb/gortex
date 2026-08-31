@@ -11,16 +11,80 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 )
 
+// copyGateGraph is the in-memory graph plus the one question
+// worktreeCopySource actually ranks on: which commit a tracked repository's
+// subgraph describes, and whether its tree was dirty when that subgraph was
+// written.
+//
+// *graph.Graph does NOT implement graph.RepoIndexStateReader — only the sqlite
+// store does — and copySourceCommit declines any candidate whose indexed commit
+// it cannot read. Without this wrapper every test below would decline on the
+// BACKEND rather than on the checkout, and would pass for the wrong reason.
+type copyGateGraph struct {
+	*graph.Graph
+	state map[string]graph.RepoIndexState
+}
+
+func (g *copyGateGraph) GetRepoIndexState(prefix string) (graph.RepoIndexState, bool, error) {
+	st, ok := g.state[prefix]
+	return st, ok, nil
+}
+
 // copyGateIndexer builds an indexer that knows about one already-tracked
 // checkout at root, which is what worktreeCopySource scans for a source.
+//
+// The source's subgraph is declared to describe root's CURRENT HEAD, clean —
+// the ordinary case of a freshly indexed checkout. Tests that need a stale or
+// dirty source say so with copyGateIndexerAt.
 func copyGateIndexer(t *testing.T, prefix, root string) *MultiIndexer {
 	t.Helper()
+	return copyGateIndexerAt(t, prefix, root, gitHeadSHA(root), false)
+}
+
+// copyGateIndexerAt spells out the source's persisted index state.
+//
+// indexedSHA is the commit the source's ROWS describe, which is not necessarily
+// the commit its checkout is sitting on — that gap is the whole subject of
+// copySourceCommit. An empty indexedSHA with dirty=false records no state at
+// all, i.e. a repository the store has never indexed.
+func copyGateIndexerAt(t *testing.T, prefix, root, indexedSHA string, dirty bool) *MultiIndexer {
+	t.Helper()
+	mi := copyGateIndexerNoState(t, prefix, root)
+	if indexedSHA != "" || dirty {
+		mi.graph.(*copyGateGraph).state[prefix] = graph.RepoIndexState{
+			RepoPrefix: prefix,
+			IndexedSHA: indexedSHA,
+			Dirty:      dirty,
+		}
+	}
+	return mi
+}
+
+// copyGateIndexerNoState is the same indexer with an empty state table: the
+// backend can answer, and answers "never indexed".
+func copyGateIndexerNoState(t *testing.T, prefix, root string) *MultiIndexer {
+	t.Helper()
 	return &MultiIndexer{
-		graph:    graph.New(),
+		graph:    &copyGateGraph{Graph: graph.New(), state: map[string]graph.RepoIndexState{}},
 		repos:    map[string]*RepoMetadata{prefix: {RepoPrefix: prefix, RootPath: root}},
 		indexers: map[string]*Indexer{prefix: {repoPrefix: prefix}},
 		logger:   zap.NewNop(),
 	}
+}
+
+// addTrackedWorktree adds a second candidate to mi: a linked worktree of the
+// same repository, tracked under its own prefix, with its own declared index
+// state. Returns the checkout path.
+func addTrackedWorktree(t *testing.T, mi *MultiIndexer, repo, prefix, branch, indexedSHA string) string {
+	t.Helper()
+	wt := addWorktree(t, repo, branch)
+	mi.repos[prefix] = &RepoMetadata{RepoPrefix: prefix, RootPath: wt}
+	mi.indexers[prefix] = &Indexer{repoPrefix: prefix}
+	mi.graph.(*copyGateGraph).state[prefix] = graph.RepoIndexState{
+		RepoPrefix: prefix,
+		IndexedSHA: indexedSHA,
+	}
+	return wt
 }
 
 // addWorktree checks out branch as a linked worktree of repo and returns its
@@ -196,6 +260,48 @@ func TestRestatDoesNotTreatAnUnreadablePathAsDeleted(t *testing.T) {
 		"a permissions fault must not be reported as a deletion")
 }
 
+// scheduleCopiedRepoEnrich is the caller a diverged copy was missing: without
+// it the repository carries the SOURCE's enrichment_state rows, reads "partial"
+// — which blocks queries — and never recovers, because the only other caller of
+// MaybeSeedPendingEnrich runs from daemon warmup. Measured before the fix: 801s
+// of further daemon activity left MIN(enrichment content_gen) at 1 against a
+// repo content_gen of 4.
+func TestCopiedRepoEnrichIsANoOpForAnUnknownPrefix(t *testing.T) {
+	mi := copyGateIndexer(t, "base", realpath(t, t.TempDir()))
+	require.NotPanics(t, func() { mi.scheduleCopiedRepoEnrich("no-such-prefix") },
+		"the copy path names a prefix the indexer map may not carry; a panic here kills the track")
+}
+
+// The gate must be armed unconditionally, NOT by asking MaybeSeedPendingEnrich.
+//
+// That was the first attempt, and production proved it a silent no-op: the
+// predicate needs a __repo__ completion marker to conclude anything, and
+// RecordRepoEnrichmentComplete never writes one for a dirty tree, so copying
+// from a source with a single untracked file carried no marker and the pass was
+// never armed. The repo went straight back to `partial`. Three of the six repos
+// in the workspace this was written for are dirty at any given moment.
+//
+// This test needs no semantic manager, which is the point: the call site knows
+// the rows came from another checkout, so it does not have to infer anything.
+func TestCopiedRepoEnrichArmsTheGateUnconditionally(t *testing.T) {
+	repo := realpath(t, t.TempDir())
+	initTestRepo(t, repo, "main")
+
+	mi := copyGateIndexer(t, "base", repo)
+	idx := mi.indexers["base"]
+	idx.rootPath = repo
+	idx.graph = mi.graph
+	idx.logger = zap.NewNop()
+
+	require.False(t, idx.pendingEnrich.Load(), "precondition: the gate starts closed")
+
+	mi.scheduleCopiedRepoEnrich("base")
+
+	require.True(t, idx.pendingEnrich.Load(),
+		"a diverged copy carries another checkout's enrichment rows, so the pass "+
+			"is owed no matter what the copied marker does or does not say")
+}
+
 // A plain checkout is not a worktree of anything, so there is nothing to copy
 // from even when a sibling repository is tracked.
 func TestCopySourceRefusesANonWorktree(t *testing.T) {
@@ -205,4 +311,214 @@ func TestCopySourceRefusesANonWorktree(t *testing.T) {
 	mi := copyGateIndexer(t, "base", repo)
 	_, _, ok := mi.worktreeCopySource(repo)
 	require.False(t, ok)
+}
+
+// The bug this whole change exists for. worktreeCopySource used to rank on the
+// source's live HEAD, but the rows it copies were written by the source's last
+// INDEX — so a source whose HEAD has moved since was compared against a tree its
+// graph does not describe. Measured in production: 273 reconciled paths where
+// the copied graph was 20 away, 253 files reindexed for nothing.
+func TestCopySourceRanksOnTheIndexedCommitNotHEAD(t *testing.T) {
+	repo := realpath(t, t.TempDir())
+	initTestRepo(t, repo, "main")
+	indexed := gitHeadSHA(repo)
+	wt := addWorktree(t, repo, "feature")
+
+	// The source's checkout advances well past what its graph describes.
+	for _, name := range []string{"moved1.go", "moved2.go", "moved3.go"} {
+		writeFile(t, filepath.Join(repo, name), "package main\n")
+	}
+	runGit(t, repo, "add", ".")
+	runGit(t, repo, "commit", "-q", "-m", "source advances past its index")
+
+	// The destination differs from the INDEXED commit by exactly one file.
+	writeFile(t, filepath.Join(wt, "b.go"), "package main\n")
+	runGit(t, wt, "add", ".")
+	runGit(t, wt, "commit", "-q", "-m", "feature")
+
+	mi := copyGateIndexerAt(t, "base", repo, indexed, false)
+	src, changed, ok := mi.worktreeCopySource(wt)
+
+	require.True(t, ok)
+	require.Equal(t, "base", src)
+	require.Equal(t, []string{"b.go"}, changed,
+		"the reconcile set must be measured against the commit the copied rows "+
+			"describe; ranking on the source's HEAD would have named its three "+
+			"advanced files too and reindexed them for nothing")
+}
+
+// The fail-open half, and the reason this is a correctness fix rather than an
+// optimisation. A file that differs from the source's INDEXED commit but happens
+// to match the source's HEAD is absent from a HEAD-ranked diff — and
+// restatWorktreeMtimes then records it as current, so the reconcile never
+// revisits it and the source's stale nodes stand under this prefix forever.
+func TestCopySourceKeepsAFileMatchingSourceHEADButNotItsGraph(t *testing.T) {
+	repo := realpath(t, t.TempDir())
+	initTestRepo(t, repo, "main")
+	indexed := gitHeadSHA(repo)
+	wt := addWorktree(t, repo, "converged")
+
+	// Source advances a.go to v2 AFTER the index that produced its rows.
+	writeFile(t, filepath.Join(repo, "a.go"), "package main // v2\n")
+	runGit(t, repo, "add", ".")
+	runGit(t, repo, "commit", "-q", "-m", "source advances a.go")
+
+	// The destination independently reaches the SAME content on its own commit.
+	writeFile(t, filepath.Join(wt, "a.go"), "package main // v2\n")
+	runGit(t, wt, "add", ".")
+	runGit(t, wt, "commit", "-q", "-m", "same content, different commit")
+
+	mi := copyGateIndexerAt(t, "base", repo, indexed, false)
+	_, changed, ok := mi.worktreeCopySource(wt)
+
+	require.True(t, ok)
+	require.Contains(t, changed, "a.go",
+		"a.go matches the source's HEAD, so a HEAD-ranked diff omits it — but the "+
+			"copied rows hold the pre-advance content, and a path left out of "+
+			"`changed` is one the reconcile never looks at again")
+}
+
+// A dirty source is refused outright. RepoIndexState.Dirty records THAT the tree
+// was dirty when indexed, never WHICH files, so no commit-to-commit diff covers
+// the difference and asking git today answers about the tree today. Measured
+// consequence of copying one anyway: the destination's indexed content_hash
+// matched its dirty source at 15,642 bytes while its own checkout held the
+// committed file at 15,596.
+func TestCopySourceDeclinesASourceDirtyWhenItWasIndexed(t *testing.T) {
+	repo := realpath(t, t.TempDir())
+	initTestRepo(t, repo, "main")
+	wt := addWorktree(t, repo, "branch")
+
+	mi := copyGateIndexerAt(t, "base", repo, gitHeadSHA(repo), true)
+	_, _, ok := mi.worktreeCopySource(wt)
+
+	require.False(t, ok,
+		"a source dirty at index time describes a working tree nobody recorded; "+
+			"declining costs an ordinary index, copying costs a wrong graph")
+}
+
+// Even at the identical commit. The fast path returns before any diff, so a
+// dirty source taken there would be restamped `ready` over rows describing
+// uncommitted content — the worst reachable outcome of this gate.
+func TestCopySourceDeclinesADirtySourceEvenAtTheSameCommit(t *testing.T) {
+	repo := realpath(t, t.TempDir())
+	initTestRepo(t, repo, "main")
+	wt := addWorktree(t, repo, "same")
+
+	mi := copyGateIndexerAt(t, "base", repo, gitHeadSHA(wt), true)
+	_, _, ok := mi.worktreeCopySource(wt)
+
+	require.False(t, ok,
+		"the identical fast path must consult Dirty before short-circuiting, or "+
+			"it restamps a dirty-source graph as ready")
+}
+
+// No index state at all: the store has never indexed this candidate, so nothing
+// says what its rows describe. Decline — never fall back to HEAD, which is the
+// unsound proxy the whole change removes.
+func TestCopySourceDeclinesWhenTheIndexStateIsUnknown(t *testing.T) {
+	repo := realpath(t, t.TempDir())
+	initTestRepo(t, repo, "main")
+	wt := addWorktree(t, repo, "branch")
+
+	mi := copyGateIndexerNoState(t, "base", repo)
+	_, _, ok := mi.worktreeCopySource(wt)
+
+	require.False(t, ok,
+		"an unknown indexed commit must decline, not silently rank on HEAD")
+}
+
+// The backend cannot answer the question at all — the in-memory *graph.Graph
+// implements no RepoIndexStateReader. Same verdict, different cause: an
+// optimisation is lost, correctness is not.
+func TestCopySourceDeclinesWhenTheBackendCannotAnswer(t *testing.T) {
+	repo := realpath(t, t.TempDir())
+	initTestRepo(t, repo, "main")
+	wt := addWorktree(t, repo, "branch")
+
+	mi := &MultiIndexer{
+		graph:    graph.New(),
+		repos:    map[string]*RepoMetadata{"base": {RepoPrefix: "base", RootPath: repo}},
+		indexers: map[string]*Indexer{"base": {repoPrefix: "base"}},
+		logger:   zap.NewNop(),
+	}
+	_, _, ok := mi.worktreeCopySource(wt)
+
+	require.False(t, ok,
+		"a backend that cannot report an indexed commit gets no copy; indexing "+
+			"is always correct and only slower")
+}
+
+// The source's indexed commit was rebased away or garbage collected, so this
+// checkout cannot resolve it. gitChangedPaths fails, and there is no sound
+// fallback — HEAD is exactly what must not be substituted here.
+func TestCopySourceDeclinesAnIndexedCommitThisCheckoutCannotResolve(t *testing.T) {
+	repo := realpath(t, t.TempDir())
+	initTestRepo(t, repo, "main")
+	wt := addWorktree(t, repo, "branch")
+
+	mi := copyGateIndexerAt(t, "base", repo, "0123456789abcdef0123456789abcdef01234567", false)
+	_, _, ok := mi.worktreeCopySource(wt)
+
+	require.False(t, ok,
+		"an unresolvable indexed commit must decline rather than diff against HEAD")
+}
+
+// The free case now keys on the INDEXED commit, not the checkout's HEAD: the
+// source's rows already describe this code even though its working tree has
+// moved on. Under the old rule this diffed; it should short-circuit.
+func TestCopySourceIdenticalPathKeysOnTheIndexedCommit(t *testing.T) {
+	repo := realpath(t, t.TempDir())
+	initTestRepo(t, repo, "main")
+	indexed := gitHeadSHA(repo)
+	wt := addWorktree(t, repo, "atindexed")
+
+	// The source checkout advances; its rows do not.
+	writeFile(t, filepath.Join(repo, "later.go"), "package main\n")
+	runGit(t, repo, "add", ".")
+	runGit(t, repo, "commit", "-q", "-m", "source moves on")
+
+	mi := copyGateIndexerAt(t, "base", repo, indexed, false)
+	src, changed, ok := mi.worktreeCopySource(wt)
+
+	require.True(t, ok)
+	require.Equal(t, "base", src)
+	require.Empty(t, changed,
+		"the copied rows describe exactly this commit, so there is nothing to "+
+			"reconcile — the source's checkout having moved on is irrelevant")
+}
+
+// Staleness is not a disqualifier, and this is the shape that proves it: the
+// production copy chose a 22h-stale worktree 20 files away over the fresh main
+// checkout 1,498 files away. Ranking is on true divergence from what each
+// candidate's rows describe, nothing else.
+func TestCopySourcePrefersAStaleCandidateThatIsActuallyCloser(t *testing.T) {
+	repo := realpath(t, t.TempDir())
+	initTestRepo(t, repo, "main")
+	base := gitHeadSHA(repo)
+
+	// The destination sits two files off `base`.
+	dest := addWorktree(t, repo, "dest")
+	writeFile(t, filepath.Join(dest, "d1.go"), "package main\n")
+	writeFile(t, filepath.Join(dest, "d2.go"), "package main\n")
+	runGit(t, dest, "add", ".")
+	runGit(t, dest, "commit", "-q", "-m", "dest")
+	destHead := gitHeadSHA(dest)
+
+	// A STALE sibling whose rows describe destHead exactly, though its own
+	// checkout has since moved somewhere else entirely.
+	mi := copyGateIndexerAt(t, "fresh", repo, base, false)
+	stale := addTrackedWorktree(t, mi, repo, "stale", "stalebranch", destHead)
+	writeFile(t, filepath.Join(stale, "wandered.go"), "package main\n")
+	runGit(t, stale, "add", ".")
+	runGit(t, stale, "commit", "-q", "-m", "stale checkout wanders")
+
+	src, changed, ok := mi.worktreeCopySource(dest)
+
+	require.True(t, ok)
+	require.Equal(t, "stale", src,
+		"the stale candidate's ROWS describe this checkout exactly; the fresh "+
+			"one's are two files away. Divergence is measured against what was "+
+			"indexed, so stale wins")
+	require.Empty(t, changed)
 }

@@ -73,12 +73,28 @@ func (mi *MultiIndexer) allowedFrameworks() frameworkgate.Set {
 // whichever file happened to be touched. Workspace membership is stable
 // configuration, so this set is identical on every run over the same workspace.
 //
-// Deliberately NOT used by the global pass. A global run can carry a nil scope
-// covering the whole store, where there is no single workspace to resolve, and
-// narrowing there would stop emitting a sibling workspace's edges on a full
-// derive — which is a real graph change, and the thing the rejected alternative
-// was guarding against. An empty scope therefore falls back to the daemon-wide
-// union, and so does a scope naming no tracked repository.
+// Used by the global pass too, as of the change that added this paragraph. It
+// was excluded at first on the grounds that a global run can carry a nil scope
+// covering the whole store, where there is no single workspace to resolve and
+// narrowing would stop emitting a sibling workspace's edges on a full derive.
+// That reasoning was sound and the conclusion was too broad: the nil case is
+// handled HERE, by falling back to the daemon-wide union on an empty scope or a
+// scope naming no tracked repository. A global run with a NON-nil scope — every
+// post-track derive, where rederiveScope returns a sibling-checkout frontier —
+// has exactly one workspace to resolve and was paying the daemon-wide union for
+// no reason the exclusion gave. Measured cost of that on one scoped Odoo derive:
+// 178.5s across four synthesizers emitting zero edges.
+//
+// Note what this does NOT change: DeriveConfigHash still fingerprints the
+// daemon-wide union, so a repository's recorded config hash is deliberately
+// BROADER than the pass set its derive actually ran. That is the safe direction
+// — it can only over-report `partial`, never under-report it — but it means an
+// allow-list edit in any workspace marks every repository stale. Narrowing the
+// hash to match is not a signature change: runDaemonStart stores one hash in
+// runtime state, stampDeriveState stamps one for all covered repos,
+// ScheduleDeriveForConfigDrift compares every repo against one current hash, and
+// the CLI's applyReadiness reads one per row. Migrate all four together or leave
+// it broad; narrowing it here alone would report `ready` over a stale derive.
 func (mi *MultiIndexer) allowedFrameworksForScope(prefixes map[string]bool) frameworkgate.Set {
 	if mi == nil {
 		return frameworkgate.Set{}

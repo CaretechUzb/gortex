@@ -1597,6 +1597,19 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 	// reads that to decide whether an edge between two prefixes can carry
 	// information at all.
 	mi.publishCheckoutGroups()
+
+	// Baseline for "did this run write anything?". Every pass below reports
+	// edges it PRODUCED, and that total deliberately includes results already
+	// in the store, so a derive that re-derives a subgraph it was handed
+	// verbatim looks identical to one that discovered it. The delta on the
+	// completion line below is the part nobody could read off the old numbers.
+	//
+	// This matters most on the worktree-copy path, which installs a sibling's
+	// derived edges and then runs these passes over the whole repository
+	// anyway. Safe as a plain before/after read: the caller holds the
+	// batch-mutation gate for this whole function, so nothing else is writing.
+	edgesBefore, _ := graph.EdgeRowsInserted(mi.graph)
+
 	fullCoverage := fullCoverageGlobalPass(scope, censusEligible)
 	reporter := progress.FromContext(ctx)
 	r := resolver.New(mi.graph)
@@ -1913,7 +1926,26 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 	fwStart := time.Now()
 	fwRep := resolver.RunFrameworkSynthesizersScopedWithCensus(
 		mi.graph, changedPrefixes, censusEligible,
-		resolver.WithAllowedFrameworks(mi.allowedFrameworks()),
+		// Scoped to the workspaces this run covers, exactly as the incremental
+		// path does. One daemon tracks unrelated workspaces in one process, and
+		// the daemon-wide fold makes a pass EXECUTE for every workspace when any
+		// single one asks for it — so a sibling workspace's synthesizers run
+		// here and stage edges the per-repo gate below then discards. Measured
+		// on a scoped post-track derive of an Odoo worktree: fastapi-resolve
+		// 124.0s, fn-value-callback 47.5s, gin-middleware 4.2s, value-ref 2.8s
+		// — 178.5s, 34% of framework synthesis, emitting ZERO edges, admitted
+		// only because the `gortex` repository in a different workspace lists
+		// them in its own honest and minimal allow-list.
+		//
+		// changedPrefixes is nil precisely when scope is, and
+		// allowedFrameworksForScope falls back to the daemon-wide union on an
+		// empty scope — so a whole-store run still emits every workspace's
+		// edges. That fallback is what makes this safe here; it is the case the
+		// helper's own doc comment used to cite as the reason to stay away.
+		//
+		// WithFrameworkAllowByRepo stays daemon-wide. It is the enforcement half
+		// and must remain exact for every repository an edge could land in.
+		resolver.WithAllowedFrameworks(mi.allowedFrameworksForScope(changedPrefixes)),
 		resolver.WithFrameworkAllowByRepo(mi.allowedFrameworksByRepo()),
 	)
 	mi.logger.Info("global pass: framework dispatch synthesis",
@@ -1967,9 +1999,18 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 	mi.logger.Info("global pass: cross-repo edges",
 		zap.Int("edges", crossRepoEdges),
 		zap.Duration("elapsed", time.Since(crStart)))
-	mi.logger.Info("global passes complete",
+	completion := []zap.Field{
 		zap.Int("covered_repos", len(covered)),
-		zap.Duration("total", time.Since(globalStart)))
+		zap.Duration("total", time.Since(globalStart)),
+	}
+	if after, ok := graph.EdgeRowsInserted(mi.graph); ok {
+		// Rows this run actually WROTE. Near zero against a large `edges` total
+		// from the passes above means the run re-derived a graph that was
+		// already there — which is the whole question on a copied worktree, and
+		// is not answerable from any other number logged here.
+		completion = append(completion, zap.Int64("edge_rows_written", after-edgesBefore))
+	}
+	mi.logger.Info("global passes complete", completion...)
 	return covered, nil
 }
 

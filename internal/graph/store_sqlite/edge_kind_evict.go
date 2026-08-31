@@ -56,3 +56,7 @@ WHERE kind IN (SELECT CAST(value AS TEXT) FROM json_each(?))`, kindsJSON)
 }
 
 var _ graph.EdgeKindEvicter = (*Store)(nil)
+
+// EdgeRowsInserted implements graph.EdgeRowsInsertedReporter. See the
+// edgeRowsInserted field for what it does and does not count.
+func (s *Store) EdgeRowsInserted() int64 { return s.edgeRowsInserted.Load() }

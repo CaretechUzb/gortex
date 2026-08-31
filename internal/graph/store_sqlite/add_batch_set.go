@@ -736,5 +736,9 @@ func (s *Store) addBatchSetOriented(nodes []*graph.Node, edges []*graph.Edge) (s
 	// The transaction is durable before index sealing. If the bounded cold
 	// threshold was reached, build the dense indexes now on the same pinned
 	// connection; a failure remains retryable at the repository/final boundary.
+	// Rows actually written, not rows a pass produced — see the field comment.
+	if stats.edgeRowsInserted > 0 {
+		s.edgeRowsInserted.Add(int64(stats.edgeRowsInserted))
+	}
 	return stats, s.noteBulkRowsLocked(stats.nodeRowsChanged, stats.edgeRowsInserted)
 }

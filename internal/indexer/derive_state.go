@@ -50,6 +50,25 @@ const derivePassVersion = DerivePassVersion
 // An unconfigured union hashes to the empty string rather than to the hash of
 // nothing. Empty means "no comparison to make", and the reader skips the clause
 // instead of accusing every repo of a config drift it cannot see.
+// Deliberately DAEMON-WIDE, and deliberately broader than the pass set a derive
+// actually runs. The global pass narrows framework execution to the covered
+// workspaces (see allowedFrameworksForScope), so a repository's recorded hash
+// names patterns that never executed for it, and an allow-list edit in an
+// unrelated workspace marks it `partial` and re-derives it.
+//
+// That is the safe direction — over-reporting `partial` costs time, while
+// under-reporting it serves a stale graph as complete — and it is not free to
+// fix. This value has four consumers that each assume a single hash exists per
+// daemon: runDaemonStart (cmd/gortex/daemon.go) stores one in runtime state,
+// stampDeriveState below stamps one for ALL covered repos, ScheduleDeriveForConfigDrift
+// compares every repo against one "current" hash, and applyReadiness
+// (cmd/gortex/repos_cmd.go) reads one per CLI row. Scoping it is a persistence
+// and runtime-state migration across all four, plus a one-time re-derive of
+// every tracked repo because the digest input changes.
+//
+// So: migrate all four together, or leave it broad. Narrowing this function
+// alone makes a repo's stamp claim a pass set that ran for someone else, which
+// reports `ready` over a derive that never happened.
 func (mi *MultiIndexer) DeriveConfigHash() string {
 	if mi == nil {
 		return ""
