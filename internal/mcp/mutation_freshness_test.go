@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -217,6 +218,90 @@ func TestMutationFreshnessSuccessKeepsPendingSamePathReceipts(t *testing.T) {
 	err := s.awaitMutationFreshnessForRepos(context.Background(), "repo-a")
 	if err == nil || !strings.Contains(err.Error(), "receipt-inflight") {
 		t.Fatalf("barrier no longer reports the in-flight receipt: %v", err)
+	}
+}
+
+func TestReindexedPathResolvesFailedReceiptsForThatPathOnly(t *testing.T) {
+	s := &Server{mutationSafetyWait: time.Millisecond}
+	failed := pendingFreshnessReceipt(s, "receipt-failed", "repo-a", "/repo-a/file.go", 6)
+	completeFreshnessReceipt(failed, indexer.MutationResult{
+		RequestedGeneration: 6,
+		Err:                 errors.New("context deadline exceeded"),
+	})
+	otherPath := pendingFreshnessReceipt(s, "receipt-other-path", "repo-a", "/repo-a/other.go", 7)
+	completeFreshnessReceipt(otherPath, indexer.MutationResult{
+		RequestedGeneration: 7,
+		Err:                 errors.New("unrelated failure"),
+	})
+	inflight := pendingFreshnessReceipt(s, "receipt-inflight", "repo-a", "/repo-a/file.go", 9)
+
+	s.resolveReindexedPathReceipts("/repo-a/file.go")
+
+	if outcome := failed.outcome(false); outcome.Err != nil || !outcome.Reindexed {
+		t.Fatalf("a re-parsed path did not resolve its failed receipt: %+v", outcome)
+	}
+	if outcome := otherPath.outcome(false); outcome.Err == nil {
+		t.Fatal("a failure on an unrelated path was resolved")
+	}
+	if outcome := inflight.outcome(true); !outcome.Pending {
+		t.Fatalf("an in-flight receipt was completed by the reindex resolve: %+v", outcome)
+	}
+	inflight.mu.RLock()
+	touched := inflight.result.Reindexed || inflight.result.AppliedGeneration != 0
+	inflight.mu.RUnlock()
+	if touched {
+		t.Fatal("the resolve stamped a result onto a receipt whose ticket is still in flight")
+	}
+
+	err := s.awaitMutationFreshnessForRepos(context.Background(), "repo-a")
+	if err == nil {
+		t.Fatal("the remaining receipts did not fail closed")
+	}
+	if strings.Contains(err.Error(), "receipt-failed") {
+		t.Fatalf("the barrier still reports the resolved receipt: %v", err)
+	}
+	for _, want := range []string{"receipt-other-path", "receipt-inflight"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("barrier %q no longer reports %q", err, want)
+		}
+	}
+}
+
+func TestReindexedReceiptPathOnlyResolvesAProvenSinglePath(t *testing.T) {
+	stale := &indexer.IndexResult{StaleFileCount: 1}
+	// A platform-real absolute path: on Windows a rooted path without a
+	// drive letter is not absolute, so a hand-written "/repo/..." would be
+	// joined rather than used as-is (harmlessly — it then matches no
+	// receipt — but it would not exercise the branch under test).
+	absFixture, absErr := filepath.Abs(filepath.Join("repo", "internal", "a.go"))
+	if absErr != nil {
+		t.Fatalf("resolving the fixture path: %v", absErr)
+	}
+	cases := []struct {
+		name   string
+		paths  []string
+		root   string
+		result *indexer.IndexResult
+		want   string
+		ok     bool
+	}{
+		{"single relative path is joined to the repo root", []string{"internal/a.go"}, "/repo", stale, filepath.Join("/repo", "internal/a.go"), true},
+		{"single absolute path is used as-is", []string{absFixture}, "/repo", stale, absFixture, true},
+		{"several paths cannot be attributed per path", []string{"a.go", "b.go"}, "/repo", stale, "", false},
+		{"a whole-repo pass resolves nothing", nil, "/repo", stale, "", false},
+		{"nothing was re-parsed", []string{"a.go"}, "/repo", &indexer.IndexResult{StaleFileCount: 0}, "", false},
+		{"the path itself failed to index", []string{"a.go"}, "/repo", &indexer.IndexResult{StaleFileCount: 1, FailedFiles: []string{"a.go"}}, "", false},
+		{"a relative path without a known root is not guessed", []string{"a.go"}, "", stale, "", false},
+		{"a missing result resolves nothing", []string{"a.go"}, "/repo", nil, "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := reindexedReceiptPath(tc.paths, tc.root, tc.result)
+			if ok != tc.ok || got != tc.want {
+				t.Fatalf("reindexedReceiptPath(%v, %q) = (%q, %v), want (%q, %v)",
+					tc.paths, tc.root, got, ok, tc.want, tc.ok)
+			}
+		})
 	}
 }
 

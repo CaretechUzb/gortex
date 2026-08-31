@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -1525,8 +1526,9 @@ func (s *Server) handleReindexRepository(ctx context.Context, req mcp.CallToolRe
 	pathArg := req.GetString("path", "")
 
 	var (
-		result *indexer.IndexResult
-		err    error
+		result      *indexer.IndexResult
+		err         error
+		reindexRoot string
 	)
 
 	// Multi-repo mode: route through the per-repo indexer so nodes keep
@@ -1557,6 +1559,7 @@ func (s *Server) handleReindexRepository(ctx context.Context, req mcp.CallToolRe
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
+		reindexRoot, _ = s.multiIndexer.RepoRoot(prefix)
 	} else {
 		if s.indexer == nil {
 			return mcp.NewToolResultError("reindex_repository: no indexer available"), nil
@@ -1577,6 +1580,23 @@ func (s *Server) handleReindexRepository(ctx context.Context, req mcp.CallToolRe
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
+		reindexRoot = root
+	}
+
+	// A successful scoped re-parse is exactly the evidence a terminally failed
+	// freshness receipt for that path is waiting for, so clear it here: a
+	// failed ingest otherwise fail-closes change.detect for the whole
+	// repository until retention lapses, and reindex is the recovery callers
+	// reach for first (#692).
+	//
+	// Deliberately narrow. IncrementalReindexRepo scopes the pass to the given
+	// paths, so with exactly one requested path a non-zero StaleFileCount
+	// proves that file was re-parsed. With several paths the count cannot be
+	// attributed per path, and clearing a receipt for a file that was not
+	// re-parsed would be a false green — the very thing the receipt exists to
+	// prevent — so anything wider is left alone.
+	if resolved, ok := reindexedReceiptPath(paths, reindexRoot, result); ok {
+		s.resolveReindexedPathReceipts(resolved)
 	}
 
 	s.RunAnalysis()
@@ -1602,6 +1622,32 @@ func (s *Server) handleReindexRepository(ctx context.Context, req mcp.CallToolRe
 		payload["failed_files"] = result.FailedFiles
 	}
 	return s.respondJSONOrTOON(ctx, req, payload)
+}
+
+// reindexedReceiptPath reports the absolute path whose failed freshness
+// receipts a reindex pass has earned the right to resolve, if any.
+//
+// Deliberately narrow. IncrementalReindexRepo scopes the pass to the requested
+// paths, so with exactly one requested path a non-zero StaleFileCount proves
+// that file was re-parsed. With several paths the count cannot be attributed
+// per path, and clearing a receipt for a file that was not re-parsed would be
+// a false green — the very thing the receipt exists to prevent — so anything
+// wider resolves nothing.
+func reindexedReceiptPath(paths []string, root string, result *indexer.IndexResult) (string, bool) {
+	if len(paths) != 1 || result == nil || result.StaleFileCount <= 0 {
+		return "", false
+	}
+	if slices.Contains(result.FailedFiles, paths[0]) {
+		return "", false
+	}
+	resolved := paths[0]
+	if !filepath.IsAbs(resolved) {
+		if root == "" {
+			return "", false
+		}
+		resolved = filepath.Join(root, resolved)
+	}
+	return resolved, true
 }
 
 func (s *Server) handleGetSymbol(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {

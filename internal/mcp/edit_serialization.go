@@ -220,6 +220,37 @@ func (s *Server) resolveSupersededFailedReceipts(succeededPath string, succeeded
 	})
 }
 
+// resolveReindexedPathReceipts resolves terminally failed freshness receipts
+// for a path that an explicit reindex has just re-parsed. A failed ingest
+// fail-closes change.detect for the whole repository until retention lapses,
+// and reindex_repository was the obvious recovery that did not work: it
+// re-reads the file into the graph but never touched this map, so the barrier
+// kept reporting a gap the graph no longer had.
+//
+// The evidence a failed receipt is waiting for is exactly "the graph has read
+// the current bytes of this path", which a successful scoped re-parse
+// provides. Pending receipts are left alone: they describe work still in
+// flight, not a dead generation, and clearing one would hide a real gap.
+func (s *Server) resolveReindexedPathReceipts(reindexedPath string) {
+	cleanPath := filepath.Clean(reindexedPath)
+	s.mutationReceipts.Range(func(_, value any) bool {
+		receipt, ok := value.(*mutationReceipt)
+		if !ok || filepath.Clean(receipt.path) != cleanPath {
+			return true
+		}
+		receipt.mu.Lock()
+		if receipt.completed && (receipt.result.Err != nil || !receipt.result.Reindexed) {
+			receipt.result = indexer.MutationResult{
+				RequestedGeneration: receipt.generation,
+				AppliedGeneration:   receipt.generation,
+				Reindexed:           true,
+			}
+		}
+		receipt.mu.Unlock()
+		return true
+	})
+}
+
 func (r *mutationReceipt) outcome(pending bool) mutationReindexOutcome {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
