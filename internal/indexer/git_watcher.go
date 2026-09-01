@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -120,19 +121,79 @@ func (gw *GitWatcher) Start() error {
 	if err != nil {
 		return fmt.Errorf("resolve .git dir for %s: %w", gw.repoPath, err)
 	}
-	// HEAD + refs/heads/ cover branch switches and same-branch
-	// commits; packed-refs covers the gc case where loose refs get
-	// packed and moved out of refs/heads. Missing files are not fatal
-	// — a fresh repo may not have packed-refs yet.
-	for _, rel := range []string{"HEAD", "packed-refs", "refs/heads"} {
-		path := filepath.Join(gitDir, rel)
-		if _, err := os.Stat(path); err != nil {
-			continue
+	// Two deliberately redundant groups of watches, because either one alone
+	// has a blind spot:
+	//
+	//        LINKED WORKTREE                      COMMON DIR
+	//  .git/modules/<r>/worktrees/<n>/       .git/modules/<r>/
+	//  +------------------------------+      +--------------------------+
+	//  | HEAD      symref, rewritten  |  W   | refs/heads/<branch>      |  W
+	//  |           on a switch only   |      |   moves on every commit  |
+	//  | logs/HEAD appended on EVERY  |  W   | refs/heads/<prefix>/...  |  W
+	//  |           HEAD move          |      | packed-refs (gc)         |  W
+	//  +------------------------------+      +--------------------------+
+	//                                          shared by every checkout
+	//
+	// Watching only the worktree gitdir is what left a linked worktree with an
+	// effectively empty watch set: HEAD there is a symref a commit never
+	// rewrites, and refs/heads and packed-refs do not exist in it at all. The
+	// redundancy matters in both directions -- refs/heads carries a repository
+	// with reflogs disabled, logs/HEAD carries a branch name git stores in a
+	// subdirectory -- so losing either group still leaves freshness working.
+	commonDir := gitCommonDir(gw.repoPath, gitDir)
+	seen := make(map[string]struct{}, 8)
+	refWatches := 0
+	add := func(path string, isRef bool) {
+		if _, dup := seen[path]; dup {
+			return
 		}
+		if _, err := os.Stat(path); err != nil {
+			return
+		}
+		seen[path] = struct{}{}
 		if err := gw.fsw.Add(path); err != nil {
 			gw.logger.Warn("git-watcher: failed to watch",
 				zap.String("path", path), zap.Error(err))
+			return
 		}
+		if isRef {
+			refWatches++
+		}
+	}
+
+	// Per-worktree state lives in the worktree's own gitdir.
+	add(filepath.Join(gitDir, "HEAD"), false)
+	add(filepath.Join(gitDir, "logs", "HEAD"), true)
+	// Shared refs live in the common dir, which is gitDir for a normal repo.
+	// Missing files are not fatal -- a fresh repo may not have packed-refs yet.
+	add(filepath.Join(commonDir, "packed-refs"), true)
+	// fsnotify watches are not recursive, so subscribing to refs/heads alone
+	// misses a branch named feat/foo, which git stores at refs/heads/feat/foo:
+	// the .lock write and rename happen in refs/heads/feat, not in its parent.
+	// Subscribe to every directory in the tree instead. A prefix directory
+	// created after this walk stays unwatched until the next restart -- the
+	// same pre-existing limitation as a packed-refs file created later by
+	// `git gc`, and logs/HEAD covers both unless reflogs are disabled.
+	_ = filepath.WalkDir(filepath.Join(commonDir, "refs", "heads"),
+		func(path string, d fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return nil // unreadable subtree: skip it, keep the rest
+			}
+			if d.IsDir() {
+				add(path, true)
+			}
+			return nil
+		})
+
+	// Count subscriptions actually installed, not paths that merely passed
+	// os.Stat: a file can exist and fsw.Add still fail, which leaves the
+	// watcher just as blind. Silence here is what let a linked worktree read
+	// stale for days with nothing in the log pointing at the watcher.
+	if refWatches == 0 {
+		gw.logger.Warn("git-watcher: no ref watch installed, commit freshness will not update for this repository",
+			zap.String("repo", gw.repoPath),
+			zap.String("git_dir", gitDir),
+			zap.String("common_dir", commonDir))
 	}
 
 	head, _ := gw.currentSHA(context.Background())
@@ -574,4 +635,26 @@ func resolveGitDir(repoPath string) (string, error) {
 		dir = filepath.Join(repoPath, dir)
 	}
 	return dir, nil
+}
+
+// gitCommonDir returns the directory holding the repository's shared refs --
+// refs/heads and packed-refs. For a linked worktree that is the common dir
+// named by <gitDir>/commondir, which ResolveWorktree already resolves,
+// including the relative "../.." form git actually writes there; for a plain
+// checkout it is the .git directory itself.
+//
+// WorktreeInfo.GitCommonDir is empty both for a submodule's main checkout --
+// whose gitdir carries no commondir file -- and for every resolution failure,
+// so an empty result falls back to gitDir. That fallback is load-bearing, not
+// defensive: a tracked submodule checkout is exactly that shape and has to
+// keep watching the refs it already watches.
+//
+// Collapsing "absent" and "unreadable" into one empty string is accepted here
+// because Start's degenerate-watch-set warning keys on subscriptions actually
+// installed, which is a stronger signal than the resolution's internals.
+func gitCommonDir(repoPath, gitDir string) string {
+	if common := ResolveWorktree(repoPath).GitCommonDir; common != "" {
+		return common
+	}
+	return gitDir
 }

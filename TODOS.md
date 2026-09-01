@@ -145,27 +145,65 @@ and the only one the copy path still ignores.
 **Priority:** P3
 **Depends on:** Nothing.
 
-### Find out why a tracked worktree can sit stale for a day with a GitWatcher running
+### Re-establish fsnotify watches created after `GitWatcher.Start`
 
-**What:** Diagnose a tracked worktree whose HEAD moved and which the daemon never
-reindexed.
+**What:** Recompute, or incrementally extend, the watcher's fsnotify watch set
+after `Start` has run — so a `packed-refs` file created later by `git gc`, and a
+`refs/heads/<prefix>/` directory created by the first branch under a new prefix,
+do not stay unwatched until the next daemon restart.
 
-**Why:** A stale tracked repo answers every query from an old graph, with only a
-column in `gortex repos` to say so. It is also the precondition that made the
-copy-path HEAD-vs-`IndexedSHA` bug bite: without staleness the two agree and the
-bug is dormant.
+**Why:** Both are the residual of the linked-worktree freshness fix, and both are
+the same failure shape as the bug that fix closed: a subscription that silently
+is not there. `logs/HEAD` covers both cases unless a repository has
+`core.logAllRefUpdates=false`, so this is narrow — but the combination is exactly
+what `TestGitWatcher_SlashBranchWithReflogDisabledRestamps` exists to pin, and
+that test only covers prefixes that exist at `Start` time.
 
-**Context:** Live and reproducible when written. `local@aurora-redesign` HEAD
-`d7e3d523022a` committed 2026-08-31 14:02; `IndexedSHA b5aea9c7348a` indexed
-2026-08-30 16:50; 262 files between them; `gortex repos` FRESHNESS `stale`.
-`GitWatcher.seedSHA` (`internal/indexer/git_watcher.go:185`) reads
-`GetRepoIndexState`, so the machinery is present and either did not fire or fired
-and the reindex failed quietly. Worth checking against the recorded trap that
-`repo_index_state.indexed_at` has only two writers, so incremental edits mutate
-the graph without advancing it — a freshness check anchored there reports current
-for the commonest staleness case.
+**Context:** This closes out the investigation that used to sit here, *"Find out
+why a tracked worktree can sit stale for a day with a GitWatcher running"*. The
+answer was not `seedSHA`: no ref event ever arrived. `GitWatcher.Start` watched
+`HEAD`, `packed-refs` and `refs/heads` relative to the **worktree** gitdir, where
+the last two do not exist and `HEAD` is a symref a commit never rewrites — so a
+linked worktree's watch set was effectively empty and `indexed_sha` froze at
+track time while the file watcher kept the graph itself current. `Start` now
+watches `HEAD` + `logs/HEAD` from the worktree gitdir and `packed-refs` +
+every directory under `refs/heads` from the common dir (`gitCommonDir`, which
+reuses `ResolveWorktree`), and warns when no ref-side subscription is installed.
+`Start` still runs exactly once per repository at warmup; making the watch set
+mutable afterwards adds state to a component that is currently fixed after
+`Start`, which is the cost to weigh.
 
 **Effort:** M
+**Priority:** P3
+**Depends on:** Nothing.
+
+### Decide what `watch.enabled` should gate, and whether it should default on
+
+**What:** Decide whether `Watch.Enabled` should default to `true`, or whether the
+poller's HEAD check should be split out from the flag that currently gates it.
+
+**Why:** `watch.enabled: false` does **not** disable watching.
+`MultiWatcher.Start` starts every repository's fsnotify watcher and its
+`GitWatcher` unconditionally; the flag gates only the slow-mount degradation
+probe and the poller (`internal/indexer/watcher.go`, `config.Default()`). The
+consequence is not cosmetic: with the poller running, the linked-worktree
+freshness bug above would have been at most ten minutes of staleness, because
+`observeGitHead` → `finalizeGitHead` (`internal/indexer/poller.go`) restamps
+`indexed_sha` on its own. With the flag off — the default — the `GitWatcher` is
+the *only* freshness path, so a watch-topology surprise is permanent rather than
+transient.
+
+**Context:** Measured 2026-09-01: six days of `~/.gortex/cache/daemon.log`
+contained zero poller lines while carrying live content-watcher lines for the
+same repositories, and no repository on that machine had a poller — the global
+config sets no `watch:` block, `gortex/.gortex.yaml` sets `enabled: false`
+explicitly, and `config.Default()` is `false`. The cost of defaulting on is one
+`git rev-parse` plus a bounded receipt sweep per repository per interval, with
+the interval scaling from 15 s to 10 min by node count (`pollInterval`). The
+cheaper half of this is renaming or splitting the flag so its name matches what
+it gates; the default is the part that affects every user.
+
+**Effort:** S
 **Priority:** P2
 **Depends on:** Nothing.
 
