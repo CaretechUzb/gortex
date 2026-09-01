@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -608,6 +609,11 @@ type fileIndex struct {
 	// the fact spool keys one row per (class, file), so no other file's
 	// apply can have disturbed this file's calls-edges first.
 	stubsByLine map[int][]stubRef
+	// stubOwners memoizes stubOwnersAt by (line, authored name). Every
+	// call fact on a line asks the same question, so without this the
+	// per-fact scan is quadratic in the sites sharing one physical line
+	// (a generated single-line class body made Enrich 49x slower).
+	stubOwners map[string][]*graph.Node
 }
 
 // stubRef is one snapshotted calls-edge under stubsByLine: the owning
@@ -622,22 +628,26 @@ type stubRef struct {
 // of the given trailing name at line — the callers the extractor already
 // attributed sites there to.
 func (idx *fileIndex) stubOwnersAt(line int, method string) []*graph.Node {
+	key := strconv.Itoa(line) + "\x00" + method
+	if owners, ok := idx.stubOwners[key]; ok {
+		return owners
+	}
 	var owners []*graph.Node
+	seen := make(map[string]struct{})
 	for _, s := range idx.stubsByLine[line] {
 		if !trailingNameMatches(s.to, method) {
 			continue
 		}
-		seen := false
-		for _, o := range owners {
-			if o.ID == s.owner.ID {
-				seen = true
-				break
-			}
+		if _, dup := seen[s.owner.ID]; dup {
+			continue
 		}
-		if !seen {
-			owners = append(owners, s.owner)
-		}
+		seen[s.owner.ID] = struct{}{}
+		owners = append(owners, s.owner)
 	}
+	if idx.stubOwners == nil {
+		idx.stubOwners = make(map[string][]*graph.Node)
+	}
+	idx.stubOwners[key] = owners
 	return owners
 }
 
@@ -647,6 +657,7 @@ func (a *applier) buildIndex(facts *fileFacts) *fileIndex {
 		imports:     make(map[string]string, len(facts.imports)),
 		types:       make(map[string]*graph.Node),
 		stubsByLine: make(map[int][]stubRef),
+		stubOwners:  make(map[string][]*graph.Node),
 	}
 	idx.superTypes = idx.types
 	superKinds := a.supertypeKinds()
