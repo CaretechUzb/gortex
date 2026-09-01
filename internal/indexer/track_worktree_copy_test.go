@@ -268,7 +268,7 @@ func TestRestatDoesNotTreatAnUnreadablePathAsDeleted(t *testing.T) {
 // repo content_gen of 4.
 func TestCopiedRepoEnrichIsANoOpForAnUnknownPrefix(t *testing.T) {
 	mi := copyGateIndexer(t, "base", realpath(t, t.TempDir()))
-	require.NotPanics(t, func() { mi.scheduleCopiedRepoEnrich("no-such-prefix") },
+	require.NotPanics(t, func() { mi.scheduleCopiedRepoEnrich("no-such-prefix", nil) },
 		"the copy path names a prefix the indexer map may not carry; a panic here kills the track")
 }
 
@@ -295,7 +295,7 @@ func TestCopiedRepoEnrichArmsTheGateUnconditionally(t *testing.T) {
 
 	require.False(t, idx.pendingEnrich.Load(), "precondition: the gate starts closed")
 
-	mi.scheduleCopiedRepoEnrich("base")
+	mi.scheduleCopiedRepoEnrich("base", nil)
 
 	require.True(t, idx.pendingEnrich.Load(),
 		"a diverged copy carries another checkout's enrichment rows, so the pass "+
@@ -521,4 +521,84 @@ func TestCopySourcePrefersAStaleCandidateThatIsActuallyCloser(t *testing.T) {
 			"one's are two files away. Divergence is measured against what was "+
 			"indexed, so stale wins")
 	require.Empty(t, changed)
+}
+
+// A diverged copy whose reconcile ran its synchronous scoped tail owes no
+// repo-wide rederive: that pass re-derived edges the copy already carried, at
+// 373–1,034 s per track on the workspace this was measured in. Both halves of
+// the predicate are load-bearing — a deferred tail or an empty frontier means
+// nothing was re-derived, and restamping then would bless a silently
+// under-derived graph.
+func TestCopiedDivergenceRepairedRequiresBothTheTailAndAFrontier(t *testing.T) {
+	require.False(t, copiedDivergenceRepaired(nil))
+	require.False(t, copiedDivergenceRepaired(&IndexResult{DerivedTailRan: true, StaleFileCount: 3}),
+		"an empty frontier despite stale work means nothing was re-derived; the fallback still owes the work")
+	require.False(t, copiedDivergenceRepaired(&IndexResult{
+		StaleFileCount:      3,
+		DerivedInvalidation: DerivedInvalidationPlan{Files: []string{"base/a.py"}},
+	}), "a tail deferred to a batch transition has not run; the fallback still owes the work")
+	require.True(t, copiedDivergenceRepaired(&IndexResult{
+		DerivedTailRan:      true,
+		DerivedInvalidation: DerivedInvalidationPlan{Files: []string{"base/a.py"}},
+	}))
+}
+
+// A divergence made only of non-indexable files (.po translations, assets)
+// reconciles to zero stale work: the graph is bit-identical to the carried
+// copy, so the copy owes neither a derive nor an enrichment — exactly the
+// identical-copy shape, reached through the diverged branch. Weblate commits
+// make this the COMMON case on the workspace this was built for.
+func TestCopiedDivergenceRepairedAcceptsProvenNoWork(t *testing.T) {
+	require.True(t, copiedDivergenceRepaired(&IndexResult{}),
+		"zero stale, zero deleted, empty plan — nothing is owed regardless of the tail")
+	require.False(t, copiedDivergenceRepaired(&IndexResult{FullRetrack: true}),
+		"a full retrack enumerates nothing; its StaleFileCount 0 is not proof of no work")
+	require.False(t, copiedDivergenceRepaired(&IndexResult{DeletedFileCount: 1}),
+		"a deletion is real work; with no frontier the fallback still owes it")
+}
+
+// The repaired path hands scheduleCopiedRepoEnrich the exact reconciled
+// frontier. Dirty sources are refused upstream, so every carried enrichment
+// row outside that frontier describes content this checkout really has —
+// re-enriching the whole repository would re-derive semantic rows the copy
+// already holds, for minutes instead of seconds.
+func TestCopiedRepoEnrichNarrowsToAGivenFrontier(t *testing.T) {
+	repo := realpath(t, t.TempDir())
+	initTestRepo(t, repo, "main")
+
+	mi := copyGateIndexer(t, "base", repo)
+	idx := mi.indexers["base"]
+	idx.rootPath = repo
+	idx.graph = mi.graph
+	idx.logger = zap.NewNop()
+
+	mi.scheduleCopiedRepoEnrich("base", []string{"base/models/hr.py"})
+
+	require.True(t, idx.pendingEnrich.Load())
+	idx.deferredEnrichMu.Lock()
+	defer idx.deferredEnrichMu.Unlock()
+	require.False(t, idx.deferredEnrichFull,
+		"a known frontier must arm a file-scoped pass, not a whole-repo one")
+	require.Contains(t, idx.deferredEnrichFiles, "base/models/hr.py")
+}
+
+// An empty frontier is the fallback path, where nothing has vouched for the
+// carried rows — the arming must stay whole-repo.
+func TestCopiedRepoEnrichWithoutAFrontierArmsTheFullPass(t *testing.T) {
+	repo := realpath(t, t.TempDir())
+	initTestRepo(t, repo, "main")
+
+	mi := copyGateIndexer(t, "base", repo)
+	idx := mi.indexers["base"]
+	idx.rootPath = repo
+	idx.graph = mi.graph
+	idx.logger = zap.NewNop()
+
+	mi.scheduleCopiedRepoEnrich("base", nil)
+
+	require.True(t, idx.pendingEnrich.Load())
+	idx.deferredEnrichMu.Lock()
+	defer idx.deferredEnrichMu.Unlock()
+	require.True(t, idx.deferredEnrichFull,
+		"with no frontier the carried rows are unvouched-for; only a full pass is sound")
 }

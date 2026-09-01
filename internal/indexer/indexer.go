@@ -119,6 +119,13 @@ type IndexResult struct {
 	// incremental reconcile. A zero plan proves that no graph-wide derived
 	// pass is required; callers must not infer work merely from stale count.
 	DerivedInvalidation DerivedInvalidationPlan `json:"derived_invalidation,omitempty"`
+	// DerivedTailRan is true when the reconcile ran its synchronous
+	// resolve + incremental-derived tail over DerivedInvalidation before
+	// returning. False when the tail was deferred to a batch transition or
+	// the result came from a full retrack (which runs its own pipeline).
+	// Callers deciding whether a repo still owes a derivation — the
+	// worktree-copy path — key off this instead of re-deriving.
+	DerivedTailRan bool `json:"derived_tail_ran,omitempty"`
 
 	// mutationErr carries a point-operation compatibility error through the
 	// resolver/semantic/derived tail. It is intentionally unexported and never

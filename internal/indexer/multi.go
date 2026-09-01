@@ -3317,12 +3317,23 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 		// resolve/global phases. A full retrack already ran its own resolve/derived
 		// pipeline and only needs the existing cross-repository contract reconcile.
 		if !result.FullRetrack && !batchMode.deferResolve {
+			// See seedDerivedFrontierFromCensus: an empty reindex plan with
+			// stale work would otherwise escalate the resolve to a
+			// whole-store ResolveAll and no-op the derived tail.
+			if seedDerivedFrontierFromCensus(result, changed, deleted, func(relPath string) string {
+				return idx.prefixPath(filepath.FromSlash(relPath))
+			}) {
+				mi.logger.Info("daemon: reconcile seeded derived frontier from census",
+					zap.String("prefix", prefix),
+					zap.Int("files", len(result.DerivedInvalidation.Files)))
+			}
 			mi.resolveIncrementalRepoMutation(prefix, result, receipt, batch)
 			if !batchMode.deferGlobalPasses {
 				idx.observeIncrementalCatchup("derived", result.DerivedInvalidation.Files)
 				mi.runIncrementalDerivedPassesTopologyHeld(context.Background(), map[string]DerivedInvalidationPlan{
 					prefix: result.DerivedInvalidation,
 				})
+				result.DerivedTailRan = true
 			}
 		} else if result.FullRetrack && !batchMode.deferGlobalPasses {
 			mi.ReconcileContractEdges()
