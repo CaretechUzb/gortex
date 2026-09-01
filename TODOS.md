@@ -177,34 +177,51 @@ mutable afterwards adds state to a component that is currently fixed after
 **Priority:** P3
 **Depends on:** Nothing.
 
-### Decide what `watch.enabled` should gate, and whether it should default on
+### Decide whether the watch poller should default on
 
-**What:** Decide whether `Watch.Enabled` should default to `true`, or whether the
-poller's HEAD check should be split out from the flag that currently gates it.
+**What:** Decide whether `Watch.Enabled` should default to `true`. Nothing else
+about the flag is open — see the correction below.
 
-**Why:** `watch.enabled: false` does **not** disable watching.
-`MultiWatcher.Start` starts every repository's fsnotify watcher and its
-`GitWatcher` unconditionally; the flag gates only the slow-mount degradation
-probe and the poller (`internal/indexer/watcher.go`, `config.Default()`). The
-consequence is not cosmetic: with the poller running, the linked-worktree
-freshness bug above would have been at most ten minutes of staleness, because
-`observeGitHead` → `finalizeGitHead` (`internal/indexer/poller.go`) restamps
-`indexed_sha` on its own. With the flag off — the default — the `GitWatcher` is
-the *only* freshness path, so a watch-topology surprise is permanent rather than
-transient.
+**Why:** The poller is the only *generic* backstop against a watch-topology
+surprise. `observeGitHead` -> `finalizeGitHead` (`internal/indexer/poller.go`)
+restamps `indexed_sha` on its own within one interval, so with it running the
+linked-worktree freshness defect fixed above would have been at most ten minutes
+of staleness rather than permanent. Its cost is one `git rev-parse` plus a
+bounded receipt sweep per repository per interval, the interval scaling from
+15 s to 10 min by node count (`pollInterval`).
 
-**Context:** Measured 2026-09-01: six days of `~/.gortex/cache/daemon.log`
-contained zero poller lines while carrying live content-watcher lines for the
-same repositories, and no repository on that machine had a poller — the global
-config sets no `watch:` block, `gortex/.gortex.yaml` sets `enabled: false`
-explicitly, and `config.Default()` is `false`. The cost of defaulting on is one
-`git rev-parse` plus a bounded receipt sweep per repository per interval, with
-the interval scaling from 15 s to 10 min by node count (`pollInterval`). The
-cheaper half of this is renaming or splitting the flag so its name matches what
-it gates; the default is the part that affects every user.
+**Correction, 2026-09-01 — the other half of this entry was wrong.** It
+originally proposed splitting the poller out from the flag, on the premise that
+`watch.enabled: false` failing to disable watching was an accident. It is not:
+upstream settled it deliberately, in both directions. `969c26b4` made `Enabled`
+gate all of `Start()` and was reverted by `30878fbe` because
+`config.Default()` ships `Enabled: false`, so every repo without an explicit
+`watch.enabled: true` silently got no live indexing at all. The flag now has
+exactly ONE reader — `internal/indexer/watcher.go:616` — gating only the poller
+that runs *alongside a live fsnotify backend*. The two degraded-path pollers
+(slow-mount, inotify/FD exhaustion) start unconditionally, because fsnotify is
+already dead there and declining the poller would leave the repo stale with no
+fallback at all. `TestWatcher_ShippedDefaultStillWatches` pins the shipped
+default; upstream noted every other watcher test hardcodes `Enabled: true`,
+which is why the regression shipped uncaught.
+
+**Context:** The evidence that raised this — six days of
+`~/.gortex/cache/daemon.log` carrying zero poller lines while carrying live
+content-watcher lines for the same repositories — is consistent with the design
+above rather than anomalous: fsnotify was healthy throughout, so the only poller
+in play was the opt-in one, and no repo opts in (the global config sets no
+`watch:` block, `gortex/.gortex.yaml` sets `enabled: false` explicitly, and
+`config.Default()` is `false`).
+
+The argument against defaulting on is now stronger than when this was written:
+the GitWatcher fix restored the designed ref path for linked worktrees, so the
+poller is redundant in every case currently known. It earns its cost only
+against the *next* topology surprise. That is a real but speculative benefit,
+which is why this is a judgement call rather than a bug.
 
 **Effort:** S
-**Priority:** P2
+**Priority:** P3 — downgraded from P2 once the GitWatcher fix closed the
+concrete case that motivated it.
 **Depends on:** Nothing.
 
 ## Readiness
