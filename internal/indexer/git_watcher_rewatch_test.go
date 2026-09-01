@@ -11,6 +11,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
@@ -205,4 +207,283 @@ func TestGitWatcher_SeedsFromIndexedCommitNotHead(t *testing.T) {
 	require.NoError(t, gw.Start())
 	t.Cleanup(func() { _ = gw.Stop() })
 	awaitReconcile(t, drained, "the startup catch-up")
+}
+
+// --- linked-worktree commit freshness -------------------------------------
+//
+// The tests above cover CHECKOUTS in a linked worktree, which work because a
+// checkout rewrites the worktree's own HEAD file. A commit on the branch
+// already checked out does not: HEAD stays the symref it was, the ref moves in
+// the COMMON dir, and the HEAD reflog is appended in the worktree gitdir.
+// Watching only the worktree gitdir therefore left commit freshness dead --
+// the repo answered every query correctly from a current graph while
+// `gortex repos` reported it stale for the life of the daemon.
+
+// startWatchedStoreIndex is startWatchedIndex over a persistent store, because
+// the in-memory graph carries no freshness row and IndexedSHA is the only
+// assertion that can distinguish this bug: in the live failure the graph
+// content is already current via the file watcher, so asserting on nodes
+// passes for the wrong reason.
+func startWatchedStoreIndex(t *testing.T, indexRoot, watchRoot string) (*store_sqlite.Store, *Indexer, <-chan int) {
+	t.Helper()
+	st, err := store_sqlite.Open(filepath.Join(t.TempDir(), "state.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	idx := New(st, newTestRegistry(), config.IndexConfig{Workers: 1}, zap.NewNop())
+	idx.search = search.NewNull()
+	idx.SetRootPath(indexRoot)
+	_, err = idx.IndexCtx(testCtx(), indexRoot)
+	require.NoError(t, err)
+	require.NoError(t, st.SetRepoIndexState(graph.RepoIndexState{
+		RepoPrefix: idx.repoPrefix,
+		IndexedSHA: headSHA(t, watchRoot),
+		IndexedAt:  time.Now().Unix(),
+	}))
+
+	gw, err := NewGitWatcher(watchRoot, idx, zap.NewNop())
+	require.NoError(t, err)
+	gw.debounce = 50 * time.Millisecond
+	drained := make(chan int, 4)
+	gw.drained = func(n int) {
+		select {
+		case drained <- n:
+		default:
+		}
+	}
+	require.NoError(t, gw.Start())
+	t.Cleanup(func() { _ = gw.Stop() })
+	return st, idx, drained
+}
+
+func storedIndexedSHA(t *testing.T, st *store_sqlite.Store, prefix string) string {
+	t.Helper()
+	state, found, err := st.GetRepoIndexState(prefix)
+	require.NoError(t, err)
+	require.True(t, found, "repo_index_state row must exist")
+	return state.IndexedSHA
+}
+
+// linkedWorktreeOnBranch adds a linked worktree checked out on a NEW branch.
+// The branch is the whole point: `git worktree add --detach` leaves HEAD
+// holding a raw SHA that git rewrites on every commit, so a detached fixture
+// exercises the watched HEAD file and passes even with every ref watch missing.
+func linkedWorktreeOnBranch(t *testing.T, repoDir, branch string) string {
+	t.Helper()
+	wtDir := filepath.Join(t.TempDir(), "wt")
+	runGit(t, repoDir, "worktree", "add", "-q", "-b", branch, wtDir, "main")
+	info, err := os.Stat(filepath.Join(wtDir, ".git"))
+	require.NoError(t, err)
+	require.False(t, info.IsDir(), "fixture must produce a linked worktree, not a nested .git dir")
+	return wtDir
+}
+
+// disableReflog removes the HEAD reflog and stops git writing it again, so the
+// refs-side watches are the only thing left that can carry a commit.
+func disableReflog(t *testing.T, wtDir string) {
+	t.Helper()
+	runGit(t, wtDir, "config", "core.logAllRefUpdates", "false")
+	gitDir, err := resolveGitDir(wtDir)
+	require.NoError(t, err)
+	require.NoError(t, os.RemoveAll(filepath.Join(gitDir, "logs")))
+}
+
+func commitFile(t *testing.T, dir, file, fn string) string {
+	t.Helper()
+	writeFile(t, filepath.Join(dir, file), "package main\nfunc "+fn+"() {}\n")
+	runGit(t, dir, "add", "-A")
+	runGit(t, dir, "commit", "-q", "-m", "commit "+fn)
+	return headSHA(t, dir)
+}
+
+// TestGitWatcher_LinkedWorktreeCommitOnBranchRestamps is the regression test.
+// It must fail before the watch set spans the common dir and the HEAD reflog.
+func TestGitWatcher_LinkedWorktreeCommitOnBranchRestamps(t *testing.T) {
+	repoDir := gitWatcherFixture(t)
+	wtDir := linkedWorktreeOnBranch(t, repoDir, "wt-branch")
+	st, idx, drained := startWatchedStoreIndex(t, wtDir, wtDir)
+	before := storedIndexedSHA(t, st, idx.repoPrefix)
+
+	head := commitFile(t, wtDir, "d.go", "Delta")
+	require.NotEqual(t, before, head, "the fixture must move HEAD")
+	awaitReconcile(t, drained, "the commit on the worktree's branch")
+
+	assert.Equal(t, head, storedIndexedSHA(t, st, idx.repoPrefix),
+		"a commit on a linked worktree's own branch must restamp indexed_sha")
+}
+
+// TestGitWatcher_SlashNamedBranchRestamps covers the branch names git stores
+// one directory deeper: refs/heads/feat/foo fires nothing on refs/heads.
+func TestGitWatcher_SlashNamedBranchRestamps(t *testing.T) {
+	repoDir := gitWatcherFixture(t)
+	wtDir := linkedWorktreeOnBranch(t, repoDir, "feat/foo")
+	st, idx, drained := startWatchedStoreIndex(t, wtDir, wtDir)
+
+	head := commitFile(t, wtDir, "d.go", "Delta")
+	awaitReconcile(t, drained, "the commit on a slash-named branch")
+
+	assert.Equal(t, head, storedIndexedSHA(t, st, idx.repoPrefix),
+		"a branch name containing a slash must still restamp indexed_sha")
+}
+
+// TestGitWatcher_ReflogDisabledStillRestamps isolates the refs-side watches by
+// removing the HEAD reflog entirely.
+func TestGitWatcher_ReflogDisabledStillRestamps(t *testing.T) {
+	repoDir := gitWatcherFixture(t)
+	wtDir := linkedWorktreeOnBranch(t, repoDir, "no-reflog")
+	disableReflog(t, wtDir)
+	st, idx, drained := startWatchedStoreIndex(t, wtDir, wtDir)
+
+	head := commitFile(t, wtDir, "d.go", "Delta")
+	awaitReconcile(t, drained, "the commit with reflogs disabled")
+
+	assert.Equal(t, head, storedIndexedSHA(t, st, idx.repoPrefix),
+		"the common-dir refs watch must carry a commit on its own")
+}
+
+// TestGitWatcher_SlashBranchWithReflogDisabledRestamps is the case where both
+// mechanisms would fail without the recursive walk of refs/heads: the reflog
+// is gone and the branch ref lives one directory below the watched parent.
+// It is what keeps the "two independent triggers" claim honest.
+func TestGitWatcher_SlashBranchWithReflogDisabledRestamps(t *testing.T) {
+	repoDir := gitWatcherFixture(t)
+	wtDir := linkedWorktreeOnBranch(t, repoDir, "feat/no-reflog")
+	disableReflog(t, wtDir)
+	st, idx, drained := startWatchedStoreIndex(t, wtDir, wtDir)
+
+	head := commitFile(t, wtDir, "d.go", "Delta")
+	awaitReconcile(t, drained, "the commit on a slash branch with reflogs disabled")
+
+	assert.Equal(t, head, storedIndexedSHA(t, st, idx.repoPrefix),
+		"walking refs/heads subdirectories must carry the commit when the reflog cannot")
+}
+
+// TestGitWatcher_SiblingWatchersDoNotRestampEachOther pins the fan-out the
+// shared common dir introduces: with N checkouts one commit wakes N watchers,
+// and N-1 must return at reconcile's oldSHA == newSHA guard without restamping.
+func TestGitWatcher_SiblingWatchersDoNotRestampEachOther(t *testing.T) {
+	repoDir := gitWatcherFixture(t)
+	wtA := linkedWorktreeOnBranch(t, repoDir, "sibling-a")
+	wtB := linkedWorktreeOnBranch(t, repoDir, "sibling-b")
+	stA, idxA, drainedA := startWatchedStoreIndex(t, wtA, wtA)
+	stB, idxB, _ := startWatchedStoreIndex(t, wtB, wtB)
+	beforeB := storedIndexedSHA(t, stB, idxB.repoPrefix)
+
+	head := commitFile(t, wtA, "d.go", "Delta")
+	awaitReconcile(t, drainedA, "the sibling's commit")
+	assert.Equal(t, head, storedIndexedSHA(t, stA, idxA.repoPrefix),
+		"the committing checkout must restamp")
+
+	assert.Never(t, func() bool {
+		return storedIndexedSHA(t, stB, idxB.repoPrefix) != beforeB
+	}, 750*time.Millisecond, 50*time.Millisecond,
+		"a sibling checkout must not restamp on another checkout's ref event")
+}
+
+// TestGitWatcher_PlainRepoWatchSetUnchanged is the negative control: the
+// de-duplication must not drop refs/heads for an ordinary repository, whose
+// gitdir and common dir are the same directory.
+func TestGitWatcher_PlainRepoWatchSetUnchanged(t *testing.T) {
+	repoDir := gitWatcherFixture(t)
+	gitDir, err := resolveGitDir(repoDir)
+	require.NoError(t, err)
+
+	gw, err := NewGitWatcher(repoDir, nil, zap.NewNop())
+	require.NoError(t, err)
+	require.NoError(t, gw.Start())
+	t.Cleanup(func() { _ = gw.Stop() })
+
+	watched := make(map[string]struct{})
+	for _, p := range gw.fsw.WatchList() {
+		watched[p] = struct{}{}
+	}
+	for _, rel := range []string{"HEAD", "refs/heads"} {
+		_, ok := watched[filepath.Join(gitDir, rel)]
+		assert.Truef(t, ok, "a plain repo must still watch %s", rel)
+	}
+
+	st, idx, drained := startWatchedStoreIndex(t, repoDir, repoDir)
+	head := commitFile(t, repoDir, "d.go", "Delta")
+	awaitReconcile(t, drained, "a commit in a plain repo")
+	assert.Equal(t, head, storedIndexedSHA(t, st, idx.repoPrefix),
+		"a plain repo must still restamp on a commit")
+}
+
+// TestGitWatcher_WarnsOnDegenerateWatchSet pins the only external signal that
+// this class of bug produces. It has to key on subscriptions actually
+// installed: a path can pass os.Stat and still fail fsw.Add.
+func TestGitWatcher_WarnsOnDegenerateWatchSet(t *testing.T) {
+	t.Run("fires when nothing ref-side is watchable", func(t *testing.T) {
+		repoDir := t.TempDir()
+		gitDir := filepath.Join(repoDir, ".git")
+		require.NoError(t, os.MkdirAll(gitDir, 0o755))
+		writeFile(t, filepath.Join(gitDir, "HEAD"), "ref: refs/heads/main\n")
+
+		core, logs := observer.New(zapcore.WarnLevel)
+		gw, err := NewGitWatcher(repoDir, nil, zap.New(core))
+		require.NoError(t, err)
+		require.NoError(t, gw.Start())
+		t.Cleanup(func() { _ = gw.Stop() })
+
+		assert.Equal(t, 1, logs.FilterMessageSnippet("no ref watch installed").Len(),
+			"a watch set with no ref-side subscription must say so")
+	})
+
+	t.Run("stays quiet on a healthy repo", func(t *testing.T) {
+		repoDir := gitWatcherFixture(t)
+		core, logs := observer.New(zapcore.WarnLevel)
+		gw, err := NewGitWatcher(repoDir, nil, zap.New(core))
+		require.NoError(t, err)
+		require.NoError(t, gw.Start())
+		t.Cleanup(func() { _ = gw.Stop() })
+
+		assert.Zero(t, logs.FilterMessageSnippet("no ref watch installed").Len(),
+			"a healthy warm restart must not warn")
+	})
+}
+
+// TestGitCommonDir_LayoutTable covers the three layouts Start has to resolve.
+// The third row is the one the ResolveWorktree reuse makes load-bearing: a
+// submodule main checkout has no commondir file, so GitCommonDir comes back
+// empty and only the fallback keeps its refs watched.
+func TestGitCommonDir_LayoutTable(t *testing.T) {
+	repoDir := gitWatcherFixture(t)
+
+	t.Run("plain repo resolves to its own .git", func(t *testing.T) {
+		gitDir, err := resolveGitDir(repoDir)
+		require.NoError(t, err)
+		assert.Equal(t, gitDir, gitCommonDir(repoDir, gitDir))
+	})
+
+	t.Run("linked worktree resolves to the common dir", func(t *testing.T) {
+		wtDir := linkedWorktreeOnBranch(t, repoDir, "common-dir-probe")
+		gitDir, err := resolveGitDir(wtDir)
+		require.NoError(t, err)
+
+		raw, err := os.ReadFile(filepath.Join(gitDir, "commondir"))
+		require.NoError(t, err)
+		require.False(t, filepath.IsAbs(strings.TrimSpace(string(raw))),
+			"git writes commondir relative; an absolute fixture would not exercise the join")
+
+		// EvalSymlinks because git writes the resolved path into the gitdir
+		// file, and on macOS t.TempDir() hands back /var/... for /private/var.
+		want, err := filepath.EvalSymlinks(filepath.Join(repoDir, ".git"))
+		require.NoError(t, err)
+		assert.Equal(t, want, gitCommonDir(wtDir, gitDir))
+	})
+
+	t.Run("submodule main checkout falls back to its own gitdir", func(t *testing.T) {
+		subDir := t.TempDir()
+		sepGitDir := filepath.Join(t.TempDir(), "modules", "sub")
+		require.NoError(t, os.MkdirAll(filepath.Dir(sepGitDir), 0o755))
+		runGit(t, subDir, "init", "-q", "-b", "main", "--separate-git-dir", sepGitDir)
+
+		gitDir, err := resolveGitDir(subDir)
+		require.NoError(t, err)
+		require.NoFileExists(t, filepath.Join(gitDir, "commondir"),
+			"the fixture must reproduce the submodule shape: a gitdir file with no commondir")
+
+		assert.Equal(t, gitDir, gitCommonDir(subDir, gitDir),
+			"a submodule main checkout must keep watching its own gitdir, not fall through to empty")
+	})
 }
