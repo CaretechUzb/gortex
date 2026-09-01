@@ -1143,6 +1143,18 @@ func (a *applier) applyCall(idx *fileIndex, cf callFact, res *semantic.EnrichRes
 	// collects a call it did not author (it has no stub to claim, so it
 	// would mint), and when no tied owner contains the line the site is
 	// refused outright.
+	//
+	// Adoption couples this tier's precision to extraction's attribution
+	// accuracy, and that trade is only sound where extraction is
+	// byte-precise for the owner kind in question. An attribution defect
+	// that used to surface as a harmless unresolved stub surfaces here as
+	// a confident resolved edge instead: issue #728 caught an indexer's
+	// body call parked on a same-line property, promoted to
+	// ast_resolved/0.95 on a member whose whole body was `=> 1`. The
+	// extractor holds up its end two ways - it refuses a call whose line
+	// owner's recorded bytes provably exclude the offset, and every member
+	// kind that can hold executable code records extents of its own -
+	// so anyone widening the extractor's owner set must keep both.
 	var caller *graph.Node
 	owners := idx.stubOwnersAt(cf.line, cf.method)
 	switch len(owners) {
