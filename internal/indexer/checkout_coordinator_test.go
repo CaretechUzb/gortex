@@ -480,6 +480,362 @@ func TestCoordinatorReusesACommitLayerOnTheWayBack(t *testing.T) {
 	}
 }
 
+func TestCoordinatorFreshProcessRetainsRoutedCommitForSwitchBack(t *testing.T) {
+	f := newCoordinatorFixture(t)
+	firstCoordinator := f.inertCoordinator(t, CheckoutCoordinatorConfig{})
+	commitA := builderGit(t, f.worktree, "rev-parse", "HEAD")
+
+	first := coordinatorReconcile(t, firstCoordinator)
+	if !first.CommitBuilt || first.CommitGenerationID == 0 {
+		t.Fatalf("the first process did not build A: %+v", first)
+	}
+	generationA := first.CommitGenerationID
+
+	// The daemon is down while the checkout moves to B. The replacement
+	// coordinator therefore inherits route A with an empty in-memory cache.
+	f.commitTreeB()
+	restarted := f.inertCoordinator(t, CheckoutCoordinatorConfig{})
+	second := coordinatorReconcile(t, restarted)
+	if !second.CommitBuilt || second.CommitGenerationID == generationA {
+		t.Fatalf("the fresh process did not build and route B: %+v", second)
+	}
+	if _, found := f.generation(generationA); !found {
+		t.Fatalf("the fresh process retired routed A generation %d while switching to B", generationA)
+	}
+
+	builderGit(t, f.worktree, "checkout", "--detach", commitA)
+	third := coordinatorReconcile(t, restarted)
+	if third.CommitBuilt || !third.CommitReused {
+		t.Fatalf("the post-restart switch back rebuilt A: %+v", third)
+	}
+	if third.CommitGenerationID != generationA {
+		t.Fatalf("the post-restart switch back routed generation %d, want %d",
+			third.CommitGenerationID, generationA)
+	}
+
+	commits := 0
+	for _, row := range f.generations() {
+		if row.GenerationKind == CommitLayerGenerationKind {
+			commits++
+		}
+	}
+	if commits != 2 {
+		t.Fatalf("%d commit generations exist for two trees across restart", commits)
+	}
+}
+
+func BenchmarkCoordinatorSwitchesBetweenRestartRetainedCommits(b *testing.B) {
+	f := newCoordinatorFixture(b)
+	first := f.inertCoordinator(b, CheckoutCoordinatorConfig{})
+	initial := first.reconcile(context.Background())
+	if initial.Err != nil || initial.CommitGenerationID == 0 {
+		b.Fatalf("initial A reconcile: %+v", initial)
+	}
+	treeB := f.commitTreeB()
+	c := f.inertCoordinator(b, CheckoutCoordinatorConfig{})
+	second := c.reconcile(context.Background())
+	if second.Err != nil || second.CommitGenerationID == 0 || second.CommitGenerationID == initial.CommitGenerationID {
+		b.Fatalf("fresh-process B reconcile: %+v", second)
+	}
+	ctx := context.Background()
+	base, err := c.primaryBase(ctx)
+	if err != nil {
+		b.Fatalf("primary base: %v", err)
+	}
+	route, found, err := c.catalog.GetCheckoutRoute(ctx, c.checkoutID)
+	if err != nil || !found {
+		b.Fatalf("route: found=%t err=%v", found, err)
+	}
+	targets := [...]string{f.treeA, treeB}
+	var physicalBuilds int64
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := range b.N {
+		out := CheckoutCycle{}
+		generationID, reconcileErr := c.reconcileCommitSlot(
+			ctx, base, targets[i%len(targets)], &route, &out,
+		)
+		if out.CommitBuilt {
+			physicalBuilds++
+		}
+		if reconcileErr != nil || generationID == 0 || !out.CommitReused {
+			b.Fatalf("switch %d: generation=%d cycle=%+v err=%v",
+				i, generationID, out, reconcileErr)
+		}
+	}
+	b.StopTimer()
+	b.ReportMetric(float64(physicalBuilds)/float64(b.N), "physical-builds/op")
+	if physicalBuilds != 0 {
+		b.Fatalf("%d physical builds across %d retained switches", physicalBuilds, b.N)
+	}
+}
+
+func TestCoordinatorPublishesCheckoutHeadBeforeTheSwitchedRoute(t *testing.T) {
+	f := newCoordinatorFixture(t)
+	c := f.inertCoordinator(t, CheckoutCoordinatorConfig{})
+	coordinatorReconcile(t, c)
+
+	treeB := f.commitTreeB()
+	cycle := coordinatorReconcile(t, c)
+	if cycle.CommitGenerationID == 0 || cycle.DirtyGenerationID == 0 {
+		t.Fatalf("switched checkout did not publish both route slots: %+v", cycle)
+	}
+
+	sample, err := gitstate.SampleDirty(context.Background(), f.worktree)
+	if err != nil {
+		t.Fatalf("SampleDirty: %v", err)
+	}
+	checkout, found, err := f.catalog.GetCheckout(context.Background(), f.checkoutID)
+	if err != nil || !found {
+		t.Fatalf("GetCheckout: found=%v err=%v", found, err)
+	}
+	if checkout.HeadRef != sample.HeadRef || checkout.HeadCommit != sample.HeadCommit ||
+		checkout.HeadTree != sample.HeadTree || checkout.HeadTree != treeB {
+		t.Fatalf("catalog HEAD = %q/%q/%q, sampled %q/%q/%q treeB=%q",
+			checkout.HeadRef, checkout.HeadCommit, checkout.HeadTree,
+			sample.HeadRef, sample.HeadCommit, sample.HeadTree, treeB)
+	}
+	route := f.route()
+	if !graphview.RouteReady(route) {
+		t.Fatalf("switched route is not ready: %+v", route)
+	}
+	commit, found := f.generation(route.CommitGenerationID)
+	if !found || commit.TreeOID != checkout.HeadTree {
+		t.Fatalf("routed commit generation tree = %q, checkout HEAD tree = %q",
+			commit.TreeOID, checkout.HeadTree)
+	}
+}
+
+func TestCoordinatorPersistsSameCommitRefSwitchWithoutMovingRoute(t *testing.T) {
+	f := newCoordinatorFixture(t)
+	c := f.inertCoordinator(t, CheckoutCoordinatorConfig{})
+	coordinatorReconcile(t, c)
+	before := f.route()
+
+	builderGit(t, f.worktree, "checkout", "-b", "same-commit-alias")
+	cycle, settled := c.settledWithoutBuild(context.Background())
+	if !settled {
+		t.Fatal("same-commit ref switch did not settle in the read-only preflight")
+	}
+	if cycle.CommitBuilt || cycle.DirtyBuilt || cycle.CommitReused {
+		t.Fatalf("same-commit ref switch did physical work: %+v", cycle)
+	}
+	after := f.route()
+	if after.RouteEpoch != before.RouteEpoch ||
+		after.CommitGenerationID != before.CommitGenerationID ||
+		after.DirtyGenerationID != before.DirtyGenerationID {
+		t.Fatalf("same-commit ref switch moved route: before=%+v after=%+v", before, after)
+	}
+	checkout, found, err := f.catalog.GetCheckout(context.Background(), f.checkoutID)
+	if err != nil || !found {
+		t.Fatalf("GetCheckout: found=%v err=%v", found, err)
+	}
+	if checkout.HeadRef != "refs/heads/same-commit-alias" {
+		t.Fatalf("catalog HEAD ref = %q, want same-commit alias", checkout.HeadRef)
+	}
+}
+
+func BenchmarkCoordinatorStableHeadObservation(b *testing.B) {
+	f := newCoordinatorFixture(b)
+	c := f.inertCoordinator(b, CheckoutCoordinatorConfig{})
+	ctx := context.Background()
+	cycle := c.reconcile(ctx)
+	if cycle.Err != nil {
+		b.Fatalf("initial reconcile: %v", cycle.Err)
+	}
+	sample, err := c.sampler.Sample(ctx)
+	if err != nil {
+		b.Fatal(err)
+	}
+	sample, err = c.canonicalDirtySnapshot(ctx, sample)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	writes := 0
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		changed, err := c.updateCheckoutHead(ctx, sample)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if changed {
+			writes++
+		}
+	}
+	b.StopTimer()
+	b.ReportMetric(float64(writes)/float64(b.N), "head-writes/op")
+}
+
+// TestCoordinatorReusesCommitAcrossIsolatedDirtyStates combines the cache and
+// composition contracts across a real A -> B -> A transition. Each checkout
+// state has a distinct tracked edit and non-ignored untracked file; every
+// routed stack must equal a flat index of disk, and returning to A must reuse
+// A's original commit generation without leaking either dirty state.
+func TestCoordinatorReusesCommitAcrossIsolatedDirtyStates(t *testing.T) {
+	f := newCoordinatorFixture(t)
+	c := f.inertCoordinator(t, CheckoutCoordinatorConfig{})
+	commitA := builderGit(t, f.worktree, "rev-parse", "HEAD")
+
+	assertState := func(label string, cycle CheckoutCycle, present, absent []string) {
+		t.Helper()
+		if cycle.CommitGenerationID == 0 || cycle.DirtyGenerationID == 0 {
+			t.Fatalf("%s did not route both layers: %+v", label, cycle)
+		}
+		reader := coordinatorComposedReader(t, f, cycle.CommitGenerationID, cycle.DirtyGenerationID)
+		flat := builderOpenStore(t, "flat-"+label)
+		builderIndex(t, flat, f.worktree)
+		builderAssertReadersAgree(t, reader, flat)
+		builderAssertMasksValidate(t, f.store, cycle.CommitGenerationID)
+		builderAssertMasksValidate(t, f.store, cycle.DirtyGenerationID)
+
+		ids := builderNodeIDs(reader)
+		for _, id := range present {
+			if !slices.Contains(ids, id) {
+				t.Errorf("%s view lost %s; ids=%v", label, id, ids)
+			}
+		}
+		for _, id := range absent {
+			if slices.Contains(ids, id) {
+				t.Errorf("%s view leaked %s; ids=%v", label, id, ids)
+			}
+		}
+	}
+	graphID := func(file, symbol string) string {
+		return builderRepoPrefix + "/" + file + "::" + symbol
+	}
+
+	builderWriteFile(t, f.worktree, "helper.go", "package fixture\n\nfunc AWorkingEdit() {}\n")
+	builderWriteFile(t, f.worktree, "a_untracked.go", "package fixture\n\nfunc AUntracked() {}\n")
+	if got := builderGit(t, f.worktree, "ls-files", "--others", "--exclude-standard"); got != "a_untracked.go" {
+		t.Fatalf("A non-ignored untracked files = %q, want a_untracked.go", got)
+	}
+	first := coordinatorReconcile(t, c)
+	if !first.CommitBuilt || !first.DirtyBuilt {
+		t.Fatalf("A did not build its initial pair: %+v", first)
+	}
+	generationA, dirtyA := first.CommitGenerationID, first.DirtyGenerationID
+	assertState("a-first", first,
+		[]string{graphID("helper.go", "AWorkingEdit"), graphID("a_untracked.go", "AUntracked")},
+		[]string{graphID("helper.go", "BWorkingEdit"), graphID("b_untracked.go", "BUntracked")})
+
+	builderGit(t, f.worktree, "checkout", "--", ".")
+	if err := os.Remove(filepath.Join(f.worktree, "a_untracked.go")); err != nil {
+		t.Fatalf("remove A's untracked file: %v", err)
+	}
+	f.commitTreeB()
+	builderWriteFile(t, f.worktree, "helper.go", "package fixture\n\nfunc BWorkingEdit() {}\n")
+	builderWriteFile(t, f.worktree, "b_untracked.go", "package fixture\n\nfunc BUntracked() {}\n")
+	if got := builderGit(t, f.worktree, "ls-files", "--others", "--exclude-standard"); got != "b_untracked.go" {
+		t.Fatalf("B non-ignored untracked files = %q, want b_untracked.go", got)
+	}
+	second := coordinatorReconcile(t, c)
+	if !second.CommitBuilt || second.CommitGenerationID == generationA {
+		t.Fatalf("B did not build a distinct commit generation: %+v", second)
+	}
+	if !second.DirtyBuilt || second.DirtyGenerationID == dirtyA {
+		t.Fatalf("B did not build a distinct dirty generation: %+v", second)
+	}
+	assertState("b", second,
+		[]string{graphID("helper.go", "BWorkingEdit"), graphID("b_untracked.go", "BUntracked")},
+		[]string{graphID("helper.go", "AWorkingEdit"), graphID("a_untracked.go", "AUntracked")})
+
+	builderGit(t, f.worktree, "checkout", "--", ".")
+	if err := os.Remove(filepath.Join(f.worktree, "b_untracked.go")); err != nil {
+		t.Fatalf("remove B's untracked file: %v", err)
+	}
+	builderGit(t, f.worktree, "checkout", "--detach", commitA)
+	builderWriteFile(t, f.worktree, "helper.go", "package fixture\n\nfunc AReturnEdit() {}\n")
+	builderWriteFile(t, f.worktree, "a_return_untracked.go", "package fixture\n\nfunc AReturnUntracked() {}\n")
+	if got := builderGit(t, f.worktree, "ls-files", "--others", "--exclude-standard"); got != "a_return_untracked.go" {
+		t.Fatalf("returned-A non-ignored untracked files = %q, want a_return_untracked.go", got)
+	}
+	third := coordinatorReconcile(t, c)
+	if third.CommitBuilt || !third.CommitReused || third.CommitGenerationID != generationA {
+		t.Fatalf("return to A did not reuse commit generation %d: %+v", generationA, third)
+	}
+	if !third.DirtyBuilt || third.DirtyGenerationID == dirtyA || third.DirtyGenerationID == second.DirtyGenerationID {
+		t.Fatalf("returned A did not build an isolated dirty generation: %+v", third)
+	}
+	assertState("a-return", third,
+		[]string{graphID("helper.go", "AReturnEdit"), graphID("a_return_untracked.go", "AReturnUntracked")},
+		[]string{graphID("helper.go", "BWorkingEdit"), graphID("b_untracked.go", "BUntracked")})
+
+	commits := 0
+	for _, row := range f.generations() {
+		if row.GenerationKind == CommitLayerGenerationKind {
+			commits++
+		}
+	}
+	if commits != 2 {
+		t.Fatalf("%d commit generations exist for two trees visited three times", commits)
+	}
+}
+
+func BenchmarkCoordinatorStableAdoptedCommitDirtyReconcile(b *testing.B) {
+	f := newCoordinatorFixture(b)
+	ctx := context.Background()
+
+	const siblingName = "benchmark-sibling"
+	siblingRoot := filepath.Join(filepath.Dir(f.worktree), siblingName)
+	builderGit(b, f.primary, "worktree", "add", "-b", siblingName, siblingRoot)
+	siblingID := f.siblingCheckout(siblingName)
+
+	checkoutID, worktree := f.checkoutID, f.worktree
+	f.checkoutID, f.worktree = siblingID, siblingRoot
+	sibling := f.inertCoordinator(b, CheckoutCoordinatorConfig{})
+	siblingCycle := sibling.reconcile(ctx)
+	if siblingCycle.Err != nil {
+		b.Fatalf("build sibling commit layer: %v", siblingCycle.Err)
+	}
+	siblingRoute := f.route()
+	if siblingRoute.CommitGenerationID <= 0 {
+		b.Fatal("sibling routed no commit generation")
+	}
+
+	f.checkoutID, f.worktree = checkoutID, worktree
+	dirtyPath := filepath.Join(f.worktree, "benchmark_dirty.go")
+	if err := os.WriteFile(dirtyPath, []byte("package fixture\n\nfunc BenchmarkDirty() {}\n"), 0o644); err != nil {
+		b.Fatalf("write dirty benchmark file: %v", err)
+	}
+	coordinator := f.inertCoordinator(b, CheckoutCoordinatorConfig{})
+	adopted := coordinator.reconcile(ctx)
+	if adopted.Err != nil {
+		b.Fatalf("adopt sibling commit layer: %v", adopted.Err)
+	}
+	initialRoute := f.route()
+	if initialRoute.CommitGenerationID != siblingRoute.CommitGenerationID || initialRoute.DirtyGenerationID <= 0 {
+		b.Fatalf("route did not adopt commit %d with a dirty layer: %+v", siblingRoute.CommitGenerationID, initialRoute)
+	}
+
+	physicalBuilds := 0
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		cycle := coordinator.reconcile(ctx)
+		if cycle.Err != nil {
+			b.Fatalf("stable reconcile: %v", cycle.Err)
+		}
+		if cycle.CommitBuilt {
+			physicalBuilds++
+		}
+		if cycle.DirtyBuilt {
+			physicalBuilds++
+		}
+	}
+	b.StopTimer()
+
+	finalRoute := f.route()
+	if finalRoute.CommitGenerationID != initialRoute.CommitGenerationID ||
+		finalRoute.DirtyGenerationID != initialRoute.DirtyGenerationID {
+		b.Fatalf("stable reconcile moved generations: before=%+v after=%+v", initialRoute, finalRoute)
+	}
+	b.ReportMetric(float64(physicalBuilds)/float64(b.N), "physical-builds/op")
+	b.ReportMetric(float64(finalRoute.RouteEpoch-initialRoute.RouteEpoch)/float64(b.N), "route-epoch-advances/op")
+}
+
 // TestCoordinatorLeavesASettledRouteAlone pins the cheapest outcome: a cycle
 // on a checkout nobody has touched builds nothing and flips nothing.
 func TestCoordinatorLeavesASettledRouteAlone(t *testing.T) {
