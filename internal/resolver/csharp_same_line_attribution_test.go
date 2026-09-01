@@ -59,6 +59,11 @@ func TestResolveCSharp_SameLineMemberCallAttribution(t *testing.T) {
  public class DtorRig { private DBag _b = new DBag();
   ~DtorRig() { _b.Take(); } public int Q => 1;
  } }`, refused: true},
+		"conversion_operator_beside_property_refused": {src: `namespace App {
+ public class CBag { public int Take() { return 1; } }
+ public class ConvRig { private static CBag _b = new CBag();
+  public static implicit operator int(ConvRig r) { _b.Take(); return 1; } public int Q => 1;
+ } }`, refused: true},
 		"field_init_shares_line": {src: `namespace App {
  public class BLBag { public int Take() { return 1; } }
  public class BLInit { private BLBag _b = new BLBag();

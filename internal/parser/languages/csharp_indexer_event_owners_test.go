@@ -1,6 +1,7 @@
 package languages
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -84,7 +85,7 @@ func TestCSharpExtractor_IndexerAndEventBodiesOwnTheirCalls(t *testing.T) {
 		}
 		for id, kind := range map[string]string{
 			"App.cs::Derrick.this[]": "indexer",
-			"App.cs::Derrick.Swing":  "event",
+			"App.cs::Derrick.Swing":  "event_accessor",
 			"App.cs::Gantry.this[]":  "indexer",
 		} {
 			n := byID[id]
@@ -133,6 +134,41 @@ func TestCSharpExtractor_OverloadedIndexersEachOwnTheirBody(t *testing.T) {
 		"the second indexer takes the line-suffixed node, as overloaded methods do")
 }
 
+// A partial indexer is NOT an overload: C# 13 splits one member across a
+// declaring fragment and an implementing one, and either may extract
+// first. Suffixing the second would leave the name-keyed ID - the one
+// anything queries - pointing at the bodyless fragment while the code
+// sat under a line-suffixed twin. The `partial` modifier separates the
+// two cases exactly, because C# requires both fragments to spell it and
+// forbids it on an overload.
+func TestCSharpExtractor_PartialIndexerMergesOntoOneMember(t *testing.T) {
+	src := []byte(`namespace App {
+    public class Hoist { public int Lift() { return 1; } }
+    public partial class Winder {
+        private Hoist _h = new Hoist();
+        public partial int this[int i] { get; }
+    }
+    public partial class Winder {
+        public partial int this[int i] { get { return _h.Lift(); } }
+    }
+}
+`)
+	e := NewCSharpExtractor()
+	result, err := e.Extract("App.cs", src)
+	require.NoError(t, err)
+
+	var ids []string
+	for _, n := range result.Nodes {
+		if strings.Contains(n.ID, "this[]") {
+			ids = append(ids, n.ID)
+		}
+	}
+	assert.Equal(t, []string{"App.cs::Winder.this[]"}, ids,
+		"the two fragments are one member, not a member and a line-suffixed twin")
+	assert.Len(t, callEdgesFrom(result.Edges, "App.cs::Winder.this[]", "Lift"), 1,
+		"the implementing fragment's call rides the canonical node")
+}
+
 // The extraction half of issue #728. An indexer sharing a physical line
 // with a property put the semantic tier in a bind: the indexer owned no
 // node, so the extractor's line fallback parked its body call on the
@@ -155,6 +191,10 @@ func TestCSharpExtractor_SharedLineIndexerDoesNotStealThePropertysOwnership(t *t
 	result, err := e.Extract("App.cs", src)
 	require.NoError(t, err)
 
+	// This half pins #720's byte-extent refusal, not the emission: it
+	// holds with emission disabled too, because the refusal already
+	// stopped the property collecting the call. It is the second
+	// assertion that this change makes true.
 	assert.Empty(t, callEdgesFrom(result.Edges, "App.cs::Ledge.Slot", "Lift"),
 		"a property whose body is `=> 1` can call nothing")
 	assert.Len(t, callEdgesFrom(result.Edges, "App.cs::Ledge.this[]", "Lift"), 1,

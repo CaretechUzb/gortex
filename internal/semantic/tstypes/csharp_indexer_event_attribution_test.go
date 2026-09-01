@@ -64,13 +64,18 @@ func TestCSharp_IndexerAndEventBodyCallsResolveFromTheirOwnMember(t *testing.T) 
 			} else {
 				assertASTProvenance(t, e, "csharp-types")
 			}
+			// Scoped to edges reaching Run: the false edge #728 minted was
+			// a SECOND caller for this one authored site. Asserting over
+			// every call edge in the graph would pin that too, but would
+			// also break on any unrelated future extractor gain in the
+			// fixture, which is not what this test is for.
 			for _, e := range g.AllEdges() {
-				if e == nil || e.Kind != graph.EdgeCalls {
+				if e == nil || e.Kind != graph.EdgeCalls || e.To != run.ID {
 					continue
 				}
 				if e.From != member.ID {
-					t.Errorf("call edge from %s: a member that authored no call must carry none (to %s, conf %.2f)",
-						e.From, e.To, e.Confidence)
+					t.Errorf("call to Run attributed to %s: only the member that authored it may carry it (conf %.2f)",
+						e.From, e.Confidence)
 				}
 			}
 		})

@@ -547,7 +547,12 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 			e.emitAccessorMember(m.Captures["indexer.def"], csharpIndexerName, "indexer", filePath, fileID, src, result, seen, fileAliases, funcBytes, funcLines, valueProps)
 
 		case m.Captures["event.def"] != nil:
-			e.emitAccessorMember(m.Captures["event.def"], m.Captures["event.name"].Text, "event", filePath, fileID, src, result, seen, fileAliases, funcBytes, funcLines, valueProps)
+			// "event_accessor", not "event": this arm sees only the
+			// accessor-bearing form. The far commoner field form
+			// (event T E;) is a different grammar node and stays
+			// unemitted, so a stamp spelled "event" would promise a
+			// type's events and deliver a biased minority of them.
+			e.emitAccessorMember(m.Captures["event.def"], m.Captures["event.name"].Text, "event_accessor", filePath, fileID, src, result, seen, fileAliases, funcBytes, funcLines, valueProps)
 
 		case m.Captures["using.def"] != nil:
 			e.emitUsing(m, filePath, fileID, result)
@@ -2178,11 +2183,30 @@ func (e *CSharpExtractor) emitAccessorMember(def *parser.CapturedNode, name, mem
 		return
 	}
 	id := filePath + "::" + owner.name + "." + name
-	// Overloads collide on the name-keyed ID - two indexers differ only
-	// by parameter list, and a type may declare both. Overloaded METHODS
-	// already resolve this by suffixing the second declaration with its
-	// line; taking the same route keeps one convention instead of two.
 	if seen[id] {
+		// A C# 13 partial indexer (C# 14: partial event) splits a single
+		// member across a declaring fragment and an implementing one, and
+		// either may extract first. That is NOT an overload, and minting a
+		// second node would leave the name-keyed ID - the one anything
+		// queries - pointing at the bodyless fragment while the code sat
+		// under a line-suffixed twin. Properties merge these onto the one
+		// node by moving the ownership record to the body-bearing
+		// fragment; the same rule applies here. The `partial` modifier is
+		// the discriminator rather than a body test: C# requires BOTH
+		// fragments to spell it, and no overload may, so it separates the
+		// two cases exactly.
+		if csharpHasModifier(def.Node, src, "partial") {
+			if csharpPropertyHasExecutableBody(def.Node) {
+				csharpRecordPropertyOwnership(id, def.Node, def.StartLine, def.EndLine, src, funcBytes, funcLines, valueProps)
+			}
+			return
+		}
+		// A genuine overload: two indexers differing only by parameter
+		// list, both body-bearing. Overloaded METHODS already resolve the
+		// ID collision by suffixing the second declaration with its line;
+		// taking the same route keeps one convention instead of two. A
+		// THIRD declaration on the same line collides again and is
+		// dropped, exactly as a third same-line method overload is.
 		id = id + "_L" + fmt.Sprint(def.StartLine+1)
 	}
 	if seen[id] {
@@ -2192,7 +2216,9 @@ func (e *CSharpExtractor) emitAccessorMember(def *parser.CapturedNode, name, mem
 	// Accessor bodies and an expression body both live inside the
 	// declaration span, so recording it makes the member a call owner.
 	// An indexer's set accessor carries the implicit `value` parameter
-	// exactly as a property's does, and rides the same seed.
+	// exactly as a property's does and rides the same seed; an event's
+	// add/remove bind `value` too, but csharpSetInitAccessorSpans scans
+	// for set/init only, so events deliberately get no seed here.
 	csharpRecordPropertyOwnership(id, def.Node, def.StartLine, def.EndLine, src, funcBytes, funcLines, valueProps)
 	isIface := owner.kind == "interface_declaration"
 	defaultVis := VisibilityPrivate
