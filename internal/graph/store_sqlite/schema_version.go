@@ -34,7 +34,7 @@ import (
 // index changes in a way an old on-disk DB would not already have, and append a
 // matching schemaMigrations entry describing how to bring an older store
 // forward (in place, or by rebuild).
-const currentSchemaVersion = 13
+const currentSchemaVersion = 14
 
 // schemaMigration is one forward step. Exactly one strategy applies:
 //   - rebuild=true: the change introduces structure/data that can only come
@@ -113,9 +113,19 @@ var schemaMigrations = []schemaMigration{
 	// standing. Waiting does not close it either: pendingBetween(13, 14) selects
 	// v14 alone, so main's next migration reconciles nothing here. A rebuild
 	// closes both halves; the repo's next real derive closes the readiness rows
-	// only, and the unstamp stays unrun. Do not mint a v14 to close it — see the
-	// standing rule above.
+	// only, and the unstamp stays unrun. Do not mint a migration of our own to
+	// close it — see the standing rule above. The v14 below is MAIN's, adopted
+	// verbatim in the merge; it is not a number minted here to close this gap.
 	{version: 13, name: "purge legacy coverage spellings and add per-repo readiness state", inPlace: migrateV13},
+	//
+	// Resolved 2026-09-01 in the upstream merge: main's next migration did
+	// arrive as v14 (purge unresolved derived tests edges) and is adopted below
+	// verbatim, so currentSchemaVersion is now 14 — equal to main's, which is
+	// exactly what the standing rule permits: go higher only once main is
+	// merged in and its number is already ours. A store this fork stamped 13
+	// runs v14 alone, which is right, because it already carries both halves
+	// of v13.
+	{version: 14, name: "purge unresolved derived tests edges", inPlace: purgeUnresolvedTestsEdges},
 }
 
 // migrateV13 runs main's coverage purge and this branch's readiness setup as
@@ -257,6 +267,22 @@ func createReadinessStateTables(tx *sql.Tx) error {
 	}
 	_, err := tx.Exec(`INSERT OR IGNORE INTO derive_state (repo_prefix, legacy)
 		SELECT repo_prefix, 1 FROM repo_index_state`)
+	return err
+}
+
+// purgeUnresolvedTestsEdges removes derived EdgeTests rows whose target is
+// an unresolved stub, in both spellings (`unresolved::X` and the multi-repo
+// `<repo>::unresolved::X` COPY-rewrite form). The test-linkage pass cloned
+// them from unresolved calls before the emission guard existed; stripped of
+// the call's receiver evidence they are naked stubs the resolver now
+// refuses to bind, new emission never re-creates them, and warm startup may
+// skip file-scoped reconciliation entirely — so an old store keeps paying
+// their resolver-scan cost forever without this explicit purge. Idempotent
+// and bounded to the tests kind: pending calls and resolved projections are
+// untouched.
+func purgeUnresolvedTestsEdges(tx *sql.Tx) error {
+	_, err := tx.Exec(`DELETE FROM edges WHERE kind = 'tests'
+		AND (to_id LIKE 'unresolved::%' OR to_id LIKE '%::unresolved::%')`)
 	return err
 }
 
