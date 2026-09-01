@@ -669,6 +669,13 @@ func (a *applier) buildIndex(facts *fileFacts) *fileIndex {
 			idx.imports[imp.Local] = imp.Path
 		}
 	}
+	// stubsByLine is read by applyCall alone, but buildIndex runs in
+	// EVERY apply phase — supers, metas, aliases and calls all reach it
+	// through preparePage, and applyAll builds it once per file whether
+	// or not the file has call facts. Snapshot only when this file's
+	// facts can ever ask: on a mixed corpus half the admitted stubs were
+	// built for phases that never read them (issue #729 item 2).
+	snapshotStubs := len(facts.calls) > 0
 	for _, n := range a.fileNodes(facts.file) {
 		if receiverTypeKinds[n.Kind] {
 			if _, dup := idx.types[n.Name]; !dup {
@@ -683,7 +690,7 @@ func (a *applier) buildIndex(facts *fileFacts) *fileIndex {
 		if n.Kind == graph.KindFunction || n.Kind == graph.KindMethod {
 			idx.funcs = append(idx.funcs, n)
 		}
-		if n.Kind == graph.KindFile {
+		if !snapshotStubs || n.Kind == graph.KindFile {
 			// Some languages park top-level calls on the file node; it is
 			// never an adoptable caller (and the paged compatibility
 			// branch loads file nodes a kind-filtered store would not).
