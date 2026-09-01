@@ -268,6 +268,51 @@ func derivedPlanForDelta(prior, fresh derivedFingerprints, semanticChanged bool,
 	return plan
 }
 
+// seedDerivedFrontierFromCensus hands the resolve and derived tails an exact
+// frontier when the reindex produced none. A probe-inert or failed file counts
+// in StaleFileCount but stages nothing, so the plan's file list can come back
+// empty while stale work happened; with no frontier the resolve escalates to a
+// whole-store ResolveAll (measured at 378 s against 5 s for the file-scoped
+// arm on the same worktree-copy divergence) and the derived tail becomes a
+// no-op. The census names exactly the files the reconcile touched, so seeding
+// from it is a strict narrowing of that escalation, never a widening.
+//
+// Reports whether it seeded. changed and deleted are repo-relative
+// slash-paths; toGraphPath lifts one into the graph's prefixed form.
+func seedDerivedFrontierFromCensus(result *IndexResult, changed, deleted []string, toGraphPath func(string) string) bool {
+	if result == nil || toGraphPath == nil {
+		return false
+	}
+	if len(result.DerivedInvalidation.Files) > 0 {
+		return false
+	}
+	if result.StaleFileCount == 0 && result.DeletedFileCount == 0 {
+		return false
+	}
+	if len(changed)+len(deleted) == 0 {
+		return false
+	}
+	seeded := make([]string, 0, len(changed)+len(deleted))
+	flags := DerivedInvalidatesDeclarations | DerivedInvalidatesImports |
+		DerivedInvalidatesRuntime | DerivedInvalidatesArtifacts
+	for _, relPath := range append(append([]string(nil), changed...), deleted...) {
+		graphPath := toGraphPath(relPath)
+		if graphPath == "" {
+			continue
+		}
+		seeded = append(seeded, graphPath)
+		if looksLikeTestPath(graphPath) {
+			flags |= DerivedInvalidatesTests
+		}
+	}
+	if len(seeded) == 0 {
+		return false
+	}
+	result.DerivedInvalidation.Files = appendUniqueSorted(nil, seeded...)
+	result.DerivedInvalidation.Flags |= flags
+	return true
+}
+
 func isTypeFrontierNodeKind(kind graph.NodeKind) bool {
 	switch strings.ToLower(string(kind)) {
 	case "type", "interface", "class", "trait", "struct", "enum":

@@ -471,26 +471,74 @@ func (mi *MultiIndexer) trackWorktreeByCopy(
 	// republish it.
 	mi.publishCheckoutGroups()
 
-	// A diverged copy is the one case that still owes a derivation. The
-	// reconcile above reindexed the changed files, which produces their
-	// extraction edges and nothing else: every derived edge the rest of the
-	// workspace owns into them — framework dispatch, cross-repo, implements,
-	// test and capability edges — comes from the global passes. Skipping this
-	// is precisely the silent under-binding that TrackRepoCtx's own
-	// scheduleWorkspaceRederive exists to prevent, and the copy path returns
-	// before reaching it.
+	// A diverged copy still owes derivation and enrichment for the files the
+	// reconcile touched — and only for those. The copy carried every derived
+	// edge, inbound included, for the unchanged files, and ReconcileRepoCtx
+	// runs the same synchronous resolve + incremental-derived tail an
+	// ordinary file save uses, over exactly this divergence (its census
+	// re-discovers the withheld paths, and the tail's frontier is seeded
+	// from that census when the reindex plan comes back empty). When that
+	// tail ran, the repair is complete before the reconcile returns.
+	// Scheduling a repo-wide rederive on top of it — the previous behavior —
+	// re-derived edges the copy already carried, at 373–1,034 s per track,
+	// dominated by framework synthesizers whose cost tracks their corpus
+	// rather than the frontier.
 	//
-	// Scoped, and cheap: rederiveScope sees a frontier that is entirely a
-	// sibling checkout of an already-tracked repository, so the passes run over
-	// the frontier rather than the whole store. Safe to call here — the
-	// ReconcileRepoCtx above has returned, so no topology mutation is open.
-	// It owes an ENRICHMENT for the same reason, one stage further down the
-	// readiness ladder — see scheduleCopiedRepoEnrich.
+	// So when the tail ran: declare the carried stamps current — sound for
+	// the same reason it is sound in the identical case above, because the
+	// changed files HAVE been re-derived — and arm enrichment for just the
+	// reconciled files. The repo-wide rederive remains only as the fallback
+	// for a reconcile whose tail was deferred to a batch transition or
+	// replaced by a forced full retrack; that path still owes everything.
 	if len(changed) > 0 {
-		mi.scheduleWorkspaceRederive(prefix)
-		mi.scheduleCopiedRepoEnrich(prefix)
+		if copiedDivergenceRepaired(result) {
+			if restamper, ok := mi.graph.(graph.CopiedReadinessRestamper); ok {
+				if err := restamper.RestampCopiedReadiness(prefix); err != nil && mi.logger != nil {
+					mi.logger.Warn("worktree copy: could not declare repaired stage stamps current",
+						zap.String("repo", prefix), zap.Error(err))
+				}
+			}
+			if mi.logger != nil {
+				mi.logger.Info("worktree copy: divergence repaired by the reconcile's scoped tail; no workspace rederive owed",
+					zap.String("repo", prefix),
+					zap.Int("files", len(result.DerivedInvalidation.Files)))
+			}
+			// An empty frontier here is the proven-no-work case: nothing
+			// was reindexed, so the carried enrichment rows are exact and
+			// arming anything would re-enrich a bit-identical graph.
+			if len(result.DerivedInvalidation.Files) > 0 {
+				mi.scheduleCopiedRepoEnrich(prefix, result.DerivedInvalidation.Files)
+			}
+		} else {
+			mi.scheduleWorkspaceRederive(prefix)
+			mi.scheduleCopiedRepoEnrich(prefix, nil)
+		}
 	}
 	return result, true, nil
+}
+
+// copiedDivergenceRepaired reports whether a diverged copy's derivation debt
+// is already discharged, so the copy path may restamp instead of scheduling
+// the repo-wide rederive.
+//
+// Two ways to be square. Either the reconcile proved there was NO indexable
+// work — a divergence made only of files outside the indexable set (.po
+// translations, assets) reconciles to zero stale files and an empty plan, and
+// the graph is bit-identical to the carried copy — or the reconcile's
+// synchronous tail re-derived a non-empty frontier. Both halves of the second
+// arm are load-bearing: a tail deferred to a batch transition has not run,
+// and an empty frontier despite stale work means nothing was re-derived —
+// either way restamping would bless a silently under-derived graph, so the
+// caller falls back to the repo-wide pass.
+func copiedDivergenceRepaired(result *IndexResult) bool {
+	if result == nil || result.FullRetrack {
+		return false
+	}
+	if result.StaleFileCount == 0 && result.DeletedFileCount == 0 &&
+		result.DerivedInvalidation.Empty() {
+		return true
+	}
+	return result.DerivedTailRan && len(result.DerivedInvalidation.Files) > 0
 }
 
 // scheduleCopiedRepoEnrich arms and runs semantic enrichment for a worktree
@@ -536,7 +584,15 @@ func (mi *MultiIndexer) trackWorktreeByCopy(
 // copySourceCommit. It has to be: the source's carried enrichment rows describe
 // a working tree, and no diff this function or its caller can compute says which
 // files that was.
-func (mi *MultiIndexer) scheduleCopiedRepoEnrich(prefix string) {
+//
+// files, when non-empty, is the exact graph-path frontier the reconcile
+// re-indexed, and narrows the arming to those files. That is sound only
+// because dirty sources are refused: every carried enrichment row outside the
+// frontier describes content this checkout really has, and the caller has
+// just declared those rows current via RestampCopiedReadiness. An empty
+// files arms the whole repository — the fallback path, where nothing has
+// vouched for the carried rows.
+func (mi *MultiIndexer) scheduleCopiedRepoEnrich(prefix string, files []string) {
 	idx := mi.GetIndexer(prefix)
 	if idx == nil {
 		return
@@ -566,7 +622,11 @@ func (mi *MultiIndexer) scheduleCopiedRepoEnrich(prefix string) {
 	// predicate — it does not touch it, and the identical-copy branch never
 	// reaches here, because RestampCopiedReadiness declares its carried stamps
 	// current, which for identical content they are.
-	idx.markPendingEnrichFull()
+	if len(files) > 0 {
+		idx.markPendingEnrichFiles(files)
+	} else {
+		idx.markPendingEnrichFull()
+	}
 	if idx.semanticMgr == nil {
 		// Nothing here can run the pass. The armed gate costs nothing and a
 		// later daemon start still honours it; returning also keeps this

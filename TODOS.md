@@ -337,6 +337,14 @@ premise it rests on. It is the same interaction recorded for ordinary saves,
 reaching the copy path through a door the copy path leaves open: the diverged copy
 arms a derive that would re-stamp, the identical copy arms nothing.
 
+**Update 2026-09-01:** the diverged branch no longer schedules that repo-wide
+derive when the reconcile's scoped tail already repaired the divergence
+(`copiedDivergenceRepaired`) — it restamps directly, like the identical branch.
+So this exposure now covers BOTH copy branches: any copied worktree that reaches
+`ready` by restamp is stranded by its first subsequent save until something
+re-stamps. Same fix candidates as below; the armed-but-idle derive would cover
+both branches at once.
+
 **Context:** the fix is not "always schedule a derive" — that reintroduces the full
 post-track derive the copy exists to avoid, for a repo that genuinely owes no
 derivation yet. The candidates are an armed-but-idle derive that only fires once
@@ -349,6 +357,37 @@ sufficient to stop the false alarm even before the pass runs.
 **Effort:** M
 **Priority:** P2
 **Depends on:** None.
+
+### The master resolve binds across sibling checkouts — the checkout gate covers only the framework passes
+
+**What:** `ast_inferred` resolver output (references / extends / composes) crosses
+checkout-group boundaries. Measured 2026-09-01 on the live docker-env store:
+`local@aurora-redesign` — a PLAIN tracked worktree, no copy involved — holds
+1,206 `references` (origin=ast_inferred) into `local`, and `local` holds 584
+into aurora. A freshly copy-tracked worktree (`rederive-probe`, 70-file
+divergence) accumulated 5,320 such edges into its two siblings from 221 source
+files during one reconcile — its `ResolveFilesAndIncoming` (files=168) ran
+BEFORE the new prefix was registered, so `publishCheckoutGroups` could not yet
+name it a sibling even if the resolver consulted the grouping. Cross-REPO
+parity is untouched (probe→odoo and probe→addons matched `local` exactly:
+99,462 / 131,641).
+
+**Why it matters:** two checkouts of one repository are in contact — "who uses
+this symbol" on `local` returns the sibling checkout's callers. Same disease as
+the ~190k-edge checkout-grouping incident, small dose, and it grows with every
+resolve over sibling-heavy frontiers.
+
+**Context:** the checkout gate exists for the framework passes
+(`frameworkRepoGateStore`) and the copy's inbound pass; the master resolve's
+candidate selection has no equivalent. Two fix shapes: (a) gate candidate
+selection by `graph.SiblingCheckouts` in the resolver, (b) for the copy path
+specifically, make the destination prefix part of the published grouping before
+`ReconcileRepoCtx`'s resolve tail runs. (a) also fixes the plain-worktree
+baseline; (b) alone does not.
+
+**Effort:** M
+**Priority:** P2
+**Depends on:** Nothing.
 
 ### Cover `trackWorktreeByCopy`'s call order with an integration test
 

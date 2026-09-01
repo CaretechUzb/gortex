@@ -128,6 +128,77 @@ func completeDerivedFingerprints(prefix string) derivedFingerprints {
 	}
 }
 
+// A probe-inert or failed file counts in StaleFileCount but stages nothing,
+// so a reconcile can finish with stale work and an empty plan — and an empty
+// plan sends the resolve to its whole-store ResolveAll arm (378 s measured
+// against 5 s file-scoped on the same worktree-copy divergence) while the
+// derived tail no-ops. The census names exactly the files the reconcile
+// touched; seeding from it keeps both tails file-scoped.
+func TestSeedDerivedFrontierFromCensusSeedsAnEmptyPlan(t *testing.T) {
+	result := &IndexResult{StaleFileCount: 2, DeletedFileCount: 1}
+	seeded := seedDerivedFrontierFromCensus(result,
+		[]string{"views/form.xml", "models/hr.py"}, []string{"gone.py"},
+		func(rel string) string { return "base/" + rel })
+	if !seeded {
+		t.Fatal("expected the empty plan to be seeded from the census")
+	}
+	want := []string{"base/gone.py", "base/models/hr.py", "base/views/form.xml"}
+	if len(result.DerivedInvalidation.Files) != len(want) {
+		t.Fatalf("seeded files = %v, want %v", result.DerivedInvalidation.Files, want)
+	}
+	for i, path := range want {
+		if result.DerivedInvalidation.Files[i] != path {
+			t.Fatalf("seeded files = %v, want %v", result.DerivedInvalidation.Files, want)
+		}
+	}
+	assertAllDerivedFamiliesInvalidated(t, result.DerivedInvalidation)
+}
+
+// The plan, when the reindex produced one, is EXACT — per-file fingerprint
+// deltas the census cannot reproduce. Seeding over it would widen the
+// frontier for nothing.
+func TestSeedDerivedFrontierFromCensusLeavesAnExactPlanAlone(t *testing.T) {
+	result := &IndexResult{
+		StaleFileCount:      3,
+		DerivedInvalidation: DerivedInvalidationPlan{Files: []string{"base/kept.py"}},
+	}
+	if seedDerivedFrontierFromCensus(result, []string{"other.py"}, nil,
+		func(rel string) string { return "base/" + rel }) {
+		t.Fatal("a plan that already carries a frontier must not be reseeded")
+	}
+	if len(result.DerivedInvalidation.Files) != 1 || result.DerivedInvalidation.Files[0] != "base/kept.py" {
+		t.Fatalf("exact plan was altered: %v", result.DerivedInvalidation.Files)
+	}
+	if result.DerivedInvalidation.Flags != 0 {
+		t.Fatalf("exact plan's flags were altered: %b", result.DerivedInvalidation.Flags)
+	}
+}
+
+// "A zero plan proves that no graph-wide derived pass is required" — when no
+// stale work happened, seeding would invent work the reindex proved absent.
+func TestSeedDerivedFrontierFromCensusRequiresStaleWork(t *testing.T) {
+	result := &IndexResult{}
+	if seedDerivedFrontierFromCensus(result, []string{"a.py"}, []string{"b.py"},
+		func(rel string) string { return "base/" + rel }) {
+		t.Fatal("no stale or deleted work — nothing may be seeded")
+	}
+	if !result.DerivedInvalidation.Empty() {
+		t.Fatalf("plan mutated without stale work: %+v", result.DerivedInvalidation)
+	}
+}
+
+// A changed test file invalidates the test-edge family too.
+func TestSeedDerivedFrontierFromCensusMarksTestPaths(t *testing.T) {
+	result := &IndexResult{StaleFileCount: 1}
+	if !seedDerivedFrontierFromCensus(result, []string{"tests/test_hr.py"}, nil,
+		func(rel string) string { return "base/" + rel }) {
+		t.Fatal("expected seeding")
+	}
+	if !result.DerivedInvalidation.Flags.Has(DerivedInvalidatesTests) {
+		t.Fatalf("a test path must set DerivedInvalidatesTests; flags = %b", result.DerivedInvalidation.Flags)
+	}
+}
+
 func assertAllDerivedFamiliesInvalidated(t *testing.T, plan DerivedInvalidationPlan) {
 	t.Helper()
 	want := DerivedInvalidatesDeclarations | DerivedInvalidatesImports | DerivedInvalidatesRuntime | DerivedInvalidatesArtifacts
