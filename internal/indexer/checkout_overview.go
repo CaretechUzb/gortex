@@ -656,7 +656,7 @@ func pathSpellings(path string) []string {
 // containsAnySpelling reports whether root contains any spelling of a path.
 func containsAnySpelling(spellings []string, root string) bool {
 	for _, spelling := range spellings {
-		if pathkey.HasPathPrefix(spelling, root) {
+		if pathkey.CanonicalHasPathPrefix(spelling, root) {
 			return true
 		}
 	}

@@ -490,7 +490,7 @@ func (s *Server) resolveOverlayGraphPath(p, absPath string) string {
 		if prefix := s.multiIndexer.RepoForFile(absPath); prefix != "" {
 			if idx, _ := s.multiIndexer.IndexerForFile(absPath); idx != nil {
 				if root := idx.RootPath(); root != "" {
-					if rel, err := filepath.Rel(root, absPath); err == nil {
+					if rel, ok := relativeWithinRoot(root, absPath); ok {
 						return prefix + "/" + filepath.ToSlash(rel)
 					}
 				}
@@ -499,7 +499,7 @@ func (s *Server) resolveOverlayGraphPath(p, absPath string) string {
 	}
 	if s.indexer != nil {
 		if root := s.indexer.RootPath(); root != "" {
-			if rel, err := filepath.Rel(root, absPath); err == nil {
+			if rel, ok := relativeWithinRoot(root, absPath); ok {
 				return filepath.ToSlash(rel)
 			}
 		}
@@ -507,6 +507,24 @@ func (s *Server) resolveOverlayGraphPath(p, absPath string) string {
 	// Fall back to caller-supplied path — this is the single-repo
 	// repo-relative case where p is already the graph_path.
 	return filepath.ToSlash(p)
+}
+
+// resolveOverlayGraphPathForRequest maps a file beneath the selected checkout
+// back to the shared graph spelling. A routed worktree is intentionally not a
+// registered MultiIndexer root, so the legacy owner lookup cannot derive this
+// identity from the absolute path alone.
+func (s *Server) resolveOverlayGraphPathForRequest(ctx context.Context, p, absPath string) string {
+	view := requestViewPathRoot(ctx)
+	if view.root != "" && view.contains(absPath) {
+		if rel, ok := relativeWithinRoot(view.root, absPath); ok {
+			rel = filepath.ToSlash(rel)
+			if view.repoPrefix != "" {
+				return path.Join(view.repoPrefix, rel)
+			}
+			return rel
+		}
+	}
+	return s.resolveOverlayGraphPath(p, absPath)
 }
 
 // pickIndexerForPath chooses the per-repo Indexer (multi-repo) or
@@ -521,7 +539,7 @@ func (s *Server) pickIndexerForPath(absPath string) *indexer.Indexer {
 	}
 	if s.indexer != nil {
 		if root := s.indexer.RootPath(); root != "" {
-			if rel, err := filepath.Rel(root, absPath); err == nil && !strings.HasPrefix(rel, "..") {
+			if _, ok := relativeWithinRoot(root, absPath); ok {
 				return s.indexer
 			}
 		}
@@ -620,7 +638,7 @@ func (s *Server) constructOverlayLayer(ctx context.Context, files []daemon.Overl
 		if idx.RepoPrefix() != "" {
 			relPath = strings.TrimPrefix(graphPath, idx.RepoPrefix()+"/")
 		} else if root != "" {
-			if r, err := filepath.Rel(root, absPath); err == nil {
+			if r, ok := relativeWithinRoot(root, absPath); ok {
 				relPath = filepath.ToSlash(r)
 			}
 		}
