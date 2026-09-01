@@ -78,7 +78,7 @@ func (s *Server) registerCodingTools() {
 
 	s.addTool(
 		mcp.NewTool("batch_symbols",
-			mcp.WithDescription("Returns signatures, source code, callers, and callees for multiple symbols in one call. Use instead of calling get_symbol_source or get_symbol multiple times — saves 60% round-trip overhead."),
+			mcp.WithDescription("Returns signatures, source code, and a capped 1-hop callers/callees sample for multiple symbols in one call. `callers_truncated` / `callees_truncated` mark a cut; use get_callers / get_call_chain for the full neighbourhood. Use instead of calling get_symbol_source or get_symbol multiple times — saves 60% round-trip overhead."),
 			mcp.WithString("ids", mcp.Required(), mcp.Description("Comma-separated list of symbol IDs")),
 			mcp.WithBoolean("include_source", mcp.Description("Include source code for each symbol (default: false)")),
 			mcp.WithNumber("context_lines", mcp.Description("Extra lines above/below source (default: 3, only if include_source)")),
@@ -348,6 +348,17 @@ func (s *Server) handleGetEditingContext(ctx context.Context, req mcp.CallToolRe
 	if err != nil {
 		return mcp.NewToolResultError("path is required"), nil
 	}
+	// Admission before any work: a fidelity_globs value that breaks a size
+	// bound refuses the request. Dropping the offending rule would rewrite
+	// a first-match policy silently — an over-budget `omit` disappearing
+	// lets a later `full` win, and the content the caller asked to hide
+	// comes back in a response that looks like a normal success. Parsed
+	// here rather than at the point of use so a malformed request cannot
+	// be served by a path that happens not to reach the compressor.
+	fidelityRules, fidelityErr := parseFidelityGlobs(req.GetString("fidelity_globs", ""))
+	if fidelityErr != nil {
+		return mcp.NewToolResultError("get_editing_context: " + fidelityErr.Error()), nil
+	}
 	// Normalise to the graph's stored path form so a repo-relative path
 	// (internal/x.go) doesn't miss the repo-prefixed nodes in multi-repo
 	// mode — the cause of spurious "no symbols found for file" misses.
@@ -593,7 +604,7 @@ func (s *Server) handleGetEditingContext(ctx context.Context, req mcp.CallToolRe
 				keepNodes := s.editingContextSymbolNodes(ctx, fp, out.Defines)
 				keepPred, resolved := resolveKeepPredicate(req.GetString("keep", ""), keepNodes)
 				keptSymbols = resolved
-				decide := fidelityDecideForPath(parseFidelityGlobs(req.GetString("fidelity_globs", "")), fp)
+				decide := fidelityDecideForPath(fidelityRules, fp)
 				if compressed, cerr := elide.CompressWith(fileBytes, language, elide.Options{Keep: keepPred, Decide: decide}); cerr == nil {
 					sourceCompressed = string(compressed)
 				}
@@ -982,6 +993,7 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 		startLine      int
 		totalFileChars int
 		viewURI        string
+		absPath        string
 	)
 	if files := refViewFilesFor(ctx); files != nil {
 		// The symbol's lines belong to the committed tree the view pins, not
@@ -994,7 +1006,8 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 		source, startLine, totalFileChars, _ = extractLinesFromContent(
 			string(content), node.StartLine, node.EndLine, contextLines)
 	} else {
-		absPath, resolveErr := s.resolveNodePath(ctx, node)
+		var resolveErr error
+		absPath, resolveErr = s.resolveNodePath(ctx, node)
 		if resolveErr != nil {
 			return mcp.NewToolResultError(resolveErr.Error()), nil
 		}
@@ -1041,7 +1054,9 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 	// response). Aggregated stats remain available via the `savings` tool.
 	returned := tokens.CachedCountInt64(source)
 	fullFile := int64(tokens.EstimateFromSample(totalFileChars, source))
-	s.tokenStatsFor(ctx).record(s.savingsAttributionNode(node), "get_symbol_source", returned, fullFile)
+	symStats := s.tokenStatsFor(ctx)
+	symStats.creditFile(absPath)
+	symStats.record(s.savingsAttributionNode(node), "get_symbol_source", returned, fullFile)
 
 	result := map[string]any{
 		"id":         node.ID,
@@ -1288,6 +1303,11 @@ func (s *Server) handleBatchSymbols(ctx context.Context, req mcp.CallToolRequest
 			if len(callerIDs) > 0 {
 				entry["callers"] = callerIDs
 			}
+			// Stamp the cut. Do not emit a total: TotalNodes is the
+			// capped subgraph (seed+9), not the neighbourhood.
+			if callers.Truncated {
+				entry["callers_truncated"] = true
+			}
 
 			// Callees (depth 1).
 			callees := s.engineFor(ctx).GetCallChain(node.ID, query.QueryOptions{Depth: 1, Limit: 10, Detail: "brief", WorkspaceID: sessWS})
@@ -1300,6 +1320,9 @@ func (s *Server) handleBatchSymbols(ctx context.Context, req mcp.CallToolRequest
 			if len(calleeIDs) > 0 {
 				entry["callees"] = calleeIDs
 			}
+			if callees.Truncated {
+				entry["callees_truncated"] = true
+			}
 		}
 
 		// Source code (optional).
@@ -1310,7 +1333,9 @@ func (s *Server) handleBatchSymbols(ctx context.Context, req mcp.CallToolRequest
 					entry["from_line"] = fromLine
 					returned := tokens.CachedCountInt64(source)
 					fullFile := int64(tokens.EstimateFromSample(totalFileChars, source))
-					s.tokenStatsFor(ctx).record(s.savingsAttributionNode(node), "batch_symbols", returned, fullFile)
+					batchStats := s.tokenStatsFor(ctx)
+					batchStats.creditFile(absPath)
+					batchStats.record(s.savingsAttributionNode(node), "batch_symbols", returned, fullFile)
 				}
 			}
 		}
@@ -2212,7 +2237,9 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 					sourcesEmbedded++
 					returned := tokens.CachedCountInt64(source)
 					fullFile := int64(tokens.EstimateFromSample(totalFileChars, source))
-					s.tokenStatsFor(ctx).record(s.savingsAttributionNode(sym), "smart_context", returned, fullFile)
+					ctxStats := s.tokenStatsFor(ctx)
+					ctxStats.creditFile(absPath)
+					ctxStats.record(s.savingsAttributionNode(sym), "smart_context", returned, fullFile)
 				}
 			}
 		}

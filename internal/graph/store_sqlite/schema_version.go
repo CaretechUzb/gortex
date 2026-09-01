@@ -33,7 +33,7 @@ import (
 // index changes in a way an old on-disk DB would not already have, and append a
 // matching schemaMigrations entry describing how to bring an older store
 // forward (in place, or by rebuild).
-const currentSchemaVersion = 18
+const currentSchemaVersion = 20
 
 // schemaMigration is one forward step. Exactly one strategy applies:
 //   - rebuild=true: the change introduces structure/data that can only come
@@ -87,6 +87,8 @@ var schemaMigrations = []schemaMigration{
 	{version: 16, name: "key nodes and edges by view generation", inPlace: keyGraphCoreByViewGeneration},
 	{version: 17, name: "add sparse view-generation enumeration indexes", inPlace: addGenerationEnumerationIndexes},
 	{version: 18, name: "add sparse generation ownership masks", inPlace: createGenerationMaskTables},
+	{version: 19, name: "purge legacy slash-spelled coverage artifacts", inPlace: purgeLegacyCoverageSpellings},
+	{version: 20, name: "purge unresolved derived tests edges", inPlace: purgeUnresolvedTestsEdges},
 }
 
 // createGenerationMaskTables is the explicit v18 migration. The mask tables are
@@ -415,6 +417,22 @@ func addEdgeViewGenerationColumn(tx *sql.Tx) error {
 // versioned contract rather than an unversioned side effect of Open.
 func createCheckoutCatalogTables(tx *sql.Tx) error {
 	_, err := tx.Exec(checkoutCatalogSchemaSQL)
+	return err
+}
+
+// purgeUnresolvedTestsEdges removes derived EdgeTests rows whose target is
+// an unresolved stub, in both spellings (`unresolved::X` and the multi-repo
+// `<repo>::unresolved::X` COPY-rewrite form). The test-linkage pass cloned
+// them from unresolved calls before the emission guard existed; stripped of
+// the call's receiver evidence they are naked stubs the resolver now
+// refuses to bind, new emission never re-creates them, and warm startup may
+// skip file-scoped reconciliation entirely — so an old store keeps paying
+// their resolver-scan cost forever without this explicit purge. Idempotent
+// and bounded to the tests kind: pending calls and resolved projections are
+// untouched.
+func purgeUnresolvedTestsEdges(tx *sql.Tx) error {
+	_, err := tx.Exec(`DELETE FROM edges WHERE kind = 'tests'
+		AND (to_id LIKE 'unresolved::%' OR to_id LIKE '%::unresolved::%')`)
 	return err
 }
 
