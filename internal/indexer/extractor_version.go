@@ -40,7 +40,7 @@ var extractorVersions = map[string]int{
 	//   "go": 2,
 	"c":      generatedParserProjectionPolicyVersion, // generated parser projection covers all strictly detected table sizes
 	"php":    2,                                      // class/interface inheritance now emits typed structural edges
-	"csharp": 21,                                     // case-label and when-guard pattern variables scope to their switch section (was: indexers and accessor-bearing events are emitted as members and own their body calls)
+	"csharp": 22,                                     // repeated partial base classes dropped, chained/awaited receivers typed at the site offset (was: case-label and when-guard pattern variables scope to their switch section)
 	"scala":  2,                                      // explicitly instantiated generic calls emit call edges
 	"go":     3,                                      // generic instantiations are marked so indexing a func value cannot bind (was: generic calls emit call edges)
 	"cpp":    2,                                      // templated and namespace-qualified calls emit call edges
