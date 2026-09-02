@@ -56,6 +56,10 @@ func noopRelease() {}
 // reconciliation dozens of times a minute while the first one still runs.
 const probeReconcileDebounce = 30 * time.Second
 
+// probeActivateReason labels the activation a probe kicks for an unrouted
+// worktree, so a log line downstream names why the coordinator came up.
+const probeActivateReason = "probe selected an unrouted checkout"
+
 type topologyNudgeLease struct {
 	once    sync.Once
 	release func()
@@ -185,16 +189,19 @@ func (c *realController) selectProbeView(ctx context.Context, path string) probe
 		}
 	}
 
-	// Nothing composed answers this working copy. Ask for a reconciliation so
-	// a later probe can, and answer without waiting on it — a probe that
-	// blocked on a build would cost the agent the latency the hook exists to
-	// save.
-	c.nudgeFamily(binding.FamilyID)
-
+	// Nothing composed answers this working copy. Ask for a build so a later
+	// probe can, and answer without waiting on it — a probe that blocked on a
+	// build would cost the agent the latency the hook exists to save.
 	if binding.CheckoutState == string(store_sqlite.CheckoutStateReady) {
-		// Registered, live, and unrouted: the view is still being built (or
-		// has not been asked for yet). Reporting the primary's content here
-		// would describe a different working copy, so nothing is reported.
+		// Registered, live, automatic and unrouted: the worktree may be dormant
+		// since startup. Activate its own coordinator so the exact view it needs
+		// is built, and answer from what exists now. A rejected activation (the
+		// lifecycle is closing) falls back to a whole-family reconcile.
+		// Reporting the primary's content here would describe a different
+		// working copy, so nothing is reported.
+		if !c.nudgeCheckout(binding.CheckoutID, binding.FamilyID) {
+			c.nudgeFamily(binding.FamilyID)
+		}
 		return probeView{
 			answer:   fallbackProbeView(daemon.ProbeViewUnrouted, binding.CheckoutID, binding.RepoPrefix, daemon.FallbackViewBuilding),
 			root:     binding.RootPath,
@@ -205,8 +212,10 @@ func (c *realController) selectProbeView(ctx context.Context, path string) probe
 
 	// Availability or removal grace: the working copy itself stopped
 	// answering, and the family primary serves it by the same fallback rule a
-	// read-only query follows. The checkout state is the reason, so a caller
-	// logging it sees which grace window is running.
+	// read-only query follows. There is no single ready checkout to activate,
+	// so a whole-family reconcile is asked for instead. The checkout state is
+	// the reason, so a caller logging it sees which grace window is running.
+	c.nudgeFamily(binding.FamilyID)
 	return probeView{
 		answer:      fallbackProbeView(daemon.ProbeViewBase, binding.CheckoutID, binding.RepoPrefix, binding.CheckoutState),
 		repoPrefix:  binding.RepoPrefix,
@@ -390,6 +399,34 @@ func (c *realController) nudgeFamily(familyID string) {
 	go run(familyID)
 }
 
+// nudgeCheckout activates one automatic checkout's coordinator on demand, so a
+// probing path that found no composed view kicks the exact build it needs
+// rather than a whole-family reconcile. It is keyed-debounced against the same
+// window nudgeFamily uses and forwards through the probeActivateCheckout seam
+// (nil in production → the real lifecycle call). It reports whether the caller
+// can treat the checkout as handled: true when an activation was started or one
+// is already in flight inside the debounce window, false when the activation
+// was rejected (the lifecycle is closing) so the caller can fall back to a
+// family reconcile.
+func (c *realController) nudgeCheckout(checkoutID, familyID string) bool {
+	if c == nil || checkoutID == "" {
+		return false
+	}
+	if !c.claimProbeNudge("checkout:" + checkoutID) {
+		// Already kicked inside the debounce window; treat it as handled rather
+		// than falling back to a family reconcile the window would only drop.
+		return true
+	}
+	activate := c.probeActivateCheckout
+	if activate == nil {
+		if c.lifecycle == nil {
+			return false
+		}
+		activate = func(id string) bool { return c.lifecycle.ActivateCheckout(id, probeActivateReason) }
+	}
+	return activate(checkoutID)
+}
+
 // nudgeFamilyTopologyRequest reconciles a filesystem topology event immediately.
 //
 // GitWatcher has already debounce-coalesced the fsnotify burst. This layer
@@ -476,15 +513,24 @@ func (c *realController) runTopologyNudgeLoop(
 // claimFamilyNudge reports whether this caller won the right to reconcile the
 // family now, stamping the window when it did.
 func (c *realController) claimFamilyNudge(familyID string) bool {
+	return c.claimProbeNudge(familyID)
+}
+
+// claimProbeNudge reports whether this caller won the right to act on one key
+// now, stamping the window when it did. It is the keyed generalisation
+// claimFamilyNudge is a special case of: a family is keyed by its id and a
+// single checkout by "checkout:"+id, and the two share one debounce window so a
+// probe cannot both activate a checkout and re-reconcile its family at once.
+func (c *realController) claimProbeNudge(key string) bool {
 	c.probeNudgeMu.Lock()
 	defer c.probeNudgeMu.Unlock()
-	if last, seen := c.probeNudgedAt[familyID]; seen && time.Since(last) < probeReconcileDebounce {
+	if last, seen := c.probeNudgedAt[key]; seen && time.Since(last) < probeReconcileDebounce {
 		return false
 	}
 	if c.probeNudgedAt == nil {
 		c.probeNudgedAt = make(map[string]time.Time)
 	}
-	c.probeNudgedAt[familyID] = time.Now()
+	c.probeNudgedAt[key] = time.Now()
 	return true
 }
 

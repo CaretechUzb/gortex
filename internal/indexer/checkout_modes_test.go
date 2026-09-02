@@ -55,7 +55,7 @@ func newFamilyFixture(t *testing.T, name string) *familyFixture {
 
 	report, err := f.lc.Sweep(ctx)
 	require.NoError(t, err)
-	require.Equal(t, 1, report.Coordinators, "the observed worktree has no coordinator")
+	require.Equal(t, 0, report.Coordinators, "the observed worktree is dormant until it is selected")
 
 	out := &familyFixture{
 		lifecycleFixture: f,
@@ -66,6 +66,11 @@ func newFamilyFixture(t *testing.T, name string) *familyFixture {
 		familyID:         tracked.FamilyID,
 	}
 	out.automatic = out.otherCheckout(tracked.CheckoutID)
+	// The mode-change flows this fixture serves all assume the automatic
+	// checkout is being served, so wake it the way a selection would. Its
+	// coordinator is then live and running exactly as a pre-dormancy sweep left
+	// it, which is the state the flows below drive.
+	f.activateAndWait(out.automatic.CheckoutID)
 	return out
 }
 
@@ -299,7 +304,7 @@ func TestPromoteRollsBackWhenTheCheckoutMovesUnderIt(t *testing.T) {
 
 	report, err := f.lc.Sweep(ctx)
 	require.NoError(t, err)
-	require.Equal(t, 1, report.Coordinators)
+	require.Equal(t, 0, report.Coordinators, "the observed worktree is dormant until it is selected")
 	automatic := store_sqlite.Checkout{}
 	checkouts, err := f.catalog.ListCheckouts(ctx, tracked.FamilyID)
 	require.NoError(t, err)
@@ -310,6 +315,10 @@ func TestPromoteRollsBackWhenTheCheckoutMovesUnderIt(t *testing.T) {
 	}
 	require.NotEmpty(t, automatic.CheckoutID)
 
+	// Wake the dormant worktree the way a selection would, so the promotion
+	// below has a coordinator to roll back. The ordinary activation build does
+	// not trip the index barrier — only the promotion's resample does.
+	f.activateAndWait(automatic.CheckoutID)
 	cycle := f.runCoordinator(automatic.CheckoutID)
 	served := f.materialize(automatic.CheckoutID)
 	before := contentIdentities(served.Reader, tracked.Prefix)

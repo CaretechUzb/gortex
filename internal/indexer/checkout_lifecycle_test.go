@@ -911,7 +911,7 @@ func TestCheckoutLifecycleImplicitRegistrationSurvivesRestartWithoutIntent(t *te
 // default reconcile interval puts between janitor passes. Registering one of
 // them explicitly afterwards is the opposite transition: the working copy gets
 // a corpus of its own and stops being served through a composed view.
-func TestCheckoutLifecycleRegistrationBringsUpCoordinators(t *testing.T) {
+func TestCheckoutLifecycleRegistrationLeavesAutomaticWorktreesDormant(t *testing.T) {
 	f := newLifecycleFixture(t)
 	defer f.close()
 	ctx := context.Background()
@@ -933,8 +933,13 @@ func TestCheckoutLifecycleRegistrationBringsUpCoordinators(t *testing.T) {
 	}
 	require.NotNil(t, automatic, "the worktree that already existed got no identity")
 	assert.Equal(t, store_sqlite.CheckoutModeAutomatic, automatic.EffectiveMode)
+	assert.False(t, f.lc.SignalCheckout(automatic.CheckoutID, "test"),
+		"an automatic worktree seen at registration is dormant until it is selected")
+
+	// Selecting it wakes its coordinator.
+	f.activateAndWait(automatic.CheckoutID)
 	assert.True(t, f.lc.SignalCheckout(automatic.CheckoutID, "test"),
-		"the worktree has no coordinator until a sweep runs")
+		"selecting the worktree wakes a coordinator")
 
 	retracked, err := f.lc.Register(ctx, config.RepoEntry{Path: worktree, Name: "register-wt"}, TrackSourceCLI)
 	require.NoError(t, err)
@@ -978,10 +983,15 @@ func TestCoordinatorLivenessFollowsTheLoopNotTheRegistry(t *testing.T) {
 	defer f.close()
 	ctx := context.Background()
 
+	// Route the automatic checkout before the restart: a served worktree is the
+	// one a restart resumes, and its persisted route is what marks it worth
+	// bringing back rather than leaving dormant.
+	f.runCoordinator(f.automatic.CheckoutID)
+
 	// The daemon's restart path: a fresh stack over the same store, the tracked
 	// set re-registered the way warmup re-tracks it, and the seeding that
-	// reconciles every family it touched — which is what brings the automatic
-	// checkouts' coordinators back up.
+	// reconciles every family it touched — which is what brings a routed
+	// worktree's coordinator back up.
 	f.restart()
 	_, err := f.mi.TrackRepoCtx(ctx, config.RepoEntry{Path: f.main, Name: f.mainPrefix})
 	require.NoError(t, err)

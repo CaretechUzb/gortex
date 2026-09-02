@@ -156,6 +156,19 @@ newly discovered worktree becomes an *automatic* checkout, served from the
 family's shared lane, rather than a second indexed repository. `gortex track` on
 a worktree still makes it *dedicated* — its own graph, indexed in its own right.
 
+**Automatic checkouts are dormant until selected.** Minting the identity is
+cheap; standing up a coordinator and building its commit and dirty layers is
+not, and a family with dozens of linked worktrees would pay that cost, serialized
+through the build gate, for every one at startup — most of them never read. So an
+automatic checkout the startup inventory sees keeps only its catalog row until a
+session or query selects it; the first selection wakes its coordinator, and the
+retry that follows finds the composed view built. A worktree already being served
+resumes on restart through its persisted route. A `git worktree add` performed
+while the daemon is running is built eagerly on discovery by default — set
+`views.lazy_worktree_activation: true` (or `GORTEX_WORKTREE_LAZY_ACTIVATION=1`,
+which overrides the file either way) to defer those too, for worktree-heavy trees
+that never want an unselected view built.
+
 **One corpus, layered per checkout.** The primary corpus is the index built
 from one checkout of the family; every automatic checkout is served by composing
 two generations on top of it — a **commit layer** that turns the corpus at the
@@ -192,6 +205,9 @@ views:
                                  # selection of the view serving it (default 7 days)
   max_cached_generations: 32     # per-graph cap on cached ref-view generations
   max_bytes_per_graph: 5368709120  # per-graph payload budget in bytes (default 5 GiB)
+  lazy_worktree_activation: false  # keep a runtime-discovered worktree dormant
+                                   # until it is selected, too (default: eager on
+                                   # discovery; startup inventory is always dormant)
 ```
 
 Each is "unset" at zero (or at an unparseable duration, which is logged) and

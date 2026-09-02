@@ -215,8 +215,8 @@ func TestLifecycleRegistersCheckoutsWhileBuildsAreDeferred(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sweep: %v", err)
 	}
-	if report.Coordinators != 1 {
-		t.Fatalf("%d coordinators while builds are deferred, want the automatic worktree's 1", report.Coordinators)
+	if report.Coordinators != 0 {
+		t.Fatalf("%d coordinators at startup while builds are deferred, want the dormant worktree's 0", report.Coordinators)
 	}
 
 	checkouts, err := f.catalog.ListCheckouts(ctx, tracked.FamilyID)
@@ -235,6 +235,10 @@ func TestLifecycleRegistersCheckoutsWhileBuildsAreDeferred(t *testing.T) {
 	if automatic.State != store_sqlite.CheckoutStateReady {
 		t.Fatalf("the observed worktree is %q, want a ready identity", automatic.State)
 	}
+	// The deferral is over build passes, not over the coordinator that runs
+	// them: selecting the worktree registers a coordinator whose build waits on
+	// the gate, so the signal listener comes up even while the gate is closed.
+	f.activateAndWait(automatic.CheckoutID)
 	if !f.lc.SignalCheckout(automatic.CheckoutID, "test") {
 		t.Fatal("the automatic checkout has no coordinator listening for signals")
 	}

@@ -1624,12 +1624,13 @@ func Untracked() {
 // --- lifecycle integration ----------------------------------------------
 
 // TestCheckoutLifecycleRunsACoordinatorPerAutomaticCheckout is the wiring: the
-// janitor's reconciliation is what decides a coordinator exists, and the
-// dispositions it already reports are the whole of the decision.
+// janitor's reconciliation mints an automatic worktree's identity but leaves it
+// dormant, and selecting it is what wakes a coordinator — one that then survives
+// later sweeps until the worktree itself is gone.
 //
 // The worktree here is deliberately never tracked. That is what makes it
 // automatic: the reconciler observes it in a family that has a primary
-// dedicated graph, mints an identity for it, and the lifecycle gives that
+// dedicated graph and mints an identity for it, and a selection gives that
 // identity a coordinator. The primary, being dedicated, gets none — its view
 // is the corpus.
 func TestCheckoutLifecycleRunsACoordinatorPerAutomaticCheckout(t *testing.T) {
@@ -1649,8 +1650,8 @@ func TestCheckoutLifecycleRunsACoordinatorPerAutomaticCheckout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sweep: %v", err)
 	}
-	if report.Coordinators != 1 {
-		t.Fatalf("%d coordinators after observing one automatic worktree, want 1", report.Coordinators)
+	if report.Coordinators != 0 {
+		t.Fatalf("%d coordinators after observing one automatic worktree, want 0 until it is selected", report.Coordinators)
 	}
 
 	checkouts, err := f.catalog.ListCheckouts(ctx, tracked.FamilyID)
@@ -1675,21 +1676,29 @@ func TestCheckoutLifecycleRunsACoordinatorPerAutomaticCheckout(t *testing.T) {
 	if automatic.EffectiveMode != store_sqlite.CheckoutModeAutomatic {
 		t.Fatalf("the observed worktree is %q, want automatic", automatic.EffectiveMode)
 	}
+	// Dormant until selected: the identity exists, but no coordinator listens.
+	if f.lc.SignalCheckout(automatic.CheckoutID, "test") {
+		t.Fatal("the observed worktree grew a coordinator before it was selected")
+	}
+
+	// Selecting it wakes a coordinator; the primary, being dedicated, still
+	// grows none — its view is the corpus.
+	f.activateAndWait(automatic.CheckoutID)
 	if !f.lc.SignalCheckout(automatic.CheckoutID, "test") {
-		t.Fatal("the automatic checkout has no coordinator listening for signals")
+		t.Fatal("the activated checkout has no coordinator listening for signals")
 	}
 	if f.lc.SignalCheckout(tracked.CheckoutID, "test") {
 		t.Fatal("the primary checkout grew a coordinator — its view is the corpus")
 	}
 
-	// A second sweep is idempotent: the coordinator that is already running is
-	// the one that keeps running.
+	// A later sweep keeps the woken coordinator: it is live, so admission holds
+	// it running rather than sweeping it back to dormant.
 	again, err := f.lc.Sweep(ctx)
 	if err != nil {
 		t.Fatalf("second sweep: %v", err)
 	}
 	if again.Coordinators != 1 {
-		t.Fatalf("%d coordinators after a second sweep, want the same 1", again.Coordinators)
+		t.Fatalf("%d coordinators after a second sweep, want the woken 1", again.Coordinators)
 	}
 
 	// The worktree leaves. The removal clock has to expire before the identity
@@ -1761,9 +1770,11 @@ func TestCheckoutLifecycleCollectsAForgottenCheckoutsPayload(t *testing.T) {
 		t.Fatal("the observed worktree has no catalog identity")
 	}
 
-	// The coordinator's loop is stopped and one cycle driven by hand, so the
-	// route is settled without waiting on a timer. The lifecycle still holds
-	// the coordinator, which is what the teardown below drops.
+	// Select the worktree so it wakes a coordinator, then stop its loop and
+	// drive one cycle by hand, so the route is settled without waiting on a
+	// timer. The lifecycle still holds the coordinator, which is what the
+	// teardown below drops.
+	f.activateAndWait(automatic)
 	coordinator := lifecycleCoordinator(t, f.lc, automatic)
 	if err := coordinator.Close(); err != nil {
 		t.Fatalf("stop the coordinator loop: %v", err)

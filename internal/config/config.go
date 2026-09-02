@@ -546,6 +546,12 @@ type ViewsConfig struct {
 	// MaxBytesPerGraph caps the total recorded payload size, in bytes, of
 	// one graph's ref-view generations. Zero takes the shipped budget.
 	MaxBytesPerGraph int64 `mapstructure:"max_bytes_per_graph" yaml:"max_bytes_per_graph,omitempty"`
+	// LazyWorktreeActivation keeps a linked worktree discovered while the
+	// daemon is running dormant until a session or query selects it, the same
+	// way the startup inventory is always deferred. Off by default: a `git
+	// worktree add` after the daemon is up builds its view eagerly on
+	// discovery. The GORTEX_WORKTREE_LAZY_ACTIVATION env var overrides it.
+	LazyWorktreeActivation bool `mapstructure:"lazy_worktree_activation" yaml:"lazy_worktree_activation,omitempty"`
 }
 
 // RetainInactiveDuration parses RetainInactive. An empty or malformed value

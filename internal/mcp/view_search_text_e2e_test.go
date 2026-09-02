@@ -114,9 +114,9 @@ func newWorktreeSearchStack(t *testing.T) *worktreeSearchStack {
 		}
 	})
 
-	// Registering the primary is what gives the worktree beside it a view: the
-	// family reconciliation at the end of a track starts a coordinator for
-	// every automatic checkout it finds.
+	// Registering the primary is what gives the worktree beside it an identity;
+	// the coordinator that composes its view is started on demand, when the
+	// worktree is first selected (see awaitRoutedCheckout below).
 	if _, err := lifecycle.Register(context.Background(),
 		config.RepoEntry{Path: primary, Name: refTestPrefix}, store_sqlite.IntentSourceCLITrack); err != nil {
 		t.Fatalf("register the primary checkout: %v", err)
@@ -144,6 +144,7 @@ func (w *worktreeSearchStack) awaitRoutedCheckout(t *testing.T) string {
 	t.Helper()
 	ctx := context.Background()
 	catalog := w.store.Catalog()
+	activated := false
 	deadline := time.Now().Add(60 * time.Second)
 	for {
 		checkout, found, err := graphview.CheckoutForPath(ctx, catalog, w.srv.viewFamilies(ctx), w.worktree)
@@ -151,6 +152,15 @@ func (w *worktreeSearchStack) awaitRoutedCheckout(t *testing.T) string {
 			t.Fatalf("bind the worktree to a checkout: %v", err)
 		}
 		if found && graphview.ServesAutomaticView(checkout) {
+			// The worktree is dormant until selected; activating it once is what
+			// a session selecting the view does, and what starts the coordinator
+			// whose route this fixture waits for. Only once: re-signalling every
+			// poll would keep resetting the coordinator's quiet window and it
+			// would never settle on a generation to route.
+			if !activated {
+				w.lifecycle.ActivateCheckout(checkout.CheckoutID, "test select")
+				activated = true
+			}
 			route, routed, err := catalog.GetCheckoutRoute(ctx, checkout.CheckoutID)
 			if err != nil {
 				t.Fatalf("read the worktree route: %v", err)

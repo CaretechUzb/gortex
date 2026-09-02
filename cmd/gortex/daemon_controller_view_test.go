@@ -307,6 +307,9 @@ func TestProbeOfRoutedWorktreeReleasesItsLease(t *testing.T) {
 func TestProbeOfUnroutedWorktreeAnswersUncovered(t *testing.T) {
 	f := newProbeFixture(t)
 	f.controller.probeReconcile = func(string) {}
+	// An unrouted, ready, automatic worktree wakes its own coordinator; the
+	// stub observes the nudge without spawning a real build behind the probe.
+	f.controller.probeActivateCheckout = func(string) bool { return true }
 	ctx := context.Background()
 	probed := filepath.Join(f.worktreeRoot, probeFile)
 
@@ -329,16 +332,17 @@ func TestProbeOfUnroutedWorktreeAnswersUncovered(t *testing.T) {
 	assert.Equal(t, daemon.ProbeViewUnrouted, found.View.Kind)
 }
 
-// TestUnroutedProbeBurstReconcilesOncePerWindow pins the debounce. A hook
-// probes once per tool call, so an agent working in an unrouted worktree
-// raises the same request continuously; the family must be reconciled once per
-// window however many probes ask for it.
-func TestUnroutedProbeBurstReconcilesOncePerWindow(t *testing.T) {
+// TestUnroutedProbeBurstActivatesOncePerWindow pins the debounce. A hook probes
+// once per tool call, so an agent working in an unrouted worktree raises the
+// same request continuously; the worktree's coordinator must be activated once
+// per window however many probes ask for it.
+func TestUnroutedProbeBurstActivatesOncePerWindow(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		f := newProbeFixture(t)
-		var families []string
-		f.controller.probeReconcile = func(familyID string) {
-			families = append(families, familyID)
+		var activated []string
+		f.controller.probeActivateCheckout = func(checkoutID string) bool {
+			activated = append(activated, checkoutID)
+			return true
 		}
 		ctx := context.Background()
 		probed := filepath.Join(f.worktreeRoot, probeFile)
@@ -348,8 +352,8 @@ func TestUnroutedProbeBurstReconcilesOncePerWindow(t *testing.T) {
 			require.NoError(t, err)
 		}
 		synctest.Wait()
-		assert.Equal(t, []string{probeFamily}, families,
-			"a burst of probes must not raise a reconciliation per probe")
+		assert.Equal(t, []string{probeWorktreeID}, activated,
+			"a burst of probes must not activate the checkout per probe")
 
 		// Inside the window nothing more is asked for, however long the burst
 		// runs.
@@ -357,7 +361,7 @@ func TestUnroutedProbeBurstReconcilesOncePerWindow(t *testing.T) {
 		_, err := f.controller.FileCoverage(ctx, daemon.FileCoverageParams{Path: probed})
 		require.NoError(t, err)
 		synctest.Wait()
-		assert.Len(t, families, 1, "the window had not elapsed")
+		assert.Len(t, activated, 1, "the window had not elapsed")
 
 		// Past it, the next probe asks again: the working copy is still
 		// unrouted and the janitor's own tick is an hour away.
@@ -365,7 +369,7 @@ func TestUnroutedProbeBurstReconcilesOncePerWindow(t *testing.T) {
 		_, err = f.controller.FileCoverage(ctx, daemon.FileCoverageParams{Path: probed})
 		require.NoError(t, err)
 		synctest.Wait()
-		assert.Equal(t, []string{probeFamily, probeFamily}, families)
+		assert.Equal(t, []string{probeWorktreeID, probeWorktreeID}, activated)
 	})
 }
 

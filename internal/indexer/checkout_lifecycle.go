@@ -98,6 +98,10 @@ type CheckoutLifecycleConfig struct {
 	// RefViews bounds how much ref-view payload the store keeps. A zero value
 	// takes the shipped defaults.
 	RefViews RefViewRetention
+	// LazyWorktrees keeps a linked worktree discovered at runtime dormant until
+	// it is selected, the same way the startup inventory is always deferred.
+	// The GORTEX_WORKTREE_LAZY_ACTIVATION env var overrides it either way.
+	LazyWorktrees bool
 
 	// indexBarrier is a test seam: it runs inside a promotion, between the
 	// sample the new corpus has to describe and the index that builds it,
@@ -168,6 +172,15 @@ type CheckoutLifecycle struct {
 	coordMu          sync.Mutex
 	coordinators     map[string]*CheckoutCoordinator
 	coordinatorHeads map[string]checkoutHeadIdentity
+	// coordinatorActivating names the checkouts an on-demand activation is
+	// building a coordinator for right now, so a burst of selections spawns
+	// exactly one build. coordinatorClosing rejects new activations once Close
+	// has begun. Both move under coordMu with the registry they gate;
+	// coordinatorStartWG.Add is taken under it too, so Close's Wait cannot miss
+	// an activation that has already been admitted.
+	coordinatorActivating map[string]struct{}
+	coordinatorClosing    bool
+	coordinatorStartWG    sync.WaitGroup
 	// started holds every coordinator this process has started and not yet
 	// seen stop, keyed by checkout. The registry is what can be handed a
 	// cycle; this is what is running. They come apart for the length of a
@@ -182,6 +195,23 @@ type CheckoutLifecycle struct {
 	// and the two slots of a checkout whose route is being withdrawn. The
 	// sweep retries them until the catalog stops refusing.
 	owed map[int64]struct{}
+
+	// admitMu guards initialInventoryTaken alone. It is separate from coordMu
+	// because the admission predicate reads this map and then asks coordMu
+	// whether a coordinator is already live, and one mutex for both would nest
+	// on itself.
+	admitMu sync.Mutex
+	// initialInventoryTaken records, per family, whether its first
+	// primary-backed enumeration has run. Every automatic checkout seen in that
+	// first pass is startup inventory and stays dormant until a session or
+	// query selects it; one minted in a later pass is a runtime addition,
+	// admitted eagerly unless cfgLazyWorktrees. In-memory, so a restart
+	// re-defers the inventory — a routed worktree resumes through its route.
+	initialInventoryTaken map[string]bool
+	// cfgLazyWorktrees keeps runtime-discovered worktrees dormant as well, for
+	// worktree-heavy trees that never want an unselected view built. Off by
+	// default: a runtime `git worktree add` builds eagerly on discovery.
+	cfgLazyWorktrees bool
 
 	// refViewMu guards the per-repository ref-view manager cache alone. A
 	// manager holds no per-request state, so the lock covers only the map.
@@ -246,16 +276,25 @@ func NewCheckoutLifecycle(cfg CheckoutLifecycleConfig) (*CheckoutLifecycle, erro
 		now:                    now,
 		buildingRecoveryCutoff: now().Unix(),
 		leases:                 cfg.ViewLeases,
-		coordinators:      map[string]*CheckoutCoordinator{},
-		coordinatorHeads:  map[string]checkoutHeadIdentity{},
-		started:           map[string][]*CheckoutCoordinator{},
-		owed:              map[int64]struct{}{},
+		coordinators:          map[string]*CheckoutCoordinator{},
+		coordinatorHeads:      map[string]checkoutHeadIdentity{},
+		coordinatorActivating: map[string]struct{}{},
+		initialInventoryTaken: map[string]bool{},
+		started:               map[string][]*CheckoutCoordinator{},
+		owed:                  map[int64]struct{}{},
 		familyRetries:     map[string]familyRetry{},
 		refViewRetention:  cfg.RefViews.withDefaults(),
 		indexBarrier:      cfg.indexBarrier,
 		transitionCtx:     transitionCtx,
 		cancelTransitions: cancelTransitions,
 		transitionRuns:    map[string]*modeTransitionRun{},
+	}
+	// The env override wins over the config-file setting either way, so a
+	// worktree-heavy tree can opt every discovered worktree into dormancy — or
+	// out of it — without editing the file the daemon reads.
+	l.cfgLazyWorktrees = cfg.LazyWorktrees
+	if value, ok := worktreeLazyActivationEnv(); ok {
+		l.cfgLazyWorktrees = value
 	}
 	if l.leases == nil {
 		l.leases = graphview.NewLeaseManager()
@@ -1498,6 +1537,7 @@ func (l *CheckoutLifecycle) applyCoordinators(ctx context.Context, report reconc
 	if l == nil || l.store == nil || l.catalog == nil {
 		return
 	}
+	routed := l.durableRoutes(ctx, report)
 	for _, entry := range report.Checkouts {
 		if entry.CheckoutID == "" || !entry.Durable {
 			continue
@@ -1517,8 +1557,201 @@ func (l *CheckoutLifecycle) applyCoordinators(ctx context.Context, report reconc
 			l.withdrawStaleRoute(ctx, entry.CheckoutID)
 			continue
 		}
-		l.ensureCoordinator(ctx, report.PrimaryGraphID, checkout)
+		if l.coordinatorAdmitted(checkout, routed[entry.CheckoutID], entry.Action) {
+			l.ensureCoordinator(ctx, report.PrimaryGraphID, checkout)
+		}
 	}
+	l.markInitialInventory(report)
+}
+
+// durableRoutes reads, in one batched catalog call, which of a family's durable
+// checkouts already hold a route. A routed checkout was built before, so its
+// coordinator is admitted on sight — a restart resumes the view it was serving
+// rather than leaving it dark until something selects it again. A read failure
+// degrades to no routes: the checkout falls to the other admission arms and is
+// re-activated on its next selection.
+func (l *CheckoutLifecycle) durableRoutes(ctx context.Context, report reconcile.FamilyReport) map[string]bool {
+	ids := make([]string, 0, len(report.Checkouts))
+	for _, entry := range report.Checkouts {
+		if entry.CheckoutID == "" || !entry.Durable {
+			continue
+		}
+		ids = append(ids, entry.CheckoutID)
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	routes, err := l.catalog.GetCheckoutRoutes(ctx, ids)
+	if err != nil {
+		l.logger.Debug("checkout lifecycle: could not batch-load routes for admission",
+			zap.String("family", report.FamilyID), zap.Error(err))
+		return nil
+	}
+	routed := make(map[string]bool, len(routes))
+	for id := range routes {
+		routed[id] = true
+	}
+	return routed
+}
+
+// coordinatorAdmitted decides whether one ready, automatic, primary-backed
+// checkout gets a coordinator now, or stays dormant until it is selected. A
+// live coordinator keeps running, a routed checkout resumes across a restart,
+// and a checkout a track or promote is converging keeps building. Everything
+// else is admitted only when it is a genuine runtime addition — minted after
+// its family's initial inventory was taken, and not opted into lazy activation.
+// The startup inventory itself, and anything under the lazy flag, stays dormant.
+func (l *CheckoutLifecycle) coordinatorAdmitted(
+	checkout store_sqlite.Checkout, routed bool, action reconcile.CheckoutAction,
+) bool {
+	if l.hasCoordinator(checkout.CheckoutID) {
+		return true
+	}
+	if routed {
+		return true
+	}
+	if checkout.ActiveIntentTransitionID != "" {
+		return true
+	}
+	l.admitMu.Lock()
+	inventoried := l.initialInventoryTaken[checkout.FamilyID]
+	l.admitMu.Unlock()
+	return inventoried &&
+		action == reconcile.ActionIdentityAllocated &&
+		!l.cfgLazyWorktrees
+}
+
+// markInitialInventory records that a family's first primary-backed enumeration
+// has run. Until this is set every automatic checkout the pass sees is startup
+// inventory and stays dormant; a worktree minted after it is a runtime addition
+// and is admitted eagerly by default.
+func (l *CheckoutLifecycle) markInitialInventory(report reconcile.FamilyReport) {
+	if report.PrimaryGraphID == "" || report.FamilyID == "" {
+		return
+	}
+	l.admitMu.Lock()
+	if l.initialInventoryTaken == nil {
+		l.initialInventoryTaken = map[string]bool{}
+	}
+	l.initialInventoryTaken[report.FamilyID] = true
+	l.admitMu.Unlock()
+}
+
+// worktreeLazyActivationEnv reads GORTEX_WORKTREE_LAZY_ACTIVATION. The bool it
+// returns is meaningful only when ok is true; an unset or unrecognised value
+// leaves the config-file setting in force.
+func worktreeLazyActivationEnv() (value, ok bool) {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("GORTEX_WORKTREE_LAZY_ACTIVATION"))) {
+	case "1", "true", "yes", "on", "y":
+		return true, true
+	case "0", "false", "no", "off", "n":
+		return false, true
+	default:
+		return false, false
+	}
+}
+
+// ActivateCheckout brings a dormant automatic checkout's coordinator up on
+// demand — the selection path's answer to a worktree the startup inventory left
+// dormant. It is fire-and-forget: the build runs under the lifecycle's own
+// transition context, not the caller's, so a disconnected request cannot
+// abandon it, and the caller returns its labelled base fallback while the build
+// runs. It reports true when a coordinator is already live or an activation was
+// started, false when the lifecycle is closing or the id is empty.
+func (l *CheckoutLifecycle) ActivateCheckout(checkoutID, reason string) bool {
+	if l == nil || checkoutID == "" {
+		return false
+	}
+	// Deliberately does NOT signal a coordinator that is already live. The
+	// coordinator's build loop re-arms its quiet window on every signal and
+	// runs a cycle only once that window elapses with no further signals; a
+	// caller polling a not-yet-routed view faster than the window and kicking
+	// activation on every poll would reset the timer forever and starve the very
+	// build it is waiting for — a livelock. beginCheckoutActivation already
+	// reports a running or activating coordinator as already=true, so an
+	// established coordinator returns true here without a signal; only a genuine
+	// cold activation spawns a build, and ensureCoordinator's cold path signals
+	// that build once on install. Return semantics are unchanged: true means the
+	// coordinator is live or being brought up, false means the lifecycle is
+	// closing or the id is empty (nudgeCheckout's fallback relies on false).
+	started, already := l.beginCheckoutActivation(checkoutID)
+	if already {
+		return true
+	}
+	if !started {
+		return false
+	}
+	l.logger.Debug("checkout lifecycle: activating a dormant checkout on demand",
+		zap.String("checkout", checkoutID), zap.String("reason", reason))
+	go l.activateCheckout(l.transitionCtx, checkoutID)
+	return true
+}
+
+// beginCheckoutActivation admits one activation. It returns (true, false) when
+// this caller owns the build and has counted it on the start WaitGroup,
+// (false, true) when a coordinator is already up or another activation owns the
+// build, and (false, false) when the lifecycle is closing. The WaitGroup add
+// happens under coordMu so Close, which sets coordinatorClosing under the same
+// lock before it waits, can never miss an activation it has to join.
+func (l *CheckoutLifecycle) beginCheckoutActivation(checkoutID string) (started, already bool) {
+	l.coordMu.Lock()
+	defer l.coordMu.Unlock()
+	if l.coordinatorClosing {
+		return false, false
+	}
+	if _, running := l.coordinators[checkoutID]; running {
+		return false, true
+	}
+	if l.runningLocked(checkoutID) {
+		return false, true
+	}
+	if l.coordinatorActivating == nil {
+		l.coordinatorActivating = map[string]struct{}{}
+	}
+	if _, activating := l.coordinatorActivating[checkoutID]; activating {
+		return false, true
+	}
+	l.coordinatorActivating[checkoutID] = struct{}{}
+	l.coordinatorStartWG.Add(1)
+	return true, false
+}
+
+// finishCheckoutActivation releases the slot beginCheckoutActivation took.
+func (l *CheckoutLifecycle) finishCheckoutActivation(checkoutID string) {
+	l.coordMu.Lock()
+	delete(l.coordinatorActivating, checkoutID)
+	l.coordMu.Unlock()
+	l.coordinatorStartWG.Done()
+}
+
+// activateCheckout builds and installs one dormant checkout's coordinator. It
+// owns the transition context, so it runs to completion or to shutdown
+// independent of the request that asked for it. It calls ensureCoordinator
+// directly rather than re-entering applyCoordinators: the admission gate is a
+// startup-inventory decision the selection has already overridden, and a second
+// pass through it would only re-derive the same dormant verdict.
+func (l *CheckoutLifecycle) activateCheckout(ctx context.Context, checkoutID string) {
+	defer l.finishCheckoutActivation(checkoutID)
+	if l.catalog == nil {
+		return
+	}
+	checkout, found, err := l.catalog.GetCheckout(ctx, checkoutID)
+	if err != nil || !found {
+		return
+	}
+	if checkout.State != store_sqlite.CheckoutStateReady ||
+		checkout.EffectiveMode != store_sqlite.CheckoutModeAutomatic {
+		return
+	}
+	_, primary, err := l.familyGraphsFor(ctx, checkout)
+	if err != nil || primary == nil || primary.GraphID == "" {
+		return
+	}
+	// ensureCoordinator's cold-install path signals "checkout registered" once,
+	// which arms the first build. Signalling again here would only re-reset the
+	// coordinator's quiet window and delay that build — the same starvation
+	// ActivateCheckout avoids on a live coordinator.
+	l.ensureCoordinator(ctx, primary.GraphID, checkout)
 }
 
 // ensureCoordinator brings up the coordinator for one automatic checkout, or
@@ -1869,6 +2102,16 @@ func (l *CheckoutLifecycle) Close() error {
 	}
 	l.transitionMu.Unlock()
 	l.transitionWG.Wait()
+
+	// Stop admitting on-demand activations and join the ones already building.
+	// Cancelling the transition context above already told any in-flight build
+	// to wind down; this waits for each to finish installing or bail, so its
+	// coordinator is in the registry the snapshot below closes and no activation
+	// can register one after that snapshot.
+	l.coordMu.Lock()
+	l.coordinatorClosing = true
+	l.coordMu.Unlock()
+	l.coordinatorStartWG.Wait()
 
 	// Serialize the retry phase of concurrent Close calls. The admission gate
 	// and WaitGroup share retryMu, so no callback can Add after this goroutine
@@ -2250,9 +2493,10 @@ func readyLayerRetirementCandidates(
 // resumed.
 //
 // The families it touched are then reconciled once, which is what brings the
-// automatic checkouts' coordinators back up. Leaving that to the janitor would
-// mean every restart costs a worktree its view for a whole reconcile interval
-// — an hour, by default.
+// each routed worktree's coordinator back up. Leaving that to the janitor would
+// mean every restart costs a served worktree its view for a whole reconcile
+// interval — an hour, by default. A worktree that was not being served stays
+// dormant until it is selected again.
 func (l *CheckoutLifecycle) Seed(ctx context.Context) error {
 	if l == nil {
 		return nil
@@ -2304,8 +2548,10 @@ func (l *CheckoutLifecycle) Seed(ctx context.Context) error {
 		errs = append(errs, err)
 	}
 	// The seeded families are reconciled once here rather than at the janitor's
-	// first tick, so a restart's automatic checkouts get their coordinators
-	// back within the boot rather than within the hour.
+	// first tick, so a restart resumes each routed worktree's coordinator within
+	// the boot rather than within the hour. An automatic worktree that was not
+	// being served stays dormant until it is selected again — its route is what
+	// marks it worth resuming across the restart.
 	for familyID, probeDir := range seeded {
 		l.reconcileFamilyNow(ctx, familyID, probeDir)
 	}

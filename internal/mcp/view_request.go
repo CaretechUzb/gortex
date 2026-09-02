@@ -676,11 +676,19 @@ func (s *Server) materializeRequestView(
 		return viewFallback(strict, rider, graphview.WrapViewError(graphview.CodeCheckoutInaccessible,
 			fmt.Sprintf("read the route of checkout %q", checkout.CheckoutID), err))
 	case !found || !graphview.RouteReady(route):
+		// The selected worktree has no ready route — it may be dormant, never
+		// built since startup. Kick its coordinator so the awaited or retried
+		// build actually runs, then return the labelled base fallback now. The
+		// activation is fire-and-forget; nothing here waits on it.
+		s.activateSelectedCheckout(checkout.CheckoutID, "view requested but not routed")
 		return viewFallback(strict, rider, graphview.NewViewError(graphview.CodeViewBuilding,
 			fmt.Sprintf("checkout %q is not fully routed yet", checkout.CheckoutID)))
 	}
 	view, err := s.materializer.MaterializeCheckout(ctx, checkout.CheckoutID)
 	if err != nil {
+		// A route that will not materialize is a stale-HEAD or half-built
+		// generation; kick a rebuild the same way before falling back.
+		s.activateSelectedCheckout(checkout.CheckoutID, "view requested but materialization failed")
 		return viewFallback(strict, rider, err)
 	}
 	rider.MarkExact(requested.String())
@@ -698,6 +706,18 @@ func (s *Server) materializeRequestView(
 
 // viewFallback either propagates the failure (an explicit selector) or serves
 // the base corpus with the reason recorded on the rider (a cwd binding).
+// activateSelectedCheckout kicks a dormant checkout's coordinator when a
+// request selects a view that is not routed yet. It is fire-and-forget: the
+// request returns its labelled base fallback now and the build runs behind it,
+// so a later retry finds the composed view ready. Nil-safe for the surfaces
+// wired without a lifecycle.
+func (s *Server) activateSelectedCheckout(checkoutID, reason string) {
+	if s == nil || s.lifecycle == nil || checkoutID == "" {
+		return
+	}
+	s.lifecycle.ActivateCheckout(checkoutID, reason)
+}
+
 func viewFallback(strict bool, rider *graphview.ViewRider, err error) (*requestView, error) {
 	if strict {
 		return nil, err

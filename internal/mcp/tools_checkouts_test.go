@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	mcplib "github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/assert"
@@ -76,10 +77,35 @@ func newCheckoutAdminFixture(t *testing.T) *checkoutAdminFixture {
 	return fixture
 }
 
+// activateWorktree wakes the family's automatic checkout — what a session
+// selecting its view does — and waits for its coordinator to come up, so a
+// test that needs a live coordinator to count has one. Registration only mints
+// the identity; the coordinator is started on demand.
+func (f *checkoutAdminFixture) activateWorktree(t *testing.T, familyID string) {
+	t.Helper()
+	ctx := context.Background()
+	checkouts, err := f.catalog.ListCheckouts(ctx, familyID)
+	require.NoError(t, err)
+	var automatic string
+	for i := range checkouts {
+		if checkouts[i].EffectiveMode == store_sqlite.CheckoutModeAutomatic {
+			automatic = checkouts[i].CheckoutID
+		}
+	}
+	require.NotEmpty(t, automatic, "the family has no automatic checkout to activate")
+	require.True(t, f.srv.lifecycle.ActivateCheckout(automatic, "test select"))
+	deadline := time.Now().Add(30 * time.Second)
+	for f.srv.lifecycle.LiveCoordinators(familyID) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the activated worktree never ran a coordinator")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 // quiesce stops the family's build loops.
 //
-// Reconciliation starts a coordinator for every automatic checkout, and a
-// live coordinator repoints the route it finds at the layers it builds
+// A live coordinator repoints the route it finds at the layers it builds
 // itself: it clears the working-tree slot and puts the route back to pending
 // for the length of the rebuild. A test that installs a route by hand and
 // then reads it has to stop the loops first, or it races that rebuild.
@@ -830,6 +856,10 @@ func TestReconcileCheckoutsReportsWhatItDecided(t *testing.T) {
 func TestReconcileOneFamilyReportsItsLiveCoordinators(t *testing.T) {
 	f := newCheckoutAdminFixture(t)
 	family := f.families(t, map[string]any{}).Families[0]
+
+	// The worktree is dormant until selected; wake it so there is a live
+	// coordinator for the reconcile to count.
+	f.activateWorktree(t, family.FamilyID)
 
 	var all struct {
 		Coordinators int `json:"coordinators"`

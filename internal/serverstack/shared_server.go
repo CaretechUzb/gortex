@@ -603,6 +603,7 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 			ConfigManager: cm,
 			Graph:         g,
 			Logger:        logger,
+			LazyWorktrees: conf.Views.LazyWorktreeActivation,
 			RefViews: indexer.RefViewRetention{
 				RetainInactive:       conf.Views.RetainInactiveDuration(),
 				MaxCachedGenerations: conf.Views.MaxCachedGenerations,

@@ -85,6 +85,10 @@ type realController struct {
 	// copy has no composed view. nil routes to the lifecycle's own per-family
 	// path; tests substitute it to observe the debounce.
 	probeReconcile func(familyID string)
+	// probeActivateCheckout activates one checkout's coordinator when a probe
+	// selects a ready, automatic, unrouted working copy. nil in production →
+	// the real lifecycle call; a test substitutes it to observe the nudge.
+	probeActivateCheckout func(string) bool
 	// multiWatcher is an atomic pointer, not a mu-guarded field: the daemon's
 	// teardown hook reads it, and reading it under mu is what kept `daemon
 	// stop` queued behind a running track / reload / enrichment. One writer
