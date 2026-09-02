@@ -70,9 +70,31 @@ func TestResolveCSharp_LabelPatternVarScopesToItsSection(t *testing.T) {
 		assert.Equal(t, 1, got,
 			"the label's pattern variable dies with its section - the default section's `repo` is the FIELD, exactly one field read")
 	})
+
+	// A braced section body is the one shape whose first statement is a
+	// `block`, not a `*_statement`: it is what the discriminator's block
+	// arm exists for. Without that arm every braced section reads as
+	// all-label and #724 returns in full for the idiomatic
+	// `case X x: { ... }` form.
+	t.Run("case label pattern, braced section bodies", func(t *testing.T) {
+		got := fieldReads(t, `namespace App {
+    public class LbRepo { public int Get(int id) { return id; } }
+    public class LbFlow {
+        private readonly LbRepo repo;
+        public int Run(object o, int k) {
+            switch (o) {
+                case LbRepo repo: { return repo.Get(1); }
+                default: { return repo.Get(2); }
+            }
+        }
+    }
+}`)
+		assert.Equal(t, 1, got,
+			"a braced section body is the section's first statement - the label's pattern variable still dies with its section, exactly one field read")
+	})
 }
 
-// The boundary case that fixes the discriminator as POSITION IN THE
+// The boundary case that motivates the discriminator as POSITION IN THE
 // SECTION, not ancestor node type: a pattern variable introduced by an
 // `if` INSIDE a section's statement list escapes to the switch body
 // (Roslyn reports CS0165 - it resolves to the local and is merely not
@@ -82,6 +104,13 @@ func TestResolveCSharp_LabelPatternVarScopesToItsSection(t *testing.T) {
 // section's `esc.Get(2)` must bind through the body-scoped LOCAL's
 // type, and the same-named DECOY field (which has no Get) must attract
 // nothing.
+//
+// This is a companion assertion, not the discriminator's guard: an `if`
+// pattern binder sits inside a statement, so a discriminator that
+// section-scoped EVERY binder under switch_section would still leave it
+// green. The over-correction is caught by
+// TestResolveCSharpTypedLocal_AliveAcrossSwitchSections (a body-scoped
+// ordinary local), which is the test to keep when touching either.
 func TestResolveCSharp_SectionStatementPatternVarEscapesToBody(t *testing.T) {
 	g := buildCSharpResolverGraph(t, map[string]string{"E.cs": `namespace App {
     public class EbRepo { public int Get(int id) { return id; } }
