@@ -14,6 +14,7 @@ import (
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/daemon"
+	"github.com/zzet/gortex/internal/pathkey"
 )
 
 func TestBeforeTrackDeadlineBoundsDaemonReadiness(t *testing.T) {
@@ -120,8 +121,13 @@ func TestRunTrackWaitTimeoutIncludesControlTrackAndKeepsConfig(t *testing.T) {
 	if loadErr != nil {
 		t.Fatalf("load global config: %v", loadErr)
 	}
+	// runTrack canonicalizes the tracked root (da32db99 "fix canonical
+	// worktree path identity") so the persisted entry resolves macOS's
+	// /var -> /private/var alias; compare on filesystem identity rather than
+	// exact spelling.
+	wantRoot := pathkey.CanonicalExistingRoot(repo)
 	for _, entry := range gc.Repos {
-		if abs, absErr := filepath.Abs(entry.Path); absErr == nil && abs == repo {
+		if pathkey.CanonicalExistingRoot(entry.Path) == wantRoot {
 			return
 		}
 	}
