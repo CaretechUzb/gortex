@@ -1722,6 +1722,7 @@ func generationCapabilityChecklist() []capabilityCase {
 		{iface: (*graph.CrossRepoCandidates)(nil), probe: "CrossRepoCandidates"},
 		{iface: (*graph.CrossRepoEdgeAggregator)(nil), probe: "CrossRepoEdgeCounts"},
 		{iface: (*graph.CrossRepoFlagMarker)(nil), skip: skipWrite, writeFence: writerFamilyFence("cross_repo_flags")},
+		{iface: (*graph.CurrentGenerationRepoEvicter)(nil), skip: skipWrite, writeFence: "TestGenerationScopedFileEvict"},
 		{iface: (*graph.DeadCodeCandidator)(nil), probe: "DeadCodeCandidates"},
 		{iface: (*graph.DerivedContractReplacer)(nil), skip: skipWrite, writeFence: writerFamilyFence("derived_contract_replace")},
 		{iface: (*graph.EdgeAdjacencyForKinds)(nil), probe: "EdgeAdjacencyForKinds"},
