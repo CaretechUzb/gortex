@@ -23,7 +23,6 @@ func TestPassiveCheckpointTransientDeferralsRequestRetry(t *testing.T) {
 
 	t.Run("bulk writer", func(t *testing.T) {
 		s, _ := openTempStore(t)
-		useAmpleBulkPressureFixture(s)
 		s.BeginBulkLoad()
 		if s.bulkConn == nil {
 			t.Fatal("bulk writer did not engage")

@@ -179,38 +179,10 @@ type storeCore struct {
 	bulkDeferredEdgeRows   int64
 	bulkCheckpointNodeRows int64
 	bulkCheckpointEdgeRows int64
-	// bulkCheckpointBackoffShift spaces automatic row-cadence retries after a
-	// reader-limited or timed-out PASSIVE checkpoint. Unlike the former boolean
-	// latch it never disables checkpoints for the rest of a long cold build:
-	// each failed attempt doubles the row interval up to a bounded ceiling, and
-	// the next complete checkpoint restores the base cadence.
-	bulkCheckpointBackoffShift uint8
-	// Pressure counters stay on the base cadence even while checkpoint retries
-	// back off. They make the store inspect WAL/disk headroom often enough to
-	// stop a generation cleanly before a pinned reader can fill the volume.
-	bulkPressureNodeRows int64
-	bulkPressureEdgeRows int64
-	// bulkReusableWALBytes is the physical WAL high-water mark observed after a
-	// complete PASSIVE checkpoint. SQLite can reuse that allocation in place;
-	// pressure policy therefore measures new growth beyond it instead of forcing
-	// a checkpoint storm solely because PASSIVE did not truncate the file.
-	bulkReusableWALBytes int64
-	// bulkWALInspectionBytes is the absolute new-growth watermark for cheap
-	// per-batch WAL stat checks after a checkpoint backs off. It is lowered when
-	// the latest filesystem sample shows limited usable headroom.
-	bulkWALInspectionBytes int64
-	// Package-private seams keep pressure/checkpoint policy deterministic in
-	// tests. Production leaves them nil and uses the filesystem and SQLite.
-	bulkWALPressureProbe  func() bulkWALPressureSnapshot
-	bulkWALSizeProbe      func() (int64, error)
-	bulkPassiveCheckpoint func(context.Context, *sql.Conn, string) (walCheckpointResult, error)
-	bulkLastWALBytes      int64
-	bulkWALProbeFailed    bool
-	// bulkTerminalErr fences writes after a pressure/checkpoint failure has
-	// already terminated this bulk lifecycle. Queued drain batches then observe
-	// the same failure without committing more WAL behind the failed generation.
-	bulkTerminalErr     error
-	bulkTerminalViewGen int64
+	// bulkRowCheckpointBackoff suppresses only automatic row-cadence attempts
+	// after contention makes one bounded checkpoint unproductive. Explicit
+	// seal/planner/final checkpoints remain active. Reset at bulk begin/close.
+	bulkRowCheckpointBackoff bool
 	// These flags mean "bounded FTS maintenance requested" during a
 	// coordinated cold load. The historical names are retained to keep the
 	// cancellation/Close path stable; normal cold finalization never runs a
@@ -943,21 +915,17 @@ func (s *Store) Close() error {
 	var bulkErr error
 	hadBulk := s.bulkConn != nil
 	if hadBulk {
-		terminalErr := s.bulkTerminalErr
-		if terminalErr == nil {
-			if s.deferredFTSOptimize {
-				_, _ = s.execActiveWriteLocked(context.Background(), `INSERT INTO symbol_fts(symbol_fts, rank) VALUES('merge', ?)`, coldFTSMergePages)
-			}
-			if s.deferredContentFTS {
-				_, _ = s.execActiveWriteLocked(context.Background(), `INSERT INTO content_fts(content_fts, rank) VALUES('merge', ?)`, coldFTSMergePages)
-			}
-			s.deferredFTSOptimize = false
-			s.deferredContentFTS = false
-			s.coordinatedBulkLoad = false
-			terminalErr = s.sealBulkIndexesLocked("close")
+		if s.deferredFTSOptimize {
+			_, _ = s.execActiveWriteLocked(context.Background(), `INSERT INTO symbol_fts(symbol_fts, rank) VALUES('merge', ?)`, coldFTSMergePages)
 		}
+		if s.deferredContentFTS {
+			_, _ = s.execActiveWriteLocked(context.Background(), `INSERT INTO content_fts(content_fts, rank) VALUES('merge', ?)`, coldFTSMergePages)
+		}
+		s.deferredFTSOptimize = false
+		s.deferredContentFTS = false
 		s.coordinatedBulkLoad = false
-		bulkErr = errors.Join(terminalErr, s.closeBulkConnectionLocked())
+		sealErr := s.sealBulkIndexesLocked("close")
+		bulkErr = errors.Join(sealErr, s.closeBulkConnectionLocked())
 	}
 	s.writeMu.Unlock()
 
@@ -1489,14 +1457,9 @@ func (s *Store) AddBatch(nodes []*graph.Node, edges []*graph.Edge) {
 
 // AddBatchChecked is the durable, error-returning sibling of AddBatch. It
 // preserves the historical Store interface while allowing long-running index
-// builds to stop on storage pressure without taking down the daemon. If the
-// error matches ErrBulkLoadWALPressure, use errors.As to a
-// *BulkLoadWALPressureError and inspect Committed: false is a pre-transaction
-// admission refusal, while true means the triggering transaction committed in
-// the unpublished generation and must not be retried. Other errors discovered by
-// post-commit bulk maintenance are wrapped by CommittedStorageError and carry
-// the same Committed() bool contract; transaction begin/write/commit failures
-// do not.
+// builds to surface a genuine storage failure (SQLITE_FULL, I/O error, or a
+// failed deferred-index seal) without taking down the daemon, instead of the
+// void AddBatch path that panics through panicOnFatal.
 func (s *Store) AddBatchChecked(nodes []*graph.Node, edges []*graph.Edge) error {
 	_, err := s.addBatchSetOriented(nodes, edges)
 	return wrapStorageError(err)

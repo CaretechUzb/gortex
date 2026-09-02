@@ -397,20 +397,7 @@ func (s *Store) beginBulkLoadLocked() {
 	s.bulkDeferredEdgeRows = 0
 	s.bulkCheckpointNodeRows = 0
 	s.bulkCheckpointEdgeRows = 0
-	s.bulkCheckpointBackoffShift = 0
-	s.bulkPressureNodeRows = 0
-	s.bulkPressureEdgeRows = 0
-	s.bulkReusableWALBytes = 0
-	s.bulkLastWALBytes = 0
-	s.bulkWALProbeFailed = false
-	initialPressure := s.inspectBulkWALPressure()
-	s.bulkWALInspectionBytes = initialPressure.nextInspectionBytes()
-	s.bulkTerminalErr = nil
-	s.bulkTerminalViewGen = 0
-	if err := initialPressure.failureBeforeFirstWrite(); err != nil {
-		s.bulkTerminalErr = err
-		s.bulkTerminalViewGen = s.viewGen
-	}
+	s.bulkRowCheckpointBackoff = false
 	// The bulk path changes durability and secondary-index maintenance outside
 	// the ordinary row mutation protocol. Active receipts therefore fail closed.
 	s.markMutationReceiptsIncompleteLocked()
@@ -423,14 +410,6 @@ func (s *Store) beginBulkLoadLocked() {
 // for a second writer slot while the bulk connection is still pinned.
 func (s *Store) FlushBulk() error {
 	s.writeMu.Lock()
-	if s.bulkTerminalErr != nil {
-		terminalErr := s.bulkTerminalErr
-		s.coordinatedBulkLoad = false
-		closeErr := s.closeBulkConnectionLocked()
-		s.jsonbIngestBuffers.release()
-		s.writeMu.Unlock()
-		return errors.Join(terminalErr, closeErr)
-	}
 	if s.coordinatedBulkLoad {
 		// The outer coordinated window owns index sealing and its final
 		// durability checkpoint. WAL pressure inside that window is already
@@ -460,14 +439,6 @@ func (s *Store) EndCoordinatedBulkLoad() error {
 	if !s.coordinatedBulkLoad {
 		s.writeMu.Unlock()
 		return nil
-	}
-	if s.bulkTerminalErr != nil {
-		terminalErr := s.bulkTerminalErr
-		s.coordinatedBulkLoad = false
-		closeErr := s.closeBulkConnectionLocked()
-		s.jsonbIngestBuffers.release()
-		s.writeMu.Unlock()
-		return errors.Join(terminalErr, closeErr)
 	}
 	s.coordinatedBulkLoad = false
 	if s.deferredFTSOptimize {
@@ -553,12 +524,6 @@ func (s *Store) AbortCoordinatedBulkLoad() error {
 	s.coordinatedBulkLoad = false
 	err := s.closeBulkConnectionLocked()
 	s.jsonbIngestBuffers.release()
-	// Callers reach this boundary only after joining/draining the generation's
-	// producers. It is therefore the explicit point where the post-commit fence
-	// may be retired; End/Flush alone deliberately keep queued same-generation
-	// writes rejected.
-	s.bulkTerminalErr = nil
-	s.bulkTerminalViewGen = 0
 	return err
 }
 
@@ -570,10 +535,10 @@ func (s *Store) noteBulkRowsLocked(nodeRows, edgeRows int) error {
 		return nil
 	}
 	nodeDelta, edgeDelta := int64(nodeRows), int64(edgeRows)
-	s.bulkCheckpointNodeRows += nodeDelta
-	s.bulkCheckpointEdgeRows += edgeDelta
-	s.bulkPressureNodeRows += nodeDelta
-	s.bulkPressureEdgeRows += edgeDelta
+	if !s.bulkRowCheckpointBackoff {
+		s.bulkCheckpointNodeRows += nodeDelta
+		s.bulkCheckpointEdgeRows += edgeDelta
+	}
 
 	var sealReason string
 	if s.bulkIndexesDeferred {
@@ -597,84 +562,20 @@ func (s *Store) noteBulkRowsLocked(nodeRows, edgeRows int) error {
 	if sealReason != "" {
 		return s.sealBulkIndexesLocked(sealReason)
 	}
+	if s.bulkRowCheckpointBackoff {
+		return nil
+	}
 	nodeInterval, edgeInterval := s.bulkCheckpointIntervalsLocked()
-	checkpointDue := s.bulkCheckpointNodeRows >= nodeInterval ||
-		s.bulkCheckpointEdgeRows >= edgeInterval
-	pressureDue := s.bulkPressureNodeRows >= bulkCheckpointNodeInterval ||
-		s.bulkPressureEdgeRows >= bulkCheckpointEdgeInterval
-	// Row count is not a byte bound: one batch can carry unusually large symbol
-	// metadata. The cheap WAL-file stat therefore runs after every committed
-	// bulk batch; DB size and statfs remain on the coarse/near-pressure path.
-	if !pressureDue {
-		walBytes := s.currentBulkWALBytes()
-		pressureDue = s.bulkWALProbeFailed ||
-			s.bulkWALGrowthSinceReusable(walBytes) >= s.bulkWALInspectionThreshold()
+	if s.bulkCheckpointNodeRows >= nodeInterval ||
+		s.bulkCheckpointEdgeRows >= edgeInterval {
+		err := s.checkpointBulkWALPassiveLocked("row_limit")
+		s.noteBulkRowCheckpointResultLocked(err)
 	}
-	var pressure bulkWALPressureSnapshot
-	pressureSampled := false
-	pressureActive := false
-	if pressureDue {
-		s.bulkPressureNodeRows = 0
-		s.bulkPressureEdgeRows = 0
-		pressure = s.inspectBulkWALPressure()
-		pressureSampled = true
-		s.bulkWALInspectionBytes = pressure.nextInspectionBytes()
-		pressureActive = pressure.needsCheckpoint()
-	}
-	if checkpointDue && !pressureSampled {
-		pressure = s.inspectBulkWALPressure()
-		pressureSampled = true
-		s.bulkWALInspectionBytes = pressure.nextInspectionBytes()
-	}
-	if !checkpointDue && !pressureActive {
-		return nil
-	}
-	if pressureSampled {
-		if err := pressure.failureBeforeCheckpoint(); err != nil {
-			s.bulkTerminalErr = err
-			s.bulkTerminalViewGen = s.viewGen
-			return err
-		}
-	}
-
-	result, checkpointErr := s.checkpointBulkWALPassiveLockedResult("row_limit", s.passiveCheckpointWindow())
-	if err := s.noteBulkRowCheckpointResultLocked(checkpointErr); err != nil {
-		s.bulkTerminalErr = err
-		s.bulkTerminalViewGen = s.viewGen
-		return err
-	}
-	if checkpointErr == nil {
-		s.bulkReusableWALBytes = s.currentBulkWALBytes()
-		pressure = s.inspectBulkWALPressure()
-		if err := pressure.failureAfterCheckpoint(result, checkpointErr); err != nil {
-			s.bulkTerminalErr = err
-			s.bulkTerminalViewGen = s.viewGen
-			return err
-		}
-		s.bulkWALInspectionBytes = pressure.nextInspectionBytes()
-		return nil
-	}
-
-	// A nonterminal incomplete checkpoint advances the byte watermark beyond
-	// current growth. Without this, a WAL already above the old absolute
-	// threshold would force a statfs + one-second PASSIVE attempt after every
-	// subsequent batch and defeat the row backoff.
-	pressure = s.inspectBulkWALPressure()
-	if err := pressure.failureAfterCheckpoint(result, checkpointErr); err != nil {
-		s.bulkTerminalErr = err
-		s.bulkTerminalViewGen = s.viewGen
-		return err
-	}
-	s.bulkWALInspectionBytes = pressure.nextInspectionBytes()
 	return nil
 }
 
 func (s *Store) bulkCheckpointIntervalsLocked() (nodeRows, edgeRows int64) {
-	shift := s.bulkCheckpointBackoffShift
-	if shift > bulkCheckpointMaxBackoffShift {
-		shift = bulkCheckpointMaxBackoffShift
-	}
-	return bulkCheckpointNodeInterval << shift, bulkCheckpointEdgeInterval << shift
+	return bulkCheckpointNodeInterval, bulkCheckpointEdgeInterval
 }
 
 // sealBulkIndexesLocked rebuilds the deferred dense indexes without restoring
@@ -741,13 +642,7 @@ func (s *Store) closeBulkConnectionLocked() error {
 	s.bulkDeferredEdgeRows = 0
 	s.bulkCheckpointNodeRows = 0
 	s.bulkCheckpointEdgeRows = 0
-	s.bulkCheckpointBackoffShift = 0
-	s.bulkPressureNodeRows = 0
-	s.bulkPressureEdgeRows = 0
-	s.bulkReusableWALBytes = 0
-	s.bulkWALInspectionBytes = 0
-	s.bulkLastWALBytes = 0
-	s.bulkWALProbeFailed = false
+	s.bulkRowCheckpointBackoff = false
 	s.bulkPrevSync = 0
 	s.bulkPrevCacheSize = 0
 	s.bulkPrevAutoCheckpoint = 0
@@ -791,29 +686,19 @@ func (s *Store) checkpointBulkWALPassiveLocked(boundary string) error {
 }
 
 func (s *Store) checkpointBulkWALPassiveLockedWithin(boundary string, window time.Duration) error {
-	_, err := s.checkpointBulkWALPassiveLockedResult(boundary, window)
-	if err == nil {
-		s.bulkCheckpointBackoffShift = 0
-		s.bulkReusableWALBytes = s.currentBulkWALBytes()
-		s.bulkWALInspectionBytes = bulkWALInspectionFloor
-	}
-	return err
-}
-
-func (s *Store) checkpointBulkWALPassiveLockedResult(boundary string, window time.Duration) (walCheckpointResult, error) {
 	if s.bulkConn == nil {
-		return walCheckpointResult{}, nil
+		return nil
 	}
 	nodeRows, edgeRows := s.bulkCheckpointNodeRows, s.bulkCheckpointEdgeRows
 
 	ctx, cancel := context.WithTimeout(context.Background(), window)
 	defer cancel()
 	started := time.Now()
-	result, err := s.runBulkPassiveCheckpoint(ctx, s.bulkConn, "PASSIVE")
+	result, err := checkpointWALOnceOn(ctx, s.bulkConn, "PASSIVE")
 	// Every bounded attempt consumes one cadence unit, so its counters reset even
-	// when timeout/contention provides no reliable progress. The adaptive retry
-	// state schedules another attempt at a bounded multiple of this cadence; the
-	// independent byte/headroom guard may force it sooner.
+	// when timeout/contention provides no reliable progress. Coordinated loads
+	// then back off later automatic row-limit attempts; the explicit final
+	// checkpoint remains the durability and WAL-drain boundary.
 	s.bulkCheckpointNodeRows = 0
 	s.bulkCheckpointEdgeRows = 0
 	s.emitBulkFinalizeEvent(bulkFinalizeEvent{
@@ -822,25 +707,16 @@ func (s *Store) checkpointBulkWALPassiveLockedResult(boundary string, window tim
 		Busy: result.Busy, WALFrames: result.WALFrames,
 		CheckpointedFrames: result.CheckpointedFrames, Err: err,
 	})
-	return result, err
+	return err
 }
 
-// noteBulkRowCheckpointResultLocked adaptively spaces repeated automatic
-// attempts within the current lifecycle. A complete drain immediately restores
-// the base cadence. Reader/contention failures double the next interval up to a
-// bounded ceiling; all other failures terminate the checked write path.
-func (s *Store) noteBulkRowCheckpointResultLocked(err error) error {
-	if err == nil {
-		s.bulkCheckpointBackoffShift = 0
-		return nil
+// noteBulkRowCheckpointResultLocked backs off repeated automatic attempts only
+// within the current coordinated lifecycle. Explicit checkpoint boundaries do
+// not call it and therefore remain independent of the automatic cadence.
+func (s *Store) noteBulkRowCheckpointResultLocked(err error) {
+	if s.coordinatedBulkLoad && shouldBackoffBulkRowCheckpoint(err) {
+		s.bulkRowCheckpointBackoff = true
 	}
-	if shouldBackoffBulkRowCheckpoint(err) {
-		if s.bulkCheckpointBackoffShift < bulkCheckpointMaxBackoffShift {
-			s.bulkCheckpointBackoffShift++
-		}
-		return nil
-	}
-	return err
 }
 
 func shouldBackoffBulkRowCheckpoint(err error) bool {
@@ -850,7 +726,8 @@ func shouldBackoffBulkRowCheckpoint(err error) bool {
 	if errors.Is(err, context.DeadlineExceeded) || isSQLiteBusyErr(err) {
 		return true
 	}
-	return false
+	var timeout interface{ Timeout() bool }
+	return errors.As(err, &timeout) && timeout.Timeout()
 }
 
 // coldGraphStoreEmpty proves this is a fresh, never-indexed store. Nodes and
