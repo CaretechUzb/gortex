@@ -3413,14 +3413,18 @@ func (s *Server) buildGraphStatsPayload(ctx context.Context) map[string]any {
 	result["edge_identity_revisions"] = s.readerFor(ctx).EdgeIdentityRevisions()
 
 	if s.multiIndexer != nil && s.multiIndexer.IsMultiRepo() {
-		// BUG_FIX_CONTEXT: an unbounded per-repo dump here made the MCP unusable on large
-		// monorepos. The gortex://stats resource is advertised "read at session start to
-		// orient", so an agent reads it on connect — and a full GraphStats for every one of
-		// the hundreds of tracked sub-repos a monorepo decomposes into overflowed the agent's
-		// context window before any user turn (small repos: IsMultiRepo()==false → no dump →
-		// fine). Cap to the top-N repos by node count + a truncation marker; per-repo detail
-		// for one repo stays available via graph_stats repo=<prefix>.
-		result["per_repo"] = cappedRepoStats(s.readerFor(ctx).RepoStats(), graphStatsPerRepoCap)
+		// The per-repo dump is bounded two ways. Each entry is only the
+		// node/edge totals — no per-repo histogram and no edge join — so it
+		// reads from the persisted counters instead of scanning the nodes
+		// and edges tables. The number of entries is then capped with a
+		// truncation marker. Both matter because the gortex://stats resource
+		// is advertised "read at session start to orient": an agent reads it
+		// on connect, and on a monorepo that decomposes into hundreds of
+		// sub-repos an unbounded full-GraphStats dump overflowed the agent's
+		// context window before any user turn (small repos:
+		// IsMultiRepo()==false → no dump). Per-repo detail for one repo stays
+		// available via graph_stats repo=<prefix>.
+		result["per_repo"] = cappedRepoTotals(perRepoTotals(s.readerFor(ctx)), graphStatsPerRepoCap)
 	}
 
 	result["token_savings"] = s.tokenStatsFor(ctx).snapshot()
@@ -3459,43 +3463,80 @@ func (s *Server) buildGraphStatsPayload(ctx context.Context) map[string]any {
 	return result
 }
 
-// graphStatsPerRepoCap bounds how many per-repo GraphStats entries the
+// graphStatsPerRepoCap bounds how many per-repo entries the
 // gortex://stats resource / graph_stats tool inlines. On a large monorepo
-// gortex tracks hundreds of sub-repos; dumping a full GraphStats per repo
-// into a resource that is read "at session start" overflows an agent's
-// context window — the bug that made the MCP unusable on big monorepos.
+// gortex tracks hundreds of sub-repos; inlining an entry per repo into a
+// resource that is read "at session start" overflows an agent's context
+// window — the bug that made the MCP unusable on big monorepos.
 const graphStatsPerRepoCap = 25
 
-// cappedRepoStats returns the per_repo rollup verbatim when the repo count is
-// within the cap, otherwise the top-`limit` repos by TotalNodes plus a
-// `_truncated` marker pointing at graph_stats repo=<prefix> for the rest.
-// Keeps the stats payload bounded regardless of how many repos are tracked.
-func cappedRepoStats(stats map[string]graph.GraphStats, limit int) map[string]any {
-	out := make(map[string]any, len(stats)+1)
-	if len(stats) <= limit {
-		for k, v := range stats {
-			out[k] = v
+// repoTotal is one repository's whole-graph contribution by count. The
+// stats dump reports these instead of a full per-repo GraphStats so the
+// multi-repo payload stays counter-cheap: the persisted counters already
+// hold the totals, so no per-repo node histogram or edge join is run.
+type repoTotal struct {
+	nodes int
+	edges int
+}
+
+// perRepoTotals returns each repository's node and edge totals for the
+// reader's view. A store or graph that maintains the persisted per-repo
+// counters answers from them in O(repos) with no scan; any other reader —
+// a composed overlay view — falls back to RepoStats, whose per-repo totals
+// are already correct under composition.
+func perRepoTotals(r graph.Reader) map[string]repoTotal {
+	if c, ok := r.(interface {
+		AllRepoMemoryEstimates() map[string]graph.RepoMemoryEstimate
+	}); ok {
+		est := c.AllRepoMemoryEstimates()
+		out := make(map[string]repoTotal, len(est))
+		for repo, e := range est {
+			out[repo] = repoTotal{nodes: e.NodeCount, edges: e.EdgeCount}
+		}
+		return out
+	}
+	rs := r.RepoStats()
+	out := make(map[string]repoTotal, len(rs))
+	for repo, st := range rs {
+		out[repo] = repoTotal{nodes: st.TotalNodes, edges: st.TotalEdges}
+	}
+	return out
+}
+
+// cappedRepoTotals renders per-repo totals into the stats payload:
+// verbatim when the repo count is within the cap, otherwise the top-`limit`
+// repos by node count plus a `_truncated` marker pointing at graph_stats
+// repo=<prefix> for the rest. Keeps the payload bounded regardless of how
+// many repos are tracked.
+func cappedRepoTotals(totals map[string]repoTotal, limit int) map[string]any {
+	entry := func(t repoTotal) map[string]any {
+		return map[string]any{"total_nodes": t.nodes, "total_edges": t.edges}
+	}
+	out := make(map[string]any, len(totals)+1)
+	if len(totals) <= limit {
+		for k, v := range totals {
+			out[k] = entry(v)
 		}
 		return out
 	}
 	type kv struct {
 		name string
-		st   graph.GraphStats
+		t    repoTotal
 	}
-	arr := make([]kv, 0, len(stats))
-	for k, v := range stats {
-		arr = append(arr, kv{name: k, st: v})
+	arr := make([]kv, 0, len(totals))
+	for k, v := range totals {
+		arr = append(arr, kv{name: k, t: v})
 	}
-	sort.Slice(arr, func(i, j int) bool { return arr[i].st.TotalNodes > arr[j].st.TotalNodes })
+	sort.Slice(arr, func(i, j int) bool { return arr[i].t.nodes > arr[j].t.nodes })
 	for i := 0; i < limit; i++ {
-		out[arr[i].name] = arr[i].st
+		out[arr[i].name] = entry(arr[i].t)
 	}
 	out["_truncated"] = map[string]any{
 		"shown":       limit,
-		"total_repos": len(stats),
+		"total_repos": len(totals),
 		"note": fmt.Sprintf("per_repo capped to the top %d of %d tracked repos by node count "+
 			"(context-frugal on monorepos); call graph_stats with repo=<prefix> for a specific repo.",
-			limit, len(stats)),
+			limit, len(totals)),
 	}
 	return out
 }

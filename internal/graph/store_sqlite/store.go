@@ -225,6 +225,7 @@ type storeCore struct {
 	stmtAllRepoCountsNodes  *sql.Stmt
 	stmtAllRepoCountsEdges  *sql.Stmt
 	stmtAllRepoStateCounts  *sql.Stmt
+	stmtIndexStateTotals    *sql.Stmt
 	stmtStatsByKind         *sql.Stmt
 	stmtStatsByLanguage     *sql.Stmt
 
@@ -946,7 +947,7 @@ func (s *Store) Close() error {
 		s.stmtRepoStatsNodes, s.stmtRepoStatsEdges,
 		s.stmtRepoNodeCount, s.stmtRepoEdgeCount,
 		s.stmtAllRepoCountsNodes, s.stmtAllRepoCountsEdges,
-		s.stmtAllRepoStateCounts,
+		s.stmtAllRepoStateCounts, s.stmtIndexStateTotals,
 		s.stmtStatsByKind, s.stmtStatsByLanguage,
 		s.stmtInsertEdge, s.stmtOutEdges, s.stmtInEdges,
 		s.stmtRepoEdges,
@@ -1101,6 +1102,11 @@ func (s *Store) prepare() error {
 	// tracked repo with no scan of nodes or edges.
 	prep(&s.stmtAllRepoStateCounts,
 		`SELECT repo_prefix, node_count, edge_count FROM repo_index_state WHERE view_gen = ?`)
+	// Whole-graph totals summed from the same persisted counters. The
+	// leading COUNT(*) lets the reader tell "no counter rows for this
+	// view" (fall back to the exact scan) from a genuine zero total.
+	prep(&s.stmtIndexStateTotals,
+		`SELECT COUNT(*), COALESCE(SUM(node_count),0), COALESCE(SUM(edge_count),0) FROM repo_index_state WHERE view_gen = ?`)
 
 	prep(&s.stmtStatsByKind,
 		`SELECT kind, COUNT(*) FROM nodes WHERE view_gen = ? GROUP BY kind`)
@@ -2297,13 +2303,39 @@ func (s *Store) EdgeCount() int {
 	return n
 }
 
+// countsFromIndexState returns the whole-graph node and edge totals for
+// this view from the persisted per-repo counters in repo_index_state --
+// one indexed row per tracked repo, with no scan of the nodes or edges
+// tables. ok is false when the view has no counter rows (a never-indexed
+// or pre-counter store) so the caller falls back to the exact scan rather
+// than reporting a counter-absent zero as a real total.
+func (s *Store) countsFromIndexState() (nodes, edges int, ok bool) {
+	var rows int
+	if err := s.stmtIndexStateTotals.QueryRow(s.viewGen).Scan(&rows, &nodes, &edges); err != nil {
+		panicOnFatal(err)
+		return 0, 0, false
+	}
+	if rows == 0 {
+		return 0, 0, false
+	}
+	return nodes, edges, true
+}
+
 func (s *Store) Stats() graph.GraphStats {
 	st := graph.GraphStats{
 		ByKind:     map[string]int{},
 		ByLanguage: map[string]int{},
 	}
-	st.TotalNodes = s.NodeCount()
-	st.TotalEdges = s.EdgeCount()
+	// Totals come from the persisted per-repo counters when present so a
+	// base (view_gen 0) read stays O(repos); the exact scan is the
+	// fallback for a store that has no counter rows yet.
+	if nodes, edges, ok := s.countsFromIndexState(); ok {
+		st.TotalNodes = nodes
+		st.TotalEdges = edges
+	} else {
+		st.TotalNodes = s.NodeCount()
+		st.TotalEdges = s.EdgeCount()
+	}
 
 	rows, err := s.stmtStatsByKind.Query(s.viewGen)
 	if err != nil {
