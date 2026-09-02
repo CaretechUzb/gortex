@@ -50,8 +50,13 @@ func serializeToolsList(t *testing.T, preset, mode string) (int, []string) {
 // Universal structured `view` publication adds a bounded per-tool schema
 // cost. Measured core cost is 97246 bytes; the rounded 97350 baseline keeps
 // sub-1% slack without hiding future growth.
+//
+// Re-based 97350 → 97500 when main's view-selector schema completion and the
+// bounded `**` glob description landed on find_files / get_editing_context /
+// read_file (~194 bytes across the three). Measured core cost is 97440
+// bytes; the rounded margin stays below 1%.
 const (
-	corePresetBaselineBytes = 97350
+	corePresetBaselineBytes = 97500
 	fullPresetBaselineBytes = 289808
 )
 
@@ -86,7 +91,12 @@ const (
 //
 // Re-based 29700 → 29900 for universal structured `view` publication.
 // Measured cost is 29832 bytes; the rounded margin remains below 1%.
-const agentPresetByteCeiling = 29900
+//
+// Re-based 29900 → 30000 when batch_symbols' description grew to disclose the
+// capped neighbourhood and the `callers_truncated` / `callees_truncated`
+// markers (+136 bytes). Measured cost is 29968 bytes; the rounded margin
+// remains below 1%.
+const agentPresetByteCeiling = 30000
 
 // localizationPresetByteCeiling is the hard budget for the diet
 // localization preset (the `localization` instruction profile's tool
@@ -107,7 +117,11 @@ const agentPresetByteCeiling = 29900
 //
 // Re-based 21350 → 21450 for universal structured `view` publication.
 // Measured cost is 21389 bytes; the rounded margin remains below 1%.
-const localizationPresetByteCeiling = 21450
+//
+// Re-based 21450 → 21600 alongside the batch_symbols neighbourhood-truncation
+// description growth (+136 bytes, the same shared tool the agent surface
+// carries). Measured cost is 21525 bytes; the rounded margin remains below 1%.
+const localizationPresetByteCeiling = 21600
 
 // TestToolsListByteCeilings is the permanent measurement gate: it prints the
 // cold tools/list byte cost of every preset and asserts the agent preset

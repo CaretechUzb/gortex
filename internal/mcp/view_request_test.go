@@ -659,7 +659,15 @@ func TestGraceFallbackRequiresAReadyPrimary(t *testing.T) {
 	stack.setWorktreeState(t, store_sqlite.CheckoutStateRemovalGrace)
 	stack.setPrimaryGraphState(t, "graph_building")
 
-	res, err := stack.callWithView(t, stack.worktreeRoot, "search_symbols", worktreeViewArgs(),
+	// Driven from the primary's own root, not the worktree root: a checkout in
+	// removal grace no longer serves an automatic view, so a session sitting
+	// inside it binds unresolved (see
+	// TestAutomaticCheckoutScope_OnlyLiveAutomaticCheckoutsBind) and its
+	// selector would refuse as selector_out_of_scope before readiness is ever
+	// consulted. The primary-not-ready contract is exercised from the in-scope
+	// primary root, where the grace selector resolves and reaches the readiness
+	// gate this test pins.
+	res, err := stack.callWithView(t, stack.repoRoot, "search_symbols", worktreeViewArgs(),
 		captureReader(stack.srv, new(graph.Reader)))
 	if err != nil {
 		t.Fatalf("call: %v", err)
@@ -859,7 +867,12 @@ func TestWorktreeSelectorRefusalsCarryTheirOwnCode(t *testing.T) {
 	t.Run("checkout that stopped answering", func(t *testing.T) {
 		stack := newViewStack(t)
 		stack.setWorktreeState(t, store_sqlite.CheckoutStateUnavailable)
-		res, err := stack.callWithView(t, stack.worktreeRoot, "get_symbol", worktreeArgs(), captureReader(stack.srv, new(graph.Reader)))
+		// From the in-scope primary root: an unavailable worktree no longer
+		// serves an automatic view, so a session inside it binds unresolved and
+		// the selector would refuse as selector_out_of_scope on the scope
+		// ceiling. Named from the primary's own root, the selector resolves and
+		// carries the checkout_inaccessible code its unavailable state earns.
+		res, err := stack.callWithView(t, stack.repoRoot, "get_symbol", worktreeArgs(), captureReader(stack.srv, new(graph.Reader)))
 		if err != nil {
 			t.Fatalf("call: %v", err)
 		}
