@@ -60,7 +60,7 @@ func TestRunKimiPreToolUseReadUnindexedSoftStdout(t *testing.T) {
 func TestRunKimiPreToolUseGrepSymbolDenies(t *testing.T) {
 	cwd := writeGortexProjectMarker(t, t.TempDir())
 	old := grepProbe
-	grepProbe = func(string, time.Duration) ([]grepSymbolHit, error) {
+	grepProbe = func(string, string, time.Duration) ([]grepSymbolHit, error) {
 		return []grepSymbolHit{
 			{Name: "ValidateToken", Kind: "function", FilePath: "internal/auth/token.go", Line: 42},
 		}, nil
