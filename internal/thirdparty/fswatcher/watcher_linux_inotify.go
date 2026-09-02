@@ -282,7 +282,9 @@ func (w *watcher) handleInotifyEvent(p *inotify, e *unix.InotifyEvent, now time.
 	isDir := (e.Mask & unix.IN_ISDIR) != 0
 	if isDir && (e.Mask&(unix.IN_CREATE|unix.IN_MOVED_TO) != 0) {
 		if parentWatch.Depth != WatchTopLevel {
-			p.addWatch(w, &WatchPath{Path: path, Depth: WatchNested})
+			if err := p.addWatch(w, &WatchPath{Path: path, Depth: WatchNested}); err != nil {
+				w.logError("inotify add nested watch error", "error", err)
+			}
 		}
 	}
 
