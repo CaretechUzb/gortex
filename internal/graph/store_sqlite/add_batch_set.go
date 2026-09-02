@@ -573,8 +573,6 @@ func (s *Store) addBatchSetOriented(nodes []*graph.Node, edges []*graph.Edge) (s
 			nodes = append(append(make([]*graph.Node, 0, len(nodes)+len(fresh)), nodes...), fresh...)
 		}
 	}
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
 
 	hasGraphInput := false
 	for _, node := range nodes {
