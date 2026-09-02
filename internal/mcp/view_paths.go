@@ -3,7 +3,6 @@ package mcp
 import (
 	"context"
 	"errors"
-	"fmt"
 	"path/filepath"
 	"strings"
 )
@@ -74,44 +73,6 @@ func (v viewPathRoot) contains(abs string) bool {
 		realAbs = resolveNearestExistingAncestor(abs)
 	}
 	return realAbs != "" && pathContainedIn(filepath.Clean(realAbs), filepath.Clean(realRoot))
-}
-
-// validateAbsolute refuses a path that names another checkout while the
-// request reads a selected worktree. Accepting it would combine graph rows from
-// one view with bytes from a sibling checkout merely because both roots are
-// registered and therefore pass the general repository confinement guard.
-func (v viewPathRoot) validateAbsolute(abs string) error {
-	if v.root == "" || !filepath.IsAbs(abs) || v.contains(abs) {
-		return nil
-	}
-	return fmt.Errorf(
-		"absolute path %q belongs to a different checkout than the selected view rooted at %q; name the file relative to the selected checkout",
-		abs, v.root)
-}
-
-// graphRelative renders an absolute path inside the selected checkout using
-// the spelling stored in the graph. Linked worktree roots are not canonical
-// MultiIndexer roots, so Server.repoRelative cannot attribute them and would
-// otherwise leak the absolute checkout path into mutation responses, sessions,
-// syntax checks, and graph lookups.
-//
-// Prefer the lexical spelling so a symlinked file inside the checkout keeps
-// its own graph identity. When the caller used the physical spelling of a
-// symlinked checkout root (for example /private/tmp for /tmp on macOS), fall
-// back to physical root and target spellings solely to compute the same
-// checkout-relative suffix.
-func (v viewPathRoot) graphRelative(abs string) (string, bool) {
-	if v.root == "" || abs == "" || !filepath.IsAbs(abs) {
-		return "", false
-	}
-	rel, ok := relativeWithinRoot(v.root, abs)
-	if !ok {
-		return "", false
-	}
-	if v.repoPrefix != "" {
-		rel = filepath.Join(v.repoPrefix, rel)
-	}
-	return rel, true
 }
 
 // relativeWithinRoot renders target beneath root without letting a filesystem

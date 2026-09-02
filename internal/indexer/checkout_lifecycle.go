@@ -551,7 +551,7 @@ func (l *CheckoutLifecycle) recordCheckout(
 	// worker removes the dedicated corpus. On restart that stale entry must not
 	// resurrect the intent the durable transition already revoked.
 	restoreExplicitIntent := source != TrackSourceImplicit &&
-		!(seeding && existing != nil && existing.ActiveIntentTransitionID != "")
+		(!seeding || existing == nil || existing.ActiveIntentTransitionID == "")
 	if restoreExplicitIntent {
 		intent := store_sqlite.TrackingIntent{
 			IntentID:      uuid.NewV7().String(),

@@ -205,7 +205,7 @@ func (l *CheckoutLifecycle) promoteCheckoutTransition(
 	index, resampled, err := l.indexPromotedCorpus(ctx, checkout, out.Prefix)
 	out.Index, out.Resampled = index, resampled
 	if err != nil {
-		l.rollbackPromotion(ctx, out.Prefix, "")
+		l.rollbackPromotionOrLog(ctx, out.Prefix, "")
 		return out, l.promotionFailed(ctx, &out, transition, err)
 	}
 
@@ -219,11 +219,11 @@ func (l *CheckoutLifecycle) promoteCheckoutTransition(
 		State:           reconcile.GraphStateReady,
 	}
 	if err := l.catalog.UpsertDedicatedGraph(ctx, row); err != nil {
-		l.rollbackPromotion(ctx, out.Prefix, "")
+		l.rollbackPromotionOrLog(ctx, out.Prefix, "")
 		return out, l.promotionFailed(ctx, &out, transition, err)
 	}
 	if err := l.serveFromOwnCorpus(ctx, checkout); err != nil {
-		l.rollbackPromotion(ctx, out.Prefix, out.GraphID)
+		l.rollbackPromotionOrLog(ctx, out.Prefix, out.GraphID)
 		return out, l.promotionFailed(ctx, &out, transition, err)
 	}
 
@@ -384,6 +384,17 @@ func (l *CheckoutLifecycle) rollbackPromotion(ctx context.Context, prefix, graph
 		}
 	}
 	return nil
+}
+
+// rollbackPromotionOrLog performs the best-effort rollback of a failed
+// promotion and only logs any cleanup error: the caller is already returning
+// the promotion failure that triggered the rollback, so a cleanup error is
+// secondary and has nothing to act on beyond the record.
+func (l *CheckoutLifecycle) rollbackPromotionOrLog(ctx context.Context, prefix, graphID string) {
+	if err := l.rollbackPromotion(ctx, prefix, graphID); err != nil {
+		l.logger.Warn("checkout lifecycle: could not roll back a failed promotion",
+			zap.String("prefix", prefix), zap.String("graph", graphID), zap.Error(err))
+	}
 }
 
 // beginModeChange journals a mode change, adopting the entry an interrupted

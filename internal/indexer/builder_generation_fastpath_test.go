@@ -74,24 +74,6 @@ func fastPathGenerationIdentity(layerID string) GenerationIdentity {
 	}
 }
 
-func fastPathPayloadRequest(identity GenerationIdentity) store_sqlite.PayloadGenerationRequest {
-	return store_sqlite.PayloadGenerationRequest{
-		OwnerKind:            identity.OwnerKind,
-		GraphID:              identity.GraphID,
-		LayerID:              identity.LayerID,
-		CheckoutID:           identity.CheckoutID,
-		GenerationKind:       identity.GenerationKind,
-		BaseGenerationID:     identity.BaseGenerationID,
-		LowerViewFingerprint: identity.LowerViewFingerprint,
-		TreeOID:              identity.TreeOID,
-		ProvenanceCommitOID:  identity.ProvenanceCommitOID,
-		ConfigHash:           identity.ConfigHash,
-		ExtractorVersions:    identity.ExtractorVersions,
-		ResolverVersion:      identity.ResolverVersion,
-		CreatedAt:            identity.CreatedAt,
-	}
-}
-
 func fastPathBuildRequest(t *testing.T, store *store_sqlite.Store, target source.ContentSource, layerID string) BuildRequest {
 	t.Helper()
 	return BuildRequest{

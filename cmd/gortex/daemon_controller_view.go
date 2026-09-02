@@ -390,7 +390,7 @@ func (c *realController) nudgeFamily(familyID string) {
 	go run(familyID)
 }
 
-// nudgeFamilyTopology reconciles a filesystem topology event immediately.
+// nudgeFamilyTopologyRequest reconciles a filesystem topology event immediately.
 //
 // GitWatcher has already debounce-coalesced the fsnotify burst. This layer
 // single-flights duplicate watchers in the same family and remembers one
@@ -398,14 +398,6 @@ func (c *realController) nudgeFamily(familyID string) {
 // trailing edge is essential: removal of the last linked worktree also removes
 // the watched administration directory, so there may be no later event to
 // recover a dropped nudge.
-func (c *realController) nudgeFamilyTopology(familyID string) {
-	c.nudgeFamilyTopologyContext(context.Background(), familyID)
-}
-
-func (c *realController) nudgeFamilyTopologyContext(ctx context.Context, familyID string) {
-	c.nudgeFamilyTopologyRequest(ctx, familyID, nil)
-}
-
 func (c *realController) nudgeFamilyTopologyRequest(ctx context.Context, familyID string, release func()) {
 	request := newTopologyNudgeRequest(ctx, release)
 	if c == nil || familyID == "" {

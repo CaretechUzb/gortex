@@ -2055,53 +2055,6 @@ func BenchmarkMultiWatcherTopologyFamilyRegistration(b *testing.B) {
 	}
 }
 
-func setupMultiWatcherBenchmark(b *testing.B) *MultiWatcher {
-	b.Helper()
-	base := b.TempDir()
-	repoADir := filepath.Join(base, "repo-a")
-	repoBDir := filepath.Join(base, "repo-b")
-	for _, dir := range []string{repoADir, repoBDir} {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			b.Fatalf("create repo dir: %v", err)
-		}
-	}
-	if err := os.WriteFile(filepath.Join(repoADir, "main.go"), []byte("package main\n\nfunc HelloA() {}\n"), 0o644); err != nil {
-		b.Fatalf("write repo-a: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(repoBDir, "main.go"), []byte("package main\n\nfunc HelloB() {}\n"), 0o644); err != nil {
-		b.Fatalf("write repo-b: %v", err)
-	}
-
-	cm, err := config.NewConfigManager(filepath.Join(base, "config.yaml"))
-	if err != nil {
-		b.Fatalf("create config manager: %v", err)
-	}
-	cm.Global().Repos = []config.RepoEntry{
-		{Path: repoADir, Name: "repo-a"},
-		{Path: repoBDir, Name: "repo-b"},
-	}
-	if err := cm.Global().Save(); err != nil {
-		b.Fatalf("save benchmark config: %v", err)
-	}
-
-	g := graph.New()
-	reg := parser.NewRegistry()
-	reg.Register(languages.NewGoExtractor())
-	mi := NewMultiIndexer(g, reg, search.NewNull(), cm, zap.NewNop())
-	if _, err := mi.IndexAll(); err != nil {
-		b.Fatalf("index benchmark repos: %v", err)
-	}
-	configs := map[string]config.WatchConfig{
-		"repo-a": {Enabled: true, DebounceMs: 50, Exclude: []string{"**/*.tmp"}},
-		"repo-b": {Enabled: true, DebounceMs: 50, Exclude: []string{"**/*.tmp"}},
-	}
-	mw, err := NewMultiWatcher(mi, configs, zap.NewNop())
-	if err != nil {
-		b.Fatalf("create multi-watcher: %v", err)
-	}
-	return mw
-}
-
 func BenchmarkMultiWatcherTopologyRetainedDispatch(b *testing.B) {
 	fixture := newTopologyWatchFixture(b, 1)
 	mw := newTopologyRegistry()

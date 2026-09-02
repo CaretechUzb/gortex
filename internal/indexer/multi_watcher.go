@@ -888,7 +888,11 @@ func (mw *MultiWatcher) StopContext(ctx context.Context) error {
 	mw.mu.Unlock()
 
 	if reentrant {
-		go mw.completeStop(plan)
+		go func() {
+			if err := mw.completeStop(plan); err != nil {
+				mw.logger.Warn("multi-watcher: deferred stop completion failed", zap.Error(err))
+			}
+		}()
 		return nil
 	}
 	return mw.completeStop(plan)
@@ -1340,7 +1344,11 @@ func (mw *MultiWatcher) RemoveRepoContext(ctx context.Context, repoPrefix string
 	mw.mu.Unlock()
 
 	if reentrant {
-		go mw.completeWatcherRetirement(retirement)
+		go func() {
+			if err := mw.completeWatcherRetirement(retirement); err != nil {
+				mw.logger.Warn("multi-watcher: deferred watcher retirement failed", zap.Error(err))
+			}
+		}()
 		return nil
 	}
 	return mw.completeWatcherRetirement(retirement)
