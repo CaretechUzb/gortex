@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -608,6 +609,11 @@ type fileIndex struct {
 	// the fact spool keys one row per (class, file), so no other file's
 	// apply can have disturbed this file's calls-edges first.
 	stubsByLine map[int][]stubRef
+	// stubOwners memoizes stubOwnersAt by (line, authored name). Every
+	// call fact on a line asks the same question, so without this the
+	// per-fact scan is quadratic in the sites sharing one physical line
+	// (a generated single-line class body made Enrich 49x slower).
+	stubOwners map[string][]*graph.Node
 }
 
 // stubRef is one snapshotted calls-edge under stubsByLine: the owning
@@ -622,22 +628,26 @@ type stubRef struct {
 // of the given trailing name at line — the callers the extractor already
 // attributed sites there to.
 func (idx *fileIndex) stubOwnersAt(line int, method string) []*graph.Node {
+	key := strconv.Itoa(line) + "\x00" + method
+	if owners, ok := idx.stubOwners[key]; ok {
+		return owners
+	}
 	var owners []*graph.Node
+	seen := make(map[string]struct{})
 	for _, s := range idx.stubsByLine[line] {
 		if !trailingNameMatches(s.to, method) {
 			continue
 		}
-		seen := false
-		for _, o := range owners {
-			if o.ID == s.owner.ID {
-				seen = true
-				break
-			}
+		if _, dup := seen[s.owner.ID]; dup {
+			continue
 		}
-		if !seen {
-			owners = append(owners, s.owner)
-		}
+		seen[s.owner.ID] = struct{}{}
+		owners = append(owners, s.owner)
 	}
+	if idx.stubOwners == nil {
+		idx.stubOwners = make(map[string][]*graph.Node)
+	}
+	idx.stubOwners[key] = owners
 	return owners
 }
 
@@ -647,6 +657,7 @@ func (a *applier) buildIndex(facts *fileFacts) *fileIndex {
 		imports:     make(map[string]string, len(facts.imports)),
 		types:       make(map[string]*graph.Node),
 		stubsByLine: make(map[int][]stubRef),
+		stubOwners:  make(map[string][]*graph.Node),
 	}
 	idx.superTypes = idx.types
 	superKinds := a.supertypeKinds()
@@ -658,6 +669,13 @@ func (a *applier) buildIndex(facts *fileFacts) *fileIndex {
 			idx.imports[imp.Local] = imp.Path
 		}
 	}
+	// stubsByLine is read by applyCall alone, but buildIndex runs in
+	// EVERY apply phase — supers, metas, aliases and calls all reach it
+	// through preparePage, and applyAll builds it once per file whether
+	// or not the file has call facts. Snapshot only when this file's
+	// facts can ever ask: on a mixed corpus half the admitted stubs were
+	// built for phases that never read them (issue #729 item 2).
+	snapshotStubs := len(facts.calls) > 0
 	for _, n := range a.fileNodes(facts.file) {
 		if receiverTypeKinds[n.Kind] {
 			if _, dup := idx.types[n.Name]; !dup {
@@ -672,7 +690,7 @@ func (a *applier) buildIndex(facts *fileFacts) *fileIndex {
 		if n.Kind == graph.KindFunction || n.Kind == graph.KindMethod {
 			idx.funcs = append(idx.funcs, n)
 		}
-		if n.Kind == graph.KindFile {
+		if !snapshotStubs || n.Kind == graph.KindFile {
 			// Some languages park top-level calls on the file node; it is
 			// never an adoptable caller (and the paged compatibility
 			// branch loads file nodes a kind-filtered store would not).
@@ -1143,6 +1161,25 @@ func (a *applier) applyCall(idx *fileIndex, cf callFact, res *semantic.EnrichRes
 	// collects a call it did not author (it has no stub to claim, so it
 	// would mint), and when no tied owner contains the line the site is
 	// refused outright.
+	//
+	// Adoption couples this tier's precision to extraction's attribution
+	// accuracy, and that trade is only sound where extraction is
+	// byte-precise for the owner kind in question. An attribution defect
+	// that used to surface as a harmless unresolved stub surfaces here as
+	// a confident resolved edge instead: issue #728 caught an indexer's
+	// body call parked on a same-line property, promoted to
+	// ast_resolved/0.95 on a member whose whole body was `=> 1`.
+	//
+	// Two different things hold that end up, and they cover different
+	// kinds. The accessor-bearing members (property, indexer, event with
+	// add/remove) record byte extents, so they own their calls outright.
+	// The kinds that still record NONE - operator, conversion operator,
+	// destructor - are held only by the extractor REFUSING a call whose
+	// line owner's recorded bytes provably exclude the offset. That
+	// refusal is what turns their attribution defect into a dropped edge
+	// rather than a confident wrong one. So: giving one of those kinds a
+	// node without giving it extents in the same change re-opens #728,
+	// because adoption would start trusting a line fallback again.
 	var caller *graph.Node
 	owners := idx.stubOwnersAt(cf.line, cf.method)
 	switch len(owners) {
