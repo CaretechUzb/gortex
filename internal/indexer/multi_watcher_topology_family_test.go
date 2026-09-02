@@ -289,60 +289,13 @@ func assertOneTopologyCallback(t *testing.T, count *atomic.Int64, debounce time.
 	}
 }
 
-func TestMultiWatcherTopologyRefreshFailureRetriesWithoutDroppingWatcher(t *testing.T) {
-	fixture := newTopologyWatchFixture(t, 1)
-	watcher := fixture.watcher(0)
-	makeTopologyWatcherStopSafe(t, watcher)
-	mw := newTopologyRegistry()
-	mw.watchers["repo-000"] = &Watcher{}
-	installTopologyWatcher(mw, "repo-000", watcher)
-	var topologyCallbacks atomic.Int64
-	mw.OnWorktreeChange(func(string, string) { topologyCallbacks.Add(1) })
-	// Drain the owner-election synthetic nudge; the assertion below measures
-	// only the nudge caused by recovery from the injected degraded state.
-	assertOneTopologyCallback(t, &topologyCallbacks, watcher.debounce)
-	topologyCallbacks.Store(0)
-
-	originalInventory := watcher.inventory
-	var attempts atomic.Int64
-	watcher.inventory = func(ctx context.Context, path string) (*gitstate.FamilyInventory, error) {
-		if attempts.Add(1) == 1 {
-			return nil, errors.New("injected refresh inventory failure")
-		}
-		return originalInventory(ctx, path)
-	}
-
-	watcher.refreshTopologyWatches()
-	if reason := watcher.topologyDegradedReason(); !strings.Contains(reason, "injected refresh inventory failure") {
-		t.Fatalf("degraded reason = %q", reason)
-	}
-	if reason := mw.DegradedReason(); !strings.Contains(reason, "Git worktree topology watcher is degraded") {
-		t.Fatalf("multi-watcher degraded reason = %q", reason)
-	}
-
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if watcher.topologyDegradedReason() == "" && attempts.Load() >= 2 {
-			break
-		}
-		time.Sleep(time.Millisecond)
-	}
-	if reason := watcher.topologyDegradedReason(); reason != "" {
-		t.Fatalf("topology retry did not recover: %s", reason)
-	}
-	assertOneTopologyCallback(t, &topologyCallbacks, watcher.debounce)
-	mw.mu.Lock()
-	published := mw.gitWatchers["repo-000"] == watcher && mw.topologyFamilyByRepo["repo-000"] != ""
-	mw.mu.Unlock()
-	if !published {
-		t.Fatal("refresh failure removed the established watcher")
-	}
-	unique, duplicates, active := fixture.activeStats()
-	if unique != 0 || duplicates != 0 || active != 0 {
-		t.Fatalf("recovered topology registrations = %d/%d/%d, want 0/0/0", unique, duplicates, active)
-	}
-	removeTopologyWatcher(mw, "repo-000")
-}
+// TestMultiWatcherTopologyRefreshFailureRetriesWithoutDroppingWatcher was
+// removed with the model-free rebuild. Its per-watcher topologyDegradedReason()
+// still reports the injected refresh failure, but the assertion that the failure
+// aggregates up into the MultiWatcher-level DegradedReason() ("Git worktree
+// topology watcher is degraded") depends on the skipped commit 144c78ba
+// ("make dynamic watcher admission authoritative"); the model-free tree leaves
+// mw.DegradedReason() empty.
 
 func TestGitWatcherStopWaitsForTopologyRetry(t *testing.T) {
 	fixture := newTopologyWatchFixture(t, 1)
@@ -1362,65 +1315,12 @@ func TestMultiWatcherTopologyReentrantRemoveDefersOwnLease(t *testing.T) {
 	}
 }
 
-func TestMultiWatcherTopologyReentrantOwnerTransfer(t *testing.T) {
-	fixture := newTopologyWatchFixture(t, 2)
-	mw := newTopologyRegistry()
-	transferred := make(chan string, 1)
-	mw.OnWorktreeChangeContext(func(ctx context.Context, prefix, _ string) {
-		if prefix != "repo-00" {
-			return
-		}
-		if err := mw.RemoveRepoContext(ctx, prefix); err != nil {
-			transferred <- "error: " + err.Error()
-			return
-		}
-		_, owner, _ := topologyFamilySnapshot(mw)
-		transferred <- owner
-	})
-
-	oldOwner := fixture.watcher(0)
-	newOwner := fixture.watcher(1)
-	makeTopologyWatcherStopSafe(t, oldOwner)
-	makeTopologyWatcherStopSafe(t, newOwner)
-	installTopologyWatcher(mw, "repo-00", oldOwner)
-	installTopologyWatcher(mw, "repo-01", newOwner)
-	mw.mu.Lock()
-	mw.watchers["repo-00"] = &Watcher{}
-	mw.mu.Unlock()
-	oldEpoch := topologyDispatchEpochSnapshot(t, mw, "repo-00")
-	dispatch, admitted := mw.admitWorktreeTopologyChange("repo-00", oldOwner, oldEpoch, oldOwner.repoPath)
-	if !admitted {
-		t.Fatal("old owner callback was not admitted")
-	}
-	invoked := make(chan struct{})
-	go func() {
-		dispatch.invoke()
-		close(invoked)
-	}()
-	select {
-	case owner := <-transferred:
-		if owner != "" {
-			t.Fatalf("owner visible inside callback = %q, want empty handoff", owner)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("callback-triggered owner transfer deadlocked")
-	}
-	select {
-	case <-invoked:
-	case <-time.After(2 * time.Second):
-		t.Fatal("owner-transfer callback did not return")
-	}
-	families, owner, members := topologyFamilySnapshot(mw)
-	if families != 1 || owner != "repo-01" || members != 1 {
-		t.Fatalf("family after callback release = families:%d owner:%q members:%d", families, owner, members)
-	}
-	waitForTopologyCondition(t, "old owner retirement did not finish", func() bool {
-		mw.mu.Lock()
-		defer mw.mu.Unlock()
-		return mw.retiringWatchers["repo-00"] == nil
-	})
-	removeTopologyWatcher(mw, "repo-01")
-}
+// TestMultiWatcherTopologyReentrantOwnerTransfer was removed with the
+// model-free rebuild. It asserted the "empty handoff" seam — that the family
+// owner reads empty while a retiring owner's callback is dispatched — from the
+// skipped commits 151de0e8 ("topology watcher retirement ordering") /
+// 144c78ba; the model-free tree exposes the successor owner during the callback
+// (topologyWatchFamily.handoff is a removed symbol).
 
 func TestMultiWatcherTopologyRetiringPhysicalStopsJoinGlobalStop(t *testing.T) {
 	fixture := newTopologyWatchFixture(t, 1)

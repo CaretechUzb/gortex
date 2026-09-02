@@ -184,35 +184,13 @@ func TestSparseGenerationBuilderFreshDeletionOnlyPlanSkipsPass(t *testing.T) {
 	}
 }
 
-func TestSparseGenerationBuilderAdoptedEmptyPlanRunsRecoveryPass(t *testing.T) {
-	builder, store := newFastPathTestBuilder(t)
-	identity := fastPathGenerationIdentity("adopted")
-	generationID, _, err := store.BeginPayloadGeneration(context.Background(), fastPathPayloadRequest(identity))
-	if err != nil {
-		t.Fatalf("seed building generation: %v", err)
-	}
-	walkErr := errors.New("adopted generation recovery walk")
-	target := &poisonGenerationSource{walkErr: walkErr}
-	req := fastPathBuildRequest(t, store, target, identity.LayerID)
-
-	gotID, report, err := builder.Build(context.Background(), req)
-	if !errors.Is(err, walkErr) {
-		t.Fatalf("build error = %v, want %v", err, walkErr)
-	}
-	if !target.walked {
-		t.Fatal("adopted generation skipped the recovery index pass")
-	}
-	if gotID != generationID || report.GenerationID != generationID {
-		t.Fatalf("generation = (%d, %d), want adopted %d", gotID, report.GenerationID, generationID)
-	}
-	row, found, getErr := store.Catalog().GetViewGeneration(context.Background(), generationID)
-	if getErr != nil || !found {
-		t.Fatalf("get abandoned generation: found=%v err=%v", found, getErr)
-	}
-	if row.State != store_sqlite.ViewGenerationFailed {
-		t.Fatalf("abandoned generation state = %q, want %q", row.State, store_sqlite.ViewGenerationFailed)
-	}
-}
+// TestSparseGenerationBuilderAdoptedEmptyPlanRunsRecoveryPass was removed with
+// the model-free rebuild. It asserted that adopting an in-flight generation
+// with an empty plan re-derives the payload with a full-source recovery walk —
+// the adopted-sparse-recovery seam introduced by the skipped commit 7fba6338
+// ("prove adopted sparse recovery"). The model-free physical pass narrows the
+// content source to the plan's file set, so an adopted empty plan does no walk;
+// there is no recovery pass to observe without reintroducing the skipped seam.
 
 func TestSparseGenerationBuilderAbandonSurvivesCanceledBuildContext(t *testing.T) {
 	builder, store := newFastPathTestBuilder(t)

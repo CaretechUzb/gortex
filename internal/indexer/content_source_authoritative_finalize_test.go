@@ -127,7 +127,12 @@ func runContentFinalizeIndex(
 }
 
 func TestAuthoritativeContentSourceFinalizeSweepsOnlyTargetGeneration(t *testing.T) {
-	for _, shadow := range []bool{false, true} {
+	// The shadow=true arm was removed with the model-free rebuild: these indexes
+	// target a derived generation (store.AtGeneration), which indexer.go's
+	// shadowLocallyEligible gate categorically refuses the in-memory shadow, so
+	// shadow_taken is always false here. The shadow=false arm still positively
+	// asserts that invariant.
+	for _, shadow := range []bool{false} {
 		t.Run(fmt.Sprintf("shadow_%t", shadow), func(t *testing.T) {
 			store := builderOpenStore(t, fmt.Sprintf("content-finalize-%t", shadow))
 			target := store.AtGeneration(41)
@@ -157,7 +162,10 @@ func TestAuthoritativeContentSourceFinalizeSweepsOnlyTargetGeneration(t *testing
 }
 
 func TestInterruptedContentSourceIndexRetainsUnvisitedContent(t *testing.T) {
-	for _, shadow := range []bool{false, true} {
+	// The shadow=true arm was removed with the model-free rebuild: a derived
+	// generation target is categorically shadow-ineligible (see the sibling
+	// finalize test), so shadow_taken is always false here.
+	for _, shadow := range []bool{false} {
 		t.Run(fmt.Sprintf("shadow_%t", shadow), func(t *testing.T) {
 			store := builderOpenStore(t, fmt.Sprintf("content-interrupted-%t", shadow))
 			target := store.AtGeneration(51)
