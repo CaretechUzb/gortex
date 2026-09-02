@@ -282,9 +282,10 @@ func TestGenerationScopedExactEdgeDelete(t *testing.T) {
 	}
 }
 
-// TestGenerationScopedFileEvict pins both halves of the eviction split: a file
-// eviction is per-checkout and scopes, a repository eviction is administration
-// and does not.
+// TestGenerationScopedFileEvict pins the file/repository eviction split: both a
+// file eviction and the default repository eviction (EvictRepo) scope to the
+// calling handle's generation; all-generation removal is the explicit
+// EvictRepoAllGenerations / PurgeRepo path instead.
 func TestGenerationScopedFileEvict(t *testing.T) {
 	base, derived := openGenerationWritePair(t)
 
@@ -313,17 +314,24 @@ func TestGenerationScopedFileEvict(t *testing.T) {
 		t.Fatalf("a derived-handle batch eviction removed the base corpus's node: %d rows left", got)
 	}
 
-	// Repository eviction is deliberately generation-blind: the repository
-	// leaves the store, so nothing of it may survive in another generation.
+	// Repository eviction defaults to the calling handle's generation: base
+	// clears its own generation-0 rows while the derived generation-1 corpus is
+	// left intact. Authoritative all-generation removal is EvictRepoAllGenerations
+	// (or the sidecar-aware PurgeRepo); TestEvictRepoDefaultsToCurrentGeneration
+	// pins that split directly.
 	base.EvictRepo(genWriteRepo)
-	for _, gen := range []int64{baseViewGeneration, 1} {
+	countAtGen := func(gen int64) int {
 		var count int
 		if err := base.db.QueryRow(`SELECT COUNT(*) FROM nodes WHERE view_gen = ?`, gen).Scan(&count); err != nil {
 			t.Fatalf("count nodes at generation %d: %v", gen, err)
 		}
-		if count != 0 {
-			t.Fatalf("EvictRepo left %d nodes at generation %d; repo administration must reach every generation", count, gen)
-		}
+		return count
+	}
+	if got := countAtGen(baseViewGeneration); got != 0 {
+		t.Fatalf("EvictRepo left %d nodes at generation 0; it must clear the calling handle's generation", got)
+	}
+	if got := countAtGen(1); got != 1 {
+		t.Fatalf("EvictRepo changed generation 1 to %d nodes; repo eviction is generation-scoped and must leave the derived generation's surviving node", got)
 	}
 }
 
