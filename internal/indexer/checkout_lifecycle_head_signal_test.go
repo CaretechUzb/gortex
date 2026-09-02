@@ -25,7 +25,6 @@ func newHeadSignalCoordinator(
 	cycles := make(chan struct{}, 8)
 	coordinator := &CheckoutCoordinator{
 		checkoutID:     checkoutID,
-		graphID:        graphID,
 		gate:           gate,
 		logger:         zap.NewNop(),
 		quiet:          time.Millisecond,
@@ -149,7 +148,6 @@ func BenchmarkCheckoutLifecycleStableHeadIdentity(b *testing.B) {
 	const graphID = "graph-benchmark"
 	coordinator := &CheckoutCoordinator{
 		checkoutID: checkoutID,
-		graphID:    graphID,
 		done:       make(chan struct{}),
 		signal:     make(chan struct{}, 1),
 	}

@@ -16,6 +16,21 @@ import (
 	"github.com/zzet/gortex/internal/reach"
 )
 
+// observedShadowDecision reads the single "shadow-swap decision" log entry the
+// builder emits and returns its shadow_taken verdict.
+func observedShadowDecision(t testing.TB, logs *observer.ObservedLogs) bool {
+	t.Helper()
+	entries := logs.FilterMessage("indexer: shadow-swap decision").All()
+	if len(entries) != 1 {
+		t.Fatalf("shadow decisions = %d, want 1", len(entries))
+	}
+	taken, ok := entries[0].ContextMap()["shadow_taken"].(bool)
+	if !ok {
+		t.Fatalf("shadow decision has no boolean shadow_taken: %#v", entries[0].ContextMap())
+	}
+	return taken
+}
+
 // The reach topology writer under a sparse generation build.
 //
 // One process-global gate serialises every reach reader against every topology

@@ -48,7 +48,6 @@ func TestExplicitRetrackDoesNotReelectPrimaryAfterClosure(t *testing.T) {
 		config.RepoEntry{Path: f.main, Name: f.mainPrefix}, TrackSourceCLI)
 	require.NoError(t, err)
 	require.NoError(t, retracked.CatalogErr)
-	require.False(t, retracked.Pending)
 
 	graphs, err := f.catalog.ListDedicatedGraphs(ctx, f.familyID)
 	require.NoError(t, err)

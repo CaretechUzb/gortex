@@ -6,7 +6,6 @@ import (
 	"io"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"testing"
 
 	"go.uber.org/zap"

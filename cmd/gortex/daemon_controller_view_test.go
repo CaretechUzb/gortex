@@ -720,7 +720,6 @@ func TestAttachedWatcherDiscoversAndForgetsLinkedWorktree(t *testing.T) {
 		Name: "topology-event",
 	}, indexer.TrackSourceCLI)
 	require.NoError(t, err)
-	require.False(t, registration.Pending, "the tiny dedicated base should publish before watcher attachment")
 	require.NotEmpty(t, registration.CheckoutID)
 	require.NotEmpty(t, registration.FamilyID)
 	require.NotEmpty(t, registration.GraphID)

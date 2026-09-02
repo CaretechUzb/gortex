@@ -160,7 +160,7 @@ func checkoutBudgetOverview(checkoutCount int) indexer.FamiliesOverview {
 		PrimaryRepoPrefix: "repo-high-cardinality",
 		Graphs: []indexer.GraphOverview{{
 			GraphID: "graph-primary", RepoPrefix: "repo-high-cardinality",
-			IsPrimary: true, State: store_sqlite.DedicatedGraphStateReady, Served: true,
+			IsPrimary: true, State: "ready", Served: true,
 		}},
 		Checkouts: checkouts,
 	}}}
@@ -331,7 +331,7 @@ func TestApplyCheckoutOverviewBudgetTrimsGraphsAndRefViewsInsideFamily(t *testin
 						GraphID: fmt.Sprintf("graph-%03d-%s", i, strings.Repeat("g", 80)),
 						RepoPrefix: fmt.Sprintf("repo-%03d/%s", i,
 							strings.Repeat("representative-prefix/", 6)),
-						State: store_sqlite.DedicatedGraphStateReady, Served: true,
+						State: "ready", Served: true,
 					})
 				}
 				return indexer.FamiliesOverview{Families: []indexer.FamilyOverview{{
@@ -393,7 +393,7 @@ func TestApplyCheckoutOverviewBudgetPreservesCheckoutAndGraphHeads(t *testing.T)
 			RepoPrefix: fmt.Sprintf("repo-%03d/%s", i,
 				strings.Repeat("representative-prefix/", 5)),
 			IsPrimary: i == 0,
-			State:     store_sqlite.DedicatedGraphStateReady,
+			State:     "ready",
 			Served:    true,
 		})
 	}

@@ -4,8 +4,31 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"testing"
+	"time"
 )
+
+// payloadLifecycleRaceStore opens a fresh store and returns a seed
+// PayloadGenerationRequest keyed by suffix. Shared by the catalog listing
+// and route-batch tests.
+func payloadLifecycleRaceStore(t testing.TB, suffix string) (*Store, PayloadGenerationRequest) {
+	t.Helper()
+	store, err := Open(filepath.Join(t.TempDir(), suffix+".sqlite"))
+	if err != nil {
+		t.Fatalf("open payload lifecycle store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	return store, PayloadGenerationRequest{
+		OwnerKind:      "dedicated_graph",
+		GraphID:        "graph-" + suffix,
+		LayerID:        "layer-" + suffix,
+		CheckoutID:     "checkout-" + suffix,
+		GenerationKind: "commit",
+		TreeOID:        "tree-" + suffix,
+		CreatedAt:      time.Now().Unix(),
+	}
+}
 
 func seedListedGeneration(
 	t testing.TB,

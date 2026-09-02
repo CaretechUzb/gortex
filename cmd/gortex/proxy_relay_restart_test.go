@@ -241,7 +241,6 @@ func stopProxyRestartDaemon(t *testing.T, server *daemon.Server, done <-chan err
 	shutdownErr := server.Shutdown()
 	select {
 	case err := <-done:
-		server.ReleaseProcessState()
 		if shutdownErr != nil {
 			t.Fatal(shutdownErr)
 		}
@@ -281,7 +280,6 @@ func BenchmarkProxyRestartDaemonLifecycle(b *testing.B) {
 		if err := <-done; err != nil {
 			b.Fatal(err)
 		}
-		server.ReleaseProcessState()
 	}
 }
 

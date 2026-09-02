@@ -111,7 +111,6 @@ func spinUpDaemonWithConfig(t *testing.T) (configPath, socket, trackedRoot strin
 		shutdownErr := d.Shutdown()
 		select {
 		case err := <-serveDone:
-			d.ReleaseProcessState()
 			require.NoError(t, shutdownErr)
 			require.NoError(t, err)
 		case <-time.After(2 * time.Second):

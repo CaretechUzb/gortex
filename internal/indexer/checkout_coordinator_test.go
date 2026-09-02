@@ -14,6 +14,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/gitstate"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/graphview"
@@ -33,7 +34,7 @@ import (
 const coordinatorAdminName = "worktree"
 
 type coordinatorFixture struct {
-	t *testing.T
+	t testing.TB
 
 	store   *store_sqlite.Store
 	catalog *store_sqlite.Catalog
@@ -55,7 +56,7 @@ type coordinatorFixture struct {
 
 // newCoordinatorFixture builds the family, indexes the primary and writes the
 // catalog identity a coordinator needs to exist.
-func newCoordinatorFixture(t *testing.T) *coordinatorFixture {
+func newCoordinatorFixture(t testing.TB) *coordinatorFixture {
 	t.Helper()
 	builderIsolateGit(t)
 
@@ -161,7 +162,7 @@ func (f *coordinatorFixture) writeCatalogIdentity() {
 // coordinator builds one over the fixture, with the self-signal off: the tests
 // decide when a cycle runs, either by signalling inside a synctest bubble or by
 // calling the cycle directly.
-func (f *coordinatorFixture) coordinator(t *testing.T, cfg CheckoutCoordinatorConfig) *CheckoutCoordinator {
+func (f *coordinatorFixture) coordinator(t testing.TB, cfg CheckoutCoordinatorConfig) *CheckoutCoordinator {
 	t.Helper()
 	cfg.CheckoutID = f.checkoutID
 	cfg.CheckoutRoot = f.worktree
@@ -199,7 +200,7 @@ func (f *coordinatorFixture) coordinator(t *testing.T, cfg CheckoutCoordinatorCo
 // the struct rather than in the loop. Stopping the loop is what lets a test
 // assert on that self-signal — a running loop would consume it and arm a window
 // of its own, which is a second cycle the test did not ask for.
-func (f *coordinatorFixture) inertCoordinator(t *testing.T, cfg CheckoutCoordinatorConfig) *CheckoutCoordinator {
+func (f *coordinatorFixture) inertCoordinator(t testing.TB, cfg CheckoutCoordinatorConfig) *CheckoutCoordinator {
 	t.Helper()
 	coordinator := f.coordinator(t, cfg)
 	if err := coordinator.Close(); err != nil {
@@ -634,39 +635,6 @@ func TestCoordinatorPersistsSameCommitRefSwitchWithoutMovingRoute(t *testing.T) 
 	if checkout.HeadRef != "refs/heads/same-commit-alias" {
 		t.Fatalf("catalog HEAD ref = %q, want same-commit alias", checkout.HeadRef)
 	}
-}
-
-func BenchmarkCoordinatorStableHeadObservation(b *testing.B) {
-	f := newCoordinatorFixture(b)
-	c := f.inertCoordinator(b, CheckoutCoordinatorConfig{})
-	ctx := context.Background()
-	cycle := c.reconcile(ctx)
-	if cycle.Err != nil {
-		b.Fatalf("initial reconcile: %v", cycle.Err)
-	}
-	sample, err := c.sampler.Sample(ctx)
-	if err != nil {
-		b.Fatal(err)
-	}
-	sample, err = c.canonicalDirtySnapshot(ctx, sample)
-	if err != nil {
-		b.Fatal(err)
-	}
-
-	writes := 0
-	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
-		changed, err := c.updateCheckoutHead(ctx, sample)
-		if err != nil {
-			b.Fatal(err)
-		}
-		if changed {
-			writes++
-		}
-	}
-	b.StopTimer()
-	b.ReportMetric(float64(writes)/float64(b.N), "head-writes/op")
 }
 
 // TestCoordinatorReusesCommitAcrossIsolatedDirtyStates combines the cache and
