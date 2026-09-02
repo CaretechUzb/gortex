@@ -29,16 +29,20 @@ import (
 // a stub anywhere there removes exactly the seam the tests exist to check.
 
 // activateAndWait activates one checkout and blocks until its coordinator is
-// registered. Activation is fire-and-forget, so the build lands on the
-// lifecycle's own goroutine; the poll is what lets a test read the result
-// deterministically without reaching into the activation's internals.
+// registered — the point at which SignalCheckout will find it, which is the
+// precondition the tests that go on to signal or read the checkout rely on. A
+// coordinator whose build loop has merely started is not yet in the registry,
+// so the poll waits on registry membership rather than on a live loop.
+// Activation is fire-and-forget, so the build lands on the lifecycle's own
+// goroutine; the poll is what lets a test read the result deterministically
+// without reaching into the activation's internals.
 func (f *lifecycleFixture) activateAndWait(checkoutID string) {
 	f.t.Helper()
 	if !f.lc.ActivateCheckout(checkoutID, "test activation") {
 		f.t.Fatalf("activation of %s was rejected", checkoutID)
 	}
 	deadline := time.Now().Add(15 * time.Second)
-	for !f.lc.hasCoordinator(checkoutID) {
+	for !f.lc.coordinatorRegistered(checkoutID) {
 		if time.Now().After(deadline) {
 			f.t.Fatalf("coordinator for %s never came up after activation", checkoutID)
 		}

@@ -273,3 +273,19 @@ func (l *CheckoutLifecycle) hasCoordinator(checkoutID string) bool {
 	}
 	return l.runningLocked(checkoutID)
 }
+
+// coordinatorRegistered reports whether the checkout's coordinator is in the
+// registry — the exact precondition SignalCheckout needs. Unlike hasCoordinator
+// it ignores a build loop that has started but not yet registered, so a caller
+// that must go on to signal the coordinator waits on registry membership, the
+// condition SignalCheckout itself checks, rather than on a loop that is merely
+// running.
+func (l *CheckoutLifecycle) coordinatorRegistered(checkoutID string) bool {
+	if l == nil {
+		return false
+	}
+	l.coordMu.Lock()
+	defer l.coordMu.Unlock()
+	_, ok := l.coordinators[checkoutID]
+	return ok
+}
