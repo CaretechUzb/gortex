@@ -1828,7 +1828,12 @@ func (mi *MultiIndexer) runGlobalGraphPassesTopologyHeld(
 	// carries the caller's detached census attestation: admission censuses read
 	// the raw whole store while synthesizer execution keeps the scoped view.
 	fwStart := time.Now()
-	fwRep := resolver.RunFrameworkSynthesizersScopedWithCensus(mi.graph, changedPrefixes, censusEligible)
+	fwRep := resolver.RunFrameworkSynthesizersScopedWithCensusAndSelection(
+		mi.graph,
+		changedPrefixes,
+		censusEligible,
+		mi.frameworkSynthesizerSelection(changedPrefixes),
+	)
 	mi.logger.Info("global pass: framework dispatch synthesis",
 		zap.Int("edges", fwRep.Total),
 		zap.Any("per_synthesizer", fwRep.Per),
