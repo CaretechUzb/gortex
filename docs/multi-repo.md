@@ -70,6 +70,15 @@ The embedded MCP fallback is a machine-level, default-off policy. Enable `mcp.al
 
 `synthesize_external_calls: true` (opt-in, default off — set in `.gortex.yaml` or the global config) makes the resolver synthesize placeholder nodes for calls into un-indexed external packages or sibling services, so call-chains keep the external hop instead of terminating at the indexed boundary.
 
+`index.framework_synthesizers` controls framework-derived resolution work. An
+omitted key preserves the complete registry, `[]` disables the whole framework
+pipeline, and a non-empty list enables only those named synthesizers and
+claiming resolvers. For a shared graph pass, an omitted key in any participating
+repository enables the complete registry; otherwise Gortex uses the union of
+the participating repositories' allow-lists. This keeps a repository from
+silently losing framework edges requested by a sibling while allowing a
+workspace where every repository opts out to avoid the scans entirely.
+
 ## Daemon tuning (optional)
 
 The daemon's defaults handle typical workflows without configuration. These knobs exist for monorepos, branch-heavy workflows, or filesystems without fsnotify support.
