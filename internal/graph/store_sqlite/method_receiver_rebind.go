@@ -23,12 +23,35 @@ var (
 // replacement all come from the same corpus. The phantom-target probe rides in
 // the LEFT JOIN's ON clause rather than the WHERE, so a target that exists only
 // in another generation reads as absent instead of dropping the row.
+//
+// Both queries use CROSS JOIN, and that keyword is load-bearing (issue #651).
+// INDEXED BY pins which index a relation is read through, but it does not pin
+// the order of the nested loops: the planner still picks the outer relation
+// from sqlite_stat1. When the partial receiver index nodes_go_receiver_type
+// carried a tiny or zero believed cardinality — the literal '0 0 0 0 0' row
+// that ANALYZE writes when no Go type/interface node exists yet is the common
+// case, and a believed 1-3 rows flips the same way — SQLite chose to SCAN the
+// receiver index outermost and re-drove the member_of side once per receiver
+// type: O(types * member_of), hours on a real store. CROSS JOIN is SQLite's
+// documented join-order constraint (the right relation is always the inner
+// loop), so the plan below is independent of statistics at every believed
+// cardinality. Only the two inner joins carry the keyword: t can never precede
+// e because it depends on e, so the LEFT JOIN cannot become the driver whether
+// or not it is pinned. The keyword is needed only to stop c (and m) from being
+// hoisted above e. Pinning t ahead of c is not a cost regression — t is one
+// primary-key probe per surviving (e, m) row wherever it sits in the loop
+// order — and the plan it yields is e, m, t, c.
+//
+// goMethodReceiverCandidatesForFilesSQL in method_receiver_rebind_batch.go
+// uses the same construct, and for the same reason, to pin its
+// frontier -> method -> edge -> receiver chain; the batch_frontier_zero_row
+// plan lock holds that one to the seek plan.
 const goMethodReceiverCandidatesGlobalSQL = `
 SELECT e.id, MIN(c.id)
 FROM edges AS e INDEXED BY edges_by_kind
-JOIN nodes AS m ON m.id = e.from_id AND m.view_gen = ?
+CROSS JOIN nodes AS m ON m.id = e.from_id AND m.view_gen = ?
 LEFT JOIN nodes AS t ON t.id = e.to_id AND t.view_gen = ?
-JOIN nodes AS c INDEXED BY nodes_go_receiver_type
+CROSS JOIN nodes AS c INDEXED BY nodes_go_receiver_type
   ON c.repo_prefix = m.repo_prefix
  AND c.file_dir = e.member_receiver_dir
  AND c.name = e.member_receiver
@@ -50,16 +73,19 @@ HAVING COUNT(*) = 1 AND MIN(c.id) <> e.to_id`
 // The scoped sibling starts from nodes_by_file and reaches member_of through
 // edges_by_from. This matters for partial indexing: repeatedly scanning the
 // global member index once per changed file would turn the streaming tail back
-// into O(files*all_methods).
+// into O(files*all_methods). The CROSS JOINs keep that method-first order
+// fixed for the same reason the global query needs them: the file-scoped
+// method set must stay the outermost loop no matter what sqlite_stat1
+// believes about the receiver or edge indexes.
 const goMethodReceiverCandidatesForFileSQL = `
 SELECT e.id, MIN(c.id)
 FROM nodes AS m INDEXED BY nodes_by_file
-JOIN edges AS e INDEXED BY edges_by_from
+CROSS JOIN edges AS e INDEXED BY edges_by_from
   ON e.from_id = m.id
  AND e.kind = 'member_of'
  AND e.view_gen = ?
 LEFT JOIN nodes AS t ON t.id = e.to_id AND t.view_gen = ?
-JOIN nodes AS c INDEXED BY nodes_go_receiver_type
+CROSS JOIN nodes AS c INDEXED BY nodes_go_receiver_type
   ON c.repo_prefix = m.repo_prefix
  AND c.file_dir = e.member_receiver_dir
  AND c.name = e.member_receiver

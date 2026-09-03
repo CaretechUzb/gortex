@@ -14,13 +14,22 @@ const goMethodReceiverFileTableSQL = `CREATE TEMP TABLE IF NOT EXISTS go_receive
 // sibling does (see method_receiver_rebind.go): the edge, the owning method,
 // the current target and the canonical replacement are all held to the writing
 // handle's generation, and the target probe stays in the LEFT JOIN's ON clause.
+//
+// Every join that could otherwise be hoisted above the frontier carries CROSS
+// JOIN for the same reason the global query does (issue #651): INDEXED BY pins
+// which index a relation is read through, never the order of the nested loops,
+// so a tiny or zero believed cardinality on nodes_go_receiver_type would let
+// the planner drive from `c` and re-read the frontier once per receiver type.
+// Pinning `c` costs nothing — it is a three-column seek per surviving (m, e)
+// row wherever it sits — and the plan is now f, m, e, t, c at every believed
+// cardinality rather than only at the ones measured so far.
 const goMethodReceiverCandidatesForFilesSQL = `
 SELECT e.id, MIN(c.id)
 FROM temp.go_receiver_rebind_files AS f
 CROSS JOIN nodes AS m INDEXED BY nodes_by_file
 CROSS JOIN edges AS e INDEXED BY edges_by_from
 LEFT JOIN nodes AS t ON t.id = e.to_id AND t.view_gen = ?
-JOIN nodes AS c INDEXED BY nodes_go_receiver_type
+CROSS JOIN nodes AS c INDEXED BY nodes_go_receiver_type
   ON c.repo_prefix = m.repo_prefix
  AND c.file_dir = e.member_receiver_dir
  AND c.name = e.member_receiver
