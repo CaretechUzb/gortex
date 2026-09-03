@@ -358,19 +358,69 @@ func validBatchExpectedSHA256(expected string) bool {
 	return err == nil && len(decoded) == sha256.Size
 }
 
-// guardBatchLifecycleDestination rejects every symlink component below the
-// lexical repository root. General file resolution permits in-repo symlinks,
-// which is correct for reads, but a move destination must not redirect a
-// transaction write through either a symlink leaf or a symlinked parent.
-// The repository root itself is deliberately not inspected so checkouts under
-// symlinked system prefixes remain valid.
-func (s *Server) guardBatchLifecycleDestination(absPath string) error {
-	cleanPath := filepath.Clean(absPath)
-	root := ""
+// batchCheckoutCandidate is one spelling of a checkout a request may write
+// through, with the identity behind it when the spelling exists on disk.
+type batchCheckoutCandidate struct {
+	spelling string
+	identity os.FileInfo
+}
+
+// batchLifecycleRoot returns the innermost checkout containing a lifecycle
+// path, in the caller's own spelling, plus whether any checkout is known at
+// all. A control client with no known roots gets ("", false) and keeps its
+// deliberate no-op posture; ("", true) means checkouts are known and none of
+// them accounts for this spelling, which the callers refuse rather than skip.
+//
+// The candidates are every checkout a request can legitimately write through:
+// each tracked repository root — linked worktrees included, since they are
+// registered under their own prefix like any other repo — the lone indexer's
+// root, and the root of a view the request was routed to. Each is registered
+// in its own spelling and in its symlink-resolved one, and the match runs in
+// two passes.
+//
+// The first pass is lexical: the longest candidate spelling that contains the
+// path wins. It decides every ordinary request, and it is what makes a symlink
+// inside a checkout a component of the path rather than a root of its own —
+// `repoRoot/self -> repoRoot` is a candidate spelling only after resolution,
+// while `repoRoot` itself lexically contains the destination and is the deeper
+// answer the guard needs.
+//
+// The second pass exists for spellings no candidate prefixes: a path that
+// resolves some of its symlinks and not others (macOS hands out /var/folders/…
+// for a checkout registered as /private/var/…), a case variant of the root on a
+// case-insensitive filesystem, or an alias nobody registered. It climbs the
+// caller's own ancestors. A real directory is the root when it IS a checkout
+// root — os.SameFile with a candidate — and it is taken at once, being the
+// deepest such spelling. A symlink ancestor is an alias into a checkout when
+// its resolved location lies inside one; it is remembered rather than taken,
+// and a later (outer) alias replaces it, so that when only aliases identify the
+// checkout the outermost one becomes the root and every link between it and
+// the destination stays in the range the callers inspect. A real directory is
+// never matched by containment: a subdirectory inside a checkout resolves
+// inside it too, and taking one as the root would lift a symlinked parent
+// above the inspected range.
+func (s *Server) batchLifecycleRoot(ctx context.Context, absPath string) (string, bool) {
+	var candidates []batchCheckoutCandidate
+	seen := make(map[string]struct{}, 4)
+	addSpelling := func(spelling string) {
+		spelling = filepath.Clean(spelling)
+		if _, dup := seen[spelling]; dup {
+			return
+		}
+		seen[spelling] = struct{}{}
+		candidate := batchCheckoutCandidate{spelling: spelling}
+		if info, err := os.Stat(spelling); err == nil {
+			candidate.identity = info
+		}
+		candidates = append(candidates, candidate)
+	}
 	considerRoot := func(candidate string) {
-		candidate = filepath.Clean(candidate)
-		if pathContainedIn(cleanPath, candidate) && len(candidate) > len(root) {
-			root = candidate
+		if candidate == "" {
+			return
+		}
+		addSpelling(candidate)
+		if resolved, err := filepath.EvalSymlinks(candidate); err == nil {
+			addSpelling(resolved)
 		}
 	}
 	if s.multiIndexer != nil {
@@ -380,11 +430,94 @@ func (s *Server) guardBatchLifecycleDestination(absPath string) error {
 			}
 		}
 	}
-	if s.indexer != nil && s.indexer.RootPath() != "" {
+	if s.indexer != nil {
 		considerRoot(s.indexer.RootPath())
 	}
+	considerRoot(requestViewPathRoot(ctx).root)
+	if len(candidates) == 0 {
+		return "", false
+	}
+
+	cleanPath := filepath.Clean(absPath)
+	lexical := ""
+	for _, candidate := range candidates {
+		if pathContainedIn(cleanPath, candidate.spelling) && len(candidate.spelling) > len(lexical) {
+			lexical = candidate.spelling
+		}
+	}
+	if lexical != "" {
+		return lexical, true
+	}
+
+	isCheckoutRoot := func(ancestor string) bool {
+		info, err := os.Stat(ancestor)
+		if err != nil {
+			return false
+		}
+		for _, candidate := range candidates {
+			if candidate.identity != nil && os.SameFile(info, candidate.identity) {
+				return true
+			}
+		}
+		return false
+	}
+	aliasesCheckout := func(ancestor string) bool {
+		resolved, err := filepath.EvalSymlinks(ancestor)
+		if err != nil {
+			return false
+		}
+		resolved = filepath.Clean(resolved)
+		for _, candidate := range candidates {
+			if pathContainedIn(resolved, candidate.spelling) {
+				return true
+			}
+		}
+		return false
+	}
+	// Start at the parent: a lifecycle destination is allowed not to exist, so
+	// the path itself has no spelling to resolve.
+	symlinked := ""
+	for ancestor := filepath.Dir(cleanPath); ; {
+		info, err := os.Lstat(ancestor)
+		switch {
+		case err != nil:
+		case info.Mode()&os.ModeSymlink != 0:
+			if aliasesCheckout(ancestor) {
+				symlinked = ancestor
+			}
+		case isCheckoutRoot(ancestor):
+			return ancestor, true
+		}
+		parent := filepath.Dir(ancestor)
+		if parent == ancestor {
+			return symlinked, true
+		}
+		ancestor = parent
+	}
+}
+
+// guardBatchLifecycleDestination inspects every component of a move destination
+// strictly below the checkout root batchLifecycleRoot selects, Lstat-ing each
+// and refusing the destination when one is a symlink. The root itself is not
+// inspected, which is what keeps a checkout under a symlinked system prefix
+// valid. A symlink can be the root only when it is a registered spelling of a
+// checkout or an alias that resolves into one; the write then still lands
+// inside that checkout, and every component below the alias is inspected.
+// General file resolution permits in-repo symlinks, which is correct for
+// reads, but a move destination must not redirect a transaction write through
+// either a symlink leaf or a symlinked parent.
+func (s *Server) guardBatchLifecycleDestination(ctx context.Context, absPath string) error {
+	cleanPath := filepath.Clean(absPath)
+	root, known := s.batchLifecycleRoot(ctx, cleanPath)
 	if root == "" {
-		return nil
+		if !known {
+			return nil
+		}
+		// Path resolution admitted the destination, so its real location is
+		// inside some checkout — yet no spelling of one accounts for it.
+		// Skipping the walk here would leave whatever redirected the path
+		// uninspected, so the destination is refused instead.
+		return fmt.Errorf("move destination %s is not spelled under any indexed checkout", cleanPath)
 	}
 
 	rel, err := filepath.Rel(root, cleanPath)
@@ -410,8 +543,8 @@ func (s *Server) guardBatchLifecycleDestination(absPath string) error {
 	return nil
 }
 
-func (s *Server) validateBatchCreateTarget(absPath, relPath string) error {
-	if err := s.guardBatchLifecycleDestination(absPath); err != nil {
+func (s *Server) validateBatchCreateTarget(ctx context.Context, absPath, relPath string) error {
+	if err := s.guardBatchLifecycleDestination(ctx, absPath); err != nil {
 		return err
 	}
 	_, err := os.Lstat(absPath)
@@ -425,7 +558,7 @@ func (s *Server) validateBatchCreateTarget(absPath, relPath string) error {
 	}
 }
 
-func (s *Server) readBatchBuffers(plans []plannedBatchEdit) (map[string]*batchFileBuffer, []string, error) {
+func (s *Server) readBatchBuffers(ctx context.Context, plans []plannedBatchEdit) (map[string]*batchFileBuffer, []string, error) {
 	buffers := make(map[string]*batchFileBuffer)
 	paths := make([]string, 0)
 	add := func(path, relPath string) error {
@@ -467,7 +600,7 @@ func (s *Server) readBatchBuffers(plans []plannedBatchEdit) (map[string]*batchFi
 			return nil, nil, err
 		}
 		if plan.destinationPath != "" {
-			if err := s.guardBatchLifecycleDestination(plan.destinationPath); err != nil {
+			if err := s.guardBatchLifecycleDestination(ctx, plan.destinationPath); err != nil {
 				return nil, nil, err
 			}
 			if err := add(plan.destinationPath, plan.destination); err != nil {
@@ -726,7 +859,7 @@ func (s *Server) runBatchTransaction(ctx context.Context, edits []batchEditItem,
 		return s.finishBatchTransaction(state, receipt, "aborted", "unchanged", "not_started", receipt.Results[0].Error), nil
 	}
 
-	buffers, orderedPaths, readErr := s.readBatchBuffers(plans)
+	buffers, orderedPaths, readErr := s.readBatchBuffers(ctx, plans)
 	if readErr != nil {
 		receipt.Results = batchFailureResults(plans, 0, readErr.Error())
 		receipt.Summary = batchSummary(receipt.Results)
@@ -782,7 +915,7 @@ func (s *Server) runBatchTransaction(ctx context.Context, edits []batchEditItem,
 		}
 		var commitErr error
 		if !buffer.existsBefore {
-			if targetErr := s.validateBatchCreateTarget(path, buffer.relPath); targetErr != nil {
+			if targetErr := s.validateBatchCreateTarget(ctx, path, buffer.relPath); targetErr != nil {
 				commitErr = targetErr
 			} else {
 				commitErr = writer(path, buffer.content, buffer.mode)
