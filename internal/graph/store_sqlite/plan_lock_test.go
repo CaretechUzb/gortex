@@ -29,6 +29,10 @@ import (
 //   - stream scoped edges      → streamScopedEdges keyset cursor
 //     (scoped projection tests lock the no-temp-btree property)
 //   - BFS adjacency expansion  → store_bfs.go builders (store_bfs_test.go)
+//   - rebind receiver candidates → goMethodReceiverCandidates{Global,ForFile,ForFiles}SQL
+//     (method_receiver_rebind_plan_lock_test.go locks the join ORDER, not just
+//     the index: those queries run under four statistics regimes because a
+//     tiny sqlite_stat1 row inverts the order INDEXED BY cannot pin)
 //
 // A new hot query lands with a row in this table. Rows run against a
 // realistically-shaped fixture WITH planner statistics (ANALYZE), because
