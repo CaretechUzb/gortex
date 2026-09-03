@@ -1525,8 +1525,17 @@ func (s *Server) handleReindexRepository(ctx context.Context, req mcp.CallToolRe
 	pathArg := req.GetString("path", "")
 
 	var (
-		result *indexer.IndexResult
-		err    error
+		result      *indexer.IndexResult
+		err         error
+		reindexRoot string
+		// eligible is snapshotted BEFORE the pass runs: only receipts that
+		// had already failed when the indexer read the file may be resolved
+		// by it. A mutation that lands mid-pass, fails its own ingest and
+		// completes before this handler returns would otherwise be stamped
+		// fresh, certifying bytes the graph never read. Using pass start as
+		// the cutoff declines some safe resolutions, which is the right way
+		// to be wrong here.
+		eligible map[string]struct{}
 	)
 
 	// Multi-repo mode: route through the per-repo indexer so nodes keep
@@ -1553,6 +1562,8 @@ func (s *Server) handleReindexRepository(ctx context.Context, req mcp.CallToolRe
 					"reindex_repository: no repository specified and the active repository is ambiguous; pass `path`"), nil
 			}
 		}
+		reindexRoot, _ = s.multiIndexer.RepoRoot(prefix)
+		eligible = s.failedReceiptsBefore(paths, reindexRoot)
 		result, err = s.multiIndexer.IncrementalReindexRepo(prefix, paths)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
@@ -1573,10 +1584,28 @@ func (s *Server) handleReindexRepository(ctx context.Context, req mcp.CallToolRe
 		if absErr != nil {
 			return mcp.NewToolResultError(absErr.Error()), nil
 		}
+		reindexRoot = root
+		eligible = s.failedReceiptsBefore(paths, reindexRoot)
 		result, err = s.indexer.IncrementalReindexPaths(root, paths)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
+	}
+
+	// A successful scoped re-parse is exactly the evidence a terminally failed
+	// freshness receipt for that path is waiting for, so clear it here: a
+	// failed ingest otherwise fail-closes change.detect for the whole
+	// repository until retention lapses, and reindex is the recovery callers
+	// reach for first (#692).
+	//
+	// Deliberately narrow. IncrementalReindexRepo scopes the pass to the given
+	// paths, so with exactly one requested path a non-zero StaleFileCount
+	// proves that file was re-parsed. With several paths the count cannot be
+	// attributed per path, and clearing a receipt for a file that was not
+	// re-parsed would be a false green — the very thing the receipt exists to
+	// prevent — so anything wider is left alone.
+	if resolved, ok := reindexedReceiptPath(paths, reindexRoot, result); ok {
+		s.resolveReindexedPathReceipts(resolved, eligible)
 	}
 
 	s.RunAnalysis()
@@ -1602,6 +1631,68 @@ func (s *Server) handleReindexRepository(ctx context.Context, req mcp.CallToolRe
 		payload["failed_files"] = result.FailedFiles
 	}
 	return s.respondJSONOrTOON(ctx, req, payload)
+}
+
+// reindexCandidatePath resolves the single requested path against the repo
+// root. Split out from reindexedReceiptPath so the pre-pass snapshot and the
+// post-pass resolution agree on the spelling by construction: if they ever
+// disagreed, the snapshot would bound the wrong receipts.
+func reindexCandidatePath(paths []string, root string) (string, bool) {
+	if len(paths) != 1 {
+		return "", false
+	}
+	resolved := paths[0]
+	if !filepath.IsAbs(resolved) {
+		if root == "" {
+			return "", false
+		}
+		resolved = filepath.Join(root, resolved)
+	}
+	return filepath.Clean(resolved), true
+}
+
+// reindexedReceiptPath reports the absolute path whose failed freshness
+// receipts a reindex pass has earned the right to resolve, if any.
+//
+// Deliberately narrow. IncrementalReindexRepo scopes the pass to the requested
+// paths, so with exactly one requested path a non-zero StaleFileCount proves
+// that file was re-parsed. With several paths the count cannot be attributed
+// per path, and clearing a receipt for a file that was not re-parsed would be
+// a false green — the very thing the receipt exists to prevent — so anything
+// wider resolves nothing.
+//
+// Two properties worth stating because both are fail-closed by construction
+// and would be surprising to rediscover: path comparison is case-sensitive,
+// so a spelling difference on a case-insensitive filesystem silently skips a
+// resolution rather than making a wrong one; and `paths` may name a directory,
+// which returns a directory path here and then matches no receipt, because
+// receipts hold file paths and matching is exact equality. If receipt matching
+// ever became prefix-based, that second property would turn into a hole.
+func reindexedReceiptPath(paths []string, root string, result *indexer.IndexResult) (string, bool) {
+	if len(paths) != 1 || result == nil || result.StaleFileCount <= 0 {
+		return "", false
+	}
+	resolved, ok := reindexCandidatePath(paths, root)
+	if !ok {
+		return "", false
+	}
+
+	// FailedFiles carries ABSOLUTE paths (pinned by
+	// TestIncrementalReindex_FailedFileSurfacedAndRetried) while paths[0] is
+	// whatever spelling the caller passed, so the comparison has to happen
+	// after the join — checking the raw request alone lets a relative request
+	// walk straight past this guard, which is the only thing standing between
+	// a file that failed to index and a barrier that reports it fresh.
+	// StaleFileCount counts discovered-stale files INCLUDING the ones that
+	// then failed, so it cannot stand in for this check. Both spellings are
+	// compared because refusing a resolution is always the safe direction.
+	requested := filepath.Clean(paths[0])
+	for _, failed := range result.FailedFiles {
+		if clean := filepath.Clean(failed); clean == resolved || clean == requested {
+			return "", false
+		}
+	}
+	return resolved, true
 }
 
 func (s *Server) handleGetSymbol(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
