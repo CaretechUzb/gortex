@@ -475,24 +475,87 @@ func TestMutationStatusRefreshesPendingGraphStatus(t *testing.T) {
 // cannot otherwise draw: only "pending" resolves on its own, so every other
 // graph_status must announce itself as terminal or a caller will wait on it
 // forever.
+func TestMutationStatusTerminalForWritesThatNeverHappened(t *testing.T) {
+	// markNotApplied and markFailed leave graph at the same "stale" seed an
+	// in-flight record carries, but they are genuinely terminal: nothing was
+	// written, so no reindex is coming. Terminality has to follow the recorded
+	// flag rather than the status string, and these are the two cases where
+	// the string alone would give the wrong answer in the safe-looking
+	// direction.
+	for _, tc := range []struct {
+		name string
+		mark func(*mutationCommitRecord)
+	}{
+		{"nothing was written", func(r *mutationCommitRecord) { r.markNotApplied(errors.New("refused")) }},
+		{"the write failed", func(r *mutationCommitRecord) { r.markFailed(errors.New("disk full")) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newMutationServer()
+			record := s.beginMutationCommit(context.Background(), "edit_file", "", "fp", "pkg/a.go", "/abs/pkg/a.go")
+			tc.mark(record)
+
+			payload := s.mutationStatusPayload(record)
+			require.Equal(t, mutationGraphStale, payload["graph_status"])
+			require.Equal(t, true, payload["graph_status_terminal"],
+				"a mutation that never reached disk is waiting for nothing")
+			require.Equal(t, true, payload["retry_safe"])
+		})
+	}
+}
+
+func TestMutationCommitListingCarriesGraphTerminality(t *testing.T) {
+	// The listing is a second entry point onto the same records. Rendering
+	// graph_status there without the flag hands an agent the reading this
+	// whole change exists to stop.
+	s := newMutationServer()
+	inflight := s.beginMutationCommit(context.Background(), "edit_file", "", "fp-a", "pkg/a.go", "/abs/pkg/a.go")
+	inflight.markCommitted("sha-a", 10)
+
+	settled := s.beginMutationCommit(context.Background(), "edit_file", "", "fp-b", "pkg/b.go", "/abs/pkg/b.go")
+	settled.markCommitted("sha-b", 10)
+	settled.recordGraph(mutationReindexOutcome{})
+
+	byPath := map[string]map[string]any{}
+	for _, entry := range mutationCommitListingPayload([]*mutationCommitRecord{inflight, settled}) {
+		path, _ := entry["path"].(string)
+		byPath[path] = entry
+	}
+	require.Len(t, byPath, 2)
+	require.Equal(t, false, byPath["pkg/a.go"]["graph_status_terminal"],
+		"an in-flight record was listed as settled")
+	require.Equal(t, true, byPath["pkg/b.go"]["graph_status_terminal"],
+		"a recorded stale record was listed as still moving")
+	require.Equal(t, mutationGraphStale, byPath["pkg/a.go"]["graph_status"])
+	require.Equal(t, mutationGraphStale, byPath["pkg/b.go"]["graph_status"],
+		"both render the same status string; only the flag separates them")
+}
+
 func TestMutationStatusMarksTerminalGraphStatus(t *testing.T) {
 	cases := []struct {
-		name     string
-		outcome  mutationReindexOutcome
-		graph    string
-		terminal bool
-		noteHas  string
+		name string
+		// unrecorded skips recordGraph, leaving the record in the state
+		// beginMutationCommit created it in. No other case reaches that state,
+		// which is why the flag could be wrong there while every recorded case
+		// stayed green.
+		unrecorded bool
+		outcome    mutationReindexOutcome
+		graph      string
+		terminal   bool
+		noteHas    string
 	}{
-		{"pending is the only value worth waiting on",
+		{"an edit still in flight is not terminal", true,
+			mutationReindexOutcome{},
+			mutationGraphStale, false, "not settled"},
+		{"pending is the only value worth waiting on", false,
 			mutationReindexOutcome{Pending: true, Receipt: "mutation-none", Generation: 1},
 			mutationGraphPending, false, "resolves on its own"},
-		{"fresh is terminal",
+		{"fresh is terminal", false,
 			mutationReindexOutcome{Reindexed: true},
 			mutationGraphFresh, true, "has read these bytes"},
-		{"stale is terminal and says so",
+		{"stale is terminal and says so", false,
 			mutationReindexOutcome{},
 			mutationGraphStale, true, "will NOT become"},
-		{"failed is terminal and says so",
+		{"failed is terminal and says so", false,
 			mutationReindexOutcome{Err: errors.New("context deadline exceeded")},
 			mutationGraphFailed, true, "Waiting will not change it"},
 	}
@@ -501,7 +564,9 @@ func TestMutationStatusMarksTerminalGraphStatus(t *testing.T) {
 			s := newMutationServer()
 			record := s.beginMutationCommit(context.Background(), "edit_file", "", "fp", "pkg/a.go", "/abs/pkg/a.go")
 			record.markCommitted("sha", 10)
-			record.recordGraph(tc.outcome)
+			if !tc.unrecorded {
+				record.recordGraph(tc.outcome)
+			}
 
 			payload := s.mutationStatusPayload(record)
 			require.Equal(t, tc.graph, payload["graph_status"])
