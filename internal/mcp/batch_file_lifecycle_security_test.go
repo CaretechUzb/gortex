@@ -201,3 +201,93 @@ func TestAtomicBatchLifecycleDestinationGuards(t *testing.T) {
 		}
 	})
 }
+
+// caseAliasPath returns the upper-cased spelling of name when the filesystem
+// under dir resolves it to the file that was written as name, and reports
+// false on a case-sensitive filesystem where the two spellings are two files.
+func caseAliasPath(t *testing.T, dir, name string) (string, bool) {
+	t.Helper()
+	alias := filepath.Join(dir, strings.ToUpper(name))
+	if _, err := os.Lstat(alias); err != nil {
+		return "", false
+	}
+	return alias, true
+}
+
+func TestAtomicBatchLifecycleAliasedPathsRefused(t *testing.T) {
+	t.Run("hard link", func(t *testing.T) {
+		s := newAtomicBatchTestServer(t, mutationTestWatcher{})
+		dir := t.TempDir()
+		source := writeAtomicBatchFixture(t, dir, "a.txt", "source\n")
+		alias := filepath.Join(dir, "b.txt")
+		if err := os.Link(source, alias); err != nil {
+			t.Skipf("hard links unavailable: %v", err)
+		}
+
+		receipt, err := s.runBatchTransaction(context.Background(), []batchEditItem{
+			atomicFileEdit(source, "source", "edited"),
+			atomicFileDelete(alias, ""),
+		}, "file-lifecycle-hard-link")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if receipt.Status != "aborted" || receipt.DiskStatus != "unchanged" || !strings.Contains(receipt.Error, "name the same file") {
+			t.Fatalf("receipt = %+v", receipt)
+		}
+		if got := readAtomicBatchFixture(t, source); got != "source\n" {
+			t.Fatalf("source = %q", got)
+		}
+		if _, err := os.Stat(alias); err != nil {
+			t.Fatalf("hard link was removed: %v", err)
+		}
+	})
+
+	t.Run("case alias", func(t *testing.T) {
+		s := newAtomicBatchTestServer(t, mutationTestWatcher{})
+		dir := t.TempDir()
+		source := writeAtomicBatchFixture(t, dir, "a.txt", "source\n")
+		alias, ok := caseAliasPath(t, dir, "a.txt")
+		if !ok {
+			t.Skip("filesystem is case-sensitive; two spellings are two files")
+		}
+
+		receipt, err := s.runBatchTransaction(context.Background(), []batchEditItem{
+			atomicFileEdit(source, "source", "edited"),
+			atomicFileDelete(alias, ""),
+		}, "file-lifecycle-case-alias")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if receipt.Status != "aborted" || receipt.DiskStatus != "unchanged" || !strings.Contains(receipt.Error, "name the same file") {
+			t.Fatalf("receipt = %+v", receipt)
+		}
+		if got := readAtomicBatchFixture(t, source); got != "source\n" {
+			t.Fatalf("source = %q", got)
+		}
+	})
+
+	t.Run("case-only rename", func(t *testing.T) {
+		s := newAtomicBatchTestServer(t, mutationTestWatcher{})
+		dir := t.TempDir()
+		source := writeAtomicBatchFixture(t, dir, "a.txt", "source\n")
+		destination, ok := caseAliasPath(t, dir, "a.txt")
+		if !ok {
+			t.Skip("filesystem is case-sensitive; two spellings are two files")
+		}
+
+		// A case-only rename is one inode under two spellings, so the batch
+		// cannot describe it as a move: refuse rather than plan two futures.
+		receipt, err := s.runBatchTransaction(context.Background(), []batchEditItem{
+			atomicFileMove(source, destination, ""),
+		}, "file-lifecycle-case-only-rename")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if receipt.Status != "aborted" || receipt.DiskStatus != "unchanged" || !strings.Contains(receipt.Error, "name the same file") {
+			t.Fatalf("receipt = %+v", receipt)
+		}
+		if got := readAtomicBatchFixture(t, source); got != "source\n" {
+			t.Fatalf("source = %q", got)
+		}
+	})
+}

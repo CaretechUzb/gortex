@@ -40,6 +40,7 @@ type batchFileBuffer struct {
 	relPath      string
 	mode         os.FileMode // permission bits preserved when writing replacement files
 	fileMode     os.FileMode // complete mode retained for symlink and regular-file checks
+	info         os.FileInfo // Lstat result retained so two spellings of one file are detectable
 	original     []byte
 	content      []byte
 	existsBefore bool
@@ -445,6 +446,7 @@ func (s *Server) readBatchBuffers(plans []plannedBatchEdit) (map[string]*batchFi
 				return fmt.Errorf("could not read %s: %w", relPath, readErr)
 			}
 			buffer.fileMode = info.Mode()
+			buffer.info = info
 			// fileMode intentionally describes the path itself for lifecycle
 			// type checks, while mode follows symlinks so edit_file preserves
 			// the permissions of the content source it is replacing.
@@ -474,7 +476,47 @@ func (s *Server) readBatchBuffers(plans []plannedBatchEdit) (map[string]*batchFi
 		}
 	}
 	sort.Strings(paths)
+	if err := rejectAliasedBatchPaths(buffers, paths); err != nil {
+		return nil, nil, err
+	}
 	return buffers, paths, nil
+}
+
+// rejectAliasedBatchPaths refuses a batch whose distinct paths name one file.
+// A hard link, or a case alias on a case-insensitive filesystem, gives one
+// inode two buffers, and the transaction then plans an independent future for
+// each. On a case alias the two spellings are one directory entry, so
+// `edit_file a.txt` plus `delete_file A.txt` deletes what the edit just wrote
+// and reports both as applied. A hard link survives that exact sequence — the
+// writer renames a replacement into place, which breaks the link — and is
+// refused all the same: rollback and the before-image journal are recorded per
+// path and assume independent inodes, so one inode under two entries would be
+// restored through a history that was never written for it.
+//
+// Aliasing is Lstat identity, so a symlink leaf and its target are not aliases.
+// A lifecycle operation on a symlink source is refused outright, and a content
+// edit through a symlink replaces the link with a regular file — pre-existing
+// write behaviour this rule deliberately leaves alone.
+//
+// Two batch items spelling the path identically stay supported — they share one
+// buffer, and lifecycle overlap is already governed by the plan's path owners.
+func rejectAliasedBatchPaths(buffers map[string]*batchFileBuffer, paths []string) error {
+	for i, leftPath := range paths {
+		left := buffers[leftPath]
+		if left == nil || left.info == nil {
+			continue
+		}
+		for _, rightPath := range paths[i+1:] {
+			right := buffers[rightPath]
+			if right == nil || right.info == nil {
+				continue
+			}
+			if os.SameFile(left.info, right.info) {
+				return fmt.Errorf("batch paths %s and %s name the same file", left.relPath, right.relPath)
+			}
+		}
+	}
+	return nil
 }
 
 func applyBatchFileToContent(edit batchEditItem, content []byte) ([]byte, bool, error) {
