@@ -233,9 +233,13 @@ func TestReindexedPathResolvesFailedReceiptsForThatPathOnly(t *testing.T) {
 		RequestedGeneration: 7,
 		Err:                 errors.New("unrelated failure"),
 	})
+	// Snapshot taken where production takes it: before the pass runs. The
+	// in-flight receipt below therefore appears mid-pass and is out of scope
+	// by construction, not by the completed/pending check alone.
+	eligible := s.failedReceiptsBefore([]string{"file.go"}, "/repo-a")
 	inflight := pendingFreshnessReceipt(s, "receipt-inflight", "repo-a", "/repo-a/file.go", 9)
 
-	s.resolveReindexedPathReceipts("/repo-a/file.go")
+	s.resolveReindexedPathReceipts("/repo-a/file.go", eligible)
 
 	if outcome := failed.outcome(false); outcome.Err != nil || !outcome.Reindexed {
 		t.Fatalf("a re-parsed path did not resolve its failed receipt: %+v", outcome)
@@ -291,6 +295,22 @@ func TestReindexedReceiptPathOnlyResolvesAProvenSinglePath(t *testing.T) {
 		{"a whole-repo pass resolves nothing", nil, "/repo", stale, "", false},
 		{"nothing was re-parsed", []string{"a.go"}, "/repo", &indexer.IndexResult{StaleFileCount: 0}, "", false},
 		{"the path itself failed to index", []string{"a.go"}, "/repo", &indexer.IndexResult{StaleFileCount: 1, FailedFiles: []string{"a.go"}}, "", false},
+		// The spelling production actually produces: FailedFiles is absolute
+		// while the caller asked with a relative path. Comparing the raw
+		// request alone lets this walk past the guard and stamp a file that
+		// failed to index as fresh.
+		{
+			"an absolute failed file is refused for a relative request",
+			[]string{"internal/a.go"}, "/repo",
+			&indexer.IndexResult{StaleFileCount: 1, FailedFiles: []string{filepath.Join("/repo", "internal", "a.go")}},
+			"", false,
+		},
+		{
+			"an absolute failed file is refused for an absolute request",
+			[]string{absFixture}, "/repo",
+			&indexer.IndexResult{StaleFileCount: 1, FailedFiles: []string{absFixture}},
+			"", false,
+		},
 		{"a relative path without a known root is not guessed", []string{"a.go"}, "", stale, "", false},
 		{"a missing result resolves nothing", []string{"a.go"}, "/repo", nil, "", false},
 	}
@@ -302,6 +322,78 @@ func TestReindexedReceiptPathOnlyResolvesAProvenSinglePath(t *testing.T) {
 					tc.paths, tc.root, got, ok, tc.want, tc.ok)
 			}
 		})
+	}
+}
+
+func TestReindexResolveIgnoresReceiptsThatFailedDuringThePass(t *testing.T) {
+	s := &Server{mutationSafetyWait: time.Millisecond}
+	before := pendingFreshnessReceipt(s, "receipt-before", "repo-a", "/repo-a/file.go", 6)
+	completeFreshnessReceipt(before, indexer.MutationResult{
+		RequestedGeneration: 6,
+		Err:                 errors.New("context deadline exceeded"),
+	})
+
+	eligible := s.failedReceiptsBefore([]string{"file.go"}, "/repo-a")
+
+	// A write that lands, fails its own ingest, and completes while the
+	// indexer pass is still running. The pass read the bytes as they were at
+	// its start, so its success is evidence about those bytes and about
+	// nothing written afterwards.
+	during := pendingFreshnessReceipt(s, "receipt-during", "repo-a", "/repo-a/file.go", 7)
+	completeFreshnessReceipt(during, indexer.MutationResult{
+		RequestedGeneration: 7,
+		Err:                 errors.New("ingest failed"),
+	})
+
+	s.resolveReindexedPathReceipts("/repo-a/file.go", eligible)
+
+	if outcome := before.outcome(false); outcome.Err != nil || !outcome.Reindexed {
+		t.Fatalf("the receipt the pass actually covers was not resolved: %+v", outcome)
+	}
+	if outcome := during.outcome(false); outcome.Err == nil {
+		t.Fatalf("a write that failed while the pass ran was stamped fresh: %+v", outcome)
+	}
+
+	err := s.awaitMutationFreshnessForRepos(context.Background(), "repo-a")
+	if err == nil || !strings.Contains(err.Error(), "receipt-during") {
+		t.Fatalf("the barrier stopped reporting the mid-pass failure: %v", err)
+	}
+	if strings.Contains(err.Error(), "receipt-before") {
+		t.Fatalf("the barrier still reports the resolved receipt: %v", err)
+	}
+}
+
+func TestFailedReceiptsBeforeRefusesToSnapshotAnUnattributablePass(t *testing.T) {
+	s := &Server{mutationSafetyWait: time.Millisecond}
+	failed := pendingFreshnessReceipt(s, "receipt-failed", "repo-a", "/repo-a/file.go", 6)
+	completeFreshnessReceipt(failed, indexer.MutationResult{
+		RequestedGeneration: 6,
+		Err:                 errors.New("context deadline exceeded"),
+	})
+
+	// Every shape reindexedReceiptPath also refuses. A nil snapshot has to
+	// resolve nothing on its own, so the two guards cannot drift into a state
+	// where one of them alone is what stands between a failed ingest and a
+	// fresh verdict.
+	for _, tc := range []struct {
+		name  string
+		paths []string
+		root  string
+	}{
+		{"several paths", []string{"a.go", "b.go"}, "/repo-a"},
+		{"whole-repo pass", nil, "/repo-a"},
+		{"relative path without a root", []string{"file.go"}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if eligible := s.failedReceiptsBefore(tc.paths, tc.root); eligible != nil {
+				t.Fatalf("failedReceiptsBefore(%v, %q) = %v, want nil", tc.paths, tc.root, eligible)
+			}
+		})
+	}
+
+	s.resolveReindexedPathReceipts("/repo-a/file.go", nil)
+	if outcome := failed.outcome(false); outcome.Err == nil {
+		t.Fatalf("a nil snapshot resolved a receipt: %+v", outcome)
 	}
 }
 
