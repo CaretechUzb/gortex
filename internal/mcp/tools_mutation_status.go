@@ -151,7 +151,7 @@ func graphStatusNote(graph string, recorded bool) string {
 	case mutationGraphFresh:
 		return "the graph has read these bytes"
 	case mutationGraphStale:
-		return "the reindex completed without confirming an index write, or no outcome was recorded. This will NOT become \"fresh\" on its own. It also does not gate change.detect — that barrier reads the freshness receipts, not this ledger. The bytes are on disk: verify them and proceed"
+		return "the reindex reported back without confirming an index write. This will NOT become \"fresh\" on its own. It also does not gate change.detect — that barrier reads the freshness receipts, not this ledger. The bytes are on disk: verify them and proceed"
 	case mutationGraphFailed:
 		return "the graph ingest failed terminally. Waiting will not change it. A later successful mutation of this path, or a scoped reindex of it, resolves the freshness receipt that does gate change.detect"
 	default:
@@ -194,14 +194,29 @@ func mutationCommitListingPayload(records []*mutationCommitRecord) []map[string]
 	for _, snap := range snaps {
 		entry := map[string]any{
 			"receipt":               snap.Receipt,
-			"tool":                  snap.Tool,
-			"path":                  snap.Path,
 			"disk_status":           snap.DiskStatus,
 			"graph_status":          snap.GraphStatus,
 			"graph_status_terminal": graphStatusTerminal(snap.GraphStatus, snap.GraphRecorded),
 		}
+		// Every remaining field mirrors mutationCommitSnapshot's omitempty
+		// exactly. Rendering by hand is what dropped new_sha and
+		// bytes_written the first time, so the parity is asserted against the
+		// struct itself rather than trusted here — see
+		// TestMutationCommitListingKeepsEverySnapshotField.
+		if snap.Tool != "" {
+			entry["tool"] = snap.Tool
+		}
+		if snap.Path != "" {
+			entry["path"] = snap.Path
+		}
 		if snap.MutationID != "" {
 			entry["mutation_id"] = snap.MutationID
+		}
+		if snap.NewSHA != "" {
+			entry["new_sha"] = snap.NewSHA
+		}
+		if snap.BytesWritten != 0 {
+			entry["bytes_written"] = snap.BytesWritten
 		}
 		if snap.Error != "" {
 			entry["error"] = snap.Error

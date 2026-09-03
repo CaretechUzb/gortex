@@ -475,6 +475,70 @@ func TestMutationStatusRefreshesPendingGraphStatus(t *testing.T) {
 // cannot otherwise draw: only "pending" resolves on its own, so every other
 // graph_status must announce itself as terminal or a caller will wait on it
 // forever.
+func TestMutationCommitListingKeepsEverySnapshotField(t *testing.T) {
+	// mutationCommitListingPayload renders by hand, and the first version of
+	// it silently dropped new_sha and bytes_written from a published payload.
+	// Listing the expected keys here by hand would repeat the same mistake in
+	// the test, so the expectation is derived from mutationCommitSnapshot
+	// itself: whatever the struct marshals, the listing must publish, and
+	// nothing beyond it except the flag the listing exists to add.
+	const added = "graph_status_terminal"
+
+	now := time.Now()
+	for _, tc := range []struct {
+		name   string
+		record *mutationCommitRecord
+	}{
+		{"every field populated", &mutationCommitRecord{
+			id: "commit-full", tool: "edit_file", key: "m-1",
+			relPath: "pkg/a.go", absPath: "/abs/pkg/a.go",
+			disk: mutationDiskCommitted, graph: mutationGraphFresh, graphRecorded: true,
+			newSHA: "sha-abc", bytesWritten: 42, errText: "boom",
+			startedAt: now, committedAt: now,
+		}},
+		// The omitempty half: a hand-rolled map can just as easily publish a
+		// key the struct would have dropped, rendering "" where the caller
+		// saw nothing before.
+		{"only the always-present fields", &mutationCommitRecord{
+			id: "commit-bare", disk: mutationDiskInFlight, graph: mutationGraphStale,
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, err := json.Marshal(tc.record.snapshot())
+			require.NoError(t, err)
+			var marshalled map[string]any
+			require.NoError(t, json.Unmarshal(raw, &marshalled))
+
+			want := make([]string, 0, len(marshalled)+1)
+			for key := range marshalled {
+				want = append(want, key)
+			}
+			want = append(want, added)
+
+			entries := mutationCommitListingPayload([]*mutationCommitRecord{tc.record})
+			require.Len(t, entries, 1)
+			got := make([]string, 0, len(entries[0]))
+			for key := range entries[0] {
+				got = append(got, key)
+			}
+			require.ElementsMatch(t, want, got,
+				"the listing diverged from the snapshot it renders")
+		})
+	}
+
+	// The two fields that were actually lost, asserted by value as well: a key
+	// carrying the wrong content would satisfy the parity check above.
+	record := &mutationCommitRecord{
+		id: "commit-full", tool: "edit_file", relPath: "pkg/a.go",
+		disk: mutationDiskCommitted, graph: mutationGraphFresh, graphRecorded: true,
+		newSHA: "sha-abc", bytesWritten: 42, startedAt: now, committedAt: now,
+	}
+	entry := mutationCommitListingPayload([]*mutationCommitRecord{record})[0]
+	require.Equal(t, "sha-abc", entry["new_sha"],
+		"new_sha is how a caller tells which content actually landed")
+	require.Equal(t, 42, entry["bytes_written"])
+}
+
 func TestMutationStatusTerminalForWritesThatNeverHappened(t *testing.T) {
 	// markNotApplied and markFailed leave graph at the same "stale" seed an
 	// in-flight record carries, but they are genuinely terminal: nothing was
@@ -554,7 +618,7 @@ func TestMutationStatusMarksTerminalGraphStatus(t *testing.T) {
 			mutationGraphFresh, true, "has read these bytes"},
 		{"stale is terminal and says so", false,
 			mutationReindexOutcome{},
-			mutationGraphStale, true, "will NOT become"},
+			mutationGraphStale, true, "reported back without confirming"},
 		{"failed is terminal and says so", false,
 			mutationReindexOutcome{Err: errors.New("context deadline exceeded")},
 			mutationGraphFailed, true, "Waiting will not change it"},
