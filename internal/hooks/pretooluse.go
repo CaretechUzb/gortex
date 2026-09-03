@@ -77,6 +77,10 @@ const gortexMCPToolPrefix = "mcp__gortex__"
 // alternative but the original call still runs and PostToolUse can layer
 // graph context on the actual output.
 func runPreToolUse(data []byte, gortexPort int, mode Mode) {
+	runPreToolUseForHost(data, gortexPort, mode, preToolUseClaude)
+}
+
+func runPreToolUseForHost(data []byte, gortexPort int, mode Mode, host preToolUseHost) {
 	started := time.Now()
 	var input HookInput
 	if err := json.Unmarshal(data, &input); err != nil {
@@ -161,7 +165,7 @@ func runPreToolUse(data []byte, gortexPort int, mode Mode) {
 			hso.UpdatedInput = updatedInput
 		}
 		emitted = hso.AdditionalContext != "" || hso.PermissionDecisionReason != ""
-		emitPreToolUse(HookOutput{HookSpecificOutput: hso})
+		emitPreToolUseForHost(host, input.PermissionMode, HookOutput{HookSpecificOutput: hso})
 		return
 	}
 
@@ -172,7 +176,7 @@ func runPreToolUse(data []byte, gortexPort int, mode Mode) {
 	if mode == ModeConsultUnlock && isGortexMCP {
 		markGraphConsulted(input.SessionID)
 		if updatedInput != nil {
-			emitPreToolUse(HookOutput{HookSpecificOutput: &HookSpecificOutput{
+			emitPreToolUseForHost(host, input.PermissionMode, HookOutput{HookSpecificOutput: &HookSpecificOutput{
 				HookEventName: "PreToolUse",
 				UpdatedInput:  updatedInput,
 			}})
@@ -201,7 +205,7 @@ func runPreToolUse(data []byte, gortexPort int, mode Mode) {
 			return
 		}
 		emitted = hso.AdditionalContext != ""
-		emitPreToolUse(HookOutput{HookSpecificOutput: hso})
+		emitPreToolUseForHost(host, input.PermissionMode, HookOutput{HookSpecificOutput: hso})
 		return
 	}
 
@@ -209,7 +213,7 @@ func runPreToolUse(data []byte, gortexPort int, mode Mode) {
 
 	if result.context == "" && !result.deny {
 		if updatedInput != nil {
-			emitPreToolUse(HookOutput{HookSpecificOutput: &HookSpecificOutput{
+			emitPreToolUseForHost(host, input.PermissionMode, HookOutput{HookSpecificOutput: &HookSpecificOutput{
 				HookEventName: "PreToolUse",
 				UpdatedInput:  updatedInput,
 			}})
@@ -234,7 +238,7 @@ func runPreToolUse(data []byte, gortexPort int, mode Mode) {
 	}
 
 	emitted = true
-	emitPreToolUse(output)
+	emitPreToolUseForHost(host, input.PermissionMode, output)
 }
 
 // enforceLocalizationTerminalPreToolUse applies only the local terminal
@@ -340,8 +344,64 @@ func markGraphConsulted(sessionID string) {
 	}
 }
 
+type preToolUseHost uint8
+
+const (
+	preToolUseClaude preToolUseHost = iota
+	preToolUseCodex
+)
+
+// normalizePreToolUseOutput applies the host-specific rewrite contract without
+// broadening the user's permission policy. Claude Code can ask while carrying
+// updatedInput; Codex requires allow for every rewrite and does not support ask.
+func normalizePreToolUseOutput(host preToolUseHost, permissionMode string, output HookOutput) HookOutput {
+	hso := output.HookSpecificOutput
+	if hso == nil || hso.HookEventName != "PreToolUse" {
+		return output
+	}
+
+	normalized := *hso
+	if normalized.UpdatedInput == nil {
+		// Codex rejects allow when there is no replacement input. Removing it
+		// restores the host's normal permission flow instead of broadening it.
+		if host == preToolUseCodex && normalized.PermissionDecision == "allow" {
+			normalized.PermissionDecision = ""
+			normalized.PermissionDecisionReason = ""
+		}
+		output.HookSpecificOutput = &normalized
+		return output
+	}
+
+	switch normalized.PermissionDecision {
+	case "":
+		if host == preToolUseCodex || isPermissivePermissionMode(permissionMode) {
+			normalized.PermissionDecision = "allow"
+		} else {
+			normalized.PermissionDecision = "ask"
+		}
+	case "allow":
+		// Valid for both hosts when paired with updatedInput.
+	case "ask":
+		if host == preToolUseCodex {
+			normalized.PermissionDecision = "deny"
+			normalized.PermissionDecisionReason = "[Gortex] Codex cannot safely apply an ask rewrite."
+			normalized.UpdatedInput = nil
+		}
+	default:
+		// A deny, defer, or future non-rewrite decision keeps its policy but
+		// cannot carry replacement input.
+		normalized.UpdatedInput = nil
+	}
+	output.HookSpecificOutput = &normalized
+	return output
+}
+
+func emitPreToolUseForHost(host preToolUseHost, permissionMode string, output HookOutput) {
+	emitPreToolUse(normalizePreToolUseOutput(host, permissionMode, output))
+}
+
 // emitPreToolUse marshals a PreToolUse HookOutput to stdout. A marshal
-// failure is swallowed — a hook must never block Claude Code's flow.
+// failure is swallowed — a hook must never block the host agent's flow.
 func emitPreToolUse(output HookOutput) {
 	out, err := json.Marshal(output)
 	if err != nil {
