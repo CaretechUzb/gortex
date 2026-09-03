@@ -621,7 +621,19 @@ func openWithObserver(path string, current int, migrations []schemaMigration, al
 	}
 	// A populated store opened without planner statistics would plan blind
 	// until its next cold bulk load; backfill sqlite_stat1 once here.
-	healPlannerStats(db)
+	if healPlannerStats(db) && readDB != db {
+		// The repair ran on a writer connection, and SQLite bumps the schema
+		// cookie only when sqlite_stat1 is first CREATED — never when its rows
+		// are rewritten. Every reader connection already open (openSQLiteReadPool
+		// pings one into existence above) therefore keeps the pre-repair
+		// statistics for as long as it lives, which on a long-running daemon is
+		// forever. Drop the pool's idle connections so the next reader is a
+		// fresh physical connection that loads the repaired rows on open.
+		// Skipped when the two pools are the same handle: an in-memory store
+		// would lose the database with its last connection.
+		readDB.SetMaxIdleConns(0)
+		readDB.SetMaxIdleConns(sqliteMaxIdleConns)
+	}
 	// In-memory databases have no WAL file to drain, so the periodic
 	// checkpoint is pointless there (and would leak a goroutine per
 	// short-lived test store). Only run it for on-disk stores.
