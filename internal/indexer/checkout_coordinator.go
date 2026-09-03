@@ -1764,7 +1764,14 @@ func servableGeneration(state store_sqlite.ViewGenerationState) bool {
 // with one built under these, so the digest is part of the build identity
 // rather than a diagnostic.
 func indexConfigHash(cfg config.IndexConfig) string {
-	encoded, err := json.Marshal(cfg)
+	normalized := cfg
+	if cfg.FrameworkSynthesizers != nil {
+		names := slices.Clone(*cfg.FrameworkSynthesizers)
+		slices.Sort(names)
+		names = slices.Compact(names)
+		normalized.FrameworkSynthesizers = &names
+	}
+	encoded, err := json.Marshal(normalized)
 	if err != nil {
 		// An unencodable configuration cannot be compared, and treating that
 		// as "matches everything" would reuse a payload built under rules

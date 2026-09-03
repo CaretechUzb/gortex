@@ -4003,7 +4003,9 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			// deferGlobalPasses; the batch caller folds it into
 			// shared multi-repository global-pass pipeline.
 			reporter.Report("framework dispatch synthesis", 0, 0)
-			if rep := resolver.RunFrameworkSynthesizers(idx.graph); rep.Total > 0 {
+			if rep := resolver.RunFrameworkSynthesizersWithSelection(
+				idx.graph, idx.frameworkSynthesizerSelection(),
+			); rep.Total > 0 {
 				idx.logger.Info("framework dispatch calls synthesized",
 					zap.Int("edges", rep.Total),
 					zap.Any("per_synthesizer", rep.Per),
@@ -4914,7 +4916,7 @@ func (idx *Indexer) ResolveAll() {
 	// Framework dynamic-dispatch synthesis (gRPC / Temporal / event
 	// channels / native bridges) depends on InferImplements (the
 	// interface-satisfaction signals) having run first.
-	resolver.RunFrameworkSynthesizers(idx.graph)
+	resolver.RunFrameworkSynthesizersWithSelection(idx.graph, idx.frameworkSynthesizerSelection())
 	// External-call placeholder synthesis (opt-in) — runs after the
 	// resolver and stub passes so only genuinely un-indexed external
 	// targets remain to materialise.

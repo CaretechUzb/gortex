@@ -1,8 +1,10 @@
 package resolver
 
 import (
+	"fmt"
 	"iter"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -188,6 +190,82 @@ func UnstampSynthesized(e *graph.Edge) {
 // consume the changed-repo prefix set directly. Every other pass runs through
 // frameworkScopedStore on a partial invocation; no synthFunc is permitted to
 // fall back to the unfiltered workspace store.
+// FrameworkSynthesizerSelection is a compiled allow-list for the framework
+// pipeline. Its zero value preserves the historical behavior and enables the
+// complete registry. A selection constructed from an empty list disables the
+// entire pipeline.
+type FrameworkSynthesizerSelection struct {
+	configured bool
+	names      map[string]struct{}
+}
+
+// AllFrameworkSynthesizers returns the legacy, all-enabled selection.
+func AllFrameworkSynthesizers() FrameworkSynthesizerSelection {
+	return FrameworkSynthesizerSelection{}
+}
+
+// FrameworkSynthesizerNames returns every configurable registry name in
+// canonical execution order. Correctness-only tail gates are intentionally not
+// configurable independently.
+func FrameworkSynthesizerNames() []string {
+	synthesizers := defaultFrameworkSynthesizers()
+	claimers := defaultClaimingResolvers()
+	names := make([]string, 0, len(synthesizers)+len(claimers))
+	for _, synthesizer := range synthesizers {
+		names = append(names, synthesizer.Name())
+	}
+	for _, claimer := range claimers {
+		names = append(names, claimer.Name())
+	}
+	return names
+}
+
+// NewFrameworkSynthesizerSelection validates and compiles an explicit
+// allow-list. Passing an empty slice is distinct from
+// AllFrameworkSynthesizers and disables the complete framework pipeline.
+func NewFrameworkSynthesizerSelection(names []string) (FrameworkSynthesizerSelection, error) {
+	validNames := FrameworkSynthesizerNames()
+	valid := make(map[string]struct{}, len(validNames))
+	for _, name := range validNames {
+		valid[name] = struct{}{}
+	}
+
+	selected := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		if _, exists := selected[name]; exists {
+			return FrameworkSynthesizerSelection{}, fmt.Errorf("duplicate framework synthesizer %q", name)
+		}
+		if _, exists := valid[name]; !exists {
+			allowed := append([]string(nil), validNames...)
+			sort.Strings(allowed)
+			return FrameworkSynthesizerSelection{}, fmt.Errorf(
+				"unknown framework synthesizer %q (valid: %s)",
+				name, strings.Join(allowed, ", "),
+			)
+		}
+		selected[name] = struct{}{}
+	}
+	return FrameworkSynthesizerSelection{configured: true, names: selected}, nil
+}
+
+// ValidateFrameworkSynthesizers validates a configured allow-list.
+func ValidateFrameworkSynthesizers(names []string) error {
+	_, err := NewFrameworkSynthesizerSelection(names)
+	return err
+}
+
+func (s FrameworkSynthesizerSelection) allows(name string) bool {
+	if !s.configured {
+		return true
+	}
+	_, ok := s.names[name]
+	return ok
+}
+
+func (s FrameworkSynthesizerSelection) none() bool {
+	return s.configured && len(s.names) == 0
+}
+
 type synthFunc struct {
 	name     string
 	fn       func(graph.Store) int
@@ -1111,7 +1189,16 @@ type scopedSynthesizer interface {
 // over g, in registration order, and returns the per-synthesizer and
 // total landed-edge counts. A nil graph is a no-op.
 func RunFrameworkSynthesizers(g graph.Store) FrameworkSynthReport {
-	return RunFrameworkSynthesizersScoped(g, nil)
+	return RunFrameworkSynthesizersWithSelection(g, AllFrameworkSynthesizers())
+}
+
+// RunFrameworkSynthesizersWithSelection runs the framework pipeline using a
+// validated selection.
+func RunFrameworkSynthesizersWithSelection(
+	g graph.Store,
+	selection FrameworkSynthesizerSelection,
+) FrameworkSynthReport {
+	return runFrameworkSynthesizersScoped(g, nil, nil, false, true, selection)
 }
 
 // RunFrameworkSynthesizersScoped is RunFrameworkSynthesizers with an armed
@@ -1123,7 +1210,9 @@ func RunFrameworkSynthesizers(g graph.Store) FrameworkSynthReport {
 // passes use the changed repositories plus their exact reverse dependency
 // frontier; nil scope retains full/cold whole-graph reconciliation.
 func RunFrameworkSynthesizersScoped(g graph.Store, scope map[string]bool) FrameworkSynthReport {
-	return runFrameworkSynthesizersScoped(g, scope, nil, false, true)
+	return runFrameworkSynthesizersScoped(
+		g, scope, nil, false, true, AllFrameworkSynthesizers(),
+	)
 }
 
 // RunFrameworkSynthesizersScopedWithCensus is the full-coverage batch form:
@@ -1137,7 +1226,22 @@ func RunFrameworkSynthesizersScopedWithCensus(
 	scope map[string]bool,
 	censusEligible bool,
 ) FrameworkSynthReport {
-	return runFrameworkSynthesizersScoped(g, scope, nil, censusEligible, true)
+	return runFrameworkSynthesizersScoped(
+		g, scope, nil, censusEligible, true, AllFrameworkSynthesizers(),
+	)
+}
+
+// RunFrameworkSynthesizersScopedWithCensusAndSelection is the configurable
+// form used by graph-wide indexer passes.
+func RunFrameworkSynthesizersScopedWithCensusAndSelection(
+	g graph.Store,
+	scope map[string]bool,
+	censusEligible bool,
+	selection FrameworkSynthesizerSelection,
+) FrameworkSynthReport {
+	return runFrameworkSynthesizersScoped(
+		g, scope, nil, censusEligible, true, selection,
+	)
 }
 
 // RunFrameworkSynthesizersScopedForFiles is the exact incremental form. The
@@ -1150,7 +1254,23 @@ func RunFrameworkSynthesizersScopedForFiles(
 	filePaths []string,
 	csharpHierarchyChanged bool,
 ) FrameworkSynthReport {
-	return runFrameworkSynthesizersScoped(g, scope, filePaths, false, csharpHierarchyChanged)
+	return runFrameworkSynthesizersScoped(
+		g, scope, filePaths, false, csharpHierarchyChanged, AllFrameworkSynthesizers(),
+	)
+}
+
+// RunFrameworkSynthesizersScopedForFilesWithSelection is the configurable
+// exact incremental form used by the indexer.
+func RunFrameworkSynthesizersScopedForFilesWithSelection(
+	g graph.Store,
+	scope map[string]bool,
+	filePaths []string,
+	csharpHierarchyChanged bool,
+	selection FrameworkSynthesizerSelection,
+) FrameworkSynthReport {
+	return runFrameworkSynthesizersScoped(
+		g, scope, filePaths, false, csharpHierarchyChanged, selection,
+	)
 }
 
 func frameworkScopeForFiles(
@@ -1178,9 +1298,13 @@ func runFrameworkSynthesizersScoped(
 	filePaths []string,
 	censusEligible bool,
 	csharpHierarchyChanged bool,
+	selection FrameworkSynthesizerSelection,
 ) FrameworkSynthReport {
 	rep := FrameworkSynthReport{}
 	if g == nil {
+		return rep
+	}
+	if selection.none() {
 		return rep
 	}
 	// A changed-file frontier is always partial, even when a legacy caller lost
@@ -1218,6 +1342,10 @@ func runFrameworkSynthesizersScoped(
 	}
 	rep.ScopeMillis = time.Since(scopeStart).Milliseconds()
 	for _, s := range defaultFrameworkSynthesizers() {
+		if !selection.allows(s.Name()) {
+			candidates.streams.releasePass(s.Name(), nil)
+			continue
+		}
 		start := time.Now()
 		var n int
 		var bundle *frameworkPassCandidates
@@ -1282,9 +1410,15 @@ func runFrameworkSynthesizersScoped(
 	// external-call synthesis classifies the residual unresolved refs as
 	// external. Reported in registration order for determinism.
 	claimStart := time.Now()
-	claimed := RunClaimingResolversScoped(g, executionScope)
-	rep.ClaimMillis = time.Since(claimStart).Milliseconds()
+	claimingResolvers := make([]ClaimingResolver, 0, len(defaultClaimingResolvers()))
 	for _, r := range defaultClaimingResolvers() {
+		if selection.allows(r.Name()) {
+			claimingResolvers = append(claimingResolvers, r)
+		}
+	}
+	claimed := runClaimingResolversScoped(g, executionScope, claimingResolvers)
+	rep.ClaimMillis = time.Since(claimStart).Milliseconds()
+	for _, r := range claimingResolvers {
 		n := claimed[r.Name()]
 		rep.Per = append(rep.Per, SynthCount{Name: r.Name(), Edges: n})
 		rep.Total += n
@@ -1586,11 +1720,18 @@ func RunClaimingResolvers(g graph.Store) map[string]int {
 // references sourced by changed repositories. Resolver precedence is retained:
 // each registered resolver receives only edges not claimed by an earlier one.
 func RunClaimingResolversScoped(g graph.Store, scope map[string]bool) map[string]int {
+	return runClaimingResolversScoped(g, scope, defaultClaimingResolvers())
+}
+
+func runClaimingResolversScoped(
+	g graph.Store,
+	scope map[string]bool,
+	resolvers []ClaimingResolver,
+) map[string]int {
 	out := map[string]int{}
 	if g == nil {
 		return out
 	}
-	resolvers := defaultClaimingResolvers()
 	if len(resolvers) == 0 {
 		return out
 	}

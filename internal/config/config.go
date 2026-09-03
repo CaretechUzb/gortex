@@ -737,6 +737,10 @@ type IndexConfig struct {
 	// stdlib calls are filtered out regardless so the synthetic nodes
 	// only ever name genuine third-party packages.
 	SynthesizeExternalCalls *bool `mapstructure:"synthesize_external_calls" yaml:"synthesize_external_calls,omitempty"`
+	// FrameworkSynthesizers is an optional allow-list of framework resolver
+	// names. Nil preserves the complete registry; an explicit empty list
+	// disables the framework pipeline before it scans the graph.
+	FrameworkSynthesizers *[]string `mapstructure:"framework_synthesizers" yaml:"framework_synthesizers,omitempty" json:"framework_synthesizers,omitempty"`
 	// SynthesizeSpeculativeDispatch mints opt-in, best-guess `calls` edges for
 	// dynamic-dispatch blind spots (computed-member calls obj["foo"](),
 	// getattr, decorator registries). Unlike external-call synthesis it
