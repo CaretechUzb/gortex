@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -481,7 +482,10 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 	// event-queue overflow). Default interval 1 h; override via
 	// GORTEX_RECONCILE_INTERVAL (a Go duration string, e.g. "15m").
 	// Set to "0" to disable.
-	stopJanitor := startReconcileJanitor(state.multiIndexer, reconcileInterval(), logger)
+	// sweepJanitorNow is called once from the warmup goroutine below, after
+	// the watcher is live, to close the restart window the ticker alone
+	// cannot: its first tick is one whole interval away.
+	sweepJanitorNow, stopJanitor := startReconcileJanitor(state.multiIndexer, reconcileInterval(), logger)
 	defer stopJanitor()
 
 	if err := srv.Listen(); err != nil {
@@ -553,6 +557,17 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 			})
 		})
 		mw, warmup := warmupDaemonState(state, logger, markReady)
+		// Close the restart blind window. Everything between the warmup
+		// snapshot and the watcher's start is unobserved: a file saved in
+		// that gap reaches neither, and ReconcileRepoCtx is
+		// first-registration-only so it cannot pick the save up on a later
+		// pass. warmupDaemonState logs "daemon: watching" before it returns,
+		// so the watcher is provably live here and a sweep kicked now closes
+		// the window rather than moving it. The sweep runs on the janitor
+		// goroutine, so it delays neither markReady nor the warmup summary;
+		// events arriving mid-sweep coalesce through the same per-repo
+		// mutation lane and re-run after it, so no extra guard is needed.
+		sweepJanitorNow()
 		controller.AttachWatcher(mw)
 		// Drive the /v1/events SSE stream from the MultiWatcher. The hub is
 		// the only consumer of mw.Events() (SetWatcher reads History(), not
@@ -682,8 +697,8 @@ func reconcileInterval() time.Duration {
 // startReconcileJanitor launches a background goroutine that, on every
 // interval tick, garbage-collects the index of any linked git worktree
 // whose root directory has vanished from disk and then calls
-// MultiIndexer.ReconcileAll. interval=0 is a no-op; the returned stop
-// function can be called unconditionally.
+// MultiIndexer.ReconcileAll. interval=0 is a no-op; both returned
+// functions can be called unconditionally.
 //
 // The worktree GC runs *before* ReconcileAll on purpose: a removed
 // worktree's root no longer exists, so ReconcileAll's IncrementalReindexPaths
@@ -691,48 +706,115 @@ func reconcileInterval() time.Duration {
 // Pruning the vanished worktrees first keeps the reconcile sweep
 // working on live repos and stops a deleted worktree's snapshot slot
 // and graph nodes from leaking forever.
-func startReconcileJanitor(mi *indexer.MultiIndexer, interval time.Duration, logger *zap.Logger) func() {
+//
+// sweepNow requests one sweep out of band, and it exists because
+// time.NewTicker has no t=0 tick: the first tick lands one full interval
+// (1 h by default) after start, and every daemon start constructs a fresh
+// ticker, so the clock restarts from zero on each restart. A developer who
+// restarts more often than hourly therefore never reaches a first sweep,
+// and the content saves that landed while the daemon was down — seen by
+// neither the warmup snapshot nor the not-yet-started watcher — stay
+// missing from the graph for as long as that cadence holds. The warmup
+// goroutine kicks the janitor once the watcher is live so the window
+// closes rather than moves. It is a kick and not a second ReconcileAll
+// call site on purpose: one sweep body, one place to keep correct.
+//
+// The kick channel is buffered to 1 and the send is non-blocking, so a
+// warmup that finishes after shutdown drops its kick instead of hanging
+// on a janitor goroutine that has already returned, and a burst of kicks
+// during a running sweep collapses into at most one follow-up sweep.
+func startReconcileJanitor(mi *indexer.MultiIndexer, interval time.Duration, logger *zap.Logger) (sweepNow func(), stop func()) {
 	if mi == nil || interval <= 0 {
 		logger.Info("daemon: reconcile janitor disabled")
-		return func() {}
+		// A disabled janitor swallows the kick too: GORTEX_RECONCILE_INTERVAL=off
+		// means off, and an immediate first sweep must not resurrect it.
+		return func() {}, func() {}
 	}
-	stop := make(chan struct{})
+	kick := make(chan struct{}, 1)
+	// sweepCtx is what makes stop a real join rather than a signal. The daemon
+	// tears down LIFO -- stopJanitor first, then runTeardown's
+	// state.shared.Close() -- and neither the ticker nor the kick path used to
+	// wait, so a sweep in flight kept calling into the store while the store
+	// was being closed. Cancelling first means ReconcileAllCtx yields at its
+	// next repository boundary (it checks ctx between repos and while waiting
+	// for a mutation lane), which bounds the wait to one repo rather than a
+	// whole workspace sweep.
+	sweepCtx, cancelSweep := context.WithCancel(context.Background())
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		t := time.NewTicker(interval)
 		defer t.Stop()
 		logger.Info("daemon: reconcile janitor running", zap.Duration("interval", interval))
+		// trigger is carried on the log line because the two sources are not
+		// interchangeable when something goes wrong: a sweep at t=0 can only
+		// be the warmup kick, and a missing "kick" line one interval before
+		// the first "ticker" line is exactly the blind window reopening.
+		sweep := func(trigger string) {
+			logger.Debug("janitor: sweep starting", zap.String("trigger", trigger))
+			gcedCount, reconciled := func() (int, int) {
+				runtimeactivity.Begin("reconcile")
+				defer runtimeactivity.End("reconcile")
+
+				gced := mi.GCVanishedWorktrees()
+				if len(gced) > 0 {
+					logger.Info("janitor: pruned vanished worktrees",
+						zap.Int("count", len(gced)))
+				}
+				results := mi.ReconcileAllCtx(sweepCtx)
+				reconciled := 0
+				for _, r := range results {
+					if r != nil {
+						reconciled += r.StaleFileCount + r.DeletedFileCount
+					}
+				}
+				return len(gced), reconciled
+			}()
+			// Only a sweep that changed the graph schedules reclamation. The
+			// process-wide quiet gate postpones it if another subsystem is busy.
+			if reconciled > 0 || gcedCount > 0 {
+				releaseMemoryToOS(logger, "reconcile_janitor")
+			}
+		}
 		for {
+			// Checked before the select as well as inside it. Both sources are
+			// ready at once often enough to matter -- a queued kick alongside a
+			// cancelled context -- and Go picks between ready cases at random,
+			// so without this a stopped janitor could still start one more
+			// sweep. That is the shape a reviewer flagged on the kick path; it
+			// was already true of the ticker.
+			if sweepCtx.Err() != nil {
+				return
+			}
 			select {
 			case <-t.C:
-				gcedCount, reconciled := func() (int, int) {
-					runtimeactivity.Begin("reconcile")
-					defer runtimeactivity.End("reconcile")
-
-					gced := mi.GCVanishedWorktrees()
-					if len(gced) > 0 {
-						logger.Info("janitor: pruned vanished worktrees",
-							zap.Int("count", len(gced)))
-					}
-					results := mi.ReconcileAll()
-					reconciled := 0
-					for _, r := range results {
-						if r != nil {
-							reconciled += r.StaleFileCount + r.DeletedFileCount
-						}
-					}
-					return len(gced), reconciled
-				}()
-				// Only a tick that changed the graph schedules reclamation. The
-				// process-wide quiet gate postpones it if another subsystem is busy.
-				if reconciled > 0 || gcedCount > 0 {
-					releaseMemoryToOS(logger, "reconcile_janitor")
-				}
-			case <-stop:
+				sweep("ticker")
+			case <-kick:
+				sweep("kick")
+			case <-sweepCtx.Done():
 				return
 			}
 		}
 	}()
-	return func() { close(stop) }
+	sweepNow = func() {
+		// Non-blocking on purpose. The caller is the warmup goroutine, and a
+		// kick must never block it: not when the janitor has already returned
+		// (shutdown raced warmup), and not when a sweep is in flight with one
+		// already queued behind it. A kick that lands after stop just sits in
+		// the buffer unread, because the loop re-checks the context first.
+		select {
+		case kick <- struct{}{}:
+		default:
+		}
+	}
+	// Cancel, then WAIT. Returning before the goroutine exits is what let a
+	// sweep outlive the janitor and race the store close; the whole point of
+	// this being a join is that when it returns, no sweep is running.
+	stop = func() {
+		cancelSweep()
+		<-done
+	}
+	return sweepNow, stop
 }
 
 // daemonStartAcceptedFlags returns every flag the re-exec'd `daemon start`
@@ -1294,7 +1376,7 @@ func renderDaemonHeader(w io.Writer, st daemon.StatusResponse) {
 			"state",
 			fmt.Sprintf("ready (warmup %s)%s",
 				formatDuration(time.Duration(st.EnrichSeconds)*time.Second),
-				formatWorkspaceDerivation(st.DerivingWorkspace)),
+				formatWorkspaceDerivation(st.DerivingWorkspace, st.ResolveQueuedSeconds, st.ResolveQueuedPass)),
 		})
 	case st.Ready:
 		t.AppendRow(table.Row{
@@ -1302,10 +1384,17 @@ func renderDaemonHeader(w io.Writer, st daemon.StatusResponse) {
 			fmt.Sprintf("ready — queryable (warmup %s);%s%s",
 				formatDuration(time.Duration(st.WarmupSeconds)*time.Second),
 				formatEnrichmentProgress(st.Enrichment),
-				formatWorkspaceDerivation(st.DerivingWorkspace)),
+				formatWorkspaceDerivation(st.DerivingWorkspace, st.ResolveQueuedSeconds, st.ResolveQueuedPass)),
 		})
 	default:
-		t.AppendRow(table.Row{"state", "warming up (socket reachable, resolving references)"})
+		// The queued suffix belongs here most of all: the 24m45s wait that
+		// motivated it happened during warmup, where "resolving references" was
+		// the only thing any surface said for the whole stall.
+		t.AppendRow(table.Row{
+			"state",
+			"warming up (socket reachable, resolving references)" +
+				formatWorkspaceDerivation(false, st.ResolveQueuedSeconds, st.ResolveQueuedPass),
+		})
 	}
 	t.AppendRow(table.Row{"sessions", st.Sessions})
 	if st.MemoryBytes > 0 {
@@ -1468,13 +1557,27 @@ func formatEnrichmentProgress(e *daemon.EnrichmentProgress) string {
 }
 
 // formatWorkspaceDerivation renders the suffix warning that a repository
-// tracked since the last workspace pass is not yet fully bound. Empty
-// while no pass is pending, which is every ordinary status read.
-func formatWorkspaceDerivation(deriving bool) string {
-	if !deriving {
-		return ""
+// tracked since the last workspace pass is not yet fully bound, plus the
+// queued-on-the-resolve-mutex suffix when a pass is blocked rather than
+// running. Empty while neither holds, which is every ordinary status read.
+//
+// The second half exists because "deriving workspace edges" covered two states
+// a reader has to tell apart. Measured once: a derivation that had not executed
+// a single instruction for 24m45s because two semantic enrichment applies held
+// the store-wide resolve mutex. Every surface said "deriving"; nothing said
+// "queued". The queued suffix is reported even when no derivation is pending —
+// a resolve blocked behind an apply is worth naming whoever asked for it.
+func formatWorkspaceDerivation(deriving bool, queuedSeconds float64, queuedPass string) string {
+	queued := ""
+	if queuedPass != "" && queuedSeconds > 0 {
+		age := time.Duration(queuedSeconds * float64(time.Second))
+		queued = fmt.Sprintf("; %s waiting on the resolve mutex for %s",
+			queuedPass, formatDuration(age.Truncate(time.Second)))
 	}
-	return "; deriving workspace edges (recently tracked repos not yet fully bound)"
+	if !deriving {
+		return queued
+	}
+	return "; deriving workspace edges (recently tracked repos not yet fully bound)" + queued
 }
 
 // renderDaemonRepos writes the per-repo breakdown as a single table.

@@ -341,6 +341,19 @@ type StatusResponse struct {
 	// stays true across a later track.
 	DerivingWorkspace bool `json:"deriving_workspace,omitempty"`
 
+	// ResolveQueuedSeconds and ResolveQueuedPass name a resolve pass that is
+	// blocked on the store-wide resolve mutex right now, and for how long.
+	//
+	// Without them "deriving workspace edges" covers two states a reader has to
+	// tell apart: passes running, and passes queued behind someone else's work.
+	// Measured once at 24m45s of the latter — the derivation had not executed a
+	// single instruction, while every surface said it was deriving. Zero and
+	// empty whenever nothing is queued, which is the ordinary case; a running
+	// pass is not a queued one, so an empty value never means "nothing is
+	// running".
+	ResolveQueuedSeconds float64 `json:"resolve_queued_seconds,omitempty"`
+	ResolveQueuedPass    string  `json:"resolve_queued_pass,omitempty"`
+
 	// Workspaces aggregates TrackedRepos by workspace slug. Empty
 	// when no repo declares one (every repo defaults to its own
 	// workspace; the table form is more compact in that case).

@@ -274,3 +274,177 @@ func TestRefreshingNeverPromotesAProviderThatNeverRan(t *testing.T) {
 	require.Zero(t, gens["python-types"], "declared applicable, never ran, still owed")
 	require.Zero(t, minProviderGen(gens), "so the repo is still not enriched")
 }
+
+// The file-scoped enrichment stamp. A pass over an exact file frontier renews
+// the content counter on providers that have already completed, so an
+// actively-edited repo stops reading "partial" from its first save onward. The
+// tests below pin the four guards that keep the renewal from becoming a lie.
+
+// THE hard correctness hole. gen = 0 is the only signal that re-arms a repo
+// whose enrichment has never run, and it is monotone -- once a pass completes,
+// the row can never return to zero, so acting on it discharges it for good.
+// Advancing a never-ran row's content_gen must leave that zero untouched;
+// writing gen (which CompleteEnrichmentProvider does unconditionally, and which
+// is why it cannot be used here) would let a one-file pass claim repo-wide
+// coverage and the repo would never re-arm again.
+func TestAdvancingContentGenLeavesANeverRanProviderAtZero(t *testing.T) {
+	t.Parallel()
+	store := openGenTestStore(t)
+	// gen is copied from repo_graph_gen.gen, and that anchor only exists for a
+	// prefix that OWNS a node -- so a completed row has gen > 0 only for a repo
+	// with real content, which is every repo this path can reach.
+	store.AddBatch([]*graph.Node{genNode("repoA", "A")}, nil)
+	require.NoError(t, store.BulkSetFileMtimes("repoA", map[string]int64{"a.py": 1}))
+	require.NoError(t, store.DeclareEnrichmentProviders("repoA", []string{"go-types", "python-types"}))
+	require.NoError(t, store.CompleteEnrichmentProvider("repoA", "python-types", 1))
+	require.NoError(t, store.BulkSetFileMtimes("repoA", map[string]int64{"a.py": 2}))
+
+	n, err := store.AdvanceContentGenForCompletedProviders("repoA", mustContentGen(t, store, "repoA"), nil)
+	require.NoError(t, err)
+	require.Equal(t, 1, n, "only the completed provider is eligible")
+
+	gens, err := store.EnrichmentContentGens("repoA")
+	require.NoError(t, err)
+	require.Equal(t, int64(2), gens["python-types"], "the completed provider is renewed")
+	require.Zero(t, gens["go-types"], "a provider that never ran must not be promoted")
+
+	owed, err := store.EnrichmentNeverRan("repoA")
+	require.NoError(t, err)
+	require.True(t, owed, "the never-ran re-arm must survive a scoped stamp")
+}
+
+// The caller reads the counter before the pass and hands that value back after,
+// because enrichment holds no write gate. A value ahead of the live counter is
+// therefore always a caller bug, and the clamp turns it into the honest number
+// instead of letting the row claim content the store does not hold.
+func TestAdvancingContentGenCannotClaimContentThatDoesNotExistYet(t *testing.T) {
+	t.Parallel()
+	store := openGenTestStore(t)
+	// gen is copied from repo_graph_gen.gen, and that anchor only exists for a
+	// prefix that OWNS a node -- so a completed row has gen > 0 only for a repo
+	// with real content, which is every repo this path can reach.
+	store.AddBatch([]*graph.Node{genNode("repoA", "A")}, nil)
+	require.NoError(t, store.BulkSetFileMtimes("repoA", map[string]int64{"a.py": 1}))
+	require.NoError(t, store.DeclareEnrichmentProviders("repoA", []string{"python-types"}))
+	require.NoError(t, store.CompleteEnrichmentProvider("repoA", "python-types", 1))
+
+	_, err := store.AdvanceContentGenForCompletedProviders("repoA", 999, nil)
+	require.NoError(t, err)
+
+	gens, err := store.EnrichmentContentGens("repoA")
+	require.NoError(t, err)
+	require.Equal(t, mustContentGen(t, store, "repoA"), gens["python-types"])
+	require.Equal(t, int64(1), gens["python-types"], "clamped to what the repo actually holds")
+}
+
+// Two passes can overlap, and the slow one finishes last carrying the older
+// snapshot. Without the MAX it would walk the row backwards and re-stale a repo
+// that a newer pass had already brought current.
+func TestAdvancingContentGenNeverMovesARowBackwards(t *testing.T) {
+	t.Parallel()
+	store := openGenTestStore(t)
+	// gen is copied from repo_graph_gen.gen, and that anchor only exists for a
+	// prefix that OWNS a node -- so a completed row has gen > 0 only for a repo
+	// with real content, which is every repo this path can reach.
+	store.AddBatch([]*graph.Node{genNode("repoA", "A")}, nil)
+	require.NoError(t, store.BulkSetFileMtimes("repoA", map[string]int64{"a.py": 1}))
+	require.NoError(t, store.BulkSetFileMtimes("repoA", map[string]int64{"a.py": 2}))
+	require.NoError(t, store.DeclareEnrichmentProviders("repoA", []string{"python-types"}))
+	require.NoError(t, store.CompleteEnrichmentProvider("repoA", "python-types", 2))
+
+	_, err := store.AdvanceContentGenForCompletedProviders("repoA", 1, nil)
+	require.NoError(t, err)
+
+	gens, err := store.EnrichmentContentGens("repoA")
+	require.NoError(t, err)
+	require.Equal(t, int64(2), gens["python-types"], "a stale snapshot must not re-stale the row")
+}
+
+// Neither sentinel is a provider: __none__ records that the pass looked and
+// found nothing applicable, __repo__ is the whole-repo rollup. A scoped pass
+// asserts nothing about either, and the rollup in particular must stay
+// withheld -- publishing it is what would claim every file was enriched.
+func TestAdvancingContentGenLeavesTheSentinelsAlone(t *testing.T) {
+	t.Parallel()
+	store := openGenTestStore(t)
+	// gen is copied from repo_graph_gen.gen, and that anchor only exists for a
+	// prefix that OWNS a node -- so a completed row has gen > 0 only for a repo
+	// with real content, which is every repo this path can reach.
+	store.AddBatch([]*graph.Node{genNode("repoA", "A")}, nil)
+	require.NoError(t, store.BulkSetFileMtimes("repoA", map[string]int64{"a.py": 1}))
+	require.NoError(t, store.DeclareEnrichmentProviders("repoA", []string{"python-types"}))
+	require.NoError(t, store.CompleteEnrichmentProvider("repoA", "python-types", 1))
+	// Give both sentinels a non-zero gen, so the exclusion under test is the
+	// provider name and not the gen > 0 guard doing the work by accident.
+	require.NoError(t, store.CompleteEnrichmentProvider("repoA", graph.EnrichProviderRepoMarker, 1))
+	require.NoError(t, store.CompleteEnrichmentProvider("repoA", graph.EnrichProviderNone, 1))
+	require.NoError(t, store.BulkSetFileMtimes("repoA", map[string]int64{"a.py": 2}))
+
+	n, err := store.AdvanceContentGenForCompletedProviders("repoA", 2, nil)
+	require.NoError(t, err)
+	require.Equal(t, 1, n, "only the real provider is eligible")
+
+	gens, err := store.EnrichmentContentGens("repoA")
+	require.NoError(t, err)
+	require.Equal(t, int64(2), gens["python-types"])
+	require.Equal(t, int64(1), gens[graph.EnrichProviderRepoMarker], "the rollup is not a provider")
+	require.Equal(t, int64(1), gens[graph.EnrichProviderNone], "the sentinel is not a provider")
+}
+
+// A provider whose language WAS in the frontier but which produced no result
+// had its edges evicted by the re-parse and restored by nothing. Renewing it
+// would publish a repo that reads ready while silently missing those edges;
+// holding the one row down is the honest reading and keeps the minimum correct.
+func TestAdvancingContentGenSkipsExcludedProviders(t *testing.T) {
+	t.Parallel()
+	store := openGenTestStore(t)
+	// gen is copied from repo_graph_gen.gen, and that anchor only exists for a
+	// prefix that OWNS a node -- so a completed row has gen > 0 only for a repo
+	// with real content, which is every repo this path can reach.
+	store.AddBatch([]*graph.Node{genNode("repoA", "A")}, nil)
+	require.NoError(t, store.BulkSetFileMtimes("repoA", map[string]int64{"a.py": 1}))
+	require.NoError(t, store.DeclareEnrichmentProviders("repoA", []string{"python-types", "ts-types"}))
+	require.NoError(t, store.CompleteEnrichmentProvider("repoA", "python-types", 1))
+	require.NoError(t, store.CompleteEnrichmentProvider("repoA", "ts-types", 1))
+	require.NoError(t, store.BulkSetFileMtimes("repoA", map[string]int64{"a.py": 2}))
+
+	n, err := store.AdvanceContentGenForCompletedProviders("repoA", 2, []string{"ts-types"})
+	require.NoError(t, err)
+	require.Equal(t, 1, n)
+
+	gens, err := store.EnrichmentContentGens("repoA")
+	require.NoError(t, err)
+	require.Equal(t, int64(2), gens["python-types"])
+	require.Equal(t, int64(1), gens["ts-types"], "an excluded provider must hold the minimum down")
+	require.Equal(t, int64(1), minProviderGen(gens), "the repo stays behind, which is correct")
+}
+
+// Why this cannot be folded into RefreshEnrichmentProviders. That method filters
+// on indexed_sha <> ”, which admits only providers that completed at some
+// revision -- and a dirty tree never records one. The repos this stamp exists to
+// serve are exactly the ones being edited, so the filter would exclude every
+// single one of them.
+func TestAdvancingContentGenAdvancesADirtyTreeRowWithNoSha(t *testing.T) {
+	t.Parallel()
+	store := openGenTestStore(t)
+	// gen is copied from repo_graph_gen.gen, and that anchor only exists for a
+	// prefix that OWNS a node -- so a completed row has gen > 0 only for a repo
+	// with real content, which is every repo this path can reach.
+	store.AddBatch([]*graph.Node{genNode("repoA", "A")}, nil)
+	require.NoError(t, store.BulkSetFileMtimes("repoA", map[string]int64{"a.py": 1}))
+	require.NoError(t, store.DeclareEnrichmentProviders("repoA", []string{"python-types"}))
+	require.NoError(t, store.CompleteEnrichmentProvider("repoA", "python-types", 1))
+	require.NoError(t, store.BulkSetFileMtimes("repoA", map[string]int64{"a.py": 2}))
+
+	refreshed, err := store.RefreshEnrichmentProviders("repoA")
+	require.NoError(t, err)
+	require.Zero(t, refreshed, "the sha-gated refresh cannot see a dirty-tree row")
+
+	n, err := store.AdvanceContentGenForCompletedProviders("repoA", 2, nil)
+	require.NoError(t, err)
+	require.Equal(t, 1, n, "the scoped stamp is the one that reaches an edited repo")
+
+	gens, err := store.EnrichmentContentGens("repoA")
+	require.NoError(t, err)
+	require.Equal(t, int64(2), gens["python-types"])
+}

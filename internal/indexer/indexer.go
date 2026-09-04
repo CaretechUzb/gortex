@@ -127,6 +127,20 @@ type IndexResult struct {
 	// worktree-copy path — key off this instead of re-deriving.
 	DerivedTailRan bool `json:"derived_tail_ran,omitempty"`
 
+	// deferredTail carries the resolve + incremental-derived tail that the
+	// reconcile SKIPPED because a batch was suppressing it, whole enough to be
+	// replayed once the batch transition frees the gates it needs.
+	//
+	// Unexported and never serialized, deliberately: it holds this reconcile's
+	// live mutation receipt and reparse batch, which belong to the caller that
+	// owns this result and to nobody else. A caller that ignores it gets
+	// exactly today's behaviour — the tail stays undone and the repo-wide
+	// derivation is owed.
+	//
+	// Nil whenever the tail ran, was never owed, or the route was a full
+	// retrack (which runs its own pipeline and has nothing to replay).
+	deferredTail *deferredReconcileTail
+
 	// mutationErr carries a point-operation compatibility error through the
 	// resolver/semantic/derived tail. It is intentionally unexported and never
 	// serialized: coordinated callers surface it only after the committed graph
@@ -1065,7 +1079,17 @@ func (idx *Indexer) runDeferredEnrich() {
 	// HEAD on a clean tree is skipped instead of re-running its hover pass.
 	sha, dirty := repoHeadAndDirty(idx.rootPath)
 	if !fullScope && len(pendingFiles) > 0 {
+		// Read the content counter BEFORE any provider runs. Enrichment holds
+		// no write gate, so the watcher can reindex a file while a provider is
+		// still working; content that lands mid-pass belongs to the NEXT pass,
+		// and stamping the counter as it stands at completion would claim
+		// coverage of an edit this pass never saw.
+		contentGen := idx.semanticMgr.ObserveContentGen(idx.graph, idx.repoPrefix)
 		byLanguage := idx.deferredEnrichFrontiers(pendingFiles)
+		// Providers whose language was in this frontier but which produced
+		// nothing. Their rows must not be stamped -- see the nil-result comment
+		// in the loop below.
+		var withheld []string
 		languages := make([]string, 0, len(byLanguage))
 		for language := range byLanguage {
 			languages = append(languages, language)
@@ -1097,12 +1121,50 @@ func (idx *Indexer) runDeferredEnrich() {
 				if result.Partial {
 					return
 				}
+			} else if provider := idx.semanticMgr.ProviderForLanguage(language); provider != nil {
+				// A nil result is two outcomes wearing one shape, and only the
+				// lookup above tells them apart:
+				//
+				//   no provider registered   nothing was evicted that any
+				//                            provider would restore, so this
+				//                            language is current -> STAMP
+				//   registered, ran nothing  most often an unavailable
+				//                            provider, screened out after
+				//                            selection: the re-parse dropped
+				//                            its edges and nothing put them
+				//                            back -> WITHHOLD
+				//
+				// Withholding on BOTH would strand a repo whose frontier is
+				// only .md or .yaml forever, which is the disease being cured.
+				// Stamping on both would publish a repo that reads ready while
+				// silently missing a provider's edges, which is worse than an
+				// honest "partial".
+				withheld = append(withheld, provider.Name())
 			}
 		}
 		// A file frontier proves only that the affected language/file batches
 		// were refreshed. It must never publish the whole-repository completion
 		// marker: files and packages outside this exact frontier did not run.
 		if idx.clearPendingEnrich(pendingGeneration) {
+			// Stamp first, discharge second, and the order is load-bearing.
+			// The ledger is the only thing that re-arms this pass; discharging
+			// before a stamp that then fails would consume the retry signal and
+			// strand the repo in exactly the state the stamp exists to prevent.
+			//
+			// Reaching here means every language succeeded non-partial -- the
+			// err and result.Partial arms above both return -- so what is being
+			// recorded is a completed pass over a known frontier. The whole-repo
+			// SHA marker stays withheld below, because that one really does
+			// assert every file was enriched at a revision.
+			stamped, err := idx.semanticMgr.CompleteScopedEnrichment(
+				idx.graph, idx.repoPrefix, contentGen, withheld)
+			if err != nil {
+				idx.logger.Warn("file-scoped enrichment stamp failed; leaving ledger armed",
+					zap.String("repo", idx.repoPrefix),
+					zap.Error(err))
+				idx.markPendingEnrichFiles(pendingFiles)
+				return
+			}
 			// The whole dispatched frontier is discharged, not just the paths a
 			// provider claimed: a file whose language no provider covers still
 			// had its deferred pass run, and leaving it marked would re-arm it
@@ -1110,6 +1172,13 @@ func (idx *Indexer) runDeferredEnrich() {
 			// work mid-pass) keeps its own markers — clearPendingEnrich already
 			// declined, so this does not run.
 			idx.dischargePendingEnrichFrontier(pendingFiles)
+			if stamped > 0 {
+				idx.logger.Info("file-scoped enrichment recorded content coverage",
+					zap.String("repo", idx.repoPrefix),
+					zap.Int64("content_gen", contentGen),
+					zap.Int("providers_renewed", stamped),
+					zap.Strings("withheld", withheld))
+			}
 		}
 		return
 	}

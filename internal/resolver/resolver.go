@@ -619,7 +619,10 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	if err := ctx.Err(); err != nil {
 		return &ResolveStats{}, err
 	}
-	r.mu.Lock()
+	// See lockResolveQueued: the wait for the store-wide resolve mutex is
+	// another pass's work, and reporting it is the only thing that tells a
+	// silent daemon apart from a queued one.
+	lockResolveQueued(r.mu, r.logger, "resolver")
 	defer r.mu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return &ResolveStats{}, err

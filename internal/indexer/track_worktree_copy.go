@@ -509,6 +509,29 @@ func (mi *MultiIndexer) trackWorktreeByCopy(
 			if len(result.DerivedInvalidation.Files) > 0 {
 				mi.scheduleCopiedRepoEnrich(prefix, result.DerivedInvalidation.Files)
 			}
+		} else if result.deferredTail != nil {
+			// The tail did not run, but not because it could not: a batch was
+			// suppressing it. That distinction is the whole difference between
+			// a 27.8s scoped repair and a 3,255s repo-wide derivation, and it
+			// was previously invisible here — copiedDivergenceRepaired reports
+			// only that the tail did not run, so a copy tracked during daemon
+			// warmup took the same fallback as one whose reconcile genuinely
+			// re-indexed the world.
+			//
+			// So hold the tail for the batch transition instead of paying the
+			// repo-wide pass. deferWorkspaceRederive is the fail-closed half:
+			// the repo reads "owed" the whole time, and if the replay covers
+			// nothing the deferred set is what schedules the fallback.
+			// Enrichment is ARMED here and RUN after the replay, preserving the
+			// derive-then-enrich order the fallback path has always had.
+			mi.deferCopiedReconcileTail(prefix, result.deferredTail)
+			mi.deferWorkspaceRederive(prefix)
+			mi.armCopiedRepoEnrich(prefix, nil)
+			if mi.logger != nil {
+				mi.logger.Info("worktree copy: reconcile tail deferred to the batch transition; no repo-wide rederive scheduled",
+					zap.String("repo", prefix),
+					zap.Int("reconciled_files", len(changed)))
+			}
 		} else {
 			mi.scheduleWorkspaceRederive(prefix)
 			mi.scheduleCopiedRepoEnrich(prefix, nil)
@@ -593,9 +616,31 @@ func copiedDivergenceRepaired(result *IndexResult) bool {
 // files arms the whole repository — the fallback path, where nothing has
 // vouched for the carried rows.
 func (mi *MultiIndexer) scheduleCopiedRepoEnrich(prefix string, files []string) {
+	idx := mi.armCopiedRepoEnrich(prefix, files)
+	if idx == nil || idx.semanticMgr == nil {
+		// Nothing here can run the pass. The armed gate costs nothing and a
+		// later daemon start still honours it; returning also keeps this
+		// reachable from a test with no semantic manager to build.
+		return
+	}
+	go func() {
+		mi.WaitWorkspaceRederive()
+		mi.runDeferredEnrichPool([]*Indexer{idx})
+	}()
+}
+
+// armCopiedRepoEnrich is scheduleCopiedRepoEnrich without the dispatch: it
+// raises the durable gate and returns the indexer, leaving the caller to decide
+// WHEN the pass runs.
+//
+// Split out for the deferred-tail path, which must not enrich before its
+// derivation replay. Arming immediately anyway is deliberate: the gate is the
+// only durable record that this repository owes a pass, and a transition that
+// never comes must still leave a later daemon start able to see it.
+func (mi *MultiIndexer) armCopiedRepoEnrich(prefix string, files []string) *Indexer {
 	idx := mi.GetIndexer(prefix)
 	if idx == nil {
-		return
+		return nil
 	}
 	// Arm directly rather than routing through MaybeSeedPendingEnrich.
 	//
@@ -627,16 +672,7 @@ func (mi *MultiIndexer) scheduleCopiedRepoEnrich(prefix string, files []string) 
 	} else {
 		idx.markPendingEnrichFull()
 	}
-	if idx.semanticMgr == nil {
-		// Nothing here can run the pass. The armed gate costs nothing and a
-		// later daemon start still honours it; returning also keeps this
-		// reachable from a test with no semantic manager to build.
-		return
-	}
-	go func() {
-		mi.WaitWorkspaceRederive()
-		mi.runDeferredEnrichPool([]*Indexer{idx})
-	}()
+	return idx
 }
 
 // purgeCopiedPrefix removes a subgraph this call installed, so a declined

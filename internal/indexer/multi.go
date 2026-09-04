@@ -163,6 +163,13 @@ type MultiIndexer struct {
 	// for the armed batch scope — see ArmBatchCensusEligible.
 	batchCensusEligible bool
 
+	// deferredCopyTails holds the scoped reconcile tails a batch suppressed for
+	// repositories installed by subgraph copy, keyed by prefix, so the batch
+	// transition can replay them instead of paying a repo-wide derivation for
+	// work whose exact frontier is already known. See reconcile_deferred_tail.go.
+	// Guarded by mi.mu.
+	deferredCopyTails map[string]*deferredReconcileTail
+
 	// resolverLSPHelper is the resolve-time LSP helper propagated
 	// onto every per-repo Indexer and onto the global post-pass
 	// resolver in RunDeferredPassesAllResult. nil means no LSP hot-path
@@ -3362,6 +3369,22 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 			}
 		} else if result.FullRetrack && !batchMode.deferGlobalPasses {
 			mi.ReconcileContractEdges()
+		} else if !result.FullRetrack {
+			// Suppressed, not cancelled. The batch owns the gates this tail
+			// needs and will run its own workspace-wide passes, which is the
+			// right answer for the repos the batch itself reconciled — but not
+			// for one tracked INTO the batch from outside, whose exact frontier
+			// is known here and nowhere else. Hand it back whole; a caller that
+			// ignores it keeps the previous behaviour exactly.
+			result.deferredTail = &deferredReconcileTail{
+				prefix:  prefix,
+				idx:     idx,
+				result:  result,
+				receipt: receipt,
+				batch:   batch,
+				changed: append([]string(nil), changed...),
+				deleted: append([]string(nil), deleted...),
+			}
 		}
 
 		// A full retrack stamped the freshness row itself; every other

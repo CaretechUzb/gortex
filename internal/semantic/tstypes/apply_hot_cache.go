@@ -329,3 +329,17 @@ func (c *applyHotCache) flushAdjacency() {
 		gen.in = make(map[string][]*graph.Edge)
 	}
 }
+
+// flushAll drops every cached entry in both generations. The driver calls it
+// after a page boundary at which it RELEASED the graph-wide resolve mutex: an
+// interleaving writer may have created nodes, moved a file's node group or
+// changed a name bucket, and none of that is covered by the narrower
+// flushAdjacency above. Called only when the store's mutation revision actually
+// moved, so an uncontended pass keeps its cache whole.
+func (c *applyHotCache) flushAll() {
+	if c == nil {
+		return
+	}
+	c.cur = newApplyHotGen()
+	c.prev = newApplyHotGen()
+}

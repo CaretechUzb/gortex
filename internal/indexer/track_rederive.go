@@ -310,11 +310,29 @@ func (mi *MultiIndexer) FlushDeferredWorkspaceRederive() []string {
 		return nil
 	}
 	s := &mi.rederive
+	// Replay first, schedule second. A copy-tracked repository whose scoped
+	// tail the batch suppressed is owed exactly that tail, not a workspace-wide
+	// pass, and replaying it here is what lets the prefix leave the deferred set
+	// below instead of paying one. Runs unconditionally: EndBatch clears the
+	// deferred set on its way out, so by the time this is called the set can be
+	// empty while a recorded tail is still outstanding.
+	repaired := mi.flushDeferredCopiedReconcileTails(context.Background())
 	s.mu.Lock()
 	deferred := s.deferred
 	s.deferred = nil
+	for _, prefix := range repaired {
+		delete(deferred, prefix)
+	}
 	s.mu.Unlock()
 	if len(deferred) == 0 {
+		// The marker still has to be retired: a prefix whose tail replayed left
+		// the deferred set here and nothing else would publish its departure.
+		if len(repaired) > 0 {
+			marker := mi.runtimeMarkerRef()
+			s.mu.Lock()
+			s.publishOwedLocked(marker)
+			s.mu.Unlock()
+		}
 		return nil
 	}
 	prefixes := make([]string, 0, len(deferred))

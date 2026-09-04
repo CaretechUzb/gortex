@@ -277,3 +277,84 @@ UPDATE enrichment_state
 	}
 	return int(n), nil
 }
+
+// AdvanceContentGenForCompletedProviders renews the content stamp on providers
+// that have already completed a pass, for a repo whose enrichment was refreshed
+// over an exact FILE FRONTIER rather than the whole tree.
+//
+// The caller is the indexer's file-scoped deferred pass. That pass runs real
+// provider work and used to record nothing, on the reasoning that a frontier
+// cannot publish the whole-repository completion MARKER. True of the marker,
+// which asserts every file was enriched at a SHA; false of the content COUNTER,
+// which asserts only "this provider is current as of generation N". A fully
+// discharged frontier is exactly that evidence, so withholding the counter left
+// every actively-edited repo reading "partial" from its first save onward.
+//
+// Three guards, and none is decoration:
+//
+// gen > 0 is the one that must never be relaxed. gen is written only by
+// CompleteEnrichmentProvider, from the repo's live counter, so a non-zero value
+// means some pass really finished; a declared-but-never-run provider keeps its
+// zero, and EnrichmentNeverRan reads that zero to re-arm the repo. Advancing
+// content_gen on such a row would leave the re-arm intact, but writing gen
+// would destroy it -- which is why this statement never writes gen at all, and
+// why the obvious implementation (loop the rows through
+// CompleteEnrichmentProvider, whose ON CONFLICT sets gen = excluded.gen
+// unconditionally) is not available: it would let a repo claim repo-wide
+// coverage from a one-file pass and never re-arm again.
+//
+// The MIN/MAX pair is CompleteEnrichmentProvider's clamp, copied deliberately
+// rather than reinvented: MIN against the live counter so a caller cannot claim
+// content that does not exist yet, MAX against the stored value so a slow pass
+// finishing after a fast one cannot walk a row backwards.
+//
+// excludeProviders is the caller's list of providers whose language WAS in the
+// frontier but which returned no result -- an unavailable provider, most often.
+// Those rows must not advance: the re-parse evicted their edges and nothing
+// restored them, so stamping would produce a repo that reads ready while
+// silently missing edges. Holding one row down is the honest reading.
+//
+// Deliberately NOT merged with RefreshEnrichmentProviders, which bumps gen and
+// filters on indexed_sha <> ” -- a filter that excludes exactly the dirty-tree
+// and non-git population this path exists to serve.
+func (s *Store) AdvanceContentGenForCompletedProviders(repoPrefix string, contentGen int64, excludeProviders []string) (int, error) {
+	if repoPrefix == "" {
+		return 0, nil
+	}
+	query := `
+UPDATE enrichment_state
+   SET content_gen = MAX(
+         enrichment_state.content_gen,
+         MIN(?, COALESCE((SELECT content_gen FROM repo_graph_gen WHERE repo_prefix = ?), 0)))
+ WHERE repo_prefix = ?
+   AND provider NOT IN (?, ?)
+   AND gen > 0`
+	args := []any{
+		contentGen, repoPrefix, repoPrefix,
+		graph.EnrichProviderRepoMarker, graph.EnrichProviderNone,
+	}
+	// One placeholder per excluded provider. Built here rather than passed as a
+	// joined string because a provider name is caller data, and this statement
+	// must stay parameterised end to end.
+	if len(excludeProviders) > 0 {
+		query += "\n   AND provider NOT IN (?"
+		args = append(args, excludeProviders[0])
+		for _, provider := range excludeProviders[1:] {
+			query += ", ?"
+			args = append(args, provider)
+		}
+		query += ")"
+	}
+
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	res, err := s.execActiveWriteLocked(context.Background(), query, args...)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, nil
+	}
+	return int(n), nil
+}

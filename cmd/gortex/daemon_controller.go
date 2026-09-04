@@ -24,6 +24,7 @@ import (
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/releases"
+	"github.com/zzet/gortex/internal/resolver"
 	"github.com/zzet/gortex/internal/search"
 	"github.com/zzet/gortex/internal/semantic"
 	"github.com/zzet/gortex/internal/semantic/lsp"
@@ -1097,6 +1098,13 @@ func (c *realController) Status(ctx context.Context) (daemon.StatusResponse, err
 		LSPRouter:          c.collectLSPRouterStatus(),
 		Enrichment:         c.collectEnrichmentProgress(),
 		DerivingWorkspace:  c.multiIndexer.WorkspaceRederivePending(),
+	}
+	// Read from the resolver's own queue register rather than inferring a wait
+	// from elapsed time: "deriving" and "queued behind another pass" look
+	// identical from outside the process, and only one of them is progress.
+	if queued, pass := resolver.LongestResolveQueueWait(time.Now()); pass != "" {
+		resp.ResolveQueuedSeconds = queued.Seconds()
+		resp.ResolveQueuedPass = pass
 	}
 	if c.toolSurface != nil {
 		resp.ToolPreset, resp.ToolPresetMode, resp.LearnedTools = c.toolSurface()

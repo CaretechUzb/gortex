@@ -205,3 +205,52 @@ func TestACompletedPassIsStrandedByALaterEdit(t *testing.T) {
 	require.NoError(t, err)
 	require.Greater(t, current, covered, "PARTIAL: an edit strands the enrichment stamp")
 }
+
+// supplementalMock runs outside arbitration the way every tstypes spec does:
+// it holds no language slot, so selectProviders skips it, but EnrichAll runs it
+// unconditionally after the winners.
+type supplementalMock struct{ *mockProvider }
+
+func (supplementalMock) Supplemental() bool { return true }
+
+// TestASupplementalProviderIsDeclaredApplicable is the regression gate for a
+// repo that read "ready" while its main language was ten content generations
+// behind.
+//
+// The declaration is authoritative — it deletes every row outside the declared
+// set — and it was built from the arbitration winners alone. Supplemental
+// providers were therefore deleted on every pass and restored only by their own
+// completion, so a supplemental pass that ended Partial left no row at all, and
+// readiness computed MIN(content_gen) over the survivors and called the repo
+// ready. Measured 2026-09-02 on three Odoo checkouts, none of which had a
+// python-types row after their python passes overran their budgets.
+func TestASupplementalProviderIsDeclaredApplicable(t *testing.T) {
+	g := applStore(t, "go", "python")
+
+	cfg := Config{Enabled: true, Providers: []ProviderConfig{
+		{Name: "test-go", Languages: []string{"go"}, Priority: 1, Enabled: true},
+		{Name: "test-py", Languages: []string{"python"}, Priority: 1, Enabled: true},
+	}}
+	mgr := NewManager(cfg, zap.NewNop())
+	mgr.RegisterProvider(applProvider("test-go", "go", true))
+
+	// Ends Partial, exactly as the python apply does when it overruns its
+	// budget: it writes no completion row of its own, so the declaration is the
+	// only thing that can record that it was owed.
+	supp := applProvider("test-py", "python", true)
+	supp.enrichFunc = func(graph.Store, string) (*EnrichResult, error) {
+		return &EnrichResult{Provider: "test-py", Language: "python", Partial: true}, nil
+	}
+	mgr.RegisterProvider(supplementalMock{supp})
+
+	_, partial, err := mgr.EnrichAll(g, map[string]string{applRepo: t.TempDir()}, EnrichOptions{})
+	require.NoError(t, err)
+	require.True(t, partial[applRepo])
+
+	gens, err := g.EnrichmentContentGens(applRepo)
+	require.NoError(t, err)
+	require.Contains(t, gens, "test-py",
+		"a supplemental provider that runs and does not finish must stay visible as owed")
+	assert.EqualValues(t, 0, gens["test-py"],
+		"owed and never completed is a gen-0 row, which readiness reads as behind")
+}
