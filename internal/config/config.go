@@ -526,6 +526,13 @@ type Config struct {
 	// depth-selection bounds, and the posting gate. Empty by default;
 	// the embedded default rules apply when no rule is configured.
 	Review ReviewConfig `mapstructure:"review" yaml:"review,omitempty"`
+	// Forge declares how a git host maps onto a pull-request backend, for
+	// hosts the automatic routing cannot recognise — a GitLab or GitHub
+	// Enterprise behind a vanity domain that carries no "gitlab"/"github"
+	// label. Empty by default; routing resolves github.com, GHE, gitlab.com,
+	// a "gitlab"-labelled host, and any host with an existing `glab auth
+	// login` without any configuration.
+	Forge ForgeConfig `mapstructure:"forge" yaml:"forge,omitempty"`
 	// Views bounds the payload kept for pinned views of committed state
 	// — branches, tags and commits nobody has checked out. Empty takes
 	// the shipped retention bounds.
