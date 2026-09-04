@@ -15,6 +15,7 @@ import (
 func resetPRsSeams(t *testing.T) {
 	t.Helper()
 	availPrev := forgeAvailable
+	hintPrev := forgeTokenHint
 	listPrev := forgeListPRs
 	filesPrev := forgePRFiles
 	toolPrev := prsDaemonTool
@@ -27,6 +28,7 @@ func resetPRsSeams(t *testing.T) {
 	useLLMPrev := prsUseLLM
 	t.Cleanup(func() {
 		forgeAvailable = availPrev
+		forgeTokenHint = hintPrev
 		forgeListPRs = listPrev
 		forgePRFiles = filesPrev
 		prsDaemonTool = toolPrev
@@ -88,7 +90,7 @@ func cannedPRs() []forge.PR {
 // canned PRs and asserts the rows show up with their classifications.
 func TestPRsList_Table(t *testing.T) {
 	resetPRsSeams(t)
-	forgeAvailable = func(context.Context) bool { return true }
+	forgeAvailable = func(context.Context, string) bool { return true }
 	forgeListPRs = func(_ context.Context, _ string, _ forge.ListOpts) ([]forge.PR, error) {
 		return cannedPRs(), nil
 	}
@@ -113,7 +115,7 @@ func TestPRsList_Table(t *testing.T) {
 // a PR onto a different branch classifies as BASE_MISMATCH.
 func TestPRsList_BaseFlipsMismatch(t *testing.T) {
 	resetPRsSeams(t)
-	forgeAvailable = func(context.Context) bool { return true }
+	forgeAvailable = func(context.Context, string) bool { return true }
 	forgeListPRs = func(_ context.Context, _ string, _ forge.ListOpts) ([]forge.PR, error) {
 		return cannedPRs(), nil
 	}
@@ -150,7 +152,7 @@ func TestPRsList_BaseFlipsMismatch(t *testing.T) {
 // {prs:[{number,title,author,age_days,ci,review,state,blockers}]} shape.
 func TestPRsList_JSONShape(t *testing.T) {
 	resetPRsSeams(t)
-	forgeAvailable = func(context.Context) bool { return true }
+	forgeAvailable = func(context.Context, string) bool { return true }
 	forgeListPRs = func(_ context.Context, _ string, _ forge.ListOpts) ([]forge.PR, error) {
 		return cannedPRs(), nil
 	}
@@ -203,7 +205,8 @@ func TestPRsList_JSONShape(t *testing.T) {
 // actionable GH_TOKEN hint and exits 0 (no error).
 func TestPRsList_NoTokenHint(t *testing.T) {
 	resetPRsSeams(t)
-	forgeAvailable = func(context.Context) bool { return false }
+	forgeAvailable = func(context.Context, string) bool { return false }
+	forgeTokenHint = func(context.Context, string) string { return "set GH_TOKEN (or GITHUB_TOKEN)" }
 	called := false
 	forgeListPRs = func(_ context.Context, _ string, _ forge.ListOpts) ([]forge.PR, error) {
 		called = true
@@ -227,7 +230,7 @@ func TestPRsList_NoTokenHint(t *testing.T) {
 // string, and renders the changed files + blast radius from the result.
 func TestPRsDeepDive_PassesFilesAndRenders(t *testing.T) {
 	resetPRsSeams(t)
-	forgeAvailable = func(context.Context) bool { return true }
+	forgeAvailable = func(context.Context, string) bool { return true }
 	forgePRFiles = func(_ context.Context, _ string, num int) ([]string, error) {
 		if num != 7 {
 			t.Errorf("PRFiles called with num=%d, want 7", num)
@@ -294,7 +297,8 @@ func TestPRsDeepDive_PassesFilesAndRenders(t *testing.T) {
 // self-serve — it must not error out before reaching the daemon.
 func TestPRsDeepDive_NoTokenStillCallsDaemon(t *testing.T) {
 	resetPRsSeams(t)
-	forgeAvailable = func(context.Context) bool { return false }
+	forgeAvailable = func(context.Context, string) bool { return false }
+	forgeTokenHint = func(context.Context, string) string { return "set GH_TOKEN (or GITHUB_TOKEN)" }
 	forgePRFiles = func(context.Context, string, int) ([]string, error) {
 		t.Error("PRFiles must not be called when no token is available")
 		return nil, nil
@@ -367,4 +371,50 @@ func hasBlockerStruct[T any](rows []T, number int, blocker string) bool {
 	var prRows []prRow
 	_ = json.Unmarshal(raw, &prRows)
 	return hasBlocker(prRows, number, blocker)
+}
+
+// TestPRsList_MultipleAcceptedBases is the end-to-end guard for the headline
+// CLI capability: `--base 16.0,aurora-redesign`. The unit level already covers
+// ParseBases; this pins that the flag string survives cobra and resolvePRBase
+// un-mangled, which is the part a wiring regression would break.
+func TestPRsList_MultipleAcceptedBases(t *testing.T) {
+	resetPRsSeams(t)
+	forgeAvailable = func(context.Context, string) bool { return true }
+	forgeListPRs = func(_ context.Context, _ string, _ forge.ListOpts) ([]forge.PR, error) {
+		return []forge.PR{
+			{Number: 1, Title: "on main", Author: "a", BaseRef: "main", UpdatedAt: time.Now()},
+			{Number: 2, Title: "on develop", Author: "b", BaseRef: "develop", UpdatedAt: time.Now()},
+			{Number: 3, Title: "on a stray branch", Author: "c", BaseRef: "stray", UpdatedAt: time.Now()},
+		}, nil
+	}
+	prsFormat = "json"
+
+	// Single base: the other live target is (correctly, for one base) flagged.
+	prsBase = "main"
+	rows := decodePRRows(t, mustRunPRs(t))
+	if got := stateOf(rows, 2); got != "BASE_MISMATCH" {
+		t.Errorf("control: PR #2 with --base main = %q, want BASE_MISMATCH", got)
+	}
+
+	// Both bases accepted: neither live target is flagged, the stray one is.
+	prsBase = "main,develop"
+	rows = decodePRRows(t, mustRunPRs(t))
+	for _, n := range []int{1, 2} {
+		if got := stateOf(rows, n); got == "BASE_MISMATCH" {
+			t.Errorf("PR #%d on a live target flagged with --base main,develop", n)
+		}
+	}
+	if got := stateOf(rows, 3); got != "BASE_MISMATCH" {
+		t.Errorf("stray PR #3 = %q, want BASE_MISMATCH — the --base list went inert", got)
+	}
+}
+
+// mustRunPRs runs the prs command and fails the test on error.
+func mustRunPRs(t *testing.T) string {
+	t.Helper()
+	out, err := runPRsCmd(t)
+	if err != nil {
+		t.Fatalf("runPRs: %v", err)
+	}
+	return out
 }

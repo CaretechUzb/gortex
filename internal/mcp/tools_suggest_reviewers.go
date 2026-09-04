@@ -44,10 +44,10 @@ type ReviewerSuggestion struct {
 func (s *Server) registerSuggestReviewersTool() {
 	s.addTool(
 		mcp.NewTool("suggest_reviewers",
-			mcp.WithDescription("Rank the people / teams best placed to review a changeset. Blends three signals — CODEOWNERS matches (strongest), recent authorship of the changed symbols, and co-change experts (authors of files that historically change alongside the changeset) — into one ranked reviewer list with per-reviewer reasons and matched files. Pass `ids` (comma-separated changed symbol IDs), `base` (a git ref — the changed set is derived from the diff against it), or `number` (a GitHub PR number — files fetched via the forge). Use to pick reviewers before opening or assigning a PR."),
+			mcp.WithDescription("Rank the people / teams best placed to review a changeset. Blends three signals — CODEOWNERS matches (strongest), recent authorship of the changed symbols, and co-change experts (authors of files that historically change alongside the changeset) — into one ranked reviewer list with per-reviewer reasons and matched files. Pass `ids` (comma-separated changed symbol IDs), `base` (a git ref — the changed set is derived from the diff against it), or `number` (a pull-request / merge-request number — files fetched via the forge). Use to pick reviewers before opening or assigning a PR."),
 			mcp.WithString("ids", mcp.Description("Comma-separated changed symbol IDs (already mapped). One of ids|base|number is required.")),
 			mcp.WithString("base", mcp.Description("Base git ref (e.g. main). Derives the changed files/symbols from `git diff base...HEAD` against the indexed repo.")),
-			mcp.WithNumber("number", mcp.Description("GitHub PR number. The changed file set is fetched via the forge (needs GH_TOKEN / GITHUB_TOKEN in the daemon environment).")),
+			mcp.WithNumber("number", mcp.Description("Pull-request / merge-request number. The changed file set is fetched via the forge (needs a token for the repo's forge host in the daemon environment: GH_TOKEN / GITHUB_TOKEN for GitHub, GITLAB_TOKEN for GitLab).")),
 			mcp.WithString("repo", mcp.Description("Repository prefix to resolve the working tree (multi-repo mode).")),
 			mcp.WithNumber("limit", mcp.Description("Cap the number of ranked reviewers returned (default 10).")),
 			mcp.WithString("format", mcp.Description("Output format: json (default), gcx (GCX1 compact wire format), or toon")),
@@ -195,11 +195,14 @@ func (s *Server) resolveReviewerChangeset(ctx context.Context, req mcp.CallToolR
 		return diff.ChangedFiles, analysis.RepoRelativePath, symbolIDs, nil
 
 	case number > 0:
-		if !forge.Available(ctx) {
-			return nil, analysis.RepoRelativePath, nil, fmt.Errorf("forge unavailable: set GH_TOKEN (or GITHUB_TOKEN) in the daemon environment to resolve PR files")
-		}
+		// The repo root is resolved FIRST: which forge serves this repository
+		// (and therefore which token to name) is derived from its remote, so
+		// the availability check below needs the root to answer correctly.
 		if repoRoot == "" {
 			return nil, analysis.RepoRelativePath, nil, fmt.Errorf("could not resolve a repository root for the PR file fetch")
+		}
+		if !forge.Available(ctx, repoRoot) {
+			return nil, analysis.RepoRelativePath, nil, fmt.Errorf("forge unavailable: %s in the daemon environment to resolve PR files", forge.MissingTokenHint(ctx, repoRoot))
 		}
 		prFiles, ferr := forge.PRFiles(ctx, repoRoot, number)
 		if ferr != nil {

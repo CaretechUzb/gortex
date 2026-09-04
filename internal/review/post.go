@@ -20,7 +20,7 @@ var ErrPublicPostBlocked = errors.New("posting to a public/fork PR requires --co
 // AllowPublic opt-in is required. The caller (CLI / MCP) determines Public from
 // the forge / repo identity; PostFindings only consumes it.
 type PostTarget struct {
-	Provider  string // "github" (default) — the forge backend
+	Provider  string // "github" (default) or "gitlab" — the forge backend
 	Owner     string
 	Repo      string
 	PRNumber  int
@@ -28,7 +28,25 @@ type PostTarget struct {
 	Public    bool   // the target PR is on a public or fork repo (world-readable)
 }
 
+// BatchesComments reports whether this target's forge takes every inline
+// comment as ONE review (GitHub) or one request per comment (GitLab).
+//
+// The empty Provider means GitHub, so a target built without naming a provider
+// keeps the batched behaviour it has always had.
+func (t PostTarget) BatchesComments() bool {
+	// Compare against forge's exported constant, not a bare literal: the string
+	// is produced by forge.ProviderName, so a literal here would leave producer
+	// and consumer unlinked for the compiler.
+	return !strings.EqualFold(strings.TrimSpace(t.Provider), string(forge.ProviderGitLab))
+}
+
 // PostOptions tunes how findings are posted.
+//
+// There is deliberately no AsSingleReview field: the batch-vs-per-comment
+// posting shape is decided by PostTarget.Provider, via BatchesComments. A bool
+// here was the wrong home for it — PostOptions is built as a struct literal in
+// several places, so a zero value would have silently selected the per-comment
+// GitLab path for every caller that never heard of GitLab.
 type PostOptions struct {
 	// DryRun builds and returns the would-post payloads without any network
 	// call. The dry-run payloads are redacted identically to the live path, so a
@@ -37,10 +55,6 @@ type PostOptions struct {
 	// Summary is the top-level review summary body posted alongside the
 	// inline comments.
 	Summary string
-	// AsSingleReview batches every inline comment into one forge review
-	// (GitHub createReview) rather than per-comment discussions. Always true for
-	// the GitHub backend.
-	AsSingleReview bool
 	// AllowPublic permits posting to a public / fork PR. Off by default so a
 	// misconfigured token never leaks comments to a world-readable thread.
 	AllowPublic bool
@@ -125,9 +139,18 @@ func PostFindings(ctx context.Context, repoDir string, target PostTarget, findin
 	}
 
 	if opts.DryRun {
+		// The dry run must show the shape that would actually be sent, so a
+		// GitLab target renders positioned-discussion payloads rather than
+		// GitHub createReview comments. A dry run that lied about the shape
+		// would defeat the point of inspecting it before posting.
 		res.Payloads = make([]map[string]any, 0, len(comments))
+		batched := target.BatchesComments()
 		for _, c := range comments {
-			res.Payloads = append(res.Payloads, reviewCommentPayload(c))
+			if batched {
+				res.Payloads = append(res.Payloads, reviewCommentPayload(c))
+				continue
+			}
+			res.Payloads = append(res.Payloads, discussionCommentPayload(c))
 		}
 		return res, nil
 	}
@@ -139,15 +162,65 @@ func PostFindings(ctx context.Context, repoDir string, target PostTarget, findin
 	}
 
 	if err := postReviewComments(ctx, repoDir, target.PRNumber, comments); err != nil {
-		// Clean degradation: report nothing as posted, surface the forge error.
-		res.Posted = 0
+		if target.BatchesComments() {
+			// A batched review is atomic: it either landed whole or not at all,
+			// so nothing was posted.
+			res.Posted = 0
+			return res, err
+		}
+		// A per-comment backend is NOT atomic: some comments may already be on
+		// the merge request. res.Posted was counted BEFORE any network call, so
+		// leaving it alone reported the maximum — 40 posted for a run that failed
+		// on comment 1. Take the real count from the forge's typed error.
+		var partial *forge.PartialPostError
+		if errors.As(err, &partial) {
+			res.Posted = partial.Posted
+		} else {
+			res.Posted = 0
+		}
 		return res, err
 	}
 
-	if target.Owner != "" && target.Repo != "" && target.PRNumber > 0 {
-		res.ReviewURL = fmt.Sprintf("https://github.com/%s/%s/pull/%d", target.Owner, target.Repo, target.PRNumber)
-	}
+	res.ReviewURL = reviewURL(ctx, repoDir, target)
 	return res, nil
+}
+
+// reviewURL builds the browser URL of the posted review. It asks the forge
+// layer first (which knows the host and the per-provider path shape), and only
+// falls back to the caller-supplied owner/repo GitHub form when the remote
+// could not be resolved.
+func reviewURL(ctx context.Context, repoDir string, target PostTarget) string {
+	if u := forge.PRWebURL(ctx, repoDir, target.PRNumber); u != "" {
+		return u
+	}
+	if target.Owner != "" && target.Repo != "" && target.PRNumber > 0 {
+		return fmt.Sprintf("https://github.com/%s/%s/pull/%d", target.Owner, target.Repo, target.PRNumber)
+	}
+	return ""
+}
+
+// discussionCommentPayload projects a forge.ReviewComment onto the GitLab
+// positioned-discussion dry-run shape ({body, position:{position_type,
+// new_path, new_line | old_line}}).
+//
+// The three diff-ref SHAs the live call attaches are deliberately absent: they
+// are fetched from the merge request at post time, and a dry run makes no
+// network call. Their absence here is the honest representation of a dry run.
+func discussionCommentPayload(c forge.ReviewComment) map[string]any {
+	position := map[string]any{
+		"position_type": "text",
+		"new_path":      c.Path,
+		"old_path":      c.Path,
+	}
+	if strings.EqualFold(c.Side, "LEFT") {
+		position["old_line"] = c.Line
+	} else {
+		position["new_line"] = c.Line
+	}
+	return map[string]any{
+		"body":     c.Body,
+		"position": position,
+	}
 }
 
 // findingToReviewComment adapts a review.Finding onto the L0 forge.ReviewComment

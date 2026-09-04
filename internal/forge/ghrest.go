@@ -14,8 +14,6 @@ import (
 
 	"github.com/zzet/gortex/internal/analysis"
 	"github.com/zzet/gortex/internal/churn"
-	"github.com/zzet/gortex/internal/gitcmd"
-	"github.com/zzet/gortex/internal/indexer"
 )
 
 // ghClient wraps a *github.Client with the resolved owner/repo slug for a
@@ -48,7 +46,7 @@ var makeGitHubClient = func(tok, base string) (*github.Client, error) {
 func newGHClient(ctx context.Context, repoDir string) (*ghClient, error) {
 	tok := resolveToken()
 	if tok == "" {
-		return nil, ErrNotAuthenticated
+		return nil, fmt.Errorf("%w: no GitHub token: set GH_TOKEN (or GITHUB_TOKEN)", ErrNotAuthenticated)
 	}
 	owner, repo, err := resolveSlug(ctx, repoDir)
 	if err != nil {
@@ -119,45 +117,15 @@ func ensureTrailingSlash(s string) string {
 // repo identity (indexer.DetectIdentity → NormalizeRemoteURL canonical
 // form), then falls back to `git remote get-url origin` through gitcmd.
 func resolveSlug(ctx context.Context, repoDir string) (owner, repo string, err error) {
-	if id, idErr := indexer.DetectIdentity(repoDir); idErr == nil && id != nil {
-		if o, r, ok := ownerRepoFrom(id.CanonicalID); ok {
-			return o, r, nil
-		}
-		if o, r, ok := ownerRepoFrom(id.RemoteURL); ok {
-			return o, r, nil
-		}
+	r, rerr := resolveRemote(ctx, repoDir)
+	if rerr != nil {
+		return "", "", rerr
 	}
-	// Fallback: read the remote directly through the git chokepoint.
-	raw, rErr := gitcmd.Output(ctx, repoDir, "remote", "get-url", "origin")
-	if rErr != nil {
-		return "", "", fmt.Errorf("forge: resolving owner/repo for %s: %w", repoDir, rErr)
-	}
-	if o, r, ok := ownerRepoFrom(indexer.NormalizeRemoteURL(raw)); ok {
-		return o, r, nil
-	}
-	return "", "", fmt.Errorf("forge: could not derive owner/repo from remote %q", raw)
-}
-
-// ownerRepoFrom extracts (owner, repo) from a normalized remote of the
-// form "host/owner/repo" (or "owner/repo"). The trailing two
-// slash-separated components are the owner and repo.
-func ownerRepoFrom(canonical string) (owner, repo string, ok bool) {
-	canonical = strings.TrimSpace(canonical)
-	canonical = strings.TrimSuffix(canonical, ".git")
-	canonical = strings.Trim(canonical, "/")
-	if canonical == "" {
-		return "", "", false
-	}
-	parts := strings.Split(canonical, "/")
+	parts := strings.Split(r.Path, "/")
 	if len(parts) < 2 {
-		return "", "", false
+		return "", "", fmt.Errorf("forge: could not derive owner/repo from remote %q", r.Host+"/"+r.Path)
 	}
-	repo = parts[len(parts)-1]
-	owner = parts[len(parts)-2]
-	if owner == "" || repo == "" {
-		return "", "", false
-	}
-	return owner, repo, true
+	return parts[len(parts)-2], parts[len(parts)-1], nil
 }
 
 // mapErr maps go-github's typed rate-limit errors onto ErrRateLimited
@@ -189,11 +157,7 @@ func mapErr(err error) error {
 
 // callCtx derives a per-call context bounded by the client's timeout.
 func (c *ghClient) callCtx(ctx context.Context) (context.Context, context.CancelFunc) {
-	t := c.timeout
-	if t <= 0 {
-		t = callTimeout
-	}
-	return context.WithTimeout(ctx, t)
+	return boundedCtx(ctx, c.timeout)
 }
 
 // ListPRs lists pull requests. PR.Files is left empty; decision/CI
@@ -207,11 +171,18 @@ func (c *ghClient) ListPRs(ctx context.Context, opts ListOpts) ([]PR, error) {
 		state = "open"
 	}
 	perPage := opts.Limit
-	if perPage <= 0 || perPage > 100 {
-		perPage = 100
+	if perPage <= 0 || perPage > maxPerPage {
+		perPage = maxPerPage
 	}
+	// Sort by recency of UPDATE to match the GitLab backend. Without this the
+	// two forges define "the first N" differently — GitHub defaults to
+	// created/desc — so with a shared Limit and no pagination, triage ranked a
+	// different POPULATION depending on the host, and classify's STALE state
+	// (which keys on UpdatedAt) could never surface on GitHub's tail.
 	ghOpts := &github.PullRequestListOptions{
 		State:       state,
+		Sort:        "updated",
+		Direction:   "desc",
 		ListOptions: github.ListOptions{PerPage: perPage},
 	}
 	ghPRs, _, err := c.gh.PullRequests.List(cctx, c.owner, c.repo, ghOpts)
@@ -321,13 +292,7 @@ func (c *ghClient) DiffPR(ctx context.Context, num int) (*PRDiff, error) {
 		// GitHub's per-file .patch carries only the hunk body — no
 		// `+++ b/<file>` header — so synthesize one so ParseDiffHunks
 		// scopes the hunks to this file (and so Raw is a valid diff).
-		var withHeader string
-		if patch != "" {
-			withHeader = "--- a/" + path + "\n+++ b/" + path + "\n" + patch
-			if !strings.HasSuffix(withHeader, "\n") {
-				withHeader += "\n"
-			}
-		}
+		withHeader := synthesizePatch(path, path, patch)
 		pf := PRFile{
 			Path:    path,
 			OldPath: f.GetPreviousFilename(),
@@ -402,7 +367,7 @@ func (c *ghClient) listFiles(ctx context.Context, num int) ([]*github.CommitFile
 // a bounded worker count.
 func (c *ghClient) fillAggregates(ctx context.Context, prs []PR, heads []string, withDecision, withCI bool) error {
 	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(8)
+	g.SetLimit(aggregateConcurrency)
 	for i := range prs {
 		i := i
 		head := ""

@@ -10,6 +10,7 @@ import (
 
 	"github.com/zzet/gortex/internal/analysis"
 	"github.com/zzet/gortex/internal/astquery"
+	"github.com/zzet/gortex/internal/forge"
 	"github.com/zzet/gortex/internal/review"
 )
 
@@ -44,14 +45,27 @@ func (s *Server) handlePostReview(ctx context.Context, req mcp.CallToolRequest) 
 
 	repo := strings.TrimSpace(req.GetString("repo", ""))
 	repoRoot, _ := s.diffRepoScope(ctx, repo)
+	// An empty root means "no resolvable working tree". Passing it on lets the
+	// forge layer answer from the DAEMON's own directory — the wrong repo's
+	// provider, token hint, and review URL. resolveReviewerChangeset already
+	// guards this; these sites did not.
+	if repoRoot == "" {
+		return mcp.NewToolResultError("could not resolve a repository root for this post; pass `repo`"), nil
+	}
 
 	findings, err := s.postReviewFindingsFor(ctx, req, repoRoot)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
+	// The provider is DERIVED, never taken from the caller. forge routes the
+	// actual post on the repo's remote host, so a caller-supplied value could
+	// only ever repaint the dry-run preview while the live call went elsewhere —
+	// a dry run that lies about the shape, which is the one thing it must not do.
+	provider := forge.ProviderName(ctx, repoRoot)
+
 	target := review.PostTarget{
-		Provider: strings.TrimSpace(req.GetString("provider", "github")),
+		Provider: provider,
 		Owner:    strings.TrimSpace(req.GetString("owner", "")),
 		Repo:     strings.TrimSpace(req.GetString("repo_name", "")),
 		PRNumber: number,
@@ -64,7 +78,6 @@ func (s *Server) handlePostReview(ctx context.Context, req mcp.CallToolRequest) 
 	opts := review.NewPostOptions()
 	opts.DryRun = req.GetBool("dry_run", false)
 	opts.Summary = strings.TrimSpace(req.GetString("summary", ""))
-	opts.AsSingleReview = true
 	// allow_public defaults to the configured review.post.allow_public, overridden
 	// to true by an explicit confirm_public.
 	opts.AllowPublic = s.reviewAllowPublic(repo) || req.GetBool("confirm_public", false)

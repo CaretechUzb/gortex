@@ -76,7 +76,7 @@ func stubBundleDaemon(t *testing.T) (calls *[]string, argsByTool map[string]map[
 // reviewer suggestions — joined from the stubbed daemon tools, no network.
 func TestPRsBundle_WritesWellFormedBundle(t *testing.T) {
 	resetPRsSeams(t)
-	forgeAvailable = func(context.Context) bool { return true }
+	forgeAvailable = func(context.Context, string) bool { return true }
 	forgePRFiles = func(_ context.Context, _ string, num int) ([]string, error) {
 		if num != 7 {
 			t.Errorf("PRFiles called with num=%d, want 7", num)
@@ -173,7 +173,7 @@ func TestPRsBundle_WritesWellFormedBundle(t *testing.T) {
 // pr-<number>-bundle.json when --out is not given.
 func TestPRsBundle_DefaultOutPath(t *testing.T) {
 	resetPRsSeams(t)
-	forgeAvailable = func(context.Context) bool { return false } // no token: skip PRFiles
+	forgeAvailable = func(context.Context, string) bool { return false } // no token: skip PRFiles
 	stubBundleDaemon(t)
 
 	dir := t.TempDir()
@@ -203,7 +203,7 @@ func TestPRsBundle_DefaultOutPath(t *testing.T) {
 // PR produce byte-identical bundle files (suitable for CI artifact diffing).
 func TestPRsBundle_DeterministicForUnchangedPR(t *testing.T) {
 	resetPRsSeams(t)
-	forgeAvailable = func(context.Context) bool { return true }
+	forgeAvailable = func(context.Context, string) bool { return true }
 	forgePRFiles = func(_ context.Context, _ string, _ int) ([]string, error) {
 		// Deliberately unsorted to prove the writer sorts deterministically.
 		return []string{"internal/forge/ghrest.go", "internal/forge/forge.go"}, nil
@@ -250,7 +250,7 @@ func TestPRsBundle_BadNumber(t *testing.T) {
 // sink the bundle: the impact slice is still written and reviewers is omitted.
 func TestPRsBundle_ReviewersOptional(t *testing.T) {
 	resetPRsSeams(t)
-	forgeAvailable = func(context.Context) bool { return false }
+	forgeAvailable = func(context.Context, string) bool { return false }
 	prsDaemonTool = func(_ string, tool string, _ map[string]any) (json.RawMessage, error) {
 		if tool == "suggest_reviewers" {
 			return nil, errReviewerUnavailable

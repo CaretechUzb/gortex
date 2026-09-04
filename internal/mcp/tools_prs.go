@@ -137,9 +137,10 @@ func (c *prCache) putList(repo string, number int, pr forge.PR) {
 func (s *Server) registerPRTools() {
 	s.addTool(
 		mcp.NewTool("list_prs",
-			mcp.WithDescription("List a repository's pull requests with a one-shot review-state classification. Each PR is reduced to a state label (DRAFT / BASE_MISMATCH / CHANGES_REQUESTED / APPROVED / STALE / READY), a normalized CI rollup (NONE / FAILURE / PENDING / SUCCESS), and its merge blockers. The daemon self-serves the data via its own forge client (needs GH_TOKEN / GITHUB_TOKEN in the daemon environment); pass `prs` to classify an already-fetched set with no network call. Use to triage a review queue before opening any PR."),
+			mcp.WithDescription("List a repository's pull requests with a one-shot review-state classification. Each PR is reduced to a state label (DRAFT / BASE_MISMATCH / CHANGES_REQUESTED / APPROVED / STALE / READY), a normalized CI rollup (NONE / FAILURE / PENDING / SUCCESS), and its merge blockers. The daemon self-serves the data via its own forge client (needs a token for the repo's forge host: GH_TOKEN / GITHUB_TOKEN for GitHub, GITLAB_TOKEN for GitLab in the daemon environment); pass `prs` to classify an already-fetched set with no network call. Use to triage a review queue before opening any PR."),
 			mcp.WithString("repo", mcp.Description("Repository prefix to resolve the working tree (multi-repo mode).")),
 			mcp.WithString("state", mcp.Description("PR state filter passed to the forge: open (default), closed, or all.")),
+			mcp.WithString("base", mcp.Description("Accepted base branch(es) used to flag BASE_MISMATCH. Comma-separate several when the repo has more than one live target, e.g. \"16.0,aurora-redesign\" — otherwise every PR targeting the other branch is mislabelled. Omit to disable the base check.")),
 			mcp.WithNumber("limit", mcp.Description("Cap the number of PRs fetched / returned (default 30).")),
 			mcp.WithString("prs", mcp.Description("JSON array of already-fetched forge.PR objects to classify instead of calling the forge. Skips the network entirely.")),
 			mcp.WithString("format", mcp.Description("Output format: json (default), gcx (GCX1 compact wire format), or toon")),
@@ -149,8 +150,8 @@ func (s *Server) registerPRTools() {
 	)
 	s.addTool(
 		mcp.NewTool("get_pr_impact",
-			mcp.WithDescription("Graph-joined blast radius and risk score for a pull request. Maps the PR's changed files to the symbols they define (whole-file granularity), scores PR-level risk across five axes (blast-radius flow, caller fan-in, coverage gap, security keywords, community span), and groups the affected surface by community and by caller/test file. The daemon self-serves the changed-file set via its forge client (needs GH_TOKEN / GITHUB_TOKEN); pass `files` to skip the fetch. Set `receipt:true` to additionally emit a small privacy-safe review receipt. Use to gauge how carefully a PR must be reviewed before reading the diff."),
-			mcp.WithNumber("number", mcp.Required(), mcp.Description("GitHub PR number.")),
+			mcp.WithDescription("Graph-joined blast radius and risk score for a pull request. Maps the PR's changed files to the symbols they define (whole-file granularity), scores PR-level risk across five axes (blast-radius flow, caller fan-in, coverage gap, security keywords, community span), and groups the affected surface by community and by caller/test file. The daemon self-serves the changed-file set via its forge client (needs a token for the repo's forge host: GH_TOKEN / GITHUB_TOKEN for GitHub, GITLAB_TOKEN for GitLab); pass `files` to skip the fetch. Set `receipt:true` to additionally emit a small privacy-safe review receipt. Use to gauge how carefully a PR must be reviewed before reading the diff."),
+			mcp.WithNumber("number", mcp.Required(), mcp.Description("Pull-request / merge-request number.")),
 			mcp.WithString("repo", mcp.Description("Repository prefix to resolve the working tree (multi-repo mode).")),
 			mcp.WithString("files", mcp.Description("JSON array of already-fetched changed file paths to score instead of calling the forge. Skips the network entirely.")),
 			mcp.WithBoolean("receipt", mcp.Description("When true, also emit a small machine-readable review receipt (counts, tier, next safe action, merge-blocker verdict) — no file paths or symbol IDs.")),
@@ -162,7 +163,7 @@ func (s *Server) registerPRTools() {
 	)
 	s.addTool(
 		mcp.NewTool("triage_prs",
-			mcp.WithDescription("Rank a repository's open pull requests by graph-derived review priority. Computes get_pr_impact per PR and orders them by composite risk score (highest first, deterministic). The daemon self-serves the PR list and per-PR files via its forge client (needs GH_TOKEN / GITHUB_TOKEN); pass `prs` and/or `files` to supply already-fetched data and skip the fan-out. Use to decide which PR to review first."),
+			mcp.WithDescription("Rank a repository's open pull requests by graph-derived review priority. Computes get_pr_impact per PR and orders them by composite risk score (highest first, deterministic). The daemon self-serves the PR list and per-PR files via its forge client (needs a token for the repo's forge host: GH_TOKEN / GITHUB_TOKEN for GitHub, GITLAB_TOKEN for GitLab); pass `prs` and/or `files` to supply already-fetched data and skip the fan-out. Use to decide which PR to review first."),
 			mcp.WithString("repo", mcp.Description("Repository prefix to resolve the working tree (multi-repo mode).")),
 			mcp.WithNumber("limit", mcp.Description("Cap the number of open PRs triaged / returned (default 20).")),
 			mcp.WithString("prs", mcp.Description("JSON array of already-fetched forge.PR objects to triage instead of listing via the forge.")),
@@ -177,12 +178,15 @@ func (s *Server) registerPRTools() {
 }
 
 // forgeUnavailablePayload is the typed degradation returned when no token
-// is resolvable and the caller supplied no data. It names GH_TOKEN so the
-// operator knows exactly what the daemon environment is missing.
-func forgeUnavailablePayload() map[string]any {
+// is resolvable and the caller supplied no data.
+//
+// The hint is derived from repoDir's actual remote, so a GitLab repository is
+// told to set GITLAB_TOKEN. Naming GH_TOKEN unconditionally sent every GitLab
+// user after a credential that could not have helped them.
+func forgeUnavailablePayload(ctx context.Context, repoDir string) map[string]any {
 	return map[string]any{
 		"error": "forge unavailable",
-		"hint":  "set GH_TOKEN (or GITHUB_TOKEN) in the daemon environment",
+		"hint":  forge.MissingTokenHint(ctx, repoDir) + " in the daemon environment",
 	}
 }
 
@@ -248,17 +252,17 @@ func (s *Server) handleListPRs(ctx context.Context, req mcp.CallToolRequest) (*m
 	}
 
 	if !supplied {
-		if !forge.Available(ctx) {
-			return s.respondJSONOrTOON(ctx, req, forgeUnavailablePayload())
-		}
 		repoRoot, _ := s.diffRepoScope(ctx, repo)
+		if !forge.Available(ctx, repoRoot) {
+			return s.respondJSONOrTOON(ctx, req, forgeUnavailablePayload(ctx, repoRoot))
+		}
 		fetched, ferr := forgeList(ctx, repoRoot, forge.ListOpts{State: state, Limit: limit, WithDecision: true, WithCI: true})
 		if ferr != nil {
 			if errors.Is(ferr, forge.ErrRateLimited) {
 				return s.respondJSONOrTOON(ctx, req, rateLimitedPayload(ferr))
 			}
 			if isForgeUnavailable(ferr) {
-				return s.respondJSONOrTOON(ctx, req, forgeUnavailablePayload())
+				return s.respondJSONOrTOON(ctx, req, forgeUnavailablePayload(ctx, repoRoot))
 			}
 			return mcp.NewToolResultError(fmt.Sprintf("listing PRs failed: %v", ferr)), nil
 		}
@@ -272,7 +276,7 @@ func (s *Server) handleListPRs(ctx context.Context, req mcp.CallToolRequest) (*m
 		prs = prs[:limit]
 	}
 
-	payload := listPRsPayload(prs)
+	payload := listPRsPayload(prs, strings.TrimSpace(req.GetString("base", "")))
 
 	if s.isGCX(ctx, req) {
 		return s.gcxResponseWithBudget(req)(encodeListPRs(payload))
@@ -284,10 +288,17 @@ func (s *Server) handleListPRs(ctx context.Context, req mcp.CallToolRequest) (*m
 }
 
 // listPRsPayload projects the classified PRs onto the list_prs wire shape.
-func listPRsPayload(prs []forge.PR) map[string]any {
+//
+// bases names the accepted base branches (comma-separated, from the caller's
+// `base` argument). When it is empty the base check is disabled — which is what
+// this function did unconditionally before the argument existed, by passing
+// each PR its OWN BaseRef as the expected base, so BASE_MISMATCH could never
+// fire even though list_prs advertises the state.
+func listPRsPayload(prs []forge.PR, bases string) map[string]any {
+	accepted := forge.ParseBases(bases)
 	rows := make([]map[string]any, 0, len(prs))
 	for _, pr := range prs {
-		st := forge.ClassifyStatus(pr, pr.BaseRef)
+		st := forge.ClassifyStatusAgainst(pr, accepted)
 		blockers := st.Blockers
 		if blockers == nil {
 			blockers = []string{}
@@ -501,17 +512,17 @@ func (s *Server) handleTriagePRs(ctx context.Context, req mcp.CallToolRequest) (
 	}
 
 	if !prsSupplied {
-		if !forge.Available(ctx) && len(filesByNumber) == 0 {
-			return s.respondJSONOrTOON(ctx, req, forgeUnavailablePayload())
-		}
 		repoRoot, _ := s.diffRepoScope(ctx, repo)
+		if !forge.Available(ctx, repoRoot) && len(filesByNumber) == 0 {
+			return s.respondJSONOrTOON(ctx, req, forgeUnavailablePayload(ctx, repoRoot))
+		}
 		fetched, ferr := forgeList(ctx, repoRoot, forge.ListOpts{State: "open", Limit: limit, WithCI: true})
 		if ferr != nil {
 			if errors.Is(ferr, forge.ErrRateLimited) {
 				return s.respondJSONOrTOON(ctx, req, rateLimitedPayload(ferr))
 			}
 			if isForgeUnavailable(ferr) {
-				return s.respondJSONOrTOON(ctx, req, forgeUnavailablePayload())
+				return s.respondJSONOrTOON(ctx, req, forgeUnavailablePayload(ctx, repoRoot))
 			}
 			return mcp.NewToolResultError(fmt.Sprintf("listing PRs failed: %v", ferr)), nil
 		}
@@ -812,17 +823,17 @@ func (s *Server) resolvePRFiles(ctx context.Context, repo string, pr forge.PR, f
 // non-nil only when a degradation payload should be returned to the
 // caller; the error is non-nil only for an unexpected failure.
 func (s *Server) fetchPRFiles(ctx context.Context, repo string, number int) (files []string, degraded map[string]any, err error) {
-	if !forge.Available(ctx) {
-		return nil, forgeUnavailablePayload(), nil
-	}
 	repoRoot, _ := s.diffRepoScope(ctx, repo)
+	if !forge.Available(ctx, repoRoot) {
+		return nil, forgeUnavailablePayload(ctx, repoRoot), nil
+	}
 	fetched, ferr := forgeFiles(ctx, repoRoot, number)
 	if ferr != nil {
 		if errors.Is(ferr, forge.ErrRateLimited) {
 			return nil, rateLimitedPayload(ferr), nil
 		}
 		if isForgeUnavailable(ferr) {
-			return nil, forgeUnavailablePayload(), nil
+			return nil, forgeUnavailablePayload(ctx, repoRoot), nil
 		}
 		return nil, nil, fmt.Errorf("fetching files for PR #%d failed: %v", number, ferr)
 	}

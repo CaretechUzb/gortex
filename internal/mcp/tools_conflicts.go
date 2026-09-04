@@ -37,7 +37,7 @@ type ConflictGroup struct {
 func (s *Server) registerConflictsPRTool() {
 	s.addTool(
 		mcp.NewTool("conflicts_prs",
-			mcp.WithDescription("Surface merge-order conflict risk across a repository's open pull requests. Maps each open PR's changed files to the symbols they define, to the graph communities those symbols live in, then reports the communities touched by MORE THAN ONE open PR — the merge-order hotspots where landing PRs in the wrong order is most likely to collide. Each cluster carries the colliding PR numbers, the community size, a suggested safe merge order (lowest-risk PR first), and a conflict-risk score; clusters are ranked highest-risk first. The daemon self-serves the PR list and per-PR files via its forge client (needs GH_TOKEN / GITHUB_TOKEN); pass `prs` and/or `files` to supply already-fetched data and skip the fan-out. Use to plan a merge train that minimises rebases."),
+			mcp.WithDescription("Surface merge-order conflict risk across a repository's open pull requests. Maps each open PR's changed files to the symbols they define, to the graph communities those symbols live in, then reports the communities touched by MORE THAN ONE open PR — the merge-order hotspots where landing PRs in the wrong order is most likely to collide. Each cluster carries the colliding PR numbers, the community size, a suggested safe merge order (lowest-risk PR first), and a conflict-risk score; clusters are ranked highest-risk first. The daemon self-serves the PR list and per-PR files via its forge client (needs a token for the repo's forge host: GH_TOKEN / GITHUB_TOKEN for GitHub, GITLAB_TOKEN for GitLab); pass `prs` and/or `files` to supply already-fetched data and skip the fan-out. Use to plan a merge train that minimises rebases."),
 			mcp.WithString("repo", mcp.Description("Repository prefix to resolve the working tree (multi-repo mode).")),
 			mcp.WithNumber("limit", mcp.Description("Cap the number of open PRs considered (default 20).")),
 			mcp.WithString("prs", mcp.Description("JSON array of already-fetched forge.PR objects to consider instead of listing via the forge.")),
@@ -74,17 +74,17 @@ func (s *Server) handleConflictsPRs(ctx context.Context, req mcp.CallToolRequest
 	}
 
 	if !prsSupplied {
-		if !forge.Available(ctx) && len(filesByNumber) == 0 {
-			return s.respondJSONOrTOON(ctx, req, forgeUnavailablePayload())
-		}
 		repoRoot, _ := s.diffRepoScope(ctx, repo)
+		if !forge.Available(ctx, repoRoot) && len(filesByNumber) == 0 {
+			return s.respondJSONOrTOON(ctx, req, forgeUnavailablePayload(ctx, repoRoot))
+		}
 		fetched, ferr := forgeList(ctx, repoRoot, forge.ListOpts{State: "open", Limit: limit, WithCI: true})
 		if ferr != nil {
 			if errors.Is(ferr, forge.ErrRateLimited) {
 				return s.respondJSONOrTOON(ctx, req, rateLimitedPayload(ferr))
 			}
 			if isForgeUnavailable(ferr) {
-				return s.respondJSONOrTOON(ctx, req, forgeUnavailablePayload())
+				return s.respondJSONOrTOON(ctx, req, forgeUnavailablePayload(ctx, repoRoot))
 			}
 			return mcp.NewToolResultError(fmt.Sprintf("listing PRs failed: %v", ferr)), nil
 		}

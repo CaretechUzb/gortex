@@ -31,7 +31,7 @@ func newTestClient(t *testing.T, baseURL string) *ghClient {
 func withTestSeam(t *testing.T, c *ghClient) {
 	t.Helper()
 	prev := newClient
-	newClient = func(ctx context.Context, repoDir string) (*ghClient, error) { return c, nil }
+	newClient = func(ctx context.Context, repoDir string) (Client, error) { return c, nil }
 	t.Cleanup(func() { newClient = prev })
 }
 
@@ -230,11 +230,15 @@ func TestNewGHClient_NoToken(t *testing.T) {
 func TestAvailable(t *testing.T) {
 	t.Setenv("GH_TOKEN", "")
 	t.Setenv("GITHUB_TOKEN", "")
-	if Available(context.Background()) {
+	t.Setenv("GITLAB_TOKEN", "")
+	// A directory with no git remote: the host is unresolvable, so Available
+	// takes its documented fallback to the GitHub token check.
+	dir := t.TempDir()
+	if Available(context.Background(), dir) {
 		t.Errorf("Available = true with no token")
 	}
 	t.Setenv("GITHUB_TOKEN", "tok")
-	if !Available(context.Background()) {
+	if !Available(context.Background(), dir) {
 		t.Errorf("Available = false with GITHUB_TOKEN set")
 	}
 }
@@ -291,26 +295,6 @@ func TestDefaultBranch_FromAPI(t *testing.T) {
 	c := newTestClient(t, srv.URL)
 	if got := c.DefaultBranch(context.Background()); got != "trunk" {
 		t.Errorf("DefaultBranch = %q, want trunk", got)
-	}
-}
-
-func TestOwnerRepoFrom(t *testing.T) {
-	tests := []struct {
-		in, owner, repo string
-		ok              bool
-	}{
-		{"github.com/octo/gortex", "octo", "gortex", true},
-		{"github.com/octo/gortex.git", "octo", "gortex", true},
-		{"octo/gortex", "octo", "gortex", true},
-		{"gortex", "", "", false},
-		{"", "", "", false},
-		{"ghe.example.com/org/team/repo", "team", "repo", true},
-	}
-	for _, tt := range tests {
-		o, r, ok := ownerRepoFrom(tt.in)
-		if ok != tt.ok || o != tt.owner || r != tt.repo {
-			t.Errorf("ownerRepoFrom(%q) = %q,%q,%v; want %q,%q,%v", tt.in, o, r, ok, tt.owner, tt.repo, tt.ok)
-		}
 	}
 }
 
