@@ -174,7 +174,7 @@ func TestRunCodexPreToolUseWithoutTerminalPreservesBuiltins(t *testing.T) {
 
 func TestRunCodexPreToolUseBashSoftAdditionalContext(t *testing.T) {
 	oldProbe := grepProbe
-	grepProbe = func(string, time.Duration) ([]grepSymbolHit, error) {
+	grepProbe = func(string, string, time.Duration) ([]grepSymbolHit, error) {
 		return nil, errDaemonUnreachable
 	}
 	t.Cleanup(func() { grepProbe = oldProbe })
@@ -318,7 +318,7 @@ func TestRunCodexHardDenyRequiresIndexedWorkspaceMatch(t *testing.T) {
 	}
 
 	oldProbe := grepProbe
-	grepProbe = func(string, time.Duration) ([]grepSymbolHit, error) {
+	grepProbe = func(string, string, time.Duration) ([]grepSymbolHit, error) {
 		return []grepSymbolHit{{Name: "Foo", FilePath: "internal/a.go", Line: 1}}, nil
 	}
 	t.Cleanup(func() { grepProbe = oldProbe })
@@ -768,7 +768,7 @@ func TestRunCodexPostToolUseMalformedJSONNoop(t *testing.T) {
 
 func TestRunCodexUserPromptSubmitInjectsGraphContext(t *testing.T) {
 	prev := userPromptProbe
-	userPromptProbe = func(string, time.Duration) ([]grepSymbolHit, error) {
+	userPromptProbe = func(string, string, time.Duration) ([]grepSymbolHit, error) {
 		return []grepSymbolHit{
 			{Name: "AuthMiddleware", Kind: "function", FilePath: "internal/auth.go", Line: 12},
 		}, nil
@@ -797,7 +797,7 @@ func TestRunCodexUserPromptSubmitInjectsGraphContext(t *testing.T) {
 
 func TestRunCodexUserPromptSubmitSilentWhenNoHits(t *testing.T) {
 	prev := userPromptProbe
-	userPromptProbe = func(string, time.Duration) ([]grepSymbolHit, error) {
+	userPromptProbe = func(string, string, time.Duration) ([]grepSymbolHit, error) {
 		return nil, nil
 	}
 	t.Cleanup(func() { userPromptProbe = prev })

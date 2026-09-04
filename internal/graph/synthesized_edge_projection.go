@@ -56,7 +56,11 @@ type SynthesizedEdgeSequencer interface {
 // buffers as a shadow graph holding edges the durable store does not, so
 // walking to the owner here would answer an overlay's census from the wrong
 // graph — silently, and in the direction of missing data.
-func SynthesizedEdgesSeq(s Store) (iter.Seq[SynthesizedEdge], func() error) {
+// Takes a Reader, not a Store: the census only ever walks edges, and the MCP
+// tool that drives it resolves an overlay session to a Reader. Every Store is
+// a Reader, so this widened in the 2026-09-04 merge without touching a caller,
+// and the streaming fast path below is still selected by type assertion.
+func SynthesizedEdgesSeq(s Reader) (iter.Seq[SynthesizedEdge], func() error) {
 	if s == nil {
 		return func(func(SynthesizedEdge) bool) {}, func() error { return nil }
 	}

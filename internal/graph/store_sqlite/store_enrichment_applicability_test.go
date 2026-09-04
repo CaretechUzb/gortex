@@ -274,3 +274,44 @@ func TestRefreshingNeverPromotesAProviderThatNeverRan(t *testing.T) {
 	require.Zero(t, gens["python-types"], "declared applicable, never ran, still owed")
 	require.Zero(t, minProviderGen(gens), "so the repo is still not enriched")
 }
+
+// TestDeclaringProvidersSparesCheckoutScopedMarkers pins the rule at its
+// source. The applicability prune drops every provider row outside the declared
+// set, and a checkout marker's key ("<provider>@<checkout>") is never in that
+// set — it is not an applicability row, it records that one working copy was
+// enriched at one fingerprint.
+//
+// Without the exclusion, enriching checkout-b deleted checkout-a's marker, so
+// every checkout of a family re-enriched a tree the store had already covered
+// and the "skip an unchanged working copy" gate never fired for more than the
+// most recent one. The two features are independently correct; only their
+// composition was not, which is why this is pinned on the store rather than
+// left to the end-to-end test in internal/semantic.
+func TestDeclaringProvidersSparesCheckoutScopedMarkers(t *testing.T) {
+	t.Parallel()
+	store := openGenTestStore(t)
+	require.NoError(t, store.BulkSetFileMtimes("repoA", map[string]int64{"a.go": 1}))
+
+	markerA := "go-types" + graph.EnrichCheckoutMarkerSeparator + "checkout-a"
+	require.NoError(t, store.SetEnrichmentState(graph.EnrichmentState{
+		RepoPrefix: "repoA", Provider: markerA, IndexedSHA: "fingerprint-a",
+	}))
+
+	// A declaration naming only the real provider must not disturb the marker.
+	require.NoError(t, store.DeclareEnrichmentProviders("repoA", []string{"go-types"}))
+
+	got, found, err := store.GetEnrichmentState("repoA", markerA)
+	require.NoError(t, err)
+	require.True(t, found, "the prune deleted a checkout-scoped marker")
+	require.Equal(t, "fingerprint-a", got.IndexedSHA)
+
+	// An unrelated provider row IS still pruned, so the exclusion did not turn
+	// the prune off wholesale.
+	require.NoError(t, store.SetEnrichmentState(graph.EnrichmentState{
+		RepoPrefix: "repoA", Provider: "python-types", IndexedSHA: "sha-py",
+	}))
+	require.NoError(t, store.DeclareEnrichmentProviders("repoA", []string{"go-types"}))
+	_, found, err = store.GetEnrichmentState("repoA", "python-types")
+	require.NoError(t, err)
+	require.False(t, found, "a provider outside the declared set must still be pruned")
+}

@@ -220,6 +220,7 @@ SELECT repo_prefix,
        MIN(CASE WHEN provider NOT IN (?, ?) THEN content_gen END),
        MAX(CASE WHEN provider = ? THEN 1 ELSE 0 END)
   FROM enrichment_state
+ WHERE view_gen = 0
  GROUP BY repo_prefix`,
 		func(rows *sql.Rows) error {
 			var prefix string
@@ -257,7 +258,7 @@ func queryTolerantOfMissingTablePresence(
 ) (bool, error) {
 	rows, err := db.Query(query, args...)
 	if err != nil {
-		if isMissingTableErr(err) || isMissingColumnErr(err) {
+		if isMissingTableErr(err) || isAnyMissingColumnErr(err) {
 			return false, nil
 		}
 		return false, fmt.Errorf("read readiness state from %q: %w", path, err)
@@ -297,6 +298,11 @@ func queryTolerantOfMissingTable(
 // far worse answer than "I cannot tell yet" — a status command's whole job is
 // to degrade rather than refuse. A genuinely mistyped column would be caught
 // immediately by the tests, which run against a freshly migrated store.
-func isMissingColumnErr(err error) bool {
+// Named isAnyMissingColumnErr, not isMissingColumnErr, since the 2026-09-04
+// upstream merge: read_index_state.go grew a same-named helper that matches
+// ONE named column, because it decides a targeted view_gen fallback. This one
+// deliberately matches any absent column, and collapsing the two would either
+// narrow this reader's tolerance or widen that fallback's.
+func isAnyMissingColumnErr(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "no such column")
 }

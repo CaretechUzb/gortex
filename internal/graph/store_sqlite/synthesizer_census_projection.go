@@ -43,7 +43,11 @@ func (s *Store) SynthesizedEdgesSeq() (iter.Seq[graph.SynthesizedEdge], func() e
 	var scanErr error
 	seq := func(yield func(graph.SynthesizedEdge) bool) {
 		scanErr = nil
-		rows, err := s.db.Query(`SELECT kind, from_id, to_id, meta FROM edges`)
+		// Bound to this handle's generation. Without the predicate the census
+		// counts every generation's copy of a synthesized edge as a separate
+		// firing, which is both a wrong total and a cross-view read.
+		rows, err := s.db.Query(
+			`SELECT kind, from_id, to_id, meta FROM edges WHERE view_gen = ?`, s.viewGen)
 		if err != nil {
 			scanErr = err
 			panicOnFatal(err)

@@ -28,6 +28,23 @@ The full surface, grouped by concern. Each item links to the deeper reference wh
 - **Semantic enrichment** — pluggable SCIP, go/types, and LSP providers upgrade edge confidence from ~70-85% (tree-sitter) to 95-100% (compiler-verified). Additive: graceful degradation when external tools are unavailable. Per-language `connect: { network, address, fallback_spawn }` dials an already-running language server instead of spawning a duplicate.
 - **IMPLEMENTS inference** — structural interface satisfaction for Go, TypeScript, Java, Rust, C#, Scala, Swift, Protobuf. C# bases in another compilation unit are split into `extends` vs `implements` via a local-interface prescan + the `I`-prefix convention.
 - **Framework dynamic-dispatch synthesis** — a provenance-tagged synthesizer engine materialises the call edges frameworks wire at runtime that static resolution can't see: gRPC stub→handler, Temporal workflow→activity, in-process / native event channels, and the cross-language native bridges — Swift↔Objective-C selectors, React Native (`RCT_EXPORT_*` / `@ReactMethod` ↔ JS `NativeModules`), Expo (`Function(...)` DSL ↔ `requireNativeModule`), and Fabric codegen view managers. Every synthesized edge carries `synthesized_by` provenance; `analyze kind: "synthesizers"` rolls them up.
+
+  The framework pipeline is enabled in full when `index.framework_synthesizers`
+  is omitted. Set it to `[]` to skip the registry, census, claiming resolvers,
+  family gates, and receiver demotion before any framework graph scan. A
+  non-empty list is an allow-list of stable synthesizer names; for example:
+
+  ```yaml
+  index:
+    framework_synthesizers:
+      - value-ref
+      - fn-value-callback
+  ```
+
+  Allow-listed stages run in canonical registry order, not YAML order. Tail
+  correctness gates remain enabled for non-empty selections. Invalid or
+  duplicate names are rejected by the selection compiler and the indexer falls
+  back to the complete registry rather than silently dropping derived edges.
 - **Language-specific resolution** — Rust impl-block method-owner / `self`-receiver / `crate::`-`super::` module-path resolution; Kotlin companion-object static dispatch + lambda-parameter scoping. `analyze kind: "resolution_outcomes"` explains *why* a call/reference edge was left unresolved (`ambiguous_multi_match` / `candidate_out_of_scope` / `cross_language_only` / `stub_only` / `no_definition`).
 - **Per-reference contexts** — `find_usages` classifies every usage by the role it plays (`parameter_type` / `return_type` / `field` / `value` / `type` / `attribute` / `call`) and accepts a `context:` filter — e.g. "every place this type is used as a parameter".
 - **Framework allow-list** — `index.frameworks.allow` narrows Gortex's framework intelligence to the frameworks a repository actually uses, gating all three registries at once: the extract-time route passes, the dispatch synthesizers and the claiming resolvers. Entries are pass names (`odoo`, `celery-dispatch`), trailing-`*` prefixes (`godot*`), or `*`; an absent or empty list allows everything, and the `none` sentinel allows nothing. `analyze kind: "frameworks"` lists every registered pass with whether it is active. In a multi-repository workspace the shared synthesis pass runs the union of every tracked repository's list, but each synthesized edge is confined to the repositories whose own list admits the pass that made it — see [multi-repo.md](multi-repo.md).

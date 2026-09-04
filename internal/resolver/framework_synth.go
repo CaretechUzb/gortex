@@ -1256,6 +1256,16 @@ func RunFrameworkSynthesizers(g graph.Store, opts ...FrameworkSynthOption) Frame
 	return RunFrameworkSynthesizersScoped(g, nil, opts...)
 }
 
+// RunFrameworkSynthesizersWithSelection runs the framework pipeline using a
+// validated selection. It is upstream's spelling of the same decision
+// WithAllowedFrameworks carries, kept so upstream's callers compile unchanged.
+func RunFrameworkSynthesizersWithSelection(
+	g graph.Store,
+	selection FrameworkSynthesizerSelection,
+) FrameworkSynthReport {
+	return RunFrameworkSynthesizers(g, WithFrameworkSelection(selection))
+}
+
 // RunFrameworkSynthesizersScoped is RunFrameworkSynthesizers with an armed
 // changed-repo scope: each synthesizer that implements scopedSynthesizer
 // narrows its candidate scan to those repos, the rest run whole-graph. A nil
@@ -1283,6 +1293,19 @@ func RunFrameworkSynthesizersScopedWithCensus(
 	return runFrameworkSynthesizersScoped(g, scope, nil, censusEligible, true, resolveFrameworkSynthOptions(opts))
 }
 
+// RunFrameworkSynthesizersScopedWithCensusAndSelection is the configurable
+// form used by graph-wide indexer passes.
+func RunFrameworkSynthesizersScopedWithCensusAndSelection(
+	g graph.Store,
+	scope map[string]bool,
+	censusEligible bool,
+	selection FrameworkSynthesizerSelection,
+) FrameworkSynthReport {
+	return RunFrameworkSynthesizersScopedWithCensus(
+		g, scope, censusEligible, WithFrameworkSelection(selection),
+	)
+}
+
 // RunFrameworkSynthesizersScopedForFiles is the exact incremental form. The
 // changed-file frontier owns candidate scans; incident incoming edges and exact
 // name dependencies are admitted by frameworkScopedStore so target-side edits
@@ -1295,6 +1318,22 @@ func RunFrameworkSynthesizersScopedForFiles(
 	opts ...FrameworkSynthOption,
 ) FrameworkSynthReport {
 	return runFrameworkSynthesizersScoped(g, scope, filePaths, false, csharpHierarchyChanged, resolveFrameworkSynthOptions(opts))
+}
+
+// RunFrameworkSynthesizersScopedForFilesWithSelection is the configurable
+// exact incremental form used by the indexer.
+func RunFrameworkSynthesizersScopedForFilesWithSelection(
+	g graph.Store,
+	scope map[string]bool,
+	filePaths []string,
+	csharpHierarchyChanged bool,
+	selection FrameworkSynthesizerSelection,
+	opts ...FrameworkSynthOption,
+) FrameworkSynthReport {
+	return RunFrameworkSynthesizersScopedForFiles(
+		g, scope, filePaths, csharpHierarchyChanged,
+		append([]FrameworkSynthOption{WithFrameworkSelection(selection)}, opts...)...,
+	)
 }
 
 func frameworkScopeForFiles(
@@ -1326,6 +1365,12 @@ func runFrameworkSynthesizersScoped(
 ) FrameworkSynthReport {
 	rep := FrameworkSynthReport{}
 	if g == nil {
+		return rep
+	}
+	// The "selected nothing" short circuit — the configured selection only.
+	// An allow-list of none does NOT come through here: it still reports every
+	// pass as disabled (see the gate note in framework_synth_options.go).
+	if o.selectsNothing() {
 		return rep
 	}
 	// A changed-file frontier is always partial, even when a legacy caller lost
@@ -1366,6 +1411,14 @@ func runFrameworkSynthesizersScoped(
 	// workspace pays nothing for per-repository enforcement.
 	repoGate := newFrameworkRepoGate(o.allowedByRepo)
 	for _, s := range defaultFrameworkSynthesizers() {
+		// Deselected by config: omitted from the report entirely.
+		if !o.selects(s.Name()) {
+			candidates.streams.releasePass(s.Name(), nil)
+			continue
+		}
+		// Gated off by scope: falls through, runs nothing, and is reported with
+		// Disabled set. `disabled` below governs execution, and the loop tail
+		// releases the pass stream with a nil bundle.
 		start := time.Now()
 		var n int
 		var bundle *frameworkPassCandidates
@@ -1375,7 +1428,7 @@ func runFrameworkSynthesizersScoped(
 		// shouldRunFrameworkSynthesizer stays untouched: it answers "does
 		// this graph contain candidates", which is a different question
 		// from "may this pass run here".
-		disabled := !o.allowed.Allows(s.Name())
+		disabled := !o.admits(s.Name())
 		// o.allowed is the union: it answered only that SOME repository
 		// wants this pass. Repositories that excluded it are protected
 		// here instead, by gating the store the pass writes through —
@@ -1473,9 +1526,12 @@ func runFrameworkSynthesizersScoped(
 	rep.SiblingGated += claimSiblingGated
 	rep.ClaimMillis = time.Since(claimStart).Milliseconds()
 	for _, r := range defaultClaimingResolvers() {
+		if !o.selects(r.Name()) {
+			continue
+		}
 		n := claimed[r.Name()]
 		rep.Per = append(rep.Per, SynthCount{
-			Name: r.Name(), Edges: n, Disabled: !o.allowed.Allows(r.Name()),
+			Name: r.Name(), Edges: n, Disabled: !o.admits(r.Name()),
 		})
 		rep.Total += n
 	}
@@ -1805,7 +1861,7 @@ func runClaimingResolversScopedCounted(
 	}
 	admissible := make([]ClaimingResolver, 0, len(resolvers))
 	for _, r := range resolvers {
-		if !o.allowed.Allows(r.Name()) {
+		if !o.admits(r.Name()) {
 			continue
 		}
 		if claimingResolverAdmissible(g, r) {

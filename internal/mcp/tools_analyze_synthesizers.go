@@ -34,15 +34,24 @@ func (s *Server) handleAnalyzeSynthesizers(ctx context.Context, req mcp.CallTool
 	// Clamp to the session workspace (synthesizer edge enumeration is
 	// global) so a workspace-bound caller never sees edges from sibling
 	// workspaces.
-	if wsRepos, bound := s.sessionWorkspaceRepoSet(ctx); bound {
+	wsRepos, bound := s.sessionWorkspaceRepoSet(ctx)
+	if bound && len(wsRepos) > 0 {
 		opts = append(opts, analyzer.WithSynthesizerRepoScope(wsRepos))
 	}
-	result, err := analyzer.AnalyzeSynthesizers(s.graph, opts...)
-	// An aborted census must surface as an error on BOTH response paths. The
-	// compact branch below would otherwise print "no synthesized edges", which
-	// is the specific false statement this tool was fixed to stop making.
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+	// A caller bound to a workspace with no repositories in it has an empty
+	// census by construction; skipping the scan is not the same as an aborted
+	// one, so it keeps the zero result and no error.
+	result := analyzer.SynthesizersResult{}
+	if !bound || len(wsRepos) > 0 {
+		var err error
+		result, err = analyzer.AnalyzeSynthesizers(s.readerFor(ctx), opts...)
+		// An aborted census must surface as an error on BOTH response paths.
+		// The compact branch below would otherwise print "no synthesized
+		// edges", which is the specific false statement this tool was fixed to
+		// stop making.
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
 	}
 
 	if isCompact(req) {

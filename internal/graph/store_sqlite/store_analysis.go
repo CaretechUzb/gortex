@@ -69,24 +69,30 @@ func (s *Store) DeadCodeCandidates(allowedNodeKinds []graph.NodeKind, allowedInE
 
 		var q string
 		var args []any
+		// The reachability probe pairs generations with the node it is
+		// testing. Without the pairing an incoming edge from any other
+		// generation answers "used", and every node reads as reachable.
 		if anyKindCounts {
 			// Any incoming edge disqualifies the node.
 			q = `SELECT ` + lookupNodeCols + ` FROM nodes n
 WHERE n.kind = ?
-  AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.to_id = n.id)
+  AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.to_id = n.id AND e.view_gen = n.view_gen)
+  AND n.view_gen = ?
 ORDER BY n.id`
-			args = []any{string(nk)}
+			args = []any{string(nk), s.viewGen}
 		} else {
 			// Only an incoming edge of one of the allowed kinds counts.
 			q = `SELECT ` + lookupNodeCols + ` FROM nodes n
 WHERE n.kind = ?
-  AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.to_id = n.id AND e.kind IN (` + inPlaceholders(len(allowed)) + `))
+  AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.to_id = n.id AND e.kind IN (` + inPlaceholders(len(allowed)) + `) AND e.view_gen = n.view_gen)
+  AND n.view_gen = ?
 ORDER BY n.id`
-			args = make([]any, 0, 1+len(allowed))
+			args = make([]any, 0, 2+len(allowed))
 			args = append(args, string(nk))
 			for _, ek := range allowed {
 				args = append(args, string(ek))
 			}
+			args = append(args, s.viewGen)
 		}
 
 		for _, n := range s.queryNodesSQL(q, args...) {
@@ -108,9 +114,9 @@ ORDER BY n.id`
 func (s *Store) IfaceImplementsRows() []graph.IfaceImplementsRow {
 	q := `SELECT e.from_id, n.id, n.meta
 FROM edges e
-JOIN nodes n ON n.id = e.to_id
-WHERE e.kind = ? AND n.kind = ? AND n.meta IS NOT NULL`
-	rows, err := s.db.Query(q, string(graph.EdgeImplements), string(graph.KindInterface))
+JOIN nodes n ON n.id = e.to_id AND n.view_gen = e.view_gen
+WHERE e.kind = ? AND n.kind = ? AND n.meta IS NOT NULL AND e.view_gen = ?`
+	rows, err := s.db.Query(q, string(graph.EdgeImplements), string(graph.KindInterface), s.viewGen)
 	if err != nil {
 		return nil
 	}
@@ -153,13 +159,26 @@ WHERE e.kind = ? AND n.kind = ? AND n.meta IS NOT NULL`
 // in-memory reference. Per-type lists are deduplicated by MethodID; the
 // scan is ordered by the edge PK so the first-seen winner is stable. An
 // empty graph (no qualifying rows) returns nil.
-func (s *Store) MemberMethodsByType() map[string][]graph.MemberMethodInfo {
-	q := `SELECT e.to_id, n.id, n.name, n.file_path, n.start_line, n.repo_prefix
+const memberMethodsByTypeSQL = `SELECT e.to_id, n.id, n.name, n.file_path, n.start_line, n.repo_prefix
 FROM edges e
-JOIN nodes n ON n.id = e.from_id
-WHERE e.kind = ? AND n.kind = ?
+JOIN nodes n ON n.id = e.from_id AND n.view_gen = e.view_gen
+WHERE e.kind = ? AND n.kind = ? AND e.view_gen = ?
 ORDER BY e.id`
-	rows, err := s.db.Query(q, string(graph.EdgeMemberOf), string(graph.KindMethod))
+
+const generationMemberMethodsByTypeSQL = `SELECT e.to_id, n.id, n.name, n.file_path, n.start_line, n.repo_prefix
+FROM edges AS e INDEXED BY edges_by_generation
+JOIN nodes n ON n.id = e.from_id AND n.view_gen = e.view_gen
+WHERE e.view_gen > 0 AND e.view_gen = ? AND e.kind = ? AND n.kind = ?
+ORDER BY e.id`
+
+func (s *Store) MemberMethodsByType() map[string][]graph.MemberMethodInfo {
+	q := memberMethodsByTypeSQL
+	args := []any{string(graph.EdgeMemberOf), string(graph.KindMethod), s.viewGen}
+	if s.viewGen > baseViewGeneration {
+		q = generationMemberMethodsByTypeSQL
+		args = []any{s.viewGen, string(graph.EdgeMemberOf), string(graph.KindMethod)}
+	}
+	rows, err := s.db.Query(q, args...)
 	if err != nil {
 		return nil
 	}
@@ -208,15 +227,17 @@ ORDER BY e.id`
 func (s *Store) StructuralParentEdges() []graph.StructuralParentEdgeRow {
 	q := `SELECT e.from_id, e.to_id, nf.kind, nt.kind, e.origin
 FROM edges e
-JOIN nodes nf ON nf.id = e.from_id
-JOIN nodes nt ON nt.id = e.to_id
+JOIN nodes nf ON nf.id = e.from_id AND nf.view_gen = e.view_gen
+JOIN nodes nt ON nt.id = e.to_id AND nt.view_gen = e.view_gen
 WHERE e.kind IN (?,?,?)
   AND nf.kind IN (?,?) AND nt.kind IN (?,?)
+  AND e.view_gen = ?
 ORDER BY e.id`
 	rows, err := s.db.Query(q,
 		string(graph.EdgeExtends), string(graph.EdgeImplements), string(graph.EdgeComposes),
 		string(graph.KindType), string(graph.KindInterface),
 		string(graph.KindType), string(graph.KindInterface),
+		s.viewGen,
 	)
 	if err != nil {
 		return nil
@@ -278,7 +299,8 @@ WHERE kind IN (?,?) AND start_line > 0 AND end_line > 0`
 		q += ` AND ` + pred
 		args = append(args, pargs...)
 	}
-	q += ` ORDER BY id`
+	q += ` AND view_gen = ? ORDER BY id`
+	args = append(args, s.viewGen)
 	nodes := s.queryNodesSQL(q, args...)
 
 	var out []graph.ExtractCandidateRow
@@ -378,7 +400,12 @@ func (s *Store) CrossRepoCandidatesForMutation(baseKinds []graph.EdgeKind, edgeS
 // what this query is about, and no assertion on the returned rows can
 // see it — a Cartesian plan returns exactly the same rows, just never.
 // The bool reports whether a query is worth running at all.
-func crossRepoCandidatesQuery(baseKinds []graph.EdgeKind, repoPrefixes, edgeSourceFiles, incidentNodeFiles []string) (string, []any, bool) {
+// viewGen is passed rather than read off a receiver so this stays a free
+// function. It is extracted from crossRepoCandidates for the plan-pin fixture
+// test, which asserts the CROSS JOIN survives in the generated SQL — the
+// Cartesian plan it guards against needs a real-sized store to reproduce, so
+// asserting on the text is the only test that can catch a regression at all.
+func crossRepoCandidatesQuery(viewGen int64, baseKinds []graph.EdgeKind, repoPrefixes, edgeSourceFiles, incidentNodeFiles []string) (string, []any, bool) {
 	uniq := anaDedupeEdgeKinds(baseKinds)
 	if len(uniq) == 0 {
 		return "", nil, false
@@ -409,14 +436,28 @@ func crossRepoCandidatesQuery(baseKinds []graph.EdgeKind, repoPrefixes, edgeSour
 	// without finishing; on a two-repository workspace the pinned plan
 	// answers the same question in ~6s, returning 1,909 rows out of
 	// 572,733 base-kind edges. The cost was never the result size.
+	//
+	// The projection is the authoritative generation filter: both endpoint
+	// joins pair with the edge's generation and the edge itself is bound, so
+	// a candidate id the frontier CTE produced for another generation cannot
+	// survive here. The CTE arms pair their own node joins for the same
+	// reason, which costs no extra bind.
+	//
+	// The 2026-09-04 upstream merge added those generation predicates on a
+	// plain JOIN. They are carried onto the CROSS JOIN instead: CROSS JOIN
+	// constrains only the planner's loop ORDER, not what the ON clause may
+	// say, so the pin and the predicates are independent and both survive.
+	// Downgrading to JOIN to take upstream's spelling would have restored the
+	// Cartesian plan above, which no fixture-sized test reproduces.
 	const projection = `SELECT e.from_id, e.to_id, e.kind, e.file_path, e.line,
        e.confidence, e.confidence_label, e.origin, e.tier, e.cross_repo,
        nf.repo_prefix, nt.repo_prefix
 FROM %s
-CROSS JOIN nodes nf ON nf.id = e.from_id
-CROSS JOIN nodes nt ON nt.id = e.to_id
+CROSS JOIN nodes nf ON nf.id = e.from_id AND nf.view_gen = e.view_gen
+CROSS JOIN nodes nt ON nt.id = e.to_id AND nt.view_gen = e.view_gen
 	WHERE nf.repo_prefix <> '' AND nt.repo_prefix <> ''
-  AND nf.repo_prefix <> nt.repo_prefix`
+  AND nf.repo_prefix <> nt.repo_prefix
+  AND e.view_gen = ?`
 
 	appendKinds := func(args []any) []any {
 		for _, kind := range uniq {
@@ -434,13 +475,13 @@ CROSS JOIN nodes nt ON nt.id = e.to_id
 		q = `WITH candidate_edges(id) AS (
   SELECT e.id
   FROM nodes n
-  JOIN edges e ON e.from_id = n.id
+  JOIN edges e ON e.from_id = n.id AND e.view_gen = n.view_gen
   WHERE n.repo_prefix IN (SELECT CAST(value AS TEXT) FROM json_each(?))
     AND e.kind IN (` + inPlaceholders(len(uniq)) + `)
   UNION
   SELECT e.id
   FROM nodes n
-  JOIN edges e ON e.to_id = n.id
+  JOIN edges e ON e.to_id = n.id AND e.view_gen = n.view_gen
   WHERE n.repo_prefix IN (SELECT CAST(value AS TEXT) FROM json_each(?))
     AND e.kind IN (` + inPlaceholders(len(uniq)) + `)
 )
@@ -449,6 +490,7 @@ CROSS JOIN nodes nt ON nt.id = e.to_id
 		args = appendKinds(args)
 		args = append(args, scopeJSON)
 		args = appendKinds(args)
+		args = append(args, viewGen)
 	} else if len(edgeSourceFiles) > 0 || len(incidentNodeFiles) > 0 {
 		candidateQueries := make([]string, 0, 3)
 		if len(edgeSourceFiles) > 0 {
@@ -470,14 +512,14 @@ CROSS JOIN nodes nt ON nt.id = e.to_id
 			}
 			candidateQueries = append(candidateQueries, `SELECT e.id
   FROM nodes n
-  JOIN edges e ON e.from_id = n.id
+  JOIN edges e ON e.from_id = n.id AND e.view_gen = n.view_gen
   WHERE n.file_path IN (SELECT CAST(value AS TEXT) FROM json_each(?))
     AND e.kind IN (`+inPlaceholders(len(uniq))+`)`)
 			args = append(args, scopeJSON)
 			args = appendKinds(args)
 			candidateQueries = append(candidateQueries, `SELECT e.id
   FROM nodes n
-  JOIN edges e ON e.to_id = n.id
+  JOIN edges e ON e.to_id = n.id AND e.view_gen = n.view_gen
   WHERE n.file_path IN (SELECT CAST(value AS TEXT) FROM json_each(?))
     AND e.kind IN (`+inPlaceholders(len(uniq))+`)`)
 			args = append(args, scopeJSON)
@@ -487,15 +529,18 @@ CROSS JOIN nodes nt ON nt.id = e.to_id
 ` + strings.Join(candidateQueries, "\n  UNION\n  ") + `
 )
 ` + fmt.Sprintf(projection, `candidate_edges ce CROSS JOIN edges e ON e.id = ce.id`)
+		args = append(args, viewGen)
 	} else {
 		q = fmt.Sprintf(projection, `edges e`) + ` AND e.kind IN (` + inPlaceholders(len(uniq)) + `)`
+		// The projection's generation bind precedes the kind list in the text.
+		args = append(args, viewGen)
 		args = appendKinds(args)
 	}
 	return q, args, true
 }
 
 func (s *Store) crossRepoCandidates(baseKinds []graph.EdgeKind, repoPrefixes, edgeSourceFiles, incidentNodeFiles []string) []graph.CrossRepoCandidateRow {
-	q, args, ok := crossRepoCandidatesQuery(baseKinds, repoPrefixes, edgeSourceFiles, incidentNodeFiles)
+	q, args, ok := crossRepoCandidatesQuery(s.viewGen, baseKinds, repoPrefixes, edgeSourceFiles, incidentNodeFiles)
 	if !ok {
 		return nil
 	}
@@ -559,8 +604,8 @@ func (s *Store) ThrowerErrorSurface(pathPrefix string) []graph.ThrowerErrorRow {
 	// Pass 1: EdgeThrows aggregation (count + distinct targets), keyed by
 	// thrower. The first edge (by PK insertion order) seeds FilePath /
 	// Line; an empty edge file/line falls back to the thrower node.
-	tq := `SELECT from_id, to_id, file_path, line FROM edges WHERE kind = ?`
-	targs := []any{string(graph.EdgeThrows)}
+	tq := `SELECT from_id, to_id, file_path, line FROM edges WHERE kind = ? AND view_gen = ?`
+	targs := []any{string(graph.EdgeThrows), s.viewGen}
 	if pathPrefix != "" {
 		pred, pargs := pathPrefixPredicate("file_path", pathPrefix)
 		tq += ` AND ` + pred
@@ -628,10 +673,10 @@ func (s *Store) ThrowerErrorSurface(pathPrefix string) []graph.ThrowerErrorRow {
 		acc := accums[id]
 		mq := `SELECT n.name, n.meta
 FROM edges e
-JOIN nodes n ON n.id = e.to_id
-WHERE e.from_id = ? AND e.kind = ? AND n.kind = ? AND n.meta IS NOT NULL
+JOIN nodes n ON n.id = e.to_id AND n.view_gen = e.view_gen
+WHERE e.from_id = ? AND e.kind = ? AND n.kind = ? AND n.meta IS NOT NULL AND e.view_gen = ?
 ORDER BY e.id`
-		mrows, err := s.db.Query(mq, id, string(graph.EdgeEmits), string(graph.KindString))
+		mrows, err := s.db.Query(mq, id, string(graph.EdgeEmits), string(graph.KindString), s.viewGen)
 		if err != nil {
 			continue
 		}

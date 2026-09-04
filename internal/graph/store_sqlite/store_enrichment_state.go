@@ -23,18 +23,23 @@ var _ graph.EnrichmentStateStore = (*Store)(nil)
 // their DEFAULT 0. A provider that had just recorded a completed pass would
 // read "never ran" the moment it recorded its sha. Those columns are owned by
 // CompleteEnrichmentProvider and are deliberately untouched here.
+//
+// The 2026-09-04 upstream merge moved this row under a view generation and
+// switched upstream's copy of the statement to INSERT OR REPLACE. The key
+// picked up view_gen here too, but the upsert did NOT become a REPLACE:
+// upstream has no gen/content_gen columns to lose, and this fork does.
 func (s *Store) SetEnrichmentState(st graph.EnrichmentState) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	_, err := s.execActiveWriteLocked(context.Background(), `
 INSERT INTO enrichment_state
-  (repo_prefix, provider, indexed_sha, completed_at, coverage)
-VALUES (?, ?, ?, ?, ?)
-ON CONFLICT(repo_prefix, provider) DO UPDATE SET
+  (view_gen, repo_prefix, provider, indexed_sha, completed_at, coverage)
+VALUES (?, ?, ?, ?, ?, ?)
+ON CONFLICT(view_gen, repo_prefix, provider) DO UPDATE SET
   indexed_sha  = excluded.indexed_sha,
   completed_at = excluded.completed_at,
   coverage     = excluded.coverage`,
-		st.RepoPrefix, st.Provider, st.IndexedSHA, st.CompletedAt, st.Coverage)
+		s.viewGen, st.RepoPrefix, st.Provider, st.IndexedSHA, st.CompletedAt, st.Coverage)
 	return err
 }
 
@@ -44,7 +49,7 @@ ON CONFLICT(repo_prefix, provider) DO UPDATE SET
 func (s *Store) GetEnrichmentState(repoPrefix, provider string) (graph.EnrichmentState, bool, error) {
 	row := s.db.QueryRow(`
 SELECT indexed_sha, completed_at, coverage
-  FROM enrichment_state WHERE repo_prefix = ? AND provider = ?`, repoPrefix, provider)
+  FROM enrichment_state WHERE view_gen = ? AND repo_prefix = ? AND provider = ?`, s.viewGen, repoPrefix, provider)
 	st := graph.EnrichmentState{RepoPrefix: repoPrefix, Provider: provider}
 	err := row.Scan(&st.IndexedSHA, &st.CompletedAt, &st.Coverage)
 	if err == sql.ErrNoRows {

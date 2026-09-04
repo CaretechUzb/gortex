@@ -22,24 +22,26 @@ var (
 const (
 	fileReceiptHighWaterQuery = `SELECT file_path
 FROM file_mtimes
-WHERE repo_prefix = ?
+WHERE view_gen = ?
+  AND repo_prefix = ?
 ORDER BY file_path DESC
 LIMIT 1`
 
 	fileReceiptPageQuery = `SELECT file_path, mtime_ns
 FROM file_mtimes
-WHERE repo_prefix = ?
+WHERE view_gen = ?
+  AND repo_prefix = ?
   AND file_path > ?
   AND file_path <= ?
 ORDER BY file_path
 LIMIT ?`
 )
 
-// mtimeChunk bounds how many (repo_prefix, file_path, mtime_ns) tuples
-// ride in a single multi-row INSERT. SQLite's default compiled-in host
-// parameter limit is 999; at 3 params per row that caps a statement at
-// 333 rows, so 300 leaves headroom.
-const mtimeChunk = 300
+// mtimeChunk bounds how many (view_gen, repo_prefix, file_path, mtime_ns)
+// tuples ride in a single multi-row INSERT. SQLite's default compiled-in host
+// parameter limit is 999; at 4 params per row that caps a statement at 249
+// rows, so 240 leaves headroom.
+const mtimeChunk = 240
 
 // SetFileMtime records one file's modification time (nanoseconds since
 // the epoch) for a repo prefix, replacing any prior value.
@@ -72,7 +74,7 @@ func (s *Store) BulkSetFileMtimes(repoPrefix string, mtimes map[string]int64) er
 	}
 	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
 
-	changed, err := insertMtimesTx(tx, repoPrefix, mtimes)
+	changed, err := insertMtimesTx(tx, s.viewGen, repoPrefix, mtimes)
 	if err != nil {
 		return err
 	}
@@ -113,14 +115,18 @@ func (s *Store) ReplaceFileMtimes(repoPrefix string, mtimes map[string]int64) er
 	// a full index re-persists the whole snapshot on every warm start. Bumping
 	// content_gen there would stale every stage on every daemon restart. The
 	// extra indexed scan is one read per full index, against minutes of work.
-	prior, err := loadMtimesTx(tx, repoPrefix)
+	//
+	// The read is scoped to this handle's generation, like the delete and the
+	// insert below it: comparing against another generation's set would report
+	// content movement on every write to a freshly derived view.
+	prior, err := loadMtimesTx(tx, s.viewGen, repoPrefix)
 	if err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`DELETE FROM file_mtimes WHERE repo_prefix = ?`, repoPrefix); err != nil {
+	if _, err := tx.Exec(`DELETE FROM file_mtimes WHERE view_gen = ? AND repo_prefix = ?`, s.viewGen, repoPrefix); err != nil {
 		return err
 	}
-	if _, err := insertMtimesTx(tx, repoPrefix, mtimes); err != nil {
+	if _, err := insertMtimesTx(tx, s.viewGen, repoPrefix, mtimes); err != nil {
 		return err
 	}
 	if err := bumpContentGenTx(tx, !sameMtimes(prior, mtimes), repoPrefix); err != nil {
@@ -130,9 +136,13 @@ func (s *Store) ReplaceFileMtimes(repoPrefix string, mtimes map[string]int64) er
 	return tx.Commit()
 }
 
-// loadMtimesTx reads one repo's persisted mtime set inside a transaction.
-func loadMtimesTx(tx *sql.Tx, repoPrefix string) (map[string]int64, error) {
-	rows, err := tx.Query(`SELECT file_path, mtime_ns FROM file_mtimes WHERE repo_prefix = ?`, repoPrefix)
+// loadMtimesTx reads one repo's persisted mtime set, in one view generation,
+// inside a transaction.
+func loadMtimesTx(tx *sql.Tx, viewGen int64, repoPrefix string) (map[string]int64, error) {
+	rows, err := tx.Query(
+		`SELECT file_path, mtime_ns FROM file_mtimes WHERE view_gen = ? AND repo_prefix = ?`,
+		viewGen, repoPrefix,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -185,16 +195,16 @@ func (s *Store) DeleteFileMtimes(repoPrefix string, paths []string) error {
 	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
 
 	// Chunk so the IN-list never exceeds SQLite's host-parameter limit:
-	// one leading repo_prefix arg + up to mtimeChunk path args per stmt.
+	// two leading scope args + up to mtimeChunk path args per stmt.
 	var deleted int64
 	for start := 0; start < len(paths); start += mtimeChunk {
 		end := min(start+mtimeChunk, len(paths))
 		batch := paths[start:end]
 
-		args := make([]any, 0, len(batch)+1)
-		args = append(args, repoPrefix)
+		args := make([]any, 0, len(batch)+2)
+		args = append(args, s.viewGen, repoPrefix)
 		stmt := make([]byte, 0, 64+len(batch)*2)
-		stmt = append(stmt, "DELETE FROM file_mtimes WHERE repo_prefix = ? AND file_path IN ("...)
+		stmt = append(stmt, "DELETE FROM file_mtimes WHERE view_gen = ? AND repo_prefix = ? AND file_path IN ("...)
 		for i := range batch {
 			if i > 0 {
 				stmt = append(stmt, ',')
@@ -223,7 +233,7 @@ func (s *Store) DeleteFileMtimes(repoPrefix string, paths []string) error {
 // given transaction with chunked multi-row upserts, each kept under SQLite's
 // host-parameter limit, and returns how many rows genuinely moved. The caller
 // owns the tx lifecycle (Begin/Commit/Rollback) and the write lock.
-func insertMtimesTx(tx *sql.Tx, repoPrefix string, mtimes map[string]int64) (int64, error) {
+func insertMtimesTx(tx *sql.Tx, viewGen int64, repoPrefix string, mtimes map[string]int64) (int64, error) {
 	// Stable ordering is not required for correctness, but iterating the
 	// map directly is fine — we only chunk by count.
 	type kv struct {
@@ -241,21 +251,21 @@ func insertMtimesTx(tx *sql.Tx, repoPrefix string, mtimes map[string]int64) (int
 		end := min(start+mtimeChunk, len(pending))
 		batch := pending[start:end]
 
-		// Build a multi-row INSERT OR REPLACE: (?, ?, ?), (?, ?, ?), ...
-		args := make([]any, 0, len(batch)*3)
+		// Build a multi-row INSERT OR REPLACE: (?, ?, ?, ?), (?, ?, ?, ?), ...
+		args := make([]any, 0, len(batch)*4)
 		stmt := make([]byte, 0, 64+len(batch)*16)
-		stmt = append(stmt, "INSERT INTO file_mtimes (repo_prefix, file_path, mtime_ns) VALUES "...)
+		stmt = append(stmt, "INSERT INTO file_mtimes (view_gen, repo_prefix, file_path, mtime_ns) VALUES "...)
 		for i, e := range batch {
 			if i > 0 {
 				stmt = append(stmt, ',')
 			}
-			stmt = append(stmt, "(?, ?, ?)"...)
-			args = append(args, repoPrefix, e.path, e.ns)
+			stmt = append(stmt, "(?, ?, ?, ?)"...)
+			args = append(args, viewGen, repoPrefix, e.path, e.ns)
 		}
 		// An upsert with a change predicate rather than INSERT OR REPLACE, so
 		// the reported row count means "rows that actually moved". Rewriting an
 		// unchanged mtime must not advance content_gen — see bumpContentGenTx.
-		stmt = append(stmt, ` ON CONFLICT(repo_prefix, file_path) DO UPDATE SET mtime_ns = excluded.mtime_ns`...)
+		stmt = append(stmt, ` ON CONFLICT(view_gen, repo_prefix, file_path) DO UPDATE SET mtime_ns = excluded.mtime_ns`...)
 		stmt = append(stmt, ` WHERE file_mtimes.mtime_ns <> excluded.mtime_ns`...)
 		res, err := tx.Exec(string(stmt), args...)
 		if err != nil {
@@ -274,8 +284,8 @@ func insertMtimesTx(tx *sql.Tx, repoPrefix string, mtimes map[string]int64) (int
 // "no recorded state" signal warmup expects).
 func (s *Store) LoadFileMtimes(repoPrefix string) map[string]int64 {
 	rows, err := s.db.Query(
-		`SELECT file_path, mtime_ns FROM file_mtimes WHERE repo_prefix = ?`,
-		repoPrefix,
+		`SELECT file_path, mtime_ns FROM file_mtimes WHERE view_gen = ? AND repo_prefix = ?`,
+		s.viewGen, repoPrefix,
 	)
 	if err != nil {
 		return nil
@@ -307,8 +317,8 @@ func (s *Store) LoadFileMtimes(repoPrefix string) map[string]int64 {
 // that want the error and an always-materialised map.
 func (s *Store) FileMtimes(repoPrefix string) (map[string]int64, error) {
 	rows, err := s.db.Query(
-		`SELECT file_path, mtime_ns FROM file_mtimes WHERE repo_prefix = ?`,
-		repoPrefix,
+		`SELECT file_path, mtime_ns FROM file_mtimes WHERE view_gen = ? AND repo_prefix = ?`,
+		s.viewGen, repoPrefix,
 	)
 	if err != nil {
 		return nil, err
@@ -335,7 +345,7 @@ func (s *Store) FileMtimes(repoPrefix string) (map[string]int64, error) {
 // rotation instead of extending the current one indefinitely.
 func (s *Store) FileReceiptHighWater(repoPrefix string) (string, error) {
 	var highWater string
-	err := s.db.QueryRow(fileReceiptHighWaterQuery, repoPrefix).Scan(&highWater)
+	err := s.db.QueryRow(fileReceiptHighWaterQuery, s.viewGen, repoPrefix).Scan(&highWater)
 	if err == sql.ErrNoRows {
 		return "", nil
 	}
@@ -356,7 +366,7 @@ func (s *Store) FileReceiptPage(
 	}
 	rows, err := s.db.Query(
 		fileReceiptPageQuery,
-		repoPrefix, afterPath, highWaterPath, limit,
+		s.viewGen, repoPrefix, afterPath, highWaterPath, limit,
 	)
 	if err != nil {
 		return nil, err
@@ -405,10 +415,10 @@ func (s *Store) fillFileReceiptContent(repoPrefix string, receipts []graph.FileR
 	for start := 0; start < len(graphPaths); start += fileMetaChunk {
 		end := min(start+fileMetaChunk, len(graphPaths))
 		chunk := graphPaths[start:end]
-		args := make([]any, 0, len(chunk)+1)
-		args = append(args, repoPrefix)
+		args := make([]any, 0, len(chunk)+2)
+		args = append(args, s.viewGen, repoPrefix)
 		stmt := make([]byte, 0, 96+len(chunk)*2)
-		stmt = append(stmt, "SELECT file_path, content_hash, size FROM files WHERE repo_prefix = ? AND file_path IN ("...)
+		stmt = append(stmt, "SELECT file_path, content_hash, size FROM files WHERE view_gen = ? AND repo_prefix = ? AND file_path IN ("...)
 		for i, filePath := range chunk {
 			if i > 0 {
 				stmt = append(stmt, ',')

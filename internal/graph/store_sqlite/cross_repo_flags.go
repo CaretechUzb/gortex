@@ -58,7 +58,7 @@ func (s *Store) markEdgesCrossRepo(edges []*graph.Edge) (changed, statements int
 		txChanged := 0
 		for start := txStart; start < txEnd; start += crossRepoFlagChunkSize {
 			end := minInt(start+crossRepoFlagChunkSize, txEnd)
-			query, args := crossRepoFlagStatement(unique[start:end])
+			query, args := crossRepoFlagStatement(s.viewGen, unique[start:end])
 			if len(args) == 0 {
 				continue
 			}
@@ -97,7 +97,7 @@ func (s *Store) markEdgesCrossRepo(edges []*graph.Edge) (changed, statements int
 	return changed, statements, nil
 }
 
-func crossRepoFlagStatement(edges []*graph.Edge) (string, []any) {
+func crossRepoFlagStatement(viewGen int64, edges []*graph.Edge) (string, []any) {
 	var query strings.Builder
 	query.WriteString("WITH requested(from_id,to_id,kind,file_path,line) AS (VALUES ")
 	args := make([]any, 0, len(edges)*5)
@@ -116,6 +116,7 @@ func crossRepoFlagStatement(edges []*graph.Edge) (string, []any) {
 	if rows == 0 {
 		return "", nil
 	}
+	args = append(args, viewGen)
 	query.WriteString(`)
 UPDATE edges
 SET cross_repo = 1
@@ -129,6 +130,7 @@ WHERE cross_repo = 0
      AND e.kind = r.kind
      AND e.file_path = r.file_path
      AND e.line = r.line
+     AND e.view_gen = ?
   )`)
 	return query.String(), args
 }

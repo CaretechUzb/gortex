@@ -283,16 +283,29 @@ const toRepoExpr = `CASE WHEN instr(to_id, '/') > 1 THEN substr(to_id, 1, instr(
 // edges_by_to each seek, whereas an OR over both columns degenerates into a
 // scan -- the same reason evictByPredicateResult issues two deletes instead of
 // one. The predicate is always a package constant, never caller SQL.
-func evictionTouchedPrefixesTx(ctx context.Context, tx *sql.Tx, predicate string, arg any) ([]string, error) {
+// args carries every binding the predicate needs, rather than the single value
+// it took before generations existed: a this-generation eviction appends
+// `AND view_gen = ?` to the predicate, so the caller now decides both the text
+// and its bindings and this function stays agnostic about the shape.
+//
+// The node predicate is the caller's scoped one, so the prefixes read here are
+// exactly the ones whose nodes the eviction deletes. The two EDGE reads are
+// deliberately left unscoped on the edge row itself, where the delete does
+// carry the generation conjunct a second time. That over-approximates: a
+// prefix can be reported touched because it owns an edge in ANOTHER generation
+// that points at a doomed node id this one also uses. Over-approximating is
+// the safe direction — a spurious gen bump makes readiness recompute, while
+// missing one lets a stale verdict stand.
+func evictionTouchedPrefixesTx(ctx context.Context, tx *sql.Tx, predicate string, args []any) ([]string, error) {
 	scoped := `SELECT id FROM nodes WHERE ` + predicate
 	var out []string
 	for _, q := range []struct {
 		sql  string
 		args []any
 	}{
-		{`SELECT DISTINCT repo_prefix FROM nodes WHERE ` + predicate, []any{arg}},
-		{`SELECT DISTINCT ` + toRepoExpr + ` FROM edges WHERE from_id IN (` + scoped + `)`, []any{arg}},
-		{`SELECT DISTINCT from_repo FROM edges WHERE to_id IN (` + scoped + `)`, []any{arg}},
+		{`SELECT DISTINCT repo_prefix FROM nodes WHERE ` + predicate, args},
+		{`SELECT DISTINCT ` + toRepoExpr + ` FROM edges WHERE from_id IN (` + scoped + `)`, args},
+		{`SELECT DISTINCT from_repo FROM edges WHERE to_id IN (` + scoped + `)`, args},
 	} {
 		rows, err := tx.QueryContext(ctx, q.sql, q.args...)
 		if err != nil {

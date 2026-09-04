@@ -260,8 +260,13 @@ func (mi *MultiIndexer) runIncrementalDerivedPassesTopologyHeld(
 	if merged.Flags.Has(DerivedInvalidatesDeclarations) ||
 		merged.Flags.Has(DerivedInvalidatesImports) ||
 		merged.Flags.Has(DerivedInvalidatesRuntime) {
-		framework := resolver.RunFrameworkSynthesizersScopedForFiles(
-			mi.graph, scopedPrefixes, merged.Files, merged.CSharpHierarchyChanged,
+		framework := resolver.RunFrameworkSynthesizersScopedForFilesWithSelection(
+			mi.graph,
+			scopedPrefixes,
+			merged.Files,
+			merged.CSharpHierarchyChanged,
+			// The configured selection decides which passes exist at all.
+			mi.frameworkSynthesizerSelection(scopedPrefixes),
 			// Scoped to the workspaces this run covers, not to every repo
 			// the daemon happens to track: a sibling workspace's passes can
 			// only ever stage edges the per-repo gate below discards, and

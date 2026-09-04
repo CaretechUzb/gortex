@@ -47,7 +47,13 @@ type EdgeProvenanceUpdate struct {
 // that boundary when non-negative; -1 means the backend intentionally skipped
 // a pre-count and the consumer must derive the diagnostic count while paging.
 type UnresolvedEdgeScan struct {
-	HighWaterID   int64
+	HighWaterID int64
+	// LowWaterID is the first row the pass may consider, 0 when the whole
+	// frontier is the pass's own. A backend that keeps several payload
+	// generations in one table sets it to the pinned generation's own first
+	// row, so a sparse generation's pass is bounded by what it carries
+	// instead of by how much unresolved work the corpus beneath it holds.
+	LowWaterID    int64
 	PendingBefore int
 	// SkipTerminal, when set by the consumer between Begin and the first
 	// Read, asks the pager to exclude edges carrying a live durable
@@ -119,11 +125,35 @@ type UnresolvedEdgePager interface {
 //   - ResolveMutex() returns a backend-owned mutex that resolver
 //     instances (cross-repo, temporal, external) share to serialise
 //     their edge-mutation passes against each other and against the
-//     indexer's incremental rewrites. Every backend needs equivalent
+//     indexer's incremental rewrites. A resolve rewrites To / Kind /
+//     Origin on the store's live *Edge values before handing them to
+//     ReindexEdges, so a whole-graph pass that only SCANS edges has to
+//     hold this lock too — the pointers it walks are the same memory.
+//     Every backend needs equivalent
 //     coordination; the in-memory store uses its existing
 //     graph-wide resolveMu, disk backends keep a dedicated mutex
 //     alongside their own write serialisation. The returned pointer
 //     is owned by the store and must not be Unlocked when not held.
+//
+// CurrentGenerationRepoEvicter makes replacement scope explicit for stores
+// that multiplex multiple immutable graph generations in one backend.
+type CurrentGenerationRepoEvicter interface {
+	EvictRepoCurrentGeneration(repoPrefix string) (nodesRemoved, edgesRemoved int)
+}
+
+// AllGenerationsRepoEvicter is the destructive repository-administration
+// surface. Callers must use it only when the repository is being forgotten.
+type AllGenerationsRepoEvicter interface {
+	EvictRepoAllGenerations(repoPrefix string) (nodesRemoved, edgesRemoved int)
+}
+
+// CheckedAllGenerationsRepoEvicter is the retryable form used by
+// authoritative repository cleanup. Implementations return storage failures
+// instead of converting them to empty counts or a process panic.
+type CheckedAllGenerationsRepoEvicter interface {
+	EvictRepoAllGenerationsChecked(repoPrefix string) (nodesRemoved, edgesRemoved int, err error)
+}
+
 type Store interface {
 	// --- Writes -----------------------------------------------------
 
@@ -150,6 +180,9 @@ type Store interface {
 	SetEdgeProvenanceBatch(batch []EdgeProvenanceUpdate) (changed int)
 	RemoveEdge(from, to string, kind EdgeKind) bool
 	EvictFile(filePath string) (nodesRemoved, edgesRemoved int)
+	// EvictRepo removes the repository only from this handle's logical
+	// generation. Backends without generations have one logical generation.
+	// Administrative deletion must opt in through AllGenerationsRepoEvicter.
 	EvictRepo(repoPrefix string) (nodesRemoved, edgesRemoved int)
 
 	// --- Point lookups ---------------------------------------------
@@ -1391,6 +1424,19 @@ const (
 	// row set, and readiness cannot tell a repo that needs no enrichment from
 	// one whose enrichment has never been looked at.
 	EnrichProviderNone = "__none__"
+
+	// EnrichCheckoutMarkerSeparator joins a provider name to the checkout its
+	// marker is scoped to, e.g. "gopls@checkout-a". No provider name and no
+	// reserved key above contains it, so a scoped key can never be read as an
+	// unscoped one.
+	//
+	// It lives here, beside the reserved keys, rather than privately in
+	// internal/semantic, because the STORE has to recognise the shape too: the
+	// applicability prune deletes every provider row outside the declared set,
+	// and a checkout marker is not an applicability row. Leaving the separator
+	// private meant the prune could not tell the two apart and silently dropped
+	// one checkout's marker whenever a sibling checkout was enriched.
+	EnrichCheckoutMarkerSeparator = "@"
 )
 
 // EnrichmentApplicabilityStore records WHICH providers apply to a repo and how

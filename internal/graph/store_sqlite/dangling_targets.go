@@ -55,7 +55,7 @@ func (s *Store) DanglingEdgeTargets(idPrefixes []string, kinds []graph.EdgeKind)
 	seen := make(map[string]struct{})
 	var out []string
 	for i := 0; i < len(bounds); i += 2 {
-		rows, err := s.db.Query(danglingEdgeTargetsQuery(), bounds[i], bounds[i+1], kindsJSON)
+		rows, err := s.db.Query(danglingEdgeTargetsQuery(), s.viewGen, bounds[i], bounds[i+1], kindsJSON)
 		if err != nil {
 			panicOnFatal(err)
 			return nil
@@ -87,12 +87,21 @@ func (s *Store) DanglingEdgeTargets(idPrefixes []string, kinds []graph.EdgeKind)
 // danglingEdgeTargetsQuery is a pure string builder (no I/O) so a plan-lock
 // test can EXPLAIN the exact production SQL.
 func danglingEdgeTargetsQuery() string {
+	// The generation predicate is carried TWICE, for the same reason the
+	// generation-scoped edge delete carries it twice: once to pick this
+	// handle's edges, and once inside the existence check so a node id that
+	// exists in ANOTHER generation cannot make this generation's edge look
+	// resolved. Pairing n.view_gen to e.view_gen rather than binding it again
+	// keeps the correlated subquery seeking on the nodes primary key.
 	return `
 SELECT DISTINCT e.to_id
 FROM edges AS e
-WHERE e.to_id >= ? AND e.to_id < ?
+WHERE e.view_gen = ?
+  AND e.to_id >= ? AND e.to_id < ?
   AND +e.kind IN (SELECT CAST(value AS TEXT) FROM json_each(?))
-  AND NOT EXISTS (SELECT 1 FROM nodes AS n WHERE n.id = e.to_id)`
+  AND NOT EXISTS (
+        SELECT 1 FROM nodes AS n
+         WHERE n.id = e.to_id AND n.view_gen = e.view_gen)`
 }
 
 var _ graph.DanglingEdgeTargetReader = (*Store)(nil)

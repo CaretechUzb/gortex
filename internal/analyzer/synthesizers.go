@@ -78,7 +78,11 @@ func WithSynthesizerRepoScope(repos map[string]bool) SynthesizersOption {
 // mid-read the store handed back nil — which this function then reported as "no
 // synthesizer fired", indistinguishable from the truth, and the precise
 // question the tool exists to answer.
-func AnalyzeSynthesizers(g graph.Store, opts ...SynthesizersOption) (SynthesizersResult, error) {
+//
+// The parameter is a Reader so an overlay session's shadow graph can be
+// censused directly; SynthesizedEdgesSeq still picks the streaming projection
+// when the backend offers one.
+func AnalyzeSynthesizers(g graph.Reader, opts ...SynthesizersOption) (SynthesizersResult, error) {
 	cfg := &synthConfig{}
 	for _, o := range opts {
 		o(cfg)

@@ -69,6 +69,17 @@ const qCSharpAll = `
   (property_declaration
     name: (identifier) @prop.name) @prop.def
 
+  ; An indexer has no name node - "this" is a keyword, not an
+  ; identifier - so the whole declaration is captured and the member is
+  ; named at emission.
+  (indexer_declaration) @indexer.def
+
+  ; An event declared with add/remove accessor bodies. The bodyless
+  ; field form (event T E;) is a separate grammar node
+  ; (event_field_declaration) with nothing executable in it.
+  (event_declaration
+    name: (identifier) @event.name) @event.def
+
   (using_directive (_) @using.path) @using.def
 
   ; An invocation that spells explicit type arguments parses its callee
@@ -276,12 +287,16 @@ func (s csharpLocalScopes) shadowsAnywhere(owner, name string) bool {
 // an `if` condition escapes to the ENCLOSING block (definite-assignment
 // scoping), so stopping at the `if` would under-refuse. Loop headers do
 // not leak their pattern variables past the statement. The switch BODY
-// is one declaration space shared by every section — that is exactly
-// why redeclaring a name in a sibling section is CS0128 — so the extent
-// stops at `switch_body`, never at a single section (round-6 finding
-// B1: stopping at the section read a sibling-section local as expired,
-// dropping its receiver evidence and re-minting its assignments as
-// field writes).
+// is one declaration space shared by every section for the locals its
+// STATEMENT LISTS declare — that is exactly why redeclaring a name in a
+// sibling section is CS0128 — so those extents stop at `switch_body`
+// (round-6 finding B1: stopping at the section read a sibling-section
+// local as expired, dropping its receiver evidence and re-minting its
+// assignments as field writes). A pattern variable bound in a case
+// LABEL or `when` guard is the one exception: it is section-scoped
+// (sibling sections may redeclare it), handled positionally in
+// csharpLocalScopeOf rather than by this table — the ancestor node type
+// alone cannot express both rules.
 var csharpScopeFormers = map[string]bool{
 	"block":                       true,
 	"switch_body":                 true,
@@ -314,11 +329,38 @@ var csharpScopeFormers = map[string]bool{
 // lose a refusal.
 func csharpLocalScopeOf(n *sitter.Node) csharpLocalScope {
 	for cur := n; cur != nil; cur = cur.Parent() {
+		// A switch SECTION is not a declaration space for the locals its
+		// statement list declares (those live in the switch BODY), but it
+		// IS one for a pattern variable bound in a case label or a `when`
+		// guard. Roslyn accepts `case int x:` beside `case string x:` in a
+		// sibling section AND accepts `case 1: int y = 1;` / `default: y =
+		// 2;`, so the two rules coexist and the answer depends on where in
+		// the section the binder sits: label territory is everything
+		// before the section's first statement.
+		if cur.Type() == "switch_section" && csharpInSwitchLabel(cur, n) {
+			return csharpLocalScope{start: int(cur.StartByte()), end: int(cur.EndByte())}
+		}
 		if csharpScopeFormers[cur.Type()] {
 			return csharpLocalScope{start: int(cur.StartByte()), end: int(cur.EndByte())}
 		}
 	}
 	return csharpLocalScope{start: 0, end: math.MaxInt}
+}
+
+// csharpInSwitchLabel reports whether binder sits in section's LABEL
+// region - before the first statement the section lists.
+func csharpInSwitchLabel(section, binder *sitter.Node) bool {
+	for i, _nc := 0, int(section.NamedChildCount()); i < _nc; i++ {
+		c := section.NamedChild(i)
+		if c == nil {
+			continue
+		}
+		t := c.Type()
+		if strings.HasSuffix(t, "_statement") || t == "block" {
+			return binder.StartByte() < c.StartByte()
+		}
+	}
+	return false
 }
 
 // csharpTypedBinding is one typed local declaration's evidence record:
@@ -364,6 +406,48 @@ func csharpTypedLocalAt(m map[string]map[string][]*csharpTypedBinding, owner, na
 		return nil, csharpTypedExpired
 	}
 	return best, csharpTypedFound
+}
+
+// csharpChainHead returns the leading identifier of a chained receiver
+// expression (`h.Make().Ping` -> `h`), the only name the chain walker
+// looks up in the type environment.
+func csharpChainHead(expr string) string {
+	cleaned := strings.ReplaceAll(stripCallArgs(expr), "::", ".")
+	if i := strings.IndexByte(cleaned, '.'); i >= 0 {
+		cleaned = cleaned[:i]
+	}
+	return strings.TrimSpace(cleaned)
+}
+
+// csharpOffsetEnv hands the offset-blind chain/awaited walkers a type
+// environment whose HEAD entry is corrected by the offset-aware
+// typed-local records (issue #725 item 3: the function-wide tenv is
+// written last-wins by sibling redeclarations, so consulting it raw
+// types a chain through whichever sibling declared LAST). A Found
+// record overrides the head, an Expired or type-less record removes it
+// (the flat value belongs to a sibling), and an Absent name keeps the
+// function-wide fallback exactly as before.
+func csharpOffsetEnv(typedLocals map[string]map[string][]*csharpTypedBinding, tenv typeEnv, owner, head string, offset int) typeEnv {
+	if head == "" {
+		return tenv
+	}
+	b, state := csharpTypedLocalAt(typedLocals, owner, head, offset)
+	if state == csharpTypedAbsent {
+		return tenv
+	}
+	if state == csharpTypedFound && b.typ != "" && tenv[head] == b.typ {
+		return tenv
+	}
+	env := make(typeEnv, len(tenv))
+	for k, v := range tenv {
+		env[k] = v
+	}
+	if state == csharpTypedFound && b.typ != "" {
+		env[head] = b.typ
+	} else {
+		delete(env, head)
+	}
+	return env
 }
 
 // csharpTypeUse buffers a type referenced only in a local-variable
@@ -532,6 +616,17 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 		case m.Captures["prop.def"] != nil:
 			e.emitProperty(m, filePath, fileID, src, result, seen, fileAliases, funcBytes, funcLines, valueProps)
 
+		case m.Captures["indexer.def"] != nil:
+			e.emitAccessorMember(m.Captures["indexer.def"], csharpIndexerName, "indexer", filePath, fileID, src, result, seen, fileAliases, funcBytes, funcLines, valueProps)
+
+		case m.Captures["event.def"] != nil:
+			// "event_accessor", not "event": this arm sees only the
+			// accessor-bearing form. The far commoner field form
+			// (event T E;) is a different grammar node and stays
+			// unemitted, so a stamp spelled "event" would promise a
+			// type's events and deliver a biased minority of them.
+			e.emitAccessorMember(m.Captures["event.def"], m.Captures["event.name"].Text, "event_accessor", filePath, fileID, src, result, seen, fileAliases, funcBytes, funcLines, valueProps)
+
 		case m.Captures["using.def"] != nil:
 			e.emitUsing(m, filePath, fileID, result)
 
@@ -640,6 +735,7 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 	// type environments. Owner attribution runs once per local, call and
 	// type use — the sorted lookup keeps that from multiplying into an
 	// O(locals×functions) linear-scan product on member-heavy files.
+	csharpStampOwnershipSpans(result, funcLines)
 	funcRanges := newCSharpFuncLookup(csharpOwnerRanges(result, funcBytes, funcLines), funcBytes)
 
 	// Build type environments in legacy precedence, scoped per enclosing
@@ -782,7 +878,12 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 			if inner == nil {
 				return
 			}
-			if t := csharpAwaitedCallType(inner.Content(src), csharpOwnerTypeName(owner), tenvByOwner[owner], result); t != "" {
+			// The awaited call's receiver is typed at the DECLARATION's
+			// offset, not from the function-wide last-wins map — a sibling
+			// block's same-named local must not type this block's await.
+			innerText := inner.Content(src)
+			env := csharpOffsetEnv(typedLocalsByOwner, tenvByOwner[owner], owner, csharpChainHead(innerText), int(n.StartByte()))
+			if t := csharpAwaitedCallType(innerText, csharpOwnerTypeName(owner), env, result); t != "" {
 				setLocalType(owner, l, t)
 			}
 		})
@@ -1015,11 +1116,13 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 				// `(await LoadAsync()).X()` — the chain walker collapses a
 				// fully-parenthesized receiver to nothing; the receiver is
 				// the T inside the awaited call's Task<T>.
-				if t := csharpAwaitedCallType(inner, csharpOwnerTypeName(callerID), tenvByOwner[callerID], result); t != "" {
+				env := csharpOffsetEnv(typedLocalsByOwner, tenvByOwner[callerID], callerID, csharpChainHead(inner), c.offset)
+				if t := csharpAwaitedCallType(inner, csharpOwnerTypeName(callerID), env, result); t != "" {
 					edge.Meta = map[string]any{"receiver_type": t}
 				}
 			} else if strings.Contains(c.receiver, ".") || strings.Contains(c.receiver, "(") {
-				stampFactoryChainReceiver(edge, c.receiver, resolveChainType(c.receiver, tenvByOwner[callerID], result))
+				env := csharpOffsetEnv(typedLocalsByOwner, tenvByOwner[callerID], callerID, csharpChainHead(c.receiver), c.offset)
+				stampFactoryChainReceiver(edge, c.receiver, resolveChainType(c.receiver, env, result))
 				if edge.Meta == nil && !strings.Contains(c.receiver, "(") {
 					// A namespace-qualified receiver the chain walker could
 					// not type (`Lib.BagExt.Add(bag)`). That is the same
@@ -1220,7 +1323,7 @@ func (e *CSharpExtractor) emitContainer(m parser.QueryResult, kind string, nodeK
 		case "class", "struct", "record", "iface":
 			if pi := partialSeen[id]; pi != nil && csharpHasModifier(def.Node, src, "partial") &&
 				pi.sameType(csharpPartialIdentityOf(def.Node, src)) {
-				pi.extendsTaken = emitCSharpBaseList(id, def.Node, src, filePath, localInterfaces, fileAliases, baseNameCounts, result, pi.extendsTaken)
+				pi.extendsBase = emitCSharpBaseList(id, def.Node, src, filePath, localInterfaces, fileAliases, baseNameCounts, result, pi.extendsBase)
 			}
 		}
 		return
@@ -1257,7 +1360,7 @@ func (e *CSharpExtractor) emitContainer(m parser.QueryResult, kind string, nodeK
 	if ns := csharpEnclosingNamespace(def.Node, src); ns != "" {
 		meta["scope_ns"] = ns
 	}
-	if doc := extractCSharpDoc(src, def.StartLine); doc != "" {
+	if doc := extractCSharpDoc(src, def.Node); doc != "" {
 		meta["doc"] = doc
 	}
 	// EF Core fluent mapping: a class implementing
@@ -1289,9 +1392,9 @@ func (e *CSharpExtractor) emitContainer(m parser.QueryResult, kind string, nodeK
 	// for structs and records, inheritance for interfaces).
 	switch kind {
 	case "class", "struct", "record", "iface":
-		took := emitCSharpBaseList(id, def.Node, src, filePath, localInterfaces, fileAliases, baseNameCounts, result, false)
+		took := emitCSharpBaseList(id, def.Node, src, filePath, localInterfaces, fileAliases, baseNameCounts, result, "")
 		if pi := partialSeen[id]; pi != nil {
-			pi.extendsTaken = took
+			pi.extendsBase = took
 		}
 	case "enum":
 		e.emitCSharpEnumMembers(def.Node, src, filePath, id, name, result, seen)
@@ -1668,11 +1771,19 @@ func emitCSharpAnnotationEdges(anns []javaAnnotation, fromID, filePath string, r
 
 // extractCSharpDoc tries the XML-doc form first (/// <summary>…) and
 // falls back to /** … */ block comments (less common in C# but valid).
-func extractCSharpDoc(src []byte, startRow int) string {
-	if d := ExtractDocAbove(src, startRow, DocLangCSharpXML); d != "" {
+// extractCSharpDoc returns the doc comment directly above decl: XML doc
+// lines first, then the /** */ or // fallback. Addressed by the node's
+// start byte so the walk starts at the declaration instead of counting
+// rows from the top of the file for every member.
+func extractCSharpDoc(src []byte, decl *sitter.Node) string {
+	if decl == nil {
+		return ""
+	}
+	start := int(decl.StartByte())
+	if d := ExtractDocAboveByte(src, start, DocLangCSharpXML); d != "" {
 		return d
 	}
-	return ExtractDocAbove(src, startRow, DocLangBlockStar)
+	return ExtractDocAboveByte(src, start, DocLangBlockStar)
 }
 
 func (e *CSharpExtractor) emitMethod(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen, annotationSeen map[string]bool, ifaceMethods map[string][]string, funcBytes map[string][2]int) {
@@ -1794,7 +1905,7 @@ func (e *CSharpExtractor) emitMethod(m parser.QueryResult, filePath, fileID stri
 	if ns := csharpEnclosingNamespace(def.Node, src); ns != "" {
 		meta["scope_ns"] = ns
 	}
-	if doc := extractCSharpDoc(src, def.StartLine); doc != "" {
+	if doc := extractCSharpDoc(src, def.Node); doc != "" {
 		meta["doc"] = doc
 	}
 	result.Nodes = append(result.Nodes, &graph.Node{
@@ -1951,7 +2062,7 @@ func (e *CSharpExtractor) emitField(m parser.QueryResult, filePath, fileID strin
 	if csharpHasModifier(def.Node, src, "readonly") {
 		meta["readonly"] = true
 	}
-	if doc := extractCSharpDoc(src, def.StartLine); doc != "" {
+	if doc := extractCSharpDoc(src, def.Node); doc != "" {
 		meta["doc"] = doc
 	}
 	result.Nodes = append(result.Nodes, &graph.Node{
@@ -2105,7 +2216,7 @@ func (e *CSharpExtractor) emitProperty(m parser.QueryResult, filePath, fileID st
 			meta["field_type_args"] = args
 		}
 	}
-	if doc := extractCSharpDoc(src, def.StartLine); doc != "" {
+	if doc := extractCSharpDoc(src, def.Node); doc != "" {
 		meta["doc"] = doc
 	}
 	result.Nodes = append(result.Nodes, &graph.Node{
@@ -2123,6 +2234,123 @@ func (e *CSharpExtractor) emitProperty(m parser.QueryResult, filePath, fileID st
 	})
 	// Property type annotation → EdgeTypedAs from the property node.
 	emitCSharpTypeUseEdges(id, propTypeRaw, filePath, def.StartLine+1, result)
+}
+
+// csharpIndexerName is the node name an indexer carries. The grammar
+// gives it none (`this` is a keyword), and the CLR metadata name `Item`
+// is unsafe here: [IndexerName] lets a type spell the indexer one way
+// and still declare an unrelated member called Item, so borrowing it
+// would fuse two distinct members onto one node. `this[]` cannot collide
+// with any legal C# identifier.
+const csharpIndexerName = "this[]"
+
+// emitAccessorMember mints the member node for the accessor-bearing
+// kinds that carry executable code but had no node at all: indexers and
+// events declared with add/remove bodies. Without a node the owner
+// lookup could not name the member holding an accessor body, so the
+// funcRanges gate dropped every call inside it - the exact loss
+// properties took before #720 recorded their extents (probe cells
+// AC19-AC21).
+//
+// They ride KindField with a `kind` stamp, the same shape properties
+// use, because csharpOwnerRanges already widens the call-owner set with
+// extent-carrying field-kind members. That keeps a real recall fix from
+// introducing a new node kind into federation, the wire formats, both
+// store backends and every consumer filter at the same time.
+//
+// Attribution, not just existence, is the point: an indexer sharing a
+// physical line with a property used to have its body call parked on
+// the property by the extractor's line fallback, and the semantic
+// tier's caller adoption then promoted that stub to a confident
+// resolved edge on a member that cannot call anything (issue #728).
+func (e *CSharpExtractor) emitAccessorMember(def *parser.CapturedNode, name, memberKind, filePath, fileID string, src []byte, result *parser.ExtractionResult, seen map[string]bool, fileAliases map[string]bool, funcBytes, funcLines map[string][2]int, valueProps map[string]csharpValueProp) {
+	if def == nil || def.Node == nil || name == "" {
+		return
+	}
+	owner := csharpDirectMemberOwner(def.Node, src, "class_declaration", "struct_declaration", "interface_declaration", "record_declaration")
+	if owner.kind == "" {
+		return
+	}
+	id := filePath + "::" + owner.name + "." + name
+	if seen[id] {
+		// A C# 13 partial indexer (C# 14: partial event) splits a single
+		// member across a declaring fragment and an implementing one, and
+		// either may extract first. That is NOT an overload, and minting a
+		// second node would leave the name-keyed ID - the one anything
+		// queries - pointing at the bodyless fragment while the code sat
+		// under a line-suffixed twin. Properties merge these onto the one
+		// node by moving the ownership record to the body-bearing
+		// fragment; the same rule applies here. The `partial` modifier is
+		// the discriminator rather than a body test: C# requires BOTH
+		// fragments to spell it, and no overload may, so it separates the
+		// two cases exactly.
+		if csharpHasModifier(def.Node, src, "partial") {
+			if csharpPropertyHasExecutableBody(def.Node) {
+				csharpRecordPropertyOwnership(id, def.Node, def.StartLine, def.EndLine, src, funcBytes, funcLines, valueProps)
+			}
+			return
+		}
+		// A genuine overload: two indexers differing only by parameter
+		// list, both body-bearing. Overloaded METHODS already resolve the
+		// ID collision by suffixing the second declaration with its line;
+		// taking the same route keeps one convention instead of two. A
+		// THIRD declaration on the same line collides again and is
+		// dropped, exactly as a third same-line method overload is.
+		id = id + "_L" + fmt.Sprint(def.StartLine+1)
+	}
+	if seen[id] {
+		return
+	}
+	seen[id] = true
+	// Accessor bodies and an expression body both live inside the
+	// declaration span, so recording it makes the member a call owner.
+	// An indexer's set accessor carries the implicit `value` parameter
+	// exactly as a property's does and rides the same seed; an event's
+	// add/remove bind `value` too, but csharpSetInitAccessorSpans scans
+	// for set/init only, so events deliberately get no seed here.
+	csharpRecordPropertyOwnership(id, def.Node, def.StartLine, def.EndLine, src, funcBytes, funcLines, valueProps)
+	isIface := owner.kind == "interface_declaration"
+	defaultVis := VisibilityPrivate
+	if isIface {
+		defaultVis = VisibilityPublic
+	}
+	meta := map[string]any{
+		"receiver":   owner.name,
+		"visibility": csharpVisibility(def.Node, src, defaultVis),
+		"kind":       memberKind,
+	}
+	// Call owners carry scope_ns: the resolver's scoped-usings narrowing
+	// reads it off the caller.
+	if ns := csharpEnclosingNamespace(def.Node, src); ns != "" {
+		meta["scope_ns"] = ns
+	}
+	if isIface {
+		meta["iface_member"] = true
+	}
+	var typeRaw string
+	if t := def.Node.ChildByFieldName("type"); t != nil {
+		typeRaw = strings.TrimSpace(t.Content(src))
+		meta["field_type"] = typeRaw
+		if args := csharpTypeArgsFromTypeNode(t, src, csharpUnstampableArgNames(def.Node, src, fileAliases)); args != "" {
+			meta["field_type_args"] = args
+		}
+	}
+	if doc := extractCSharpDoc(src, def.Node); doc != "" {
+		meta["doc"] = doc
+	}
+	result.Nodes = append(result.Nodes, &graph.Node{
+		ID: id, Kind: graph.KindField, Name: name,
+		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
+		Language: "csharp",
+		Meta:     meta,
+	})
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
+	})
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: id, To: filePath + "::" + owner.name, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: def.StartLine + 1,
+	})
+	emitCSharpTypeUseEdges(id, typeRaw, filePath, def.StartLine+1, result)
 }
 
 // stampCSharpUsings records the file's plain namespace usings (global
@@ -2263,7 +2491,8 @@ type csharpFuncLookup struct {
 
 // csharpOwnerRanges widens the method/constructor owner set with every
 // member that recorded byte extents but is not a KindFunction/KindMethod
-// node — properties today, any extent-carrying member kind tomorrow. A
+// node — properties, indexers and accessor-bearing events today, any
+// extent-carrying member kind tomorrow. A
 // member that can hold executable code must be able to OWN the calls in
 // it: the funcRanges gate drops a call whose enclosing member it cannot
 // name, which is how every accessor-body call vanished (round-23 catch
@@ -2289,6 +2518,41 @@ func csharpOwnerRanges(result *parser.ExtractionResult, funcBytes, funcLines map
 		ranges = append(ranges, funcRange{id: n.ID, startLine: start, endLine: end})
 	}
 	return ranges
+}
+
+// csharpStampOwnershipSpans carries the recorded ownership span onto the
+// member node whenever the node's own lines do not contain it. A node is
+// minted once per id, so a C# 13 partial property extracted declaring
+// fragment first (or a property declared in both arms of an #if / #else)
+// keeps the first fragment's lines while csharpOwnerRanges owns its
+// calls by the body-bearing fragment's span - and every stub the
+// extractor parks there sits outside the node. A consumer that tests a
+// call's line against the owner's extent (the semantic tier's adoption
+// guard, issue #731) needs the span the extractor actually attributed
+// by; the stamp is that span, the same 1-based lines csharpOwnerRanges
+// reads. Two cases leave a node unstamped, deliberately alike in effect:
+// no span was recorded at all (a field without an initializer, a member
+// kind that records none), and a recorded span the node's own lines
+// already contain (the ordinary property, the implementing-first order,
+// a field's declarator inside its declaration). Either way the node's
+// lines answer and its meta stays as before. Kept as its own walk rather
+// than folded into csharpOwnerRanges so the owner lookup stays a pure
+// read of the result.
+func csharpStampOwnershipSpans(result *parser.ExtractionResult, funcLines map[string][2]int) {
+	for _, n := range result.Nodes {
+		if n.Kind != graph.KindField {
+			continue
+		}
+		ln, ok := funcLines[n.ID]
+		if !ok || (ln[0] >= n.StartLine && ln[1] <= n.EndLine) {
+			continue
+		}
+		if n.Meta == nil {
+			n.Meta = make(map[string]any)
+		}
+		n.Meta[graph.MetaOwnershipStartLine] = ln[0]
+		n.Meta[graph.MetaOwnershipEndLine] = ln[1]
+	}
 }
 
 func newCSharpFuncLookup(ranges []funcRange, bytes map[string][2]int) *csharpFuncLookup {
@@ -2320,12 +2584,13 @@ func newCSharpFuncLookup(ranges []funcRange, bytes map[string][2]int) *csharpFun
 // carried A's call and every consumer of the attribution read the wrong
 // member's evidence (round-5 finding 4). Falls back to the line answer
 // whenever no recorded byte extent contains the offset: extents are
-// recorded for methods, constructors, properties, and initialized field
-// declarators, so a member kind still without them (indexer, event
-// accessor) sharing a line with one that has them would otherwise lose
-// its call outright rather than degrade to line attribution (round-6
-// finding B3) - unless the line answer's own recorded bytes exclude the
-// offset, in which case the fallback is refused (see below).
+// recorded for methods, constructors, properties, indexers, events and
+// initialized field declarators, so a member kind still without them
+// (operator, conversion operator, destructor) sharing a line with one
+// that has them would otherwise lose its call outright rather than
+// degrade to line attribution (round-6 finding B3) - unless the line
+// answer's own recorded bytes exclude the offset, in which case the
+// fallback is refused (see below).
 func (l *csharpFuncLookup) enclosingAt(line, offset int) string {
 	if offset < 0 || len(l.bytes) == 0 {
 		return l.enclosing(line)
@@ -2357,7 +2622,8 @@ func (l *csharpFuncLookup) enclosingAt(line, offset int) string {
 		return best
 	}
 	// The line fallback exists for member kinds that record NO extents
-	// at all (indexer, event accessor). If the line answer does have
+	// at all (operator, conversion operator, destructor). If the line
+	// answer does have
 	// recorded bytes and the offset sits outside them, the offset is
 	// provably not inside that member, so handing it the call invents a
 	// false edge on a same-line neighbour - strictly worse than the drop
@@ -2576,10 +2842,16 @@ func collectCSharpInterfaceNames(root *sitter.Node, src []byte) map[string]bool 
 // arity twins, namespace twins, and nested twins all share an ID with
 // a genuinely-partial type's fragments).
 type csharpPartialIdentity struct {
-	ns           string
-	outerChain   string
-	arity        int
-	extendsTaken bool
+	ns         string
+	outerChain string
+	arity      int
+	// extendsBase is the canonical name of the base CLASS an earlier
+	// fragment's extends budget was spent on ("" = unspent). It must be
+	// the target, not a boolean: C# permits every partial part to
+	// repeat the base class, and a repeat of the SAME base is dropped
+	// while only a genuinely different class entry degrades to
+	// implements.
+	extendsBase string
 }
 
 func csharpPartialIdentityOf(decl *sitter.Node, src []byte) csharpPartialIdentity {
@@ -2604,7 +2876,7 @@ func csharpCanonDottedName(s string) string {
 }
 
 // sameType reports whether a later fragment's identity key matches -
-// extendsTaken is bookkeeping, not identity, so it stays out.
+// extendsBase is bookkeeping, not identity, so it stays out.
 func (p csharpPartialIdentity) sameType(o csharpPartialIdentity) bool {
 	return p.ns == o.ns && p.outerChain == o.outerChain && p.arity == o.arity
 }
@@ -2645,12 +2917,14 @@ func csharpTypeParamArity(decl *sitter.Node) int {
 }
 
 // emitCSharpBaseList emits the declaration's base-list edges. It
-// receives whether an earlier fragment of the same type already minted
-// the base class and reports the state back, so partial fragments share
-// ONE extends budget the way entries within one base list always have.
-func emitCSharpBaseList(typeID string, decl *sitter.Node, src []byte, filePath string, localInterfaces, fileAliases map[string]bool, baseNameCounts map[string]map[string]int, result *parser.ExtractionResult, extendsAlready bool) bool {
+// receives which base class an earlier fragment of the same type
+// already minted ("" = none) and reports the state back, so partial
+// fragments share ONE extends budget the way entries within one base
+// list always have - and a later fragment legally REPEATING that same
+// base class emits nothing for it, instead of a demoted implements.
+func emitCSharpBaseList(typeID string, decl *sitter.Node, src []byte, filePath string, localInterfaces, fileAliases map[string]bool, baseNameCounts map[string]map[string]int, result *parser.ExtractionResult, extendsBaseAlready string) string {
 	if decl == nil {
-		return extendsAlready
+		return extendsBaseAlready
 	}
 	baseList := decl.ChildByFieldName("bases")
 	if baseList == nil {
@@ -2665,7 +2939,7 @@ func emitCSharpBaseList(typeID string, decl *sitter.Node, src []byte, filePath s
 		}
 	}
 	if baseList == nil {
-		return extendsAlready
+		return extendsBaseAlready
 	}
 	// Structs and `record struct` cannot derive from a base class — the
 	// CLR forbids it — so every entry in their base list is an interface
@@ -2693,7 +2967,7 @@ func emitCSharpBaseList(typeID string, decl *sitter.Node, src []byte, filePath s
 	// the winner's stamp. An absent entry counts as 0 and stamps nothing,
 	// so a shape the prescan cannot attribute keeps the full fan-out.
 	baseNameCount := baseNameCounts[typeID]
-	extendsTaken := extendsAlready
+	extendsBase := extendsBaseAlready
 	for i, _nc := 0, int(baseList.NamedChildCount()); i < _nc; i++ {
 		entry := baseList.NamedChild(i)
 		if entry == nil {
@@ -2709,13 +2983,19 @@ func emitCSharpBaseList(typeID string, decl *sitter.Node, src []byte, filePath s
 		// an interface.
 		isInterface := !isCtorBase &&
 			(localInterfaces[name] || csharpInterfaceNamePattern.MatchString(name))
+		// C# permits every partial part to repeat the base class the
+		// budget already spent — the repeat names the same base, so it
+		// emits nothing rather than a demoted implements.
+		if !ifaceDecl && !isInterface && name == extendsBase {
+			continue
+		}
 		kind := graph.EdgeImplements
 		switch {
 		case ifaceDecl:
 			kind = graph.EdgeExtends
-		case !isInterface && allowsBaseClass && !extendsTaken:
+		case !isInterface && allowsBaseClass && extendsBase == "":
 			kind = graph.EdgeExtends
-			extendsTaken = true
+			extendsBase = name
 		}
 		edge := &graph.Edge{
 			From: typeID, To: "unresolved::" + name,
@@ -2750,7 +3030,7 @@ func emitCSharpBaseList(typeID string, decl *sitter.Node, src []byte, filePath s
 		}
 		result.Edges = append(result.Edges, edge)
 	}
-	return extendsTaken
+	return extendsBase
 }
 
 // csharpQualifiedReceiverType resolves the type a `this.` or `base.`
@@ -2831,11 +3111,6 @@ func csharpDeclAllowsBaseClass(decl *sitter.Node) bool {
 	}
 }
 
-// csharpBaseTypeName extracts the bare type name from a single base_list
-// entry, stripping generic arguments and namespace qualification so the
-// `I`-prefix test sees IList rather than IList<int> or System.IList. The
-// bool return reports whether the entry is a primary_constructor_base_type
-// (`Base(args)`), which can only ever be a base class.
 // csharpCanonBaseIdent reduces one base-entry identifier SPELLING to the
 // identifier it denotes: the verbatim `@` prefix drops and unicode
 // escapes decode, so `@IRack` and the escaped spelling compare equal to
@@ -2851,6 +3126,11 @@ func csharpCanonBaseIdent(s string) string {
 	return s
 }
 
+// csharpBaseTypeName extracts the bare type name from a single base_list
+// entry, stripping generic arguments and namespace qualification so the
+// `I`-prefix test sees IList rather than IList<int> or System.IList. The
+// bool return reports whether the entry is a primary_constructor_base_type
+// (`Base(args)`), which can only ever be a base class.
 func csharpBaseTypeName(entry *sitter.Node, src []byte) (string, bool) {
 	switch entry.Type() {
 	case "identifier":

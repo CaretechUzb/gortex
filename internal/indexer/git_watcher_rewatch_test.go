@@ -397,10 +397,33 @@ func TestGitWatcher_PlainRepoWatchSetUnchanged(t *testing.T) {
 	for _, p := range gw.fsw.WatchList() {
 		watched[p] = struct{}{}
 	}
-	for _, rel := range []string{"HEAD", "refs/heads"} {
-		_, ok := watched[filepath.Join(gitDir, rel)]
-		assert.Truef(t, ok, "a plain repo must still watch %s", rel)
+	_, ok := watched[filepath.Join(gitDir, "HEAD")]
+	assert.True(t, ok, "a plain repo must still watch HEAD")
+
+	// The ref-side subscription is the ACTIVE REF FILE, not the refs/heads
+	// directory this test originally named. The watcher resolves HEAD's symref
+	// and subscribes to exactly that path, which is strictly narrower and fixes
+	// the case the directory watch never covered: a branch like feat/foo lives
+	// in refs/heads/feat, so a non-recursive watch on refs/heads saw nothing.
+	// The property under test is unchanged — a plain repo must still watch its
+	// ref state — so the assertion follows the implementation rather than
+	// pinning a path the watcher deliberately stopped using.
+	// Matched on the refs/heads/ SUFFIX, not on an absolute path built from
+	// gitDir. The ref watch is registered under the COMMON dir, which
+	// resolveGitCommonDir obtains from `git rev-parse` with symlinks already
+	// resolved; resolveGitDir does not resolve them. On macOS that alone is the
+	// difference between /var/folders/... and /private/var/folders/..., so an
+	// absolute-prefix comparison fails on a watch that is genuinely installed.
+	refsHeads := filepath.Join("refs", "heads") + string(filepath.Separator)
+	var activeRef string
+	for path := range watched {
+		if strings.Contains(path, refsHeads) {
+			activeRef = path
+			break
+		}
 	}
+	assert.NotEmptyf(t, activeRef,
+		"a plain repo must watch its active ref under refs/heads, watched=%v", watched)
 
 	st, idx, drained := startWatchedStoreIndex(t, repoDir, repoDir)
 	head := commitFile(t, repoDir, "d.go", "Delta")
@@ -409,24 +432,33 @@ func TestGitWatcher_PlainRepoWatchSetUnchanged(t *testing.T) {
 		"a plain repo must still restamp on a commit")
 }
 
-// TestGitWatcher_WarnsOnDegenerateWatchSet pins the only external signal that
-// this class of bug produces. It has to key on subscriptions actually
-// installed: a path can pass os.Stat and still fail fsw.Add.
-func TestGitWatcher_WarnsOnDegenerateWatchSet(t *testing.T) {
-	t.Run("fires when nothing ref-side is watchable", func(t *testing.T) {
+// TestGitWatcher_RefusesADegenerateWatchSet pins the external signal that this
+// class of bug produces.
+//
+// The signal used to be a Warn line and a watcher that started anyway, blind.
+// It is now a REFUSAL: Start returns an error rather than publishing a watcher
+// that silently missed its ref state. That is strictly stronger, and the
+// operator-visible half is unchanged because MultiWatcher logs the failed
+// Start — see TestMultiWatcherWarnsWhenTheGitWatcherCannotStart, which covers
+// the case that actually occurred in the field.
+func TestGitWatcher_RefusesADegenerateWatchSet(t *testing.T) {
+	t.Run("refuses when nothing ref-side is watchable", func(t *testing.T) {
 		repoDir := t.TempDir()
 		gitDir := filepath.Join(repoDir, ".git")
 		require.NoError(t, os.MkdirAll(gitDir, 0o755))
 		writeFile(t, filepath.Join(gitDir, "HEAD"), "ref: refs/heads/main\n")
 
-		core, logs := observer.New(zapcore.WarnLevel)
+		core, _ := observer.New(zapcore.WarnLevel)
 		gw, err := NewGitWatcher(repoDir, nil, zap.New(core))
 		require.NoError(t, err)
-		require.NoError(t, gw.Start())
 		t.Cleanup(func() { _ = gw.Stop() })
 
-		assert.Equal(t, 1, logs.FilterMessageSnippet("no ref watch installed").Len(),
-			"a watch set with no ref-side subscription must say so")
+		// A .git directory holding nothing but a HEAD file is not a repository,
+		// so the common-dir resolution refuses it before any watch is added.
+		err = gw.Start()
+		require.Error(t, err, "a watcher with no reachable ref state must not start")
+		assert.Empty(t, gw.fsw.WatchList(),
+			"a refused Start must not leave subscriptions behind")
 	})
 
 	t.Run("stays quiet on a healthy repo", func(t *testing.T) {

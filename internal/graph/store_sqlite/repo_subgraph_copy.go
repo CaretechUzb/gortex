@@ -491,28 +491,46 @@ func (s *Store) RestampCopiedReadiness(dstPrefix string) error {
 		return err
 	}
 	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
-	if err := restampCopiedReadiness(tx, dstPrefix); err != nil {
+	if err := restampCopiedReadiness(tx, s.viewGen, dstPrefix); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
-func restampCopiedReadiness(tx *sql.Tx, dstPrefix string) error {
-	for _, stmt := range []string{
-		`UPDATE derive_state
+// enrichment_state became generation-keyed in the 2026-09-04 upstream merge, so
+// its re-stamp is bound to the handle's generation; derive_state is this fork's
+// and is not keyed at all.
+//
+// KNOWN GAP, recorded rather than hidden: the rest of this copy path is still
+// generation-unaware. It selects and inserts the payload sidecars filtered by
+// repo_prefix alone, so on a store carrying a second view generation a copy
+// would carry rows across generations. Closing that means threading a
+// generation through the whole copy, which is a change of its own; it is inert
+// while a store has only the base generation 0, which is every store that has
+// not opted into a second view.
+func restampCopiedReadiness(tx *sql.Tx, viewGen int64, dstPrefix string) error {
+	// Each statement carries its OWN bindings: derive_state is not
+	// generation-keyed and names ?1 alone, so handing it the generation too
+	// would be one argument more than it has placeholders.
+	for _, stmt := range []struct {
+		sql  string
+		args []any
+	}{
+		{`UPDATE derive_state
 		    SET derived_content_gen = COALESCE(
 		          (SELECT content_gen FROM repo_graph_gen WHERE repo_prefix = ?1), 0),
 		        derived_gen         = COALESCE(
 		          (SELECT gen         FROM repo_graph_gen WHERE repo_prefix = ?1), 0)
-		  WHERE repo_prefix = ?1 AND legacy = 0`,
-		`UPDATE enrichment_state
+		  WHERE repo_prefix = ?1 AND legacy = 0`, []any{dstPrefix}},
+		{`UPDATE enrichment_state
 		    SET content_gen = COALESCE(
 		          (SELECT content_gen FROM repo_graph_gen WHERE repo_prefix = ?1), 0),
 		        gen         = COALESCE(
 		          (SELECT gen         FROM repo_graph_gen WHERE repo_prefix = ?1), 0)
-		  WHERE repo_prefix = ?1 AND content_gen > 0`,
+		  WHERE repo_prefix = ?1 AND content_gen > 0 AND view_gen = ?2`,
+			[]any{dstPrefix, viewGen}},
 	} {
-		if _, err := tx.Exec(stmt, dstPrefix); err != nil {
+		if _, err := tx.Exec(stmt.sql, stmt.args...); err != nil {
 			return fmt.Errorf("store_sqlite: CopyRepoSubgraph re-stamp readiness: %w", err)
 		}
 	}

@@ -48,16 +48,30 @@ func (s *Store) DeclareEnrichmentProviders(repoPrefix string, providers []string
 		// its stamp. Re-declaring an existing row must not reset a real pass to
 		// "never ran".
 		if _, err := tx.Exec(`
-INSERT OR IGNORE INTO enrichment_state (repo_prefix, provider, content_gen)
-VALUES (?, ?, 0)`, repoPrefix, provider); err != nil {
+INSERT OR IGNORE INTO enrichment_state (view_gen, repo_prefix, provider, content_gen)
+VALUES (?, ?, ?, 0)`, s.viewGen, repoPrefix, provider); err != nil {
 			return err
 		}
 	}
 
 	// Drop rows outside the declared set, leaving the two sentinels alone --
 	// they are rollups, not providers, and are managed just below.
-	del := `DELETE FROM enrichment_state WHERE repo_prefix = ? AND provider NOT IN (?, ?`
-	args := []any{repoPrefix, graph.EnrichProviderRepoMarker, graph.EnrichProviderNone}
+	//
+	// Checkout-scoped MARKERS are spared for a different reason: they are not
+	// applicability rows at all. Their key is "<provider>@<checkout>", one per
+	// working copy, and no declaration ever names them -- so without this
+	// clause the prune deleted a sibling checkout's marker every time another
+	// checkout of the same family was enriched, and each pass re-enriched a
+	// tree the store had already covered.
+	del := `DELETE FROM enrichment_state
+ WHERE view_gen = ? AND repo_prefix = ?
+   AND instr(provider, ?) = 0
+   AND provider NOT IN (?, ?`
+	args := []any{
+		s.viewGen, repoPrefix,
+		graph.EnrichCheckoutMarkerSeparator,
+		graph.EnrichProviderRepoMarker, graph.EnrichProviderNone,
+	}
 	for _, provider := range providers {
 		if provider == "" {
 			continue
@@ -72,13 +86,13 @@ VALUES (?, ?, 0)`, repoPrefix, provider); err != nil {
 
 	if len(providers) == 0 {
 		if _, err := tx.Exec(`
-INSERT OR IGNORE INTO enrichment_state (repo_prefix, provider, content_gen)
-VALUES (?, ?, 0)`, repoPrefix, graph.EnrichProviderNone); err != nil {
+INSERT OR IGNORE INTO enrichment_state (view_gen, repo_prefix, provider, content_gen)
+VALUES (?, ?, ?, 0)`, s.viewGen, repoPrefix, graph.EnrichProviderNone); err != nil {
 			return err
 		}
 	} else if _, err := tx.Exec(
-		`DELETE FROM enrichment_state WHERE repo_prefix = ? AND provider = ?`,
-		repoPrefix, graph.EnrichProviderNone); err != nil {
+		`DELETE FROM enrichment_state WHERE view_gen = ? AND repo_prefix = ? AND provider = ?`,
+		s.viewGen, repoPrefix, graph.EnrichProviderNone); err != nil {
 		return err
 	}
 
@@ -113,15 +127,15 @@ func (s *Store) CompleteEnrichmentProvider(repoPrefix, provider string, contentG
 	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
 
 	if _, err := tx.Exec(`
-INSERT INTO enrichment_state (repo_prefix, provider, gen, content_gen)
+INSERT INTO enrichment_state (view_gen, repo_prefix, provider, gen, content_gen)
 VALUES (
-  ?, ?,
+  ?, ?, ?,
   COALESCE((SELECT gen FROM repo_graph_gen WHERE repo_prefix = ?), 0),
   MIN(?, COALESCE((SELECT content_gen FROM repo_graph_gen WHERE repo_prefix = ?), 0)))
-ON CONFLICT(repo_prefix, provider) DO UPDATE SET
+ON CONFLICT(view_gen, repo_prefix, provider) DO UPDATE SET
   gen         = excluded.gen,
   content_gen = MAX(enrichment_state.content_gen, excluded.content_gen)`,
-		repoPrefix, provider, repoPrefix, contentGen, repoPrefix); err != nil {
+		s.viewGen, repoPrefix, provider, repoPrefix, contentGen, repoPrefix); err != nil {
 		return err
 	}
 
@@ -130,8 +144,8 @@ ON CONFLICT(repo_prefix, provider) DO UPDATE SET
 	// its first Go or Python file between two declarations.
 	if provider != graph.EnrichProviderNone && provider != graph.EnrichProviderRepoMarker {
 		if _, err := tx.Exec(
-			`DELETE FROM enrichment_state WHERE repo_prefix = ? AND provider = ?`,
-			repoPrefix, graph.EnrichProviderNone); err != nil {
+			`DELETE FROM enrichment_state WHERE view_gen = ? AND repo_prefix = ? AND provider = ?`,
+			s.viewGen, repoPrefix, graph.EnrichProviderNone); err != nil {
 			return err
 		}
 	}
@@ -159,7 +173,8 @@ func (s *Store) RepoContentGen(repoPrefix string) (int64, error) {
 // from "no provider has ever been looked at".
 func (s *Store) EnrichmentContentGens(repoPrefix string) (map[string]int64, error) {
 	rows, err := s.db.Query(
-		`SELECT provider, content_gen FROM enrichment_state WHERE repo_prefix = ?`, repoPrefix)
+		`SELECT provider, content_gen FROM enrichment_state WHERE view_gen = ? AND repo_prefix = ?`,
+		s.viewGen, repoPrefix)
 	if err != nil {
 		return nil, err
 	}
@@ -198,10 +213,10 @@ func (s *Store) EnrichmentNeverRan(repoPrefix string) (bool, error) {
 	}
 	var owed bool
 	err := s.db.QueryRow(`
-SELECT NOT EXISTS(SELECT 1 FROM enrichment_state WHERE repo_prefix = ?)
+SELECT NOT EXISTS(SELECT 1 FROM enrichment_state WHERE view_gen = ? AND repo_prefix = ?)
     OR EXISTS(SELECT 1 FROM enrichment_state
-               WHERE repo_prefix = ? AND provider NOT IN (?, ?) AND gen = 0)`,
-		repoPrefix, repoPrefix,
+               WHERE view_gen = ? AND repo_prefix = ? AND provider NOT IN (?, ?) AND gen = 0)`,
+		s.viewGen, repoPrefix, s.viewGen, repoPrefix,
 		graph.EnrichProviderRepoMarker, graph.EnrichProviderNone).Scan(&owed)
 	if err != nil {
 		return false, err
@@ -227,10 +242,10 @@ func (s *Store) DeclareNoEnrichmentProvidersIfUnrecorded(repoPrefix string) erro
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	_, err := s.execActiveWriteLocked(context.Background(), `
-INSERT OR IGNORE INTO enrichment_state (repo_prefix, provider, content_gen)
-SELECT ?, ?, 0
- WHERE NOT EXISTS (SELECT 1 FROM enrichment_state WHERE repo_prefix = ?)`,
-		repoPrefix, graph.EnrichProviderNone, repoPrefix)
+INSERT OR IGNORE INTO enrichment_state (view_gen, repo_prefix, provider, content_gen)
+SELECT ?, ?, ?, 0
+ WHERE NOT EXISTS (SELECT 1 FROM enrichment_state WHERE view_gen = ? AND repo_prefix = ?)`,
+		s.viewGen, repoPrefix, graph.EnrichProviderNone, s.viewGen, repoPrefix)
 	return err
 }
 
@@ -265,8 +280,8 @@ func (s *Store) RefreshEnrichmentProviders(repoPrefix string) (int, error) {
 UPDATE enrichment_state
    SET content_gen = COALESCE((SELECT content_gen FROM repo_graph_gen WHERE repo_prefix = ?), 0),
        gen         = COALESCE((SELECT gen         FROM repo_graph_gen WHERE repo_prefix = ?), 0)
- WHERE repo_prefix = ? AND provider NOT IN (?, ?) AND indexed_sha <> ''`,
-		repoPrefix, repoPrefix, repoPrefix,
+ WHERE view_gen = ? AND repo_prefix = ? AND provider NOT IN (?, ?) AND indexed_sha <> ''`,
+		repoPrefix, repoPrefix, s.viewGen, repoPrefix,
 		graph.EnrichProviderRepoMarker, graph.EnrichProviderNone)
 	if err != nil {
 		return 0, err

@@ -29,6 +29,10 @@ import (
 //   - stream scoped edges      → streamScopedEdges keyset cursor
 //     (scoped projection tests lock the no-temp-btree property)
 //   - BFS adjacency expansion  → store_bfs.go builders (store_bfs_test.go)
+//   - rebind receiver candidates → goMethodReceiverCandidates{Global,ForFile,ForFiles}SQL
+//     (method_receiver_rebind_plan_lock_test.go locks the join ORDER, not just
+//     the index: those queries run under four statistics regimes because a
+//     tiny sqlite_stat1 row inverts the order INDEXED BY cannot pin)
 //
 // A new hot query lands with a row in this table. Rows run against a
 // realistically-shaped fixture WITH planner statistics (ANALYZE), because
@@ -51,14 +55,14 @@ func TestHotQueryPlansLocked(t *testing.T) {
 		{
 			name:   "nodes_in_files_by_kind",
 			query:  nodesInFilesByKindQuery(3, 2),
-			args:   5,
+			args:   6,
 			want:   []string{"USING INDEX nodes_by_file"},
 			forbid: []string{"SCAN nodes", "USE TEMP B-TREE"},
 		},
 		{
 			name:  "edge_candidates_endpoint",
 			query: edgeCandidatesEndpointQuery(3),
-			args:  6,
+			args:  7,
 			// The unique-key autoindex probes (from_id=? AND to_id=?) —
 			// better than edges_by_from's prefix probe. Lock the property
 			// (an index probe seeded on from_id), not the index name.
@@ -74,14 +78,14 @@ func TestHotQueryPlansLocked(t *testing.T) {
 			// edges_by_from_line existed. Lock the property, not the name.
 			name:   "edge_candidates_exact_site",
 			query:  edgeCandidatesExactSiteQuery(3),
-			args:   9,
+			args:   10,
 			want:   []string{"SEARCH e USING INDEX", "from_id=? AND line=?"},
 			forbid: []string{"SCAN e"},
 		},
 		{
 			name:   "edge_candidates_any_site",
 			query:  edgeCandidatesAnySiteQuery(3),
-			args:   6,
+			args:   7,
 			want:   []string{"SEARCH e USING INDEX", "from_id=? AND line=?"},
 			forbid: []string{"SCAN e"},
 		},
@@ -93,7 +97,7 @@ func TestHotQueryPlansLocked(t *testing.T) {
 			// global kind scan.
 			name:   "repo_node_ids_by_kinds",
 			query:  repoNodeIDsByKindsQuery(),
-			args:   2,
+			args:   3,
 			want:   []string{"nodes_by_repo_kind (repo_prefix=? AND kind=?)"},
 			forbid: []string{"SCAN n", "USE TEMP B-TREE"},
 		},
@@ -103,7 +107,7 @@ func TestHotQueryPlansLocked(t *testing.T) {
 			// per-node over-reads.
 			name:  "repo_edges_by_kinds",
 			query: repoEdgesByKindsQuery(),
-			args:  2,
+			args:  3,
 			want: []string{
 				"nodes_by_repo_kind (repo_prefix=?)",
 				"SEARCH e USING INDEX edges_by_from (from_id=? AND kind=?)",

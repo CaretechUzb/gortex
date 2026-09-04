@@ -2,9 +2,11 @@ package store_sqlite
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/zzet/gortex/internal/graph"
 )
@@ -34,7 +36,7 @@ import (
 // index changes in a way an old on-disk DB would not already have, and append a
 // matching schemaMigrations entry describing how to bring an older store
 // forward (in place, or by rebuild).
-const currentSchemaVersion = 14
+const currentSchemaVersion = 20
 
 // schemaMigration is one forward step. Exactly one strategy applies:
 //   - rebuild=true: the change introduces structure/data that can only come
@@ -50,6 +52,33 @@ type schemaMigration struct {
 	inPlace func(tx *sql.Tx) error
 	rebuild bool
 }
+
+// MigrationPhase identifies one observable boundary in an in-place schema
+// migration. Observers are advisory: they must not block the migration or
+// mutate the graph database.
+type MigrationPhase string
+
+const (
+	MigrationStarted  MigrationPhase = "started"
+	MigrationFinished MigrationPhase = "finished"
+	MigrationFailed   MigrationPhase = "failed"
+)
+
+// MigrationProgress describes one schema migration step. Elapsed is measured
+// from the start of the current step and Error is populated only for a failed
+// step. The error is intended for logs and transient startup state; callers
+// should avoid persisting it as durable graph data.
+type MigrationProgress struct {
+	Version int
+	Name    string
+	Phase   MigrationPhase
+	Elapsed time.Duration
+	Error   error
+}
+
+// MigrationObserver receives synchronous migration boundaries. It may be nil.
+// Implementations should return promptly; a slow observer delays store Open.
+type MigrationObserver func(MigrationProgress)
 
 // schemaMigrations is the ordered, forward-only registry. Version 1 is the
 // implicit baseline (no entry): a v1 store is reconciled entirely by schemaSQL's
@@ -82,54 +111,392 @@ var schemaMigrations = []schemaMigration{
 	{version: 10, name: "rebuild vector corpus ownership and parents", inPlace: rebuildVectorCorpusSchema},
 	{version: 11, name: "add symbol FTS normalization state", inPlace: createSymbolFTSNormalizationStateTable},
 	{version: 12, name: "normalize dir column separators", inPlace: normalizeDirColumnSeparators},
-	// v13 carries BOTH sides' work, because both sides minted a v13.
+	// Upstream renumbered this registry in the 2026-09-04 merge: it inserted
+	// six new steps at 13..18 and moved the two steps this fork had adopted —
+	// the coverage-spelling purge and the unresolved-tests-edge purge — out to
+	// 19 and 20. Upstream's numbering is adopted verbatim below, so
+	// currentSchemaVersion is 20, EQUAL to upstream's.
 	//
-	// This branch developed its readiness migration as v13 in parallel with
-	// main's coverage-spelling purge, so the merge had to reconcile two
-	// different steps claiming one number. They are merged into the single v13
-	// they both claim rather than renumbering ours to 14, which would have left
-	// main's purge permanently unrun on every store this branch built.
+	// Standing rule, restated because this merge is the third time it decided
+	// the resolution: this fork's currentSchemaVersion must stay EQUAL to
+	// upstream's, and fork-only work must live INSIDE a number upstream already
+	// shipped. Never mint a number of our own. Stamping our stores 21 would
+	// carry them past upstream's next migration, which pendingBetween — it
+	// selects `version > stored && version <= current` — would then skip
+	// PERMANENTLY.
 	//
-	// Standing rule, and the reason renumbering was rejected in both
-	// directions: this branch's currentSchemaVersion must stay EQUAL to main's.
-	// Our work lives inside the number main already shipped, so whatever main
-	// numbers next (14) is strictly greater than what stores built here are
-	// stamped, and pendingBetween selects it. Stamping our stores 14/15 would
-	// carry them past main's next migration, which pendingBetween would then
-	// skip permanently.
+	// So this fork's readiness work rides v19, not a number of its own. v19 is
+	// upstream's coverage purge, which is the same purge the fork's old
+	// migrateV13 already wrapped, and it is reachable from every store this
+	// fork ever stamped (13 or 14) as well as from every upstream store (<= 18).
+	// All three halves are idempotent, so a fork store stamped 13 that already
+	// ran them under the old numbering re-runs them harmlessly.
 	//
-	// Consequence, accepted deliberately: planSchemaMigrationWith treats
-	// `stored > current` as "written by a newer build" and WIPES the store, so a
-	// store this branch already stamped 14 is rebuilt from source on first open
-	// after the merge. That is the cost of collapsing the number, and it is
-	// correct — such a store carries a schema this registry no longer describes.
-	//
-	// Known gap, recorded rather than hidden: a store MAIN stamped 13 is
-	// `stored == current` and runs nothing, so it never receives the readiness
-	// seeding or the unstamp. schemaSQL still creates the readiness tables (it
-	// runs before the registry), so such a store is structurally sound, but its
-	// repositories read "never derived" until their next real derive, and any
-	// synthetic-namespace ownership the old graph.StubRepoPrefix wrote is left
-	// standing. Waiting does not close it either: pendingBetween(13, 14) selects
-	// v14 alone, so main's next migration reconciles nothing here. A rebuild
-	// closes both halves; the repo's next real derive closes the readiness rows
-	// only, and the unstamp stays unrun. Do not mint a migration of our own to
-	// close it — see the standing rule above. The v14 below is MAIN's, adopted
-	// verbatim in the merge; it is not a number minted here to close this gap.
-	{version: 13, name: "purge legacy coverage spellings and add per-repo readiness state", inPlace: migrateV13},
-	//
-	// Resolved 2026-09-01 in the upstream merge: main's next migration did
-	// arrive as v14 (purge unresolved derived tests edges) and is adopted below
-	// verbatim, so currentSchemaVersion is now 14 — equal to main's, which is
-	// exactly what the standing rule permits: go higher only once main is
-	// merged in and its number is already ours. A store this fork stamped 13
-	// runs v14 alone, which is right, because it already carries both halves
-	// of v13.
-	{version: 14, name: "purge unresolved derived tests edges", inPlace: purgeUnresolvedTestsEdges},
+	// Checked, not assumed: a fork store stamped 13 or 14 SKIPS upstream's v13
+	// and v14, because those numbers meant something different here. Neither
+	// skip harms it. v13's tables come from checkoutCatalogSchemaSQL, which is
+	// CREATE TABLE IF NOT EXISTS and runs inside schemaSQL before the registry.
+	// v14 adds edges.view_gen, and the two steps that follow do not need it
+	// from v14: v15 rebuilds only viewGenSidecars and never reads edges, and
+	// v16's rebuildEdgesAtBaseGeneration creates the new edges table from the
+	// canonical edgesTableBody and copies the SHARED column set, so it mints
+	// the column itself whichever way it found the old table.
+	{version: 13, name: "add checkout lifecycle catalog", inPlace: createCheckoutCatalogTables},
+	{version: 14, name: "add edges view generation column", inPlace: addEdgeViewGenerationColumn},
+	{version: 15, name: "key payload sidecars by view generation", inPlace: addSidecarViewGenerationKeys},
+	{version: 16, name: "key nodes and edges by view generation", inPlace: keyGraphCoreByViewGeneration},
+	{version: 17, name: "add sparse view-generation enumeration indexes", inPlace: addGenerationEnumerationIndexes},
+	{version: 18, name: "add sparse generation ownership masks", inPlace: createGenerationMaskTables},
+	{version: 19, name: "purge legacy coverage spellings and add per-repo readiness state", inPlace: migrateV19},
+	{version: 20, name: "purge unresolved derived tests edges", inPlace: purgeUnresolvedTestsEdges},
 }
 
-// migrateV13 runs main's coverage purge and this branch's readiness setup as
-// one step, in dependency order.
+// createGenerationMaskTables is the explicit v18 migration. The mask tables are
+// purely additive — they sit beside the payload tables and re-key nothing — so
+// an older store gains them without a reindex, and an existing generation
+// simply has no masks until something writes them. schemaSQL owns the canonical
+// fresh-store definition and runs first; this step repeats the same idempotent
+// DDL so the addition is part of the versioned contract rather than an
+// unversioned side effect of Open.
+func createGenerationMaskTables(tx *sql.Tx) error {
+	_, err := tx.Exec(generationMaskSchemaSQL)
+	return err
+}
+
+// addGenerationEnumerationIndexes is the explicit migration step for the two
+// partial view-generation indexes. createGraphCoreIndexes already builds them
+// on every Open from the same shared DDL, so this step exists to make the
+// addition part of the versioned contract: a store stamped v17 is one whose
+// sparse-generation enumeration path is known to be indexed.
+func addGenerationEnumerationIndexes(tx *sql.Tx) error {
+	for _, ddl := range []string{nodesByGenerationIndexDDL, edgesByGenerationIndexDDL} {
+		if _, err := tx.Exec(ddl); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// keyGraphCoreByViewGeneration re-keys the two core payload tables on the view
+// generation their rows belong to: nodes on an (id, view_gen) primary key, edges
+// on a UNIQUE(from_id, to_id, kind, file_path, line, view_gen) dedup key. The
+// sidecars gained a generation key in v15; these are the last two payload tables
+// where a second generation's row would otherwise collide with the base corpus's
+// instead of sitting beside it. Unlike the sidecars, whose reads were retargeted
+// in the same change, view_gen goes at the END of both keys so that every
+// generation-blind read in the package keeps the identical plan it had on the
+// id-only key (see nodesTableBody).
+//
+// Neither a primary key nor a table constraint can be altered in place, so both
+// tables are rebuilt. Every existing row is copied at generation 0 — the single
+// base corpus they already belong to — so no data is re-derived and no reindex
+// is needed. Both rebuilds and the index recreation share the caller's single
+// migration transaction, so a failure anywhere leaves the store exactly as it
+// was.
+func keyGraphCoreByViewGeneration(tx *sql.Tx) error {
+	if err := rebuildNodesAtBaseGeneration(tx); err != nil {
+		return fmt.Errorf("nodes: %w", err)
+	}
+	if err := rebuildEdgesAtBaseGeneration(tx); err != nil {
+		return fmt.Errorf("edges: %w", err)
+	}
+	// Dropping a table drops its indexes with it, so both tables are indexless
+	// at this point; one call rebuilds the whole core set under its existing
+	// names, which every INDEXED BY site in the package names literally and
+	// fails closed on.
+	return createGraphCoreIndexes(tx)
+}
+
+// rebuildNodesAtBaseGeneration replaces nodes with an (id, view_gen)-keyed table
+// holding the same rows at generation 0.
+//
+// The replacement is created from the canonical body and then reconciled by the
+// same ensure helpers Open uses, so the promoted / struct columns an older
+// store accumulated by ALTER are present before the copy and the generated
+// columns are recomputed rather than copied — INSERT ... SELECT may not name a
+// generated column on either side. The copy list is the intersection of both
+// tables' ordinary columns, so a column one side does not know about can never
+// turn the copy into a silent error.
+//
+// Idempotent: nodes gains view_gen only here, so its presence means the rebuild
+// already ran.
+func rebuildNodesAtBaseGeneration(tx *sql.Tx) error {
+	var count int
+	if err := tx.QueryRow(
+		`SELECT COUNT(*) FROM pragma_table_xinfo('nodes') WHERE name = ?`,
+		viewGenColumnName,
+	).Scan(&count); err != nil {
+		return err
+	}
+	if count > 0 {
+		return nil
+	}
+	const rebuilt = "nodes_view_gen_rebuild"
+	if _, err := tx.Exec(`CREATE TABLE ` + rebuilt + nodesTableBody); err != nil {
+		return err
+	}
+	if err := ensureNodeColumns(tx, rebuilt); err != nil {
+		return err
+	}
+	if err := ensureNodeGeneratedColumns(tx, rebuilt); err != nil {
+		return err
+	}
+	columns, err := sharedCopyColumns(tx, "nodes", rebuilt)
+	if err != nil {
+		return err
+	}
+	if err := copyRowsAtBaseGeneration(tx, "nodes", rebuilt, columns); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DROP TABLE nodes`); err != nil {
+		return err
+	}
+	_, err = tx.Exec(`ALTER TABLE ` + rebuilt + ` RENAME TO nodes`)
+	return err
+}
+
+// rebuildEdgesAtBaseGeneration replaces edges with a table whose dedup key ends
+// with view_gen, holding the same rows at generation 0.
+//
+// edges.id stays an AUTOINCREMENT primary key: it names a physical row, not a
+// logical edge, and callers page and order by it. AUTOINCREMENT means the next
+// id comes from sqlite_sequence, which DROP TABLE deletes and the copy resets
+// to the highest id actually carried across — lower than the original whenever
+// rows were ever deleted. Capturing the counter before the drop and restoring
+// it after the rename keeps ids strictly increasing across the migration, so no
+// id a caller still holds can be handed out a second time.
+//
+// The edges view_gen COLUMN already exists (v14), so its presence proves
+// nothing here; the probe instead asks whether the unique constraint's own
+// index carries it. Membership, not position — the key order is a plan
+// decision and a later step may reorder it without re-running this rebuild.
+func rebuildEdgesAtBaseGeneration(tx *sql.Tx) error {
+	var keyed int
+	if err := tx.QueryRow(`
+SELECT COUNT(*)
+FROM pragma_index_list('edges') AS il
+JOIN pragma_index_info(il.name) AS ii
+WHERE il.origin = 'u' AND ii.name = ?`, viewGenColumnName).Scan(&keyed); err != nil {
+		return err
+	}
+	if keyed > 0 {
+		return nil
+	}
+	var sequence sql.NullInt64
+	if err := tx.QueryRow(`SELECT seq FROM sqlite_sequence WHERE name = 'edges'`).Scan(&sequence); err != nil &&
+		!errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	const rebuilt = "edges_view_gen_rebuild"
+	if _, err := tx.Exec(`CREATE TABLE ` + rebuilt + edgesTableBody); err != nil {
+		return err
+	}
+	if err := ensureEdgeColumns(tx, rebuilt); err != nil {
+		return err
+	}
+	columns, err := sharedCopyColumns(tx, "edges", rebuilt)
+	if err != nil {
+		return err
+	}
+	if err := copyRowsAtBaseGeneration(tx, "edges", rebuilt, columns); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DROP TABLE edges`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`ALTER TABLE ` + rebuilt + ` RENAME TO edges`); err != nil {
+		return err
+	}
+	return restoreEdgeRowidSequence(tx, sequence)
+}
+
+// restoreEdgeRowidSequence lifts the rebuilt edges table's AUTOINCREMENT
+// counter back to the value the original carried. sqlite_sequence has no unique
+// index on name, so this updates the row the rename carried across rather than
+// INSERT OR REPLACE, which would silently leave two rows for one table and let
+// SQLite read whichever it found first.
+func restoreEdgeRowidSequence(tx *sql.Tx, sequence sql.NullInt64) error {
+	if !sequence.Valid {
+		return nil
+	}
+	result, err := tx.Exec(
+		`UPDATE sqlite_sequence SET seq = ? WHERE name = 'edges' AND seq < ?`,
+		sequence.Int64, sequence.Int64,
+	)
+	if err != nil {
+		return err
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if updated > 0 {
+		return nil
+	}
+	// No row to raise: either the copy already reached a higher id, or it moved
+	// no rows at all and the rebuilt table has no counter yet.
+	var present int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM sqlite_sequence WHERE name = 'edges'`).Scan(&present); err != nil {
+		return err
+	}
+	if present > 0 {
+		return nil
+	}
+	_, err = tx.Exec(`INSERT INTO sqlite_sequence(name, seq) VALUES ('edges', ?)`, sequence.Int64)
+	return err
+}
+
+// sharedCopyColumns returns the ordinary columns both tables carry, in the
+// source table's order. Generated columns are excluded on both sides because
+// SQLite computes them; view_gen is excluded because the copy supplies it.
+func sharedCopyColumns(tx *sql.Tx, source, destination string) ([]string, error) {
+	from, err := nonGeneratedColumns(tx, source)
+	if err != nil {
+		return nil, err
+	}
+	to, err := nonGeneratedColumns(tx, destination)
+	if err != nil {
+		return nil, err
+	}
+	known := make(map[string]bool, len(to))
+	for _, name := range to {
+		known[name] = true
+	}
+	shared := make([]string, 0, len(from))
+	for _, name := range from {
+		if name == viewGenColumnName || !known[name] {
+			continue
+		}
+		shared = append(shared, name)
+	}
+	if len(shared) == 0 {
+		return nil, fmt.Errorf("%s and %s share no copyable column", source, destination)
+	}
+	return shared, nil
+}
+
+// copyRowsAtBaseGeneration moves every row across at generation 0 through an
+// explicit column list — never SELECT *, which would silently depend on column
+// order matching between two independently built tables.
+func copyRowsAtBaseGeneration(tx *sql.Tx, source, destination string, columns []string) error {
+	list := strings.Join(columns, ", ")
+	_, err := tx.Exec(`INSERT INTO ` + destination + ` (` + viewGenColumnName + `, ` + list + `)
+SELECT 0, ` + list + ` FROM ` + source)
+	return err
+}
+
+// addSidecarViewGenerationKeys re-keys every WITHOUT ROWID payload sidecar on
+// a leading view_gen column. A sidecar row belongs to exactly one payload view
+// generation, so the generation has to lead the primary key: without it a
+// second generation's row for the same (repo, file) or node id would collide
+// with the base corpus's row instead of sitting beside it.
+//
+// A primary key cannot be altered in place, so each table is rebuilt: create
+// the replacement, copy every row across at generation 0 through an explicit
+// column list, drop the old table, rename, and recreate its secondary indexes
+// under their existing names. Generation 0 is the single base corpus every
+// existing row already belongs to, so the copy preserves all data and needs no
+// reindex. The whole registry runs inside the one migration transaction, so a
+// failure on any table leaves the store exactly as it was.
+//
+// Idempotent: a table that already carries view_gen is skipped. schemaSQL runs
+// before the migration steps, so on a fresh store every sidecar is already
+// re-keyed when this runs, and the v10 vector rebuild creates its table from
+// the same registry body.
+func addSidecarViewGenerationKeys(tx *sql.Tx) error {
+	for _, sidecar := range viewGenSidecars {
+		if err := rebuildSidecarAtBaseGeneration(tx, sidecar); err != nil {
+			return fmt.Errorf("%s: %w", sidecar.table, err)
+		}
+	}
+	return nil
+}
+
+func rebuildSidecarAtBaseGeneration(tx *sql.Tx, sidecar viewGenSidecar) error {
+	var count int
+	probe := fmt.Sprintf(`SELECT COUNT(*) FROM pragma_table_xinfo('%s') WHERE name = ?`, sidecar.table)
+	if err := tx.QueryRow(probe, sidecarViewGenColumnName).Scan(&count); err != nil {
+		return err
+	}
+	if count > 0 {
+		return nil
+	}
+	rebuilt := sidecar.table + "_view_gen_rebuild"
+	if _, err := tx.Exec(`CREATE TABLE ` + rebuilt + sidecar.body); err != nil {
+		return err
+	}
+	// The copy list is INTERSECTED with the table on disk rather than taken
+	// from sidecar.columns verbatim, which is what upstream did. This fork adds
+	// columns to a sidecar upstream also defines (enrichment_state.gen and
+	// .content_gen), so the two column sets are not the same on every store
+	// this build may open. A verbatim list is wrong in both directions: naming
+	// the fork columns fails with "no such column" on a store an upstream build
+	// wrote, and omitting them silently DROPS this fork's readiness stamps when
+	// the rebuild copies the rows. sharedCopyColumns already solves exactly
+	// this for rebuildEdgesAtBaseGeneration; sidecar.columns stays as the
+	// registry's documentation of the canonical set.
+	columns, err := sharedCopyColumns(tx, sidecar.table, rebuilt)
+	if err != nil {
+		return err
+	}
+	if err := copyRowsAtBaseGeneration(tx, sidecar.table, rebuilt, columns); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DROP TABLE ` + sidecar.table); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`ALTER TABLE ` + rebuilt + ` RENAME TO ` + sidecar.table); err != nil {
+		return err
+	}
+	for _, ddl := range sidecar.indexes {
+		if _, err := tx.Exec(ddl); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// addEdgeViewGenerationColumn adds edges.view_gen to a store whose edges table
+// was created before the column existed. Purely additive: every existing row
+// takes the column default, generation 0, which is the single base corpus they
+// already belong to — no backfill, no reindex.
+//
+// schemaSQL owns the fresh-store definition and runs before the migration
+// steps, so this is a no-op there. The probe reads pragma_table_xinfo rather
+// than table_info for the same reason ensureEdgeColumns does: table_info omits
+// generated columns, and one probe shape that lists every column is the one
+// worth reusing. Idempotent — a second run finds the column and returns.
+func addEdgeViewGenerationColumn(tx *sql.Tx) error {
+	var count int
+	if err := tx.QueryRow(
+		`SELECT COUNT(*) FROM pragma_table_xinfo('edges') WHERE name = ?`,
+		viewGenColumnName,
+	).Scan(&count); err != nil {
+		return err
+	}
+	if count > 0 {
+		return nil
+	}
+	_, err := tx.Exec(`ALTER TABLE edges ADD COLUMN ` + edgeViewGenColumnDDL)
+	return err
+}
+
+// createCheckoutCatalogTables is the explicit v13 migration for existing
+// stores. The catalog is purely additive — it adds tables beside the payload
+// ones and re-keys nothing — so an older store gains it without a reindex.
+// schemaSQL owns the canonical fresh-store definition and runs first; this
+// step repeats the same idempotent DDL so the addition is part of the
+// versioned contract rather than an unversioned side effect of Open.
+func createCheckoutCatalogTables(tx *sql.Tx) error {
+	_, err := tx.Exec(checkoutCatalogSchemaSQL)
+	return err
+}
+
+// migrateV19 runs upstream's coverage purge and this fork's readiness setup as
+// one step, in dependency order. It was migrateV13 until the 2026-09-04 merge,
+// where upstream renumbered its own coverage purge from 13 to 19; the fork work
+// rode along rather than minting a number of its own. See the standing rule on
+// the registry above for why that is the only allowed shape.
 //
 // Purge first: it deletes legacy artifact rows, and the readiness seed reads
 // repo_index_state to decide which repositories get a legacy=1 row, so seeding
@@ -137,8 +504,8 @@ var schemaMigrations = []schemaMigration{
 //
 // Unstamp last: it DELETEs from repo_graph_gen, which createReadinessStateTables
 // is what creates and seeds. Reversing them would delete from a table that does
-// not exist yet on a pre-v13 store.
-func migrateV13(tx *sql.Tx) error {
+// not exist yet on a store that has never run this step.
+func migrateV19(tx *sql.Tx) error {
 	if err := purgeLegacyCoverageSpellings(tx); err != nil {
 		return err
 	}
@@ -224,19 +591,25 @@ func createReadinessStateTables(tx *sql.Tx) error {
 	// SQLite has no ADD COLUMN IF NOT EXISTS, and a duplicate ADD is a hard
 	// error that would roll the entire migration transaction back on a re-run.
 	//
-	// The three content_gen columns are added inside this step rather than as a
-	// migration of their own: they correct this step's own anchor, and the only
-	// stores carrying the earlier shape are development builds of this branch.
-	// A dev store stamped 14 is not the problem — `stored > current` now wipes
-	// it on open. A dev store stamped 13 is `stored == current`, re-runs
-	// nothing, and is exactly why each ADD is guarded individually and why
-	// schemaSQL's CREATE TABLE IF NOT EXISTS cannot be relied on to deliver
-	// them.
+	// The four columns are added inside this step rather than as a migration of
+	// their own: they correct this step's own anchor, and each ADD is guarded
+	// individually because schemaSQL's CREATE TABLE IF NOT EXISTS delivers them
+	// only to a store that does not already have the table.
 	//
-	// This reasoning originally read "before v13 has shipped". That premise
-	// died in the merge: main shipped its OWN v13 (the coverage-spelling purge)
-	// while this branch was out, and the two were folded into one v13 rather
-	// than renumbered. See the note on the migration table.
+	// Two premises this comment used to rest on have both since died, so read
+	// the guards as load-bearing rather than belt-and-braces:
+	//
+	//   - "before v13 has shipped" died in the first merge, when main shipped
+	//     its OWN v13 and the two were folded into one number.
+	//   - "a store stamped 14 is wiped by `stored > current`" died in the
+	//     2026-09-04 merge. currentSchemaVersion is 20 now, so a fork store
+	//     stamped 13 or 14 MIGRATES rather than being wiped, and it arrives
+	//     here already carrying these columns.
+	//
+	// Both directions are covered. A fork store already has the enrichment
+	// columns and the guards skip them; an upstream store gets them from v15,
+	// which rebuilds enrichment_state from enrichmentStateTableBody — that body
+	// now declares them — and the guards skip them here too.
 	for _, col := range []struct{ table, name, ddl string }{
 		{"enrichment_state", "gen", "gen INTEGER NOT NULL DEFAULT 0"},
 		{"enrichment_state", "content_gen", "content_gen INTEGER NOT NULL DEFAULT 0"},
@@ -769,9 +1142,13 @@ func setUserVersion(db *sql.DB, v int) error {
 }
 
 // applyInPlaceMigrations runs the in-place steps in a single transaction.
-func applyInPlaceMigrations(db *sql.DB, steps []schemaMigration) error {
+func applyInPlaceMigrations(db *sql.DB, steps []schemaMigration, observers ...MigrationObserver) error {
 	if len(steps) == 0 {
 		return nil
+	}
+	var observe MigrationObserver
+	if len(observers) > 0 {
+		observe = observers[0]
 	}
 	tx, err := db.Begin()
 	if err != nil {
@@ -779,8 +1156,29 @@ func applyInPlaceMigrations(db *sql.DB, steps []schemaMigration) error {
 	}
 	defer func() { _ = tx.Rollback() }() // no-op once Commit succeeds
 	for _, m := range steps {
+		started := time.Now()
+		if observe != nil {
+			observe(MigrationProgress{Version: m.version, Name: m.name, Phase: MigrationStarted})
+		}
 		if err := m.inPlace(tx); err != nil {
+			if observe != nil {
+				observe(MigrationProgress{
+					Version: m.version,
+					Name:    m.name,
+					Phase:   MigrationFailed,
+					Elapsed: time.Since(started),
+					Error:   err,
+				})
+			}
 			return fmt.Errorf("schema migration v%d (%s): %w", m.version, m.name, err)
+		}
+		if observe != nil {
+			observe(MigrationProgress{
+				Version: m.version,
+				Name:    m.name,
+				Phase:   MigrationFinished,
+				Elapsed: time.Since(started),
+			})
 		}
 	}
 	return tx.Commit()

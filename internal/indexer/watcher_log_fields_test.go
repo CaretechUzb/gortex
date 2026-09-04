@@ -35,7 +35,7 @@ import (
 // gitWatcherWithObservedLog indexes repoDir and attaches a started GitWatcher
 // whose entries the test can read back. It mirrors startWatchedIndex, which
 // hardcodes a no-op logger and so cannot see any of this.
-func gitWatcherWithObservedLog(t *testing.T, repoDir string) (*GitWatcher, *observer.ObservedLogs, <-chan int) {
+func gitWatcherWithObservedLog(t *testing.T, repoDir string) (*GitWatcher, *Indexer, *observer.ObservedLogs, <-chan int) {
 	t.Helper()
 
 	g := graph.New()
@@ -59,7 +59,7 @@ func gitWatcherWithObservedLog(t *testing.T, repoDir string) (*GitWatcher, *obse
 	}
 	require.NoError(t, gw.Start())
 	t.Cleanup(func() { _ = gw.Stop() })
-	return gw, logs, drained
+	return gw, idx, logs, drained
 }
 
 // lastReconcileTrigger returns the `trigger` field of the most recent
@@ -85,7 +85,9 @@ func lastReconcileTrigger(t *testing.T, logs *observer.ObservedLogs) string {
 // merely echoes its argument and is never set by the event path.
 func TestGitWatcherReconcileLogNamesItsTrigger(t *testing.T) {
 	repoDir := gitWatcherFixture(t)
-	gw, logs, drained := gitWatcherWithObservedLog(t, repoDir)
+	// The started watcher is driven through git commands rather than through
+	// its handle, so only its logs and drain signal are named here.
+	_, idx, logs, drained := gitWatcherWithObservedLog(t, repoDir)
 
 	// Half one: the fsnotify path. The watcher names the file it saw change,
 	// which under a normal checkout is the repository's own HEAD.
@@ -96,13 +98,38 @@ func TestGitWatcherReconcileLogNamesItsTrigger(t *testing.T) {
 	assert.Contains(t, fromEvent, "HEAD",
 		"an fsnotify-driven reconcile must name the watched path it observed, got %q", fromEvent)
 
-	// Half two: the programmatic path. Stop the watcher first so no event can
-	// race the direct call and leave the assertion reading the wrong entry.
-	require.NoError(t, gw.Stop())
-	runGit(t, repoDir, "checkout", "-q", "feature-two")
-	gw.reconcile("startup-catchup")
+	// Half two: the programmatic path, on a SECOND watcher that is never
+	// started.
+	//
+	// This half used to stop `gw` first, so that no fsnotify event could race
+	// the direct call. That stopped working when reconcile gained its
+	// stopCalled guard: a stopped watcher returns immediately and logs nothing,
+	// so the assertion below read half one's entry and compared a path against
+	// "startup-catchup". Leaving `gw` running is not an option either — a
+	// concurrent watcher-driven reconcile coalesces the direct one into a
+	// `rerun` flag, which also logs nothing under this trigger.
+	//
+	// An unstarted watcher has neither problem: no event source, no in-flight
+	// run, and stopCalled false. It is also the exact shape the startup
+	// catch-up runs in, which is what this trigger name belongs to.
+	core, directLogs := observer.New(zapcore.InfoLevel)
+	direct, err := NewGitWatcher(repoDir, idx, zap.New(core))
+	require.NoError(t, err)
 
-	assert.Equal(t, "startup-catchup", lastReconcileTrigger(t, logs),
+	// Seed the baseline before moving HEAD, exactly as Start's catch-up does.
+	// Without it lastSHA is empty, reconcile takes its first-observation path,
+	// and it returns before logging anything at all.
+	baseline, err := direct.currentSHA(testCtx())
+	require.NoError(t, err)
+	require.NotEmpty(t, baseline)
+	direct.mu.Lock()
+	direct.lastSHA = baseline
+	direct.mu.Unlock()
+
+	runGit(t, repoDir, "checkout", "-q", "feature-two")
+	direct.reconcile("startup-catchup")
+
+	assert.Equal(t, "startup-catchup", lastReconcileTrigger(t, directLogs),
 		"a programmatic reconcile must report its own caller, not the watched path")
 }
 

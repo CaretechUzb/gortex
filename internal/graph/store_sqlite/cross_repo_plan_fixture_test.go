@@ -107,7 +107,7 @@ func TestCrossRepoCandidateQuery_PinsJoinOrder(t *testing.T) {
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			q, _, ok := crossRepoCandidatesQuery(kinds, tc.repos, tc.edgeFiles, tc.incidentFiles)
+			q, _, ok := crossRepoCandidatesQuery(0, kinds, tc.repos, tc.edgeFiles, tc.incidentFiles)
 			if !ok {
 				t.Fatal("cross-repo candidate query must build")
 			}
@@ -132,7 +132,7 @@ func TestCrossRepoCandidateQuery_PinnedOrderYieldsEdgeDrivenPlan(t *testing.T) {
 	s := newCrossRepoPlanFixture(t)
 	kinds := graph.BaseKindsForCrossRepo()
 
-	q, args, ok := crossRepoCandidatesQuery(kinds, nil, nil, nil)
+	q, args, ok := crossRepoCandidatesQuery(0, kinds, nil, nil, nil)
 	if !ok {
 		t.Fatal("cross-repo candidate query must build")
 	}

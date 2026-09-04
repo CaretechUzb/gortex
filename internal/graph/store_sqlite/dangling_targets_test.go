@@ -50,8 +50,11 @@ func danglingFixture(t *testing.T) *Store {
 func TestDanglingEdgeTargetsQueryUsesTargetIndex(t *testing.T) {
 	s := danglingFixture(t)
 
+	// The leading argument is the view generation the query gained when the
+	// payload tables were keyed by it; the plan assertions below are what prove
+	// the added predicate did not cost the to_id range scan.
 	plan := queryPlan(t, s, danglingEdgeTargetsQuery(),
-		"local/", "local0", `["references","extends"]`)
+		int64(0), "local/", "local0", `["references","extends"]`)
 	if !strings.Contains(plan, "edges_by_to") {
 		t.Fatalf("dangling-target plan does not use edges_by_to:\n%s", plan)
 	}

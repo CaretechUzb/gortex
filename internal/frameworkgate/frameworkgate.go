@@ -144,6 +144,17 @@ func (s Set) Allows(name string) bool {
 // allows everything, so hot paths can skip the matcher entirely.
 func (s Set) Configured() bool { return s.configured }
 
+// AllowsNothing reports whether this Set admits no name at all — the
+// AllowNone sentinel, or a configured list that resolved to no matcher.
+//
+// It exists so a caller can skip an ENTIRE pipeline rather than calling
+// Allows once per pass and doing the surrounding setup regardless. Note the
+// asymmetry with Allows: an unset Set allows everything, so it is never
+// "nothing", and the zero value correctly reports false.
+func (s Set) AllowsNothing() bool {
+	return s.configured && !s.all && len(s.exact) == 0 && len(s.prefix) == 0
+}
+
 // Patterns returns the configured entries as written, for diagnostics.
 func (s Set) Patterns() []string {
 	out := make([]string, len(s.raw))

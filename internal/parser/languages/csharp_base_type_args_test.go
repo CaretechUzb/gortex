@@ -1,6 +1,7 @@
 package languages
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -456,12 +457,18 @@ func TestCSharpExtractor_SameLineSameNameCallsMarkReceiverAmbiguous(t *testing.T
 // stamp is the refusal; this pin is the assertion the round-5 test of
 // the same name carried before its rewrite lost it (round-6
 // non-blocking finding 7).
+//
+// The tied members call DIFFERENT names on DISTINCT receivers: a
+// same-name site is already marked by the (name,line) receiver-conflict
+// map, and the original same-name fixture pinned only that map - the
+// range-tie question itself could be reverted with the suite green
+// (issue #726). Here only ambiguousAt can produce the stamp.
 func TestCSharpExtractor_TwoMembersOnOneLineMarkReceiverAmbiguous(t *testing.T) {
 	src := []byte(`namespace App {
-    public class Store { public int Fetch(int id) { return id; } }
+    public class Store { public int Fetch(int id) { return id; } public int Grab(int id) { return id; } }
     public class Flow {
         private readonly Store _crates;
-        public int B(Store s) { return s.Fetch(1); } public int A(Store t) { return t.Fetch(2); }
+        public int B(Store s) { return s.Fetch(1); } public int A(Store t) { return t.Grab(2); }
         public int Lone(Store s) { return s.Fetch(3); }
     }
 }
@@ -471,16 +478,17 @@ func TestCSharpExtractor_TwoMembersOnOneLineMarkReceiverAmbiguous(t *testing.T) 
 
 	tied, lone := 0, 0
 	for _, ed := range result.Edges {
-		if ed == nil || ed.Kind != graph.EdgeCalls || ed.To != "unresolved::*.Fetch" {
+		if ed == nil || ed.Kind != graph.EdgeCalls {
 			continue
 		}
-		switch ed.From {
-		case "Tie.cs::Flow.B", "Tie.cs::Flow.A":
+		switch {
+		case ed.From == "Tie.cs::Flow.B" && ed.To == "unresolved::*.Fetch",
+			ed.From == "Tie.cs::Flow.A" && ed.To == "unresolved::*.Grab":
 			tied++
 			require.NotNil(t, ed.Meta)
 			assert.Equal(t, true, ed.Meta["receiver_ambiguous"],
 				"equal-span members tie on the line - the attribution is arbitrary and the evidence must say so")
-		case "Tie.cs::Flow.Lone":
+		case ed.From == "Tie.cs::Flow.Lone" && ed.To == "unresolved::*.Fetch":
 			lone++
 			if ed.Meta != nil {
 				assert.NotContains(t, ed.Meta, "receiver_ambiguous",
@@ -488,7 +496,7 @@ func TestCSharpExtractor_TwoMembersOnOneLineMarkReceiverAmbiguous(t *testing.T) 
 			}
 		}
 	}
-	require.NotZero(t, tied, "fixture: the tied line must emit member calls")
+	require.Equal(t, 2, tied, "fixture: both tied-line member calls must emit")
 	require.NotZero(t, lone, "fixture: the control line must emit a member call")
 }
 
@@ -511,5 +519,32 @@ func BenchmarkCSharpExtractSiblingHeavyTypeArgStamps(b *testing.B) {
 		if _, err := e.Extract("Siblings.cs", sb); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// Aliases x plain fields (issue 727): no stamp is ever possible - every
+// declared type is `int` - yet the per-stamp-site helper copied the file's
+// whole alias set into a fresh map once per field. 2,000 x 2,000 cost
+// 460 MB/op before csharpOpenNames kept the alias half by reference.
+func BenchmarkCSharpExtractAliasHeavyPlainFields(b *testing.B) {
+	for _, n := range []int{1000, 2000} {
+		var sb strings.Builder
+		for i := 0; i < n; i++ {
+			sb.WriteString("using Alias" + itoa(i) + " = App.Target" + itoa(i) + ";\n")
+		}
+		sb.WriteString("namespace App {\n    public class Holder {\n")
+		for i := 0; i < n; i++ {
+			sb.WriteString("        private int _f" + itoa(i) + ";\n")
+		}
+		sb.WriteString("    }\n}\n")
+		src := []byte(sb.String())
+		e := NewCSharpExtractor()
+		b.Run(itoa(n)+"x"+itoa(n), func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				if _, err := e.Extract("Aliases.cs", src); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }
