@@ -151,7 +151,14 @@ from](#what-gortex-does-not-protect-you-from) for what this boundary is not.
     off unless configured and read-only by default; the `federation.edges`
     cross-daemon edge feature (which fetches remote subgraphs) is off by default.
   - **PR / review tooling** (`gortex prs`, `gortex review --post`, and the
-    matching MCP tools): call the GitHub API / the `gh` CLI when you invoke them.
+    matching MCP tools): call the GitHub REST API or the GitLab REST v4 API —
+    whichever serves the repository's `origin` remote — when you invoke them.
+    The host is resolved *before* any credential is read, and a shared
+    `GITLAB_TOKEN` is only ever sent to a host you named yourself (`gitlab.com`,
+    a host declared under `forge.hosts` in the **global** config, or one you have
+    logged into with `glab auth login`), so a cloned repo cannot redirect your
+    token to its own `origin` host. A repo-local `.gortex.yaml` can never declare
+    a forge host, API base, or token variable.
 - **Inbound HTTP.** `gortex server` mounts a Streamable-HTTP MCP endpoint at
   `POST /mcp`; the daemon exposes it only when started with `--http-addr`. The
   listener binds to **localhost by default**; binding to a non-localhost address
@@ -164,8 +171,13 @@ from](#what-gortex-does-not-protect-you-from) for what this boundary is not.
   - **Git**, for history-derived features (blame, churn, co-change, diff review).
   - **Language servers** (e.g. `tsserver`), for cross-file resolution and LSP
     code actions, when an LSP is configured and available.
-  - **Subprocess LLM providers** and **forge tools** (`claude`, `codex`,
-    `copilot`, `cursor-agent`, `opencode`, `gh`), when configured.
+  - **Subprocess LLM providers** (`claude`, `codex`, `copilot`, `cursor-agent`,
+    `opencode`), when configured. The forge layer shells out to no forge CLI —
+    it calls the GitHub / GitLab REST APIs directly — but it does run `git
+    remote get-url origin` to learn which host serves a repository (memoized per
+    repository), and it *reads* `glab auth login`'s config file
+    (`~/.config/glab-cli/config.yml`, or the macOS Application Support path) to
+    reuse a token you already stored there.
 - These run with your privileges and may make their own network calls; they are
   invoked only when the corresponding feature is configured or requested.
 

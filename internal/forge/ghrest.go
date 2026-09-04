@@ -113,9 +113,13 @@ func ensureTrailingSlash(s string) string {
 	return s + "/"
 }
 
-// resolveSlug derives owner/name for repoDir. It first asks the indexed
-// repo identity (indexer.DetectIdentity → NormalizeRemoteURL canonical
-// form), then falls back to `git remote get-url origin` through gitcmd.
+// resolveSlug derives owner/name for repoDir.
+//
+// It is expressed over resolveRemote so the GitHub path shares ONE resolution
+// ladder with the GitLab path — inheriting both the host-shape guard (a
+// path-shaped CanonicalID used to parse as a remote) and remoteCache, which
+// exists because the `git remote get-url origin` fork was paid per PR in the
+// triage fan-out.
 func resolveSlug(ctx context.Context, repoDir string) (owner, repo string, err error) {
 	r, rerr := resolveRemote(ctx, repoDir)
 	if rerr != nil {

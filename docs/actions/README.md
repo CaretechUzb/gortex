@@ -5,7 +5,9 @@ pull requests:
 
 - **`list_prs`** — list a repo's PRs with a one-shot review-state
   classification (DRAFT / BASE_MISMATCH / CHANGES_REQUESTED / APPROVED /
-  STALE / READY), a normalized CI rollup, and per-PR merge blockers.
+  STALE / READY), a normalized CI rollup, and per-PR merge blockers. `base`
+  names the accepted base branch(es) `BASE_MISMATCH` is judged against and
+  takes a comma-separated list; omit it to disable the base check.
 - **`get_pr_impact`** — map a PR's changed files to the symbols they define,
   score PR-level risk across five axes, and group the affected surface by
   community and by caller/test file. Set `receipt: true` for a small,
@@ -13,26 +15,62 @@ pull requests:
 - **`triage_prs`** — rank a repo's open PRs by graph-derived review priority
   (highest risk first, deterministic).
 
-These tools are **read-only** — none of them edits code or posts to GitHub.
+These tools are **read-only** — none of them edits code or posts to the forge.
 
-## Providing a GitHub token to the daemon
+## Which forge serves a repository
 
-The daemon **self-serves** PR data: it pairs a GitHub token with the repo
-identity it already indexed, so there is no CLI-versus-daemon auth split and
-no dependency on a `gh` CLI login. All it needs is a token in **the daemon's
-own environment**.
+GitHub (including GitHub Enterprise) and GitLab (including self-hosted) are both
+supported. The backend is chosen from the repository's `origin` remote **host**,
+and that decision is made *before any credential is read* — so a GitLab repo
+with no GitLab token reports a missing `GITLAB_TOKEN` instead of falling through
+to GitHub and reporting a missing `GH_TOKEN` that could never have helped.
 
-The token resolves from, in order:
+The host resolves, in order:
+
+1. `GORTEX_FORGE_PROVIDER` (`github` / `gitlab`) — a one-run escape hatch.
+2. A `forge.hosts` declaration in the global config (see below).
+3. `github.com` → GitHub.
+4. `GITHUB_API_URL` / `GH_HOST` naming this host → GitHub Enterprise.
+5. An existing `glab auth login` entry for this host → GitLab.
+6. A `gitlab` label in the host name (`gitlab.example.com`, `example.gitlab.io`
+   — not `notgitlab.com`) → GitLab.
+7. Otherwise GitHub, preserving the historical default.
+
+## Providing a forge token to the daemon
+
+The daemon **self-serves** PR data: it pairs a token with the repo identity it
+already indexed, so there is no CLI-versus-daemon auth split and no dependency
+on a `gh` / `glab` login shelling out at query time. All it needs is a token in
+**the daemon's own environment**.
+
+For a **GitHub** repository the token resolves from, in order:
 
 1. `GH_TOKEN`
 2. `GITHUB_TOKEN`
 
-Set one of these in the environment the daemon process runs under — not in
-your interactive shell, unless the daemon inherits it. For example, when
-starting the daemon manually:
+For a **GitLab** repository, in order:
+
+1. The `token_env` variable declared for that host in the global config.
+2. The token in that host's `glab auth login` entry (read from glab-cli's
+   `config.yml`; no subprocess is run).
+3. `GITLAB_TOKEN`, then `GITLAB_ACCESS_TOKEN`.
+4. `CI_JOB_TOKEN`, but only when `CI_SERVER_HOST` names the same host.
+
+The last two groups are **host-scoped**: a shared `GITLAB_TOKEN` is sent only to
+`gitlab.com`, to a host declared in the global config, or to a host you have
+already logged into with `glab auth login`. Any other host — including one that
+merely carries a `gitlab` label and therefore routes to the GitLab backend —
+gets nothing. The destination is derived from a repository's own git remote, so
+this is what keeps a cloned repo whose `origin` points at an attacker's host
+from receiving your real token.
+
+Set the variable in the environment the daemon process runs under — not in your
+interactive shell, unless the daemon inherits it. For example, when starting the
+daemon manually:
 
 ```bash
 GH_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxx gortex daemon start --detach
+GITLAB_TOKEN=glpat-xxxxxxxxxxxxxxxxxxxx gortex daemon start --detach
 ```
 
 For a long-running daemon managed by a service supervisor, set the variable in
@@ -44,8 +82,16 @@ GitHub Enterprise: when `GITHUB_API_URL` or `GH_HOST` names a non-`github.com`
 host, the forge client targets that Enterprise API base automatically. The
 same `GH_TOKEN` / `GITHUB_TOKEN` resolution applies.
 
-In CI, a per-PR Action's `GITHUB_TOKEN` is picked up automatically — no extra
-configuration is needed.
+Self-hosted GitLab: the API base defaults to `https://<host>/api/v4/`, overridden
+by `GITLAB_API_URL`, by the host's `api_base` declaration, or by the `api_host` /
+`api_protocol` / subfolder recorded in its `glab auth login` entry. An override is
+vetted before a token is sent to it: it must parse, must be `https` (loopback
+excepted), and must either name the same host as the remote or be declared for
+that host in the global config.
+
+In CI, a per-PR GitHub Action's `GITHUB_TOKEN` is picked up automatically — no
+extra configuration is needed. On GitLab CI, `CI_JOB_TOKEN` is picked up for the
+instance `CI_SERVER_HOST` names.
 
 ## When no token is available
 
@@ -95,8 +141,8 @@ letting it name the API base and token variable for its own host would let a
 cloned repo redirect where a credential is sent. `GORTEX_FORGE_PROVIDER`,
 `GITLAB_API_URL`, and `GITLAB_TOKEN` still override a declaration for one run.
 
-A GitHub rate-limit is surfaced as a typed degradation carrying the
-Retry-After hint:
+A rate-limit from either forge (GitHub's, or GitLab's `429` / quota-exhausted
+`403`) is surfaced as a typed degradation carrying the Retry-After hint:
 
 ```json
 { "error": "rate limited", "retry_after_s": 42 }
