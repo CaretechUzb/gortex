@@ -144,3 +144,81 @@ func sameStringSet(a, b []string) bool {
 	}
 	return true
 }
+
+func TestParseBases(t *testing.T) {
+	tests := []struct {
+		spec string
+		want []string
+	}{
+		{"", nil},
+		{"main", []string{"main"}},
+		{"16.0,aurora-redesign", []string{"16.0", "aurora-redesign"}},
+		{" 16.0 , aurora-redesign ", []string{"16.0", "aurora-redesign"}},
+		{"16.0,,aurora-redesign", []string{"16.0", "aurora-redesign"}},
+		{" , ", nil},
+	}
+	for _, tc := range tests {
+		got := ParseBases(tc.spec)
+		if len(got) != len(tc.want) {
+			t.Errorf("ParseBases(%q) = %v, want %v", tc.spec, got, tc.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != tc.want[i] {
+				t.Errorf("ParseBases(%q)[%d] = %q, want %q", tc.spec, i, got[i], tc.want[i])
+			}
+		}
+	}
+}
+
+// TestClassifyStatus_MultipleAcceptedBases is the regression guard for a repo
+// with more than one live target branch. With a single accepted base, whichever
+// branch is not the default has EVERY one of its PRs mislabelled BASE_MISMATCH
+// — measured on a real repo: 31 MRs on 16.0 and 11 on aurora-redesign, so one
+// of those groups was always wrong.
+func TestClassifyStatus_MultipleAcceptedBases(t *testing.T) {
+	release := PR{BaseRef: "16.0", UpdatedAt: time.Now()}
+	redesign := PR{BaseRef: "aurora-redesign", UpdatedAt: time.Now()}
+	stray := PR{BaseRef: "some/feature", UpdatedAt: time.Now()}
+
+	// Single base: the other live branch is (wrongly, for this repo) flagged.
+	if st := ClassifyStatus(redesign, "16.0"); !st.BaseMismatch {
+		t.Errorf("single-base control: expected BaseMismatch for aurora-redesign")
+	}
+
+	// Both accepted: neither real target is flagged, the stray one still is.
+	const bases = "16.0,aurora-redesign"
+	if st := ClassifyStatus(release, bases); st.BaseMismatch {
+		t.Errorf("16.0 flagged as mismatch against %q", bases)
+	}
+	if st := ClassifyStatus(redesign, bases); st.BaseMismatch {
+		t.Errorf("aurora-redesign flagged as mismatch against %q", bases)
+	}
+	if st := ClassifyStatus(stray, bases); !st.BaseMismatch {
+		t.Errorf("some/feature NOT flagged against %q — the check went inert", bases)
+	}
+	if st := ClassifyStatus(release, bases); st.State != "READY" {
+		t.Errorf("State = %q, want READY", st.State)
+	}
+}
+
+// TestClassifyStatus_EmptyBasesDisablesCheck pins the "unknown" case: no
+// accepted bases must mean "do not check", never "everything is wrong".
+func TestClassifyStatus_EmptyBasesDisablesCheck(t *testing.T) {
+	pr := PR{BaseRef: "anything", UpdatedAt: time.Now()}
+	if st := ClassifyStatus(pr, ""); st.BaseMismatch {
+		t.Errorf("empty base spec flagged a mismatch")
+	}
+	if st := ClassifyStatusAgainst(pr, nil); st.BaseMismatch {
+		t.Errorf("nil bases flagged a mismatch")
+	}
+}
+
+// TestClassifyStatus_BaseMatchIsExact guards against a prefix/substring match
+// sneaking in: "16.0" must not accept "16.0-hotfix".
+func TestClassifyStatus_BaseMatchIsExact(t *testing.T) {
+	pr := PR{BaseRef: "16.0-hotfix", UpdatedAt: time.Now()}
+	if st := ClassifyStatus(pr, "16.0"); !st.BaseMismatch {
+		t.Errorf("16.0-hotfix accepted against base 16.0 — match is not exact")
+	}
+}
