@@ -57,6 +57,44 @@ each tool degrades gracefully instead of failing:
   "hint": "set GH_TOKEN (or GITHUB_TOKEN) in the daemon environment" }
 ```
 
+The hint names the token for the forge that actually serves the repository,
+derived from its `origin` remote. On a GitLab remote it instead reads:
+
+```json
+{ "error": "forge unavailable",
+  "hint": "set GITLAB_TOKEN (or run `glab auth login --hostname gitlab.example.com`) in the daemon environment" }
+```
+
+## Declaring a host the router cannot recognise
+
+Routing needs no configuration for github.com, GitHub Enterprise, gitlab.com, a
+host with a `gitlab` label, or any host you have already run `glab auth login`
+against. A GitLab or GHE behind a vanity domain carries none of those signals,
+so declare it in the **global** config (`~/.gortex/config.yaml`):
+
+```yaml
+forge:
+  hosts:
+    - host: code.internal.corp
+      provider: gitlab                                    # github | gitlab
+      api_base: https://code.internal.corp/gitlab/api/v4  # optional
+      token_env: CORP_GITLAB_TOKEN                        # optional
+```
+
+`hosts` is a list rather than a map keyed by hostname because the config loader
+treats `.` as a key-path delimiter — a map key of `code.internal.corp` would be
+parsed as the nested path `code` → `internal` → `corp`.
+
+`token_env` names the environment **variable**, never the token itself, so no
+credential lands in a file that gets committed. It is read before the generic
+`GITLAB_TOKEN`, which is what lets two instances each use their own credential.
+
+Only the global config is consulted — never a repo's own `.gortex.yaml`. A
+repo-local file is attacker-supplied content in any repo you did not write, and
+letting it name the API base and token variable for its own host would let a
+cloned repo redirect where a credential is sent. `GORTEX_FORGE_PROVIDER`,
+`GITLAB_API_URL`, and `GITLAB_TOKEN` still override a declaration for one run.
+
 A GitHub rate-limit is surfaced as a typed degradation carrying the
 Retry-After hint:
 
