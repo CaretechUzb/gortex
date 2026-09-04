@@ -26,6 +26,7 @@ import (
 	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/reconcile"
 	"github.com/zzet/gortex/internal/releases"
+	"github.com/zzet/gortex/internal/resolver"
 	"github.com/zzet/gortex/internal/search"
 	"github.com/zzet/gortex/internal/semantic"
 	"github.com/zzet/gortex/internal/semantic/lsp"
@@ -951,6 +952,20 @@ func (c *realController) status(ctx context.Context, waitForAggregate bool) (dae
 	// mem was sampled before the mutex was taken — see the note at the top
 	// of status.
 
+	// Read from the resolver's own queue register rather than inferring a wait
+	// from elapsed time: "deriving" and "queued behind another pass" look
+	// identical from outside the process, and only one of them is progress.
+	//
+	// Computed here rather than carried on the aggregate, for the same reason
+	// DerivingWorkspace is: a cached aggregate would report a wait that has
+	// since been served, which is worse than reporting none.
+	var resolveQueuedSeconds float64
+	var resolveQueuedPass string
+	if queued, pass := resolver.LongestResolveQueueWait(time.Now()); pass != "" {
+		resolveQueuedSeconds = queued.Seconds()
+		resolveQueuedPass = pass
+	}
+
 	resp := daemon.StatusResponse{
 		TrackedRepos:   tracked,
 		MemoryBytes:    mem.Alloc,
@@ -967,21 +982,23 @@ func (c *realController) status(ctx context.Context, waitForAggregate bool) (dae
 			NumGC:        mem.NumGC,
 			NumGoroutine: runtime.NumGoroutine(),
 		},
-		PProfAddr:          daemonPProfAddr(),
-		Ready:              c.ready.Load(),
-		WarmupSeconds:      c.warmupSeconds.Load(),
-		EnrichmentComplete: enriched,
-		EnrichSeconds:      c.enrichSeconds.Load(),
-		Workspaces:         agg.workspaces,
-		ConfiguredServers:  agg.configuredServers,
-		LocalServerSlug:    agg.localServerSlug,
-		LSPRouter:          agg.lspRouter,
-		Enrichment:         agg.enrichment,
-		Views:              views,
-		DerivingWorkspace:  c.multiIndexer.WorkspaceRederivePending(),
-		ToolPreset:         agg.toolPreset,
-		ToolPresetMode:     agg.toolPresetMode,
-		LearnedTools:       agg.learnedTools,
+		PProfAddr:            daemonPProfAddr(),
+		Ready:                c.ready.Load(),
+		WarmupSeconds:        c.warmupSeconds.Load(),
+		EnrichmentComplete:   enriched,
+		EnrichSeconds:        c.enrichSeconds.Load(),
+		Workspaces:           agg.workspaces,
+		ConfiguredServers:    agg.configuredServers,
+		LocalServerSlug:      agg.localServerSlug,
+		LSPRouter:            agg.lspRouter,
+		Enrichment:           agg.enrichment,
+		Views:                views,
+		DerivingWorkspace:    c.multiIndexer.WorkspaceRederivePending(),
+		ResolveQueuedSeconds: resolveQueuedSeconds,
+		ResolveQueuedPass:    resolveQueuedPass,
+		ToolPreset:           agg.toolPreset,
+		ToolPresetMode:       agg.toolPresetMode,
+		LearnedTools:         agg.learnedTools,
 	}
 	if cached {
 		// Say which half is a snapshot. Without the marker a stale repo

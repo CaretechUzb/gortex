@@ -173,18 +173,44 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		if !deadlineAt.IsZero() {
 			deadlineAt = deadlineAt.Add(lockWait)
 		}
-		applyCtx, cancelApply := phaseCtx()
-		if err := applyCtx.Err(); err != nil {
+		// The apply's bound is a PAUSABLE budget rather than a context
+		// deadline. Its page-boundary yield admits another pass on purpose,
+		// and charging that pass's work here is the same mistake the lockWait
+		// refund above exists to prevent — through a door that opens
+		// mid-apply, where a context.WithDeadline can no longer be moved. See
+		// applyBudget.
+		applyCtx, cancelApply := context.WithCancelCause(ctx)
+		budget := newApplyBudget(time.Until(deadlineAt), func() {
+			cancelApply(context.DeadlineExceeded)
+		})
+		if err := applyContextErr(applyCtx); err != nil {
 			mu.Unlock()
-			cancelApply()
+			budget.stop()
+			cancelApply(nil)
 			markContextPartial(res, err)
 			res.DurationMs = time.Since(start).Milliseconds()
 			return res, nil
 		}
-		applyErr := p.applyStagedFacts(applyCtx, g, repoPrefix, spool, res)
+		applyErr := p.applyStagedFacts(applyCtx, g, repoPrefix, spool, res, func() bool {
+			budget.pause()
+			mutated, _ := yieldResolveMutex(g, mu)
+			budget.resume()
+			return mutated
+		})
 		mu.Unlock()
-		applyCtxErr := applyCtx.Err()
-		cancelApply()
+		budget.stop()
+		applyCtxErr := applyContextErr(applyCtx)
+		cancelApply(nil)
+		if refund := budget.refunded(); refund >= applyRefundLogThreshold {
+			// The mirror of "apply began after queueing": that line reports the
+			// wait before the pass, this one the waits inside it. Without it a
+			// pass that finished only because of the refund reads as one that
+			// was simply fast enough.
+			p.logger.Info("tstypes: apply budget refunded for time queued behind another pass",
+				zap.String("provider", p.Name()),
+				zap.String("repo_prefix", repoPrefix),
+				zap.Duration("refunded", refund))
+		}
 		if applyErr != nil {
 			if applyCtxErr != nil {
 				markContextPartial(res, applyCtxErr)

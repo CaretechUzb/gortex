@@ -118,6 +118,9 @@ type Manager struct {
 	// failed) so index_health can surface an un-enriched graph instead
 	// of reporting green. Keyed by repo + "\x00" + provider name.
 	enrichStatus map[string]*EnrichmentStatus
+	// futilePasses records the (repo, provider, sha) triples whose last pass
+	// consumed its whole budget and produced zero coverage. See futile_pass.go.
+	futilePasses map[string]futilePass
 	// activityHook, when installed, is fired with the set of repos holding a
 	// running pass every time that set could have changed. The daemon uses it
 	// to publish "enriching…" to an out-of-band reader that cannot see this
@@ -682,6 +685,30 @@ func (m *Manager) declareApplicableProviders(
 				applicable = append(applicable, name)
 			}
 		}
+		// Supplemental providers hold no language slot — selectProviders skips
+		// them so a compiler-grade winner can take the language — but they DO
+		// run (EnrichAll runs them last, unconditionally) and they DO write
+		// completion rows. Leaving them out of the declaration made it delete
+		// rows it had no intention of replacing, and the deletion is invisible
+		// in exactly the case that matters: a supplemental pass that ends
+		// Partial writes nothing back, so the provider vanishes from the store
+		// and readiness computes MIN(content_gen) over the survivors and calls
+		// the repo ready. Measured 2026-09-02: three Odoo checkouts read
+		// "ready" with no python-types row at all, their python enrichment ten
+		// content generations behind. Gated exactly as EnrichAll gates the run,
+		// so the declared set and the started set cannot drift again.
+		for _, p := range m.providers {
+			if !isSupplemental(p) || !p.Available() || m.providerDisabled(p.Name()) {
+				continue
+			}
+			if !anyLangPresent(p.Languages(), langs) {
+				continue
+			}
+			if name := p.Name(); !seen[name] {
+				seen[name] = true
+				applicable = append(applicable, name)
+			}
+		}
 		sort.Strings(applicable)
 		// Authoritative: providers exist and this repo's languages match these
 		// ones, so a row for anything else is out of date and must go. This is
@@ -738,15 +765,35 @@ func durableStore(g graph.Store) graph.Store {
 	return g
 }
 
+// applicabilityStoreOf is the single encoding of "walk to the durable store,
+// then ask whether it models applicability".
+//
+// It was written out by hand at four call sites, and the walk is the half that
+// cannot be skipped: the indexer rebinds its graph to an in-memory shadow while
+// it works, enrichment runs inside that window, and the bookkeeping tables have
+// no in-memory form -- so a type assertion made against the shadow silently
+// finds nothing and the write is dropped. That is how a repo enriched at track
+// time came to report "enriched: unknown" forever. One copy of the step means
+// one place to get it right.
+//
+// No logging here on purpose: three of the four callers are package-level and
+// have no logger, and the diagnostic belongs to the Manager wrapper below,
+// which fires it once per process.
+func applicabilityStoreOf(g graph.Store) (graph.EnrichmentApplicabilityStore, bool) {
+	store, ok := durableStore(g).(graph.EnrichmentApplicabilityStore)
+	return store, ok
+}
+
 func (m *Manager) applicabilityStore(g graph.Store) (graph.EnrichmentApplicabilityStore, bool) {
-	resolved := durableStore(g)
-	store, ok := resolved.(graph.EnrichmentApplicabilityStore)
+	store, ok := applicabilityStoreOf(g)
 	if !ok && m.logger != nil {
 		applicabilityMissOnce.Do(func() {
+			// Re-walk only to name the type in the message. This runs at most
+			// once per process, on the path that already went wrong.
 			m.logger.Warn("semantic: this graph does not model enrichment applicability; "+
 				"readiness will report enrichment as unknown",
 				zap.String("graph_type", fmt.Sprintf("%T", g)),
-				zap.String("durable_type", fmt.Sprintf("%T", resolved)))
+				zap.String("durable_type", fmt.Sprintf("%T", durableStore(g))))
 		})
 	}
 	return store, ok
@@ -802,7 +849,7 @@ func (m *Manager) declareProviders(g graph.Store, repoPrefix string, providers [
 // enrichment pass's own language census (it may simply not be populated yet),
 // so this must not be able to delete a completion the pass recorded earlier.
 func DeclareNoApplicableProviders(g graph.Store, repoPrefix string) {
-	store, ok := durableStore(g).(graph.EnrichmentApplicabilityStore)
+	store, ok := applicabilityStoreOf(g)
 	if !ok {
 		return
 	}
@@ -826,7 +873,7 @@ func DeclareNoApplicableProviders(g graph.Store, repoPrefix string) {
 // forever. "Has a pass ever completed" is monotone: acting on it discharges it
 // and it cannot come back.
 func EnrichmentOwed(g graph.Store, repoPrefix string) (owed, known bool) {
-	store, ok := durableStore(g).(graph.EnrichmentApplicabilityStore)
+	store, ok := applicabilityStoreOf(g)
 	if !ok {
 		return false, false
 	}
@@ -853,11 +900,61 @@ func EnrichmentOwed(g graph.Store, repoPrefix string) (owed, known bool) {
 // and without it a store carrying pre-content-stamp enrichment rows reads
 // "partial" permanently.
 func RefreshCompletedProviders(g graph.Store, repoPrefix string) {
-	store, ok := durableStore(g).(graph.EnrichmentApplicabilityStore)
+	store, ok := applicabilityStoreOf(g)
 	if !ok {
 		return
 	}
 	_, _ = store.RefreshEnrichmentProviders(repoPrefix)
+}
+
+// ObserveContentGen is observeContentGen for callers outside this package --
+// the indexer's file-scoped deferred pass, which must read the counter before
+// it dispatches any provider work and hand the same value back to
+// CompleteScopedEnrichment afterwards.
+//
+// Exported as a thin delegate rather than reimplemented package-level: the
+// read-before, never-after rule below is the whole point of the function, and
+// two copies of it is two places for a later edit to get it backwards.
+func (m *Manager) ObserveContentGen(g graph.Store, repoPrefix string) int64 {
+	return m.observeContentGen(g, repoPrefix)
+}
+
+// CompleteScopedEnrichment records that a FILE-SCOPED enrichment pass covered
+// this repo's content as of contentGen, for every provider that has already
+// completed a pass except those named in withheldProviders.
+//
+// The counterpart to completeProvider, which the whole-repo path calls once per
+// provider that ran. A scoped pass cannot enumerate its providers that way:
+// stamping only the languages whose files were in the frontier leaves every
+// other row behind, and readiness takes the MINIMUM across rows, so the repo
+// would still read "partial" unless the user happened to edit every language at
+// once. Stamping the untouched rows is sound and has a precedent -- runEnrichOne
+// stamps a provider the completion-marker gate SKIPPED, on the reasoning that a
+// skip is an assertion rather than an absence of work. A provider with no file
+// in the frontier is current at this generation for the same reason.
+//
+// withheldProviders is the exception that keeps it honest: a provider whose
+// language WAS in the frontier and which produced no result had its edges
+// evicted by the re-parse and restored by nothing. That row must stay behind
+// and hold the minimum down.
+//
+// The error is returned, never swallowed. The caller discharges its durable
+// per-file ledger on success, and the ledger is the only thing that re-arms the
+// pass -- so a stamp that failed silently would strand the repo in precisely
+// the state this function exists to prevent.
+//
+// A backend that does not model applicability reports (0, nil): the in-memory
+// graph and every test double land here, and for them "nothing to record" is
+// the correct answer, not a failure that should hold a ledger armed forever.
+func (m *Manager) CompleteScopedEnrichment(g graph.Store, repoPrefix string, contentGen int64, withheldProviders []string) (int, error) {
+	store, ok := m.applicabilityStore(g)
+	if !ok {
+		return 0, nil
+	}
+	// Rows RENEWED, not rows moved: SQLite counts every row the WHERE clause
+	// matched, whether or not the clamp changed its value. The number is useful
+	// as "the statement reached this many completed providers".
+	return store.AdvanceContentGenForCompletedProviders(repoPrefix, contentGen, withheldProviders)
 }
 
 // observeContentGen reads the repo's content counter before a pass starts.
@@ -1434,6 +1531,25 @@ func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, p
 		return results
 	}
 
+	// Skip a pass this process has already watched exhaust its whole budget at
+	// this exact revision without covering a single symbol. Nothing about the
+	// repo has changed since, so the outcome cannot change either — and the
+	// cost is not paid by this pass alone: the apply holds the store-wide
+	// resolve mutex, so every other pass in the process queues behind it. See
+	// futile_pass.go for the measurements and for why the record is not durable.
+	//
+	// Deliberately NOT stamped as complete, unlike the marker-current skip
+	// above. That skip is an assertion that the edges are already there; this
+	// one is an admission that they are not. The repo keeps reading partial,
+	// which is the honest state.
+	if rec, ok := m.futilePassRecorded(repoName, provider.Name(), rs.SHA); ok {
+		m.logFutileSkip(repoName, provider.Name(), lang, rs.SHA, rec)
+		m.setEnrichStatus(repoName, provider.Name(), lang, EnrichStatePartial, rec.Budget, nil,
+			"previous pass exhausted its budget with zero coverage at this revision; skipped")
+		partial[repoName] = true
+		return results
+	}
+
 	start := time.Now()
 
 	// Readiness gate: a server whose workspace load continues past `initialize`
@@ -1665,6 +1781,12 @@ func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, p
 		if !result.Partial {
 			m.recordEnrichMarker(g, repoName, provider.Name(), rs, result.CoveragePercent)
 			m.completeProvider(g, repoName, provider.Name(), contentGen)
+		} else if enrichResultFutile(result) {
+			// Spent the whole budget, covered nothing. Remember it so the next
+			// trigger in this process does not repeat it — the pool runs on
+			// warmup, after a copy-track and from the janitor sweep, and this
+			// repo used to pay the same dead budget to each of them.
+			m.recordFutilePass(repoName, provider.Name(), rs.SHA, d)
 		}
 
 		m.logger.Info("semantic enrichment complete",
@@ -2022,6 +2144,16 @@ func (m *Manager) AllProviders() []Provider {
 // ProviderForLanguage returns the highest-priority registered provider
 // for the given language code, or nil. The returned provider is the
 // same one selectProviders would dispatch Enrich to.
+//
+// It must NOT filter on Available(), and that is now load-bearing rather than
+// incidental. The indexer's file-scoped enrichment pass uses a nil return to
+// mean "no provider is registered for this language, so the re-parse evicted
+// nothing any provider would have restored" -- which is the one case it is safe
+// to stamp as current. An unavailable provider is the opposite case: it IS
+// registered, EnrichFilesContext screens it out after selection and returns
+// (nil, nil), and its row must be withheld from the stamp. Adding an
+// availability filter here would collapse the two and let a repo read ready
+// while silently missing that provider's edges.
 func (m *Manager) ProviderForLanguage(lang string) Provider {
 	if !m.config.Enabled {
 		return nil

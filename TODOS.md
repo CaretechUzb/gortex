@@ -305,35 +305,6 @@ derive that never happened.
 **Priority:** P3
 **Depends on:** Nothing, but it only matters now that the gate is workspace-scoped.
 
-### Reconcile the enrichment declared-provider set with the started set
-
-**What:** Find out which of the two provider sets is wrong when semantic
-enrichment declares one provider and then starts four.
-
-**Why:** Same shape as the framework allow-list leak — a gate computes a narrowed
-set and something downstream ignores it. Enrichment was 359 s of a 29-minute
-worktree track, so if the declared set is the correct one and three providers run
-needlessly, that is a real cut on every enrichment, not just copies.
-
-**Context:** Measured on the `local@test` track, 2026-08-31:
-
-    semantic: applicable enrichment providers declared  {"providers":["go-types"]}
-    semantic enrichment starting  {"provider":"go-types"}
-    semantic enrichment starting  {"provider":"python-types"}
-    semantic enrichment starting  {"provider":"typescript-types"}
-    semantic enrichment starting  {"provider":"go-ast-types"}
-
-One declared, four started — and both Go providers reported `confirmed:0 added:0`
-on an Odoo repo with no Go, so at least one of the two sets is wrong. It may be
-the declared half rather than the started half: `python-types` did real work
-(`confirmed:1082`), so declaring only `go-types` for that repo looks incorrect
-too. `semantic/manager.go:738` emits the declared line, `:1399` emits each start;
-the gap between them holds the answer.
-
-**Effort:** S
-**Priority:** P3
-**Depends on:** Nothing.
-
 ### An identical copy schedules no derive, so the next file save strands it forever
 
 **What:** `trackWorktreeByCopy` guards both follow-up stages on `len(changed) > 0`:
@@ -421,14 +392,175 @@ work with no test that can fail if it is reverted.
 **Context:** not reachable from the unit fixtures in `track_worktree_copy_test.go`.
 `copyGateGraph` wraps `*graph.Graph`, which does not implement `CopyRepoSubgraph`,
 so `trackWorktreeByCopy` returns `supported=false` before it reaches either call.
-The harness needs a real `store_sqlite` store, a real git worktree on disk (the
-source ranking shells out to git), and `ReconcileRepoCtx`. `internal/indexer` has
-no sqlite-backed test today, so this establishes that pattern; check for an import
-cycle first — `store_sqlite` is a leaf and `internal/readiness` already imports it.
+
+**The harness now exists.** `copyTrackHarness` in
+`internal/indexer/copy_deferred_tail_test.go` is the sqlite store + real git
+worktree + `ReconcileRepoCtx` setup this entry asked for, and it drives
+`trackWorktreeByCopy` end to end (note `copySourceRepo`'s 12 files: fewer and the
+reconcile routes to a full retrack on churn). What is still missing is an
+assertion on the RESTAMP specifically — the existing tests observe the log lines
+around it, so moving `RestampCopiedReadiness` back above `ReconcileRepoCtx` would
+still leave them green. Add a `CopiedReadinessRestamper` spy that records call
+order against the reconcile.
 
 **Effort:** M
 **Priority:** P2
 **Depends on:** None.
+
+
+### Verify whether enrichment providers write edges outside the changed file set
+
+**What:** Determine whether go-types / python-types / typescript-types can add or
+evict edges on files that were NOT in the frontier they were handed. If they can,
+both the per-file ledger discharge and the new scoped content stamp are optimistic
+together.
+
+**Why:** the file-scoped enrichment stamp records repo-level `content_gen`
+coverage after a pass over an exact frontier, on the grounds that
+`dischargePendingEnrichFrontier` already makes the same frontier-sufficiency
+assumption and has done so since it was written. That is a real assumption, not a
+proof, and it was accepted knowingly rather than verified. If a provider reaches
+outside its batch, a repo can read `ready` while carrying edges no pass has
+refreshed — the silent-subset failure the readiness column exists to catch, and
+one the stamp would now hide rather than surface.
+
+**Context:** raised as an outside-voice finding during the review of the scoped
+stamp (decision 10A), 2026-09-02. The stamp itself is
+`Store.AdvanceContentGenForCompletedProviders`; the frontier is built by
+`Indexer.deferredEnrichFrontiers`. Checking one provider is enough to settle it:
+enrich a two-file repo over a one-file frontier and diff the edge set of the file
+that was not on it.
+
+**Effort:** S
+**Priority:** P2
+**Depends on:** Nothing.
+
+
+### `TestAgentsRenderIsHermetic` fails whenever Claude Code is running
+
+**What:** the hermeticity guard at `cmd/gortex/agents_render_test.go:186` asserts
+that no user-level manifest path under the real `$HOME` has an mtime newer than
+`renderGuardStart`. One of those paths is `~/.claude.json` — a file Claude Code
+rewrites continuously while a session is open. Compare content (or a hash taken
+before the render) instead of mtime, or skip a path whose mtime moved without its
+bytes changing.
+
+**Why:** it makes `go test ./cmd/gortex/` non-deterministic for anyone running the
+suite from inside a Claude Code session, which is now a normal way to work on this
+repo. A test that fails for reasons unrelated to the change under test is worse
+than no test: it trains people to re-run until green, and the next real leak gets
+re-run away with it.
+
+**Context:** measured 2026-09-02 — 2 failures in 4 consecutive `-race` runs of the
+package, both:
+
+    agents_render_test.go:186: claude-code: /Users/commeta/.claude.json was
+    modified during the render — the sandbox leaked into the real home
+
+The test already anticipates the cause in its own message ("false positive only if
+another process wrote that path during this test"), so this is closing a known
+hole rather than diagnosing a new one. Everything else in the run passed, and the
+same package passes solo.
+
+**Effort:** S
+**Priority:** P3
+**Depends on:** Nothing.
+
+### `TestConcurrencyCapNeverExceeded` samples for in-flight git processes and can see none
+
+**What:** `internal/gitcmd/gitcmd_test.go:118` fails with `expected at least one
+in-flight git process, saw 0` under a loaded `go test ./...` sweep, and passes
+3/3 in isolation on the same machine.
+
+**Why:** the assertion is a sample of a race it does not control. Under a full
+`-race` sweep the scheduler can run every spawned git process to completion
+between two samples, so the test reports a concurrency-cap violation for a run
+that never violated the cap. A flake that fires only when CI is busy is the
+worst kind: it looks like a real concurrency finding.
+
+**Context:** observed 2026-09-02 in a `go test -race -timeout=30m ./...` sweep;
+the only failing package, and `internal/gitcmd` was unmodified in that tree. The
+fix is probably to make the workers observable (a barrier the test releases)
+rather than to sample harder.
+
+**Effort:** S
+**Priority:** P3
+**Depends on:** Nothing.
+
+### Find out why `addons` python-types cannot finish, and give it a budget it can
+
+**What:** the `addons` python-types enrichment pass has never completed. Every
+run exhausts its deadline, lands zero edges and covers zero symbols, then
+records nothing — so the whole-repo completion marker stays absent and the next
+warm restart re-arms it.
+
+| when | pass | of which lock wait | apply | outcome |
+|---|---|---|---|---|
+| 2026-09-01 23:44 | 1,495s | 1,217s | ~1,088s | partial, coverage 0 |
+| 2026-09-02 18:04 | 1,495s | 407s | ~1,088s | partial, coverage 0 |
+
+The apply itself is the fixed ~1,088s in both, against 418s for
+`local@MR6373` at 122k nodes — a LARGER repo. So this is not simply "addons is
+big"; something about that repository's shape makes the apply super-linear, and
+the answer is worth knowing before the budget is raised to cover it.
+
+Read `coverage: 0` with care: `CoveragePercent` is computed only on
+`applyStagedFacts`'s success path (`provider_stream.go`), so ANY pass cut at a
+page boundary logs 0 no matter how many symbols its coverage walk counted. What
+these runs establish is "budget exhausted", not "covered nothing" — and
+`SymbolsCovered`, which the futile-pass detector uses, is not in the log. Start
+by logging it.
+
+The missing `python-types` row for `addons` was the declared-vs-started gap;
+`declareApplicableProviders` now declares supplemental providers too, so an
+unfinished pass leaves a gen-0 row instead of no row.
+
+**Why:** it is pure loss — a fixed ~18 minutes of work per daemon life for a
+result that is empty, and (before the yield below) 18 minutes of the store-wide
+resolve mutex denied to every other pass. `internal/semantic/futile_pass.go`
+now stops the repeat WITHIN one daemon life, and the tstypes apply yields the
+mutex at page boundaries so the cost is no longer charged to everyone else. The
+pass itself is still dead work.
+
+**Context:** measurements above are from `~/.gortex/cache/daemon.log`. Start
+with `tstypes: apply hot cache` for the two runs and compare miss rates against
+`local@MR6373`'s — but note both rows predate the yield, so neither is polluted
+by the cache thrash measured on 2026-09-02 (three concurrent applies, 89.8% ->
+61.0% node hit rate, 2.7x slower for identical work). That thrash is fixed:
+the apply now yields only to a pass registered in the resolve queue, and the
+time it spends yielded is refunded to its budget. `addons` was slow before any
+of that and is still unexplained.
+
+**Effort:** M
+**Priority:** P2
+**Depends on:** Nothing.
+
+### Make the futile-enrichment record survive a restart
+
+**What:** `Manager.futilePasses` (`internal/semantic/futile_pass.go`) remembers
+a (repo, provider, revision) pass that ran out its deadline and landed nothing,
+so the next trigger in the same process skips it. The record dies with the
+daemon, and `MaybeSeedPendingEnrich` re-arms the repo on the next warm restart —
+which is exactly when the cost is paid.
+
+**Why:** the in-process record only catches the second and later triggers within
+one daemon life (warmup, then a copy-track, then the janitor). The first
+trigger after every restart still pays the full dead budget.
+
+**Context:** neither existing store has a home for it, and the file explains
+both refusals in detail. `enrichment_state` records COMPLETIONS and has no
+attempt column; the schema is pinned in lockstep with upstream, and writing an
+attempt into `indexed_sha` would make `RefreshEnrichmentProviders` launder the
+row into "a pass really finished", destroying the `EnrichmentNeverRan` re-arm.
+`daemon.state.json` is written fresh at startup and removed at shutdown by
+design. So this needs either an upstream schema addition (an `attempts` /
+`last_attempt_sha` column, or a small `enrichment_attempts` table) or a new
+daemon-owned file with an explicit lifetime. Decide which before implementing.
+
+**Effort:** M
+**Priority:** P3
+**Depends on:** the investigation above — if the pass can be made to finish,
+this record stops mattering.
 
 
 ## Analysis

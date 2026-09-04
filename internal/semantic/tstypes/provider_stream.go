@@ -130,7 +130,20 @@ const (
 	stagedCalls
 )
 
-func (p *Provider) applyStagedFacts(ctx context.Context, g graph.Store, repoPrefix string, spool *factSpool, res *semantic.EnrichResult) error {
+// applyYield releases and retakes the graph-wide resolve mutex at a page
+// boundary, reporting whether the graph changed while it was released. Nil
+// means "do not yield", for a caller that holds no lock to release — which is
+// every test that drives the apply directly.
+//
+// The apply used to hold that mutex for its entire run: 4 phases over a 106k-node
+// repository measured at 1,088s, during which every other edge-mutating pass in
+// the process was stopped. A post-track workspace derivation queued behind two
+// of these waited 24m45s before executing a single instruction. The cross-repo
+// resolver has always yielded between its super-chunks for exactly this reason;
+// this is the apply learning the same manners.
+type applyYield func() (graphMutated bool)
+
+func (p *Provider) applyStagedFacts(ctx context.Context, g graph.Store, repoPrefix string, spool *factSpool, res *semantic.EnrichResult, yield applyYield) error {
 	if counter, ok := g.(graph.RepoLanguageSymbolCounter); ok {
 		res.SymbolsTotal = counter.CountRepoLanguageSymbols(repoPrefix, p.spec.Languages)
 	} else {
@@ -175,6 +188,13 @@ func (p *Provider) applyStagedFacts(ctx context.Context, g graph.Store, repoPref
 		ap := newApplier(g, p.spec, p.Name()).withHotCache(hot)
 		res.SymbolsCovered += ap.coverFiles(page)
 		after = last
+		// The coverage walk flushes no edges, but it is the longest single
+		// stretch of the apply on a large repo and holding the mutex through it
+		// stalls every other pass for nothing. SymbolsCovered is pass-local, so
+		// an interleaving writer cannot corrupt it.
+		if yield != nil && yield() {
+			hot.flushAll()
+		}
 	}
 
 	classForPhase := map[stagedFactPhase]factClass{
@@ -235,6 +255,15 @@ func (p *Provider) applyStagedFacts(ctx context.Context, g graph.Store, repoPref
 				return err
 			}
 			after = last
+			// Page boundary: this page's edges are flushed and the next page's
+			// applier has not been built, so the only state crossing here is the
+			// hot cache — and flushAll covers it whenever the graph moved.
+			// Retargets are idempotent per staged fact and coverage counters are
+			// pass-local, so a resolver page interleaved here changes nothing
+			// this pass will conclude.
+			if yield != nil && yield() {
+				hot.flushAll()
+			}
 		}
 	}
 	stats := hot.statsSnapshot()

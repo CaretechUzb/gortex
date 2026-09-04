@@ -403,7 +403,11 @@ func (cr *CrossRepoResolver) ResolveAllContext(ctx context.Context) (*CrossRepoS
 	if err := ctx.Err(); err != nil {
 		return stats, err
 	}
-	cr.mu.Lock()
+	// Announce the wait, not just the pass. Everything below — including the
+	// "pass start" line — is unreachable until this returns, so a pass queued
+	// behind a semantic apply used to leave a silent multi-minute gap in the
+	// log with no way to tell it from a wedged daemon.
+	lockResolveQueued(cr.mu, cr.logger, "cross-repo resolve")
 	defer cr.mu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return stats, err

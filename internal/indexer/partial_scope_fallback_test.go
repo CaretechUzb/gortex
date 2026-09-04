@@ -24,6 +24,12 @@ type partialScopeBatchProvider struct {
 	singleCalls int
 	fullCalls   int
 	batches     [][]string
+	// partial makes the batch report an incomplete pass, which is the signal
+	// that must stop the caller from recording any coverage.
+	partial bool
+	// onBatch runs inside the batch call, so a test can land a save while the
+	// pass is still in flight.
+	onBatch func()
 }
 
 func (p *partialScopeBatchProvider) Name() string        { return "partial-scope-" + p.language }
@@ -41,7 +47,12 @@ func (p *partialScopeBatchProvider) EnrichFile(graph.Store, string, string) (*se
 func (p *partialScopeBatchProvider) EnrichFiles(_ graph.Store, _ string, _ string, files []string) (*semantic.EnrichResult, error) {
 	p.batchCalls++
 	p.batches = append(p.batches, append([]string(nil), files...))
-	return &semantic.EnrichResult{Provider: p.Name(), Language: p.language}, nil
+	if p.onBatch != nil {
+		p.onBatch()
+	}
+	return &semantic.EnrichResult{
+		Provider: p.Name(), Language: p.language, Partial: p.partial,
+	}, nil
 }
 
 func partialScopeRegistry() *parser.Registry {

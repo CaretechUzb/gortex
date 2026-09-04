@@ -79,3 +79,32 @@ func TestAPlainGraphIsItsOwnDurableStoreAndRecordsNothing(t *testing.T) {
 	require.False(t, ok,
 		"the in-memory graph models no enrichment state; claiming otherwise would lose it silently")
 }
+
+// The walk itself, at the one place that now encodes it. Four call sites used
+// to write it out by hand, and the step being extracted is precisely the one
+// whose omission is silent: a type assertion made against the shadow finds no
+// applicability store, every writer returns early without logging, and the repo
+// reports "enriched: unknown" forever while its passes complete normally.
+//
+// Pinned centrally so the next caller inherits the resolution instead of
+// rediscovering it.
+func TestTheApplicabilityHelperResolvesThroughAShadowToTheOwningStore(t *testing.T) {
+	owner := applStore(t, "go")
+	shadow := shadowOver(owner, graph.StructuralPathShadowCold)
+
+	// The premise: the shadow models no applicability of its own, so stopping
+	// the walk at it is what loses the write.
+	_, direct := interface{}(shadow).(graph.EnrichmentApplicabilityStore)
+	require.False(t, direct, "the in-memory shadow must not model applicability")
+
+	resolved, ok := applicabilityStoreOf(shadow)
+	require.True(t, ok, "the helper must reach the store standing behind the shadow")
+	require.Same(t, graph.EnrichmentApplicabilityStore(owner), resolved)
+
+	// Shadows nest -- a chunk shadow over a streaming disk target -- so the
+	// helper has to keep walking rather than unwrap once.
+	nested := graph.NewStructuralIntegrityShadow(shadow, applRepo, graph.StructuralPathShadowStreaming)
+	resolved, ok = applicabilityStoreOf(nested)
+	require.True(t, ok)
+	require.Same(t, graph.EnrichmentApplicabilityStore(owner), resolved)
+}

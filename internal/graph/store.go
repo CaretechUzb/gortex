@@ -1479,6 +1479,19 @@ type EnrichmentApplicabilityStore interface {
 	// from reading "partial" forever.
 	RefreshEnrichmentProviders(repoPrefix string) (int, error)
 
+	// AdvanceContentGenForCompletedProviders renews the content stamp on
+	// providers that have already completed a pass, for a repo whose
+	// enrichment was refreshed over an exact FILE FRONTIER. Rows named in
+	// excludeProviders are left behind: their language was in the frontier but
+	// nothing ran for it, so their edges are gone and a stamp would claim
+	// coverage that does not exist.
+	//
+	// It never writes gen, which is what separates it from every other writer
+	// here. gen = 0 is the only signal that re-arms a repo whose enrichment has
+	// never run, and a scoped pass over one file is not the evidence that
+	// discharges it.
+	AdvanceContentGenForCompletedProviders(repoPrefix string, contentGen int64, excludeProviders []string) (int, error)
+
 	// DeclareNoEnrichmentProvidersIfUnrecorded is the additive-only form, for
 	// callers whose "nothing applies" is a weaker signal than the enrichment
 	// pass's own language census and so must never delete a real completion.
