@@ -35,6 +35,7 @@ var (
 // daemon call without touching the network or a real daemon.
 var (
 	forgeAvailable = forge.Available
+	forgeTokenHint = forge.MissingTokenHint
 	forgeListPRs   = forge.ListPRs
 	forgePRFiles   = forge.PRFiles
 	prsDaemonTool  = requireDaemonTool
@@ -59,8 +60,11 @@ touched by more than one open PR, with a suggested safe merge order — via
 the daemon's conflicts_prs tool. Both honour --format json (raw payload).
 When both flags are given, triage runs first, then conflicts.
 
-Listing needs a GitHub token (GH_TOKEN or GITHUB_TOKEN). The deep-dive,
---triage, and --conflicts also need a running daemon that tracks the repo.`,
+GitHub and GitLab are both supported; the backend is chosen from the repo's
+origin remote. Listing needs a token for that host — GH_TOKEN / GITHUB_TOKEN
+for GitHub, GITLAB_TOKEN (or an existing glab auth login) for GitLab. The
+deep-dive, --triage, and --conflicts also need a running daemon that tracks
+the repo.`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: runPRs,
 }
@@ -82,14 +86,15 @@ artifact and diffed across runs. A committed GitHub Action template that wires
 this into per-PR CI lives at .github/workflows/gortex-pr-review.yml.example
 (documented in docs/actions/README.md).
 
-Listing needs a GitHub token (GH_TOKEN or GITHUB_TOKEN) to fetch the changed
-files; the graph join needs a running daemon that tracks the repo.`,
+Fetching the changed files needs a token for the repo's forge host — GH_TOKEN
+/ GITHUB_TOKEN for GitHub, GITLAB_TOKEN (or an existing glab auth login) for
+GitLab; the graph join needs a running daemon that tracks the repo.`,
 	Args: cobra.ExactArgs(1),
 	RunE: runPRsBundle,
 }
 
 func init() {
-	prsCmd.Flags().StringVarP(&prsBase, "base", "b", "", "default base branch used to flag BASE_MISMATCH (default: the repo's default branch)")
+	prsCmd.Flags().StringVarP(&prsBase, "base", "b", "", "accepted base branch(es) used to flag BASE_MISMATCH; comma-separate several for a repo with more than one live target, e.g. --base 16.0,aurora-redesign (default: the repo's default branch)")
 	prsCmd.Flags().StringVar(&prsRepo, "repo", "", "repository path the forge / daemon must own (default: current directory)")
 	prsCmd.Flags().StringVar(&prsFormat, "format", "text", "output format: text or json")
 	prsCmd.Flags().BoolVar(&prsWorktrees, "worktrees", false, "annotate each PR whose head branch is checked out in a local worktree")
@@ -122,12 +127,13 @@ func runPRs(cmd *cobra.Command, args []string) error {
 	// Triage / conflicts dashboards route through the daemon tools. When both
 	// flags are given, run triage first then conflicts (triage takes
 	// precedence as the primary review-queue view). A missing forge token is
-	// not an error: print the GH_TOKEN hint and exit 0, like the base
-	// dashboard, since both daemon tools self-serve from the forge.
+	// not an error: print the hint for THIS repo's forge and exit 0, like the
+	// base dashboard, since both daemon tools self-serve from the forge.
 	if prsTriage || prsConflicts {
-		if !forgeAvailable(context.Background()) {
-			fmt.Fprintln(cmd.OutOrStdout(),
-				"no GitHub token found — set GH_TOKEN (or GITHUB_TOKEN) to triage pull requests")
+		ctx := context.Background()
+		if !forgeAvailable(ctx, repoPath) {
+			fmt.Fprintf(cmd.OutOrStdout(),
+				"no forge token found — %s to triage pull requests\n", forgeTokenHint(ctx, repoPath))
 			return nil
 		}
 		if prsTriage {
@@ -148,13 +154,14 @@ func runPRs(cmd *cobra.Command, args []string) error {
 }
 
 // runPRList prints the open-PR table (or its JSON form). A missing forge
-// token is not an error: it prints an actionable GH_TOKEN hint and exits 0.
+// token is not an error: it prints an actionable hint naming the token this
+// repo's forge actually wants, and exits 0.
 func runPRList(cmd *cobra.Command, repoPath string) error {
 	ctx := context.Background()
 
-	if !forgeAvailable(ctx) {
-		fmt.Fprintln(cmd.OutOrStdout(),
-			"no GitHub token found — set GH_TOKEN (or GITHUB_TOKEN) to list pull requests")
+	if !forgeAvailable(ctx, repoPath) {
+		fmt.Fprintf(cmd.OutOrStdout(),
+			"no forge token found — %s to list pull requests\n", forgeTokenHint(ctx, repoPath))
 		return nil
 	}
 
@@ -276,7 +283,7 @@ func runPRDeepDive(cmd *cobra.Command, repoPath string, number int) error {
 	// Best-effort: pass the CLI-fetched file set so the daemon skips a
 	// redundant forge fetch. When no token is resolvable we simply omit
 	// `files` and let the daemon self-serve (or degrade with its own hint).
-	if forgeAvailable(ctx) {
+	if forgeAvailable(ctx, repoPath) {
 		files, err := forgePRFiles(ctx, repoPath, number)
 		if err != nil {
 			return fmt.Errorf("fetching PR #%d files: %w", number, err)
@@ -527,8 +534,13 @@ func joinPRNumbers(nums []int) string {
 	return strings.Join(parts, ", ")
 }
 
-// resolvePRBase resolves the default base branch used to flag BASE_MISMATCH:
-// the explicit --base flag wins, otherwise the repo's default branch.
+// resolvePRBase resolves the accepted base branches used to flag
+// BASE_MISMATCH: the explicit --base flag wins (it may name several, comma-
+// separated), otherwise the repo's default branch.
+//
+// A repo with more than one live target — a release line plus a redesign
+// branch, say — needs the list form, or whichever branch is not the default
+// has every one of its PRs mislabelled BASE_MISMATCH.
 func resolvePRBase(repoPath string) string {
 	if prsBase != "" {
 		return prsBase
@@ -609,7 +621,7 @@ func runPRsBundle(cmd *cobra.Command, args []string) error {
 	// redundant forge fetch. With no token we omit it and let the daemon
 	// self-serve; a daemon with no token of its own degrades inside the tool.
 	var files []string
-	if forgeAvailable(ctx) {
+	if forgeAvailable(ctx, repoPath) {
 		fetched, ferr := forgePRFiles(ctx, repoPath, n)
 		if ferr != nil {
 			return fmt.Errorf("fetching PR #%d files: %w", n, ferr)

@@ -63,6 +63,47 @@ behaviour for anyone who currently relies on the parent binding.
 **Priority:** P2
 **Depends on:** None
 
+## Forge
+
+### Paginate both forge backends, and batch GitLab's aggregate fan-out
+
+**What:** Neither `ghClient.ListPRs` nor `glClient.ListPRs` paginates: both set
+`per_page`/`PerPage` to 100, issue one request, and ignore GitHub's
+`Link: rel="next"` and GitLab's `X-Next-Page`. A repository with more than 100
+open PRs/MRs silently triages a truncated queue. Separately, GitLab's
+`fillAggregates` costs up to two extra round-trips per MR (single-MR GET for
+`head_pipeline`, `/approvals` for the decision) under an errgroup of 8.
+
+**Why:** The truncation is silent, which is the failure shape this repo treats
+as worst: `triage_prs` and `conflicts_prs` rank a partial population and report
+it with full confidence. It was left out of the GitLab-backend change on purpose
+— GitHub has the same limit today, so the two are at parity, and fixing one side
+alone would make two implementations of one interface disagree about what "the
+first N" means. Fix them together or not at all.
+
+For the fan-out, GitLab GraphQL returns both aggregates for a whole page in one
+query:
+
+```graphql
+project(fullPath: $p) {
+  mergeRequests(state: opened, first: $n) {
+    nodes { iid headPipeline { status } approvalState { approved } }
+  }
+}
+```
+
+That replaces up to 2N REST calls with 1. The REST fan-out was kept because it
+mirrors the existing GitHub shape; the GraphQL path is a redesign, not a fix.
+
+**Also deferred with it:** `glabHosts` and `declaredHosts` are process-lifetime
+memos, so a `glab auth login --hostname X` performed AFTER the daemon started
+never takes effect — the host stays untrusted for a shared token and keeps
+reporting `errNoGitLabToken`, which reads as a broken credential rather than a
+stale cache. `MissingTokenHint` actively tells the user to run that command.
+Either give both memos a TTL, invalidate them on config reload, or say so in the
+hint.
+
+
 ## Worktrees
 
 ### Detect tracked worktrees whose work is finished

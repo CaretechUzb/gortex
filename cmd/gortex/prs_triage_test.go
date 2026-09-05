@@ -11,7 +11,7 @@ import (
 // triage_prs payload and asserts the rows show up highest-risk first.
 func TestPRsTriage_Table(t *testing.T) {
 	resetPRsSeams(t)
-	forgeAvailable = func(context.Context) bool { return true }
+	forgeAvailable = func(context.Context, string) bool { return true }
 	prsTriage = true
 
 	var gotTool string
@@ -60,7 +60,7 @@ func TestPRsTriage_Table(t *testing.T) {
 // the per-PR rationale is rendered when the queue is LLM-reranked.
 func TestPRsTriage_UseLLM(t *testing.T) {
 	resetPRsSeams(t)
-	forgeAvailable = func(context.Context) bool { return true }
+	forgeAvailable = func(context.Context, string) bool { return true }
 	prsTriage = true
 	prsUseLLM = true
 
@@ -94,7 +94,7 @@ func TestPRsTriage_UseLLM(t *testing.T) {
 // triage_prs payload unchanged.
 func TestPRsTriage_JSON(t *testing.T) {
 	resetPRsSeams(t)
-	forgeAvailable = func(context.Context) bool { return true }
+	forgeAvailable = func(context.Context, string) bool { return true }
 	prsTriage = true
 	prsFormat = "json"
 
@@ -130,7 +130,7 @@ func TestPRsTriage_JSON(t *testing.T) {
 // canned conflicts_prs payload.
 func TestPRsConflicts_Table(t *testing.T) {
 	resetPRsSeams(t)
-	forgeAvailable = func(context.Context) bool { return true }
+	forgeAvailable = func(context.Context, string) bool { return true }
 	prsConflicts = true
 
 	var gotTool string
@@ -167,7 +167,7 @@ func TestPRsConflicts_Table(t *testing.T) {
 // conflicts_prs payload unchanged.
 func TestPRsConflicts_JSON(t *testing.T) {
 	resetPRsSeams(t)
-	forgeAvailable = func(context.Context) bool { return true }
+	forgeAvailable = func(context.Context, string) bool { return true }
 	prsConflicts = true
 	prsFormat = "json"
 
@@ -201,7 +201,7 @@ func TestPRsConflicts_JSON(t *testing.T) {
 // runs triage first, then conflicts, in a single invocation.
 func TestPRsTriageConflicts_BothRunBothSections(t *testing.T) {
 	resetPRsSeams(t)
-	forgeAvailable = func(context.Context) bool { return true }
+	forgeAvailable = func(context.Context, string) bool { return true }
 	prsTriage = true
 	prsConflicts = true
 
@@ -237,7 +237,8 @@ func TestPRsTriageConflicts_BothRunBothSections(t *testing.T) {
 // actionable GH_TOKEN hint, exits 0, and never calls the daemon.
 func TestPRsTriage_NoTokenHint(t *testing.T) {
 	resetPRsSeams(t)
-	forgeAvailable = func(context.Context) bool { return false }
+	forgeAvailable = func(context.Context, string) bool { return false }
+	forgeTokenHint = func(context.Context, string) string { return "set GH_TOKEN (or GITHUB_TOKEN)" }
 	prsTriage = true
 	called := false
 	prsDaemonTool = func(_ string, _ string, _ map[string]any) (json.RawMessage, error) {
@@ -261,7 +262,7 @@ func TestPRsTriage_NoTokenHint(t *testing.T) {
 // daemon tool is rendered as a hint line, not a crash.
 func TestPRsTriage_Degradation(t *testing.T) {
 	resetPRsSeams(t)
-	forgeAvailable = func(context.Context) bool { return true }
+	forgeAvailable = func(context.Context, string) bool { return true }
 	prsTriage = true
 	prsDaemonTool = func(_ string, _ string, _ map[string]any) (json.RawMessage, error) {
 		return json.RawMessage(`{"error":"forge unavailable","hint":"set GH_TOKEN (or GITHUB_TOKEN) in the daemon environment"}`), nil

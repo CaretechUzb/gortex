@@ -224,6 +224,7 @@ internal/
   analysis/          Communities, processes, hotspots, architecture rollups
   contracts/         Contract definitions and checking
   daemon/            Long-running daemon: lifecycle, watchers, federation
+  forge/             The only PR/MR network surface: host routing, GitHub + GitLab clients
   graph/             Core graph data structures (Node, Edge, Graph)
   indexer/           Directory walker, file watcher, incremental reindex
   llm/               LLM providers and the `ask` agent

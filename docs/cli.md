@@ -185,10 +185,17 @@ All query commands support `--format text|json|dot` (DOT output for Graphviz vis
 ```bash
 # Triage the review queue — open PRs with CI rollup, review decision, age, and a
 # one-shot review-state label (DRAFT / BASE_MISMATCH / CHANGES_REQUESTED / APPROVED
-# / STALE / READY). Needs a GitHub token (GH_TOKEN / GITHUB_TOKEN).
+# / STALE / READY). GitHub and GitLab are both supported; the backend is chosen
+# from the repo's origin remote, and the token it needs follows that host —
+# GH_TOKEN / GITHUB_TOKEN for GitHub, GITLAB_TOKEN (or an existing
+# `glab auth login`) for GitLab.
 gortex prs
 gortex prs --worktrees                  # flag PRs whose head branch is checked out locally
-gortex prs --base main --format json    # override the base branch; machine-readable output
+gortex prs --base main --format json    # override the accepted base; machine-readable output
+gortex prs --base 16.0,aurora-redesign  # several accepted bases (comma-separated) for a repo
+                                        # with more than one live target branch
+gortex prs --triage                     # AI-ranked review queue, highest risk first
+gortex prs --conflicts                  # merge-order conflict clusters (PRs sharing a community)
 
 # Deep-dive one PR: join its changed files against the graph for blast radius + risk.
 gortex prs 1234                          # needs a running daemon that tracks the repo
@@ -205,7 +212,9 @@ gortex review --audience agent           # terse machine-first packet (vs the de
 gortex review --base main --post --pr 1234   # post the gated findings as inline PR comments (secrets redacted)
 ```
 
-The deterministic correctness rulepack always runs (graph-grounded to drop false positives); `--use-llm` adds LLM findings relocated to exact lines. Posting to a public / fork PR is opt-in via `--confirm-public`; `--dry-run` prints the already-redacted payloads without any network call. The same surface is exposed to agents over MCP — see [mcp.md](mcp.md#pr-review).
+`--base` on `gortex prs` names the **accepted** base branches used to flag `BASE_MISMATCH` and takes a comma-separated list; branch names are matched exactly. A repo with more than one long-lived target (a release line plus a redesign branch, say) needs the list form, or every PR targeting the non-default branch is mislabelled. Without the flag it falls back to the repo's default branch. (`gortex review --base` is unrelated: it is the git ref the changeset is diffed against.)
+
+The deterministic correctness rulepack always runs (graph-grounded to drop false positives); `--use-llm` adds LLM findings relocated to exact lines. Posting to a public / fork PR is opt-in via `--confirm-public`; `--dry-run` prints the already-redacted payloads without any network call. `--post` routes to the forge that serves the repo's `origin` remote — a GitHub review batches every comment into one review, while a GitLab post creates one positioned discussion per comment and is therefore not atomic. The same surface is exposed to agents over MCP — see [mcp.md](mcp.md#pr-review).
 
 ## Full tool surface from the CLI
 
