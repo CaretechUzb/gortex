@@ -1272,6 +1272,68 @@ func (c *Catalog) AdoptOrCreateViewGeneration(ctx context.Context, generation Vi
 	return generationID, adopted, nil
 }
 
+// servableViewGenerationMatchSQL finds a published generation a repeat build
+// request may re-route instead of rebuilding. It compares exactly the columns
+// buildingViewGenerationMatchSQL does — the whole build identity — and differs
+// from it only in which states it will accept: the two a route may name.
+// Newest first, because a later generation for the same identity was built
+// against the same inputs and is the one a reader should be pointed at.
+//
+// Handing back a stored payload is sound only while the identity determines
+// the payload. Everything that can cut a build short today is inside it: the
+// closure cap is IndexConfig.AffectedByReresolveMax, which rides config_hash,
+// so a generation truncated under one cap cannot match a request made under
+// another. A truncation that depended on something OUTSIDE the identity — a
+// deadline, a memory budget — would break that, and this predicate would then
+// have to require an empty completeness column as well, to stop a short build
+// being reused as though it were a whole one.
+//
+// The plan is two probes of view_generations_by_graph_state, one per accepted
+// state, merged and sorted: an IN list cannot ride one index scan's ordering.
+// That is bounded work rather than cheap work, and LIMIT 1 is what keeps it
+// bounded — the sort feeds a single row out.
+const servableViewGenerationMatchSQL = `
+SELECT generation_id, ` + viewGenerationColumns + ` FROM view_generations
+ WHERE state IN (?, ?) AND graph_id = ? AND owner_kind = ? AND generation_kind = ?
+   AND IFNULL(layer_id, '') = ? AND IFNULL(checkout_id, '') = ?
+   AND IFNULL(base_generation_id, 0) = ?
+   AND lower_view_fingerprint = ? AND tree_oid = ?
+   AND IFNULL(provenance_commit_oid, '') = ? AND config_hash = ?
+   AND extractor_versions = ? AND resolver_version = ?
+ ORDER BY generation_id DESC LIMIT 1`
+
+// FindViewGenerationByIdentity returns the newest servable generation already
+// built for one build identity.
+//
+// It is the durable half of the in-process re-routing caches: those remember
+// what THIS process built, and a restart empties them while the payload stays
+// in the database. Without this read a daemon that comes back up rebuilds a
+// generation it is already storing — the whole cost of a build for a row it
+// could have pointed at. The identity is compared column for column, so a hit
+// is a generation this request would have produced byte for byte, and the
+// state filter is the materializer's own rule for what a route may name.
+func (c *Catalog) FindViewGenerationByIdentity(
+	ctx context.Context, identity PayloadGenerationRequest,
+) (ViewGeneration, bool, error) {
+	var generation ViewGeneration
+	row := c.store.db.QueryRowContext(ctx, servableViewGenerationMatchSQL,
+		string(ViewGenerationReady), string(ViewGenerationSuperseded),
+		identity.GraphID, identity.OwnerKind, identity.GenerationKind,
+		identity.LayerID, identity.CheckoutID, identity.BaseGenerationID,
+		identity.LowerViewFingerprint, identity.TreeOID, identity.ProvenanceCommitOID,
+		identity.ConfigHash, identity.ExtractorVersions, identity.ResolverVersion)
+	err := scanViewGeneration(func(dest ...any) error {
+		return row.Scan(append([]any{&generation.GenerationID}, dest...)...)
+	}, &generation)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ViewGeneration{}, false, nil
+	}
+	if err != nil {
+		return ViewGeneration{}, false, err
+	}
+	return generation, true, nil
+}
+
 // SetViewGenerationState moves a generation to another lifecycle state. The
 // expected states are the compare-and-set guard; passing none accepts whatever
 // the row currently holds, which is what retirement needs — a crashed build and
@@ -1310,6 +1372,54 @@ func (c *Catalog) UpdateViewGenerationRollup(ctx context.Context, generationID, 
 UPDATE view_generations SET covered_files = ?, affected_files = ?, storage_bytes = ?
  WHERE generation_id = ? AND state = ?`,
 		coveredFiles, affectedFiles, storageBytes, generationID, string(ViewGenerationBuilding))
+}
+
+// SetViewGenerationCompleteness records what a finished generation knows it
+// could not do.
+//
+// It is a control-plane write on a sealed payload, for the same reason
+// WithdrawProducer is one: the value is a statement ABOUT the payload, not a
+// change to it, and the only moment the fact is known is after the build that
+// discovered it has published. Writing the value it already holds is a no-op
+// rather than a stale guard — two builds of the same identity reach the same
+// verdict, and the second must not have to treat agreement as a failure.
+//
+// Only a published generation accepts it. A build that is still running has
+// not finished discovering what it could not do; one that failed or is
+// retiring is on its way out, and a completeness fact recorded on it would
+// describe a payload nothing will ever read. Those are refused as a stale
+// guard, and a generation that is simply gone as not found — a caller
+// retrying after a sweep has to be able to tell the two apart.
+func (c *Catalog) SetViewGenerationCompleteness(
+	ctx context.Context, generationID int64, completeness string,
+) error {
+	if generationID <= 0 {
+		return fmt.Errorf("%w: generation_id %d", ErrCatalogInvalidValue, generationID)
+	}
+	result, err := c.exec(ctx, `
+UPDATE view_generations SET completeness = ?
+ WHERE generation_id = ? AND state IN (?, ?)`,
+		completeness, generationID,
+		string(ViewGenerationReady), string(ViewGenerationSuperseded))
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed > 0 {
+		return nil
+	}
+	row, found, err := c.GetViewGeneration(ctx, generationID)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return fmt.Errorf("%w: view generation %d", ErrCatalogNotFound, generationID)
+	}
+	return fmt.Errorf("%w: view generation %d is %s, not published",
+		ErrCatalogStaleGuard, generationID, row.State)
 }
 
 // WithdrawProducer marks one producer of a generation unavailable.

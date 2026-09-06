@@ -50,6 +50,11 @@ const lookupQualifiedEdgeCols = `e.from_id, e.to_id, e.kind, e.file_path, e.line
 var _ graph.NodeNameClassCounter = (*Store)(nil)
 var _ graph.ExistingNodeIDFinder = (*Store)(nil)
 
+// The conformance suite SKIPS a backend that fails the capability type
+// assertion, so a signature drift here would go green rather than red
+// without this line.
+var _ graph.InEdgesByKindFinder = (*Store)(nil)
+
 // ExistingNodeIDs projects only primary keys for the requested nodes. It is
 // intentionally separate from GetNodesByIDs: warm attribution passes need to
 // suppress repeat writes, not decode full node payloads and Meta blobs.
@@ -244,6 +249,23 @@ func (s *Store) GetNodesByIDsContext(ctx context.Context, ids []string) (map[str
 
 func (s *Store) GetInEdgesByNodeIDs(ids []string) map[string][]*graph.Edge {
 	return s.edgesByNodeIDs(ids, "to_id", func(e *graph.Edge) string { return e.To })
+}
+
+// GetInEdgesByNodeIDsAndKinds implements graph.InEdgesByKindFinder: the same
+// grouped inbound projection as GetInEdgesByNodeIDs, restricted to the kinds
+// the caller consumes. See that interface for why inbound degree is the one
+// direction where this matters.
+func (s *Store) GetInEdgesByNodeIDsAndKinds(ids []string, kinds []graph.EdgeKind) map[string][]*graph.Edge {
+	// An empty kind set is nil, never the unfiltered projection. The
+	// internal helper reads nil kinds as "no predicate" because
+	// GetInEdgesByNodeIDs needs exactly that, but a caller that reached
+	// for the NARROWED entry and supplied no kinds has asked for nothing
+	// — silently handing it a hub node's whole inbound degree is the
+	// failure this capability exists to prevent.
+	if len(kinds) == 0 {
+		return nil
+	}
+	return s.edgesByNodeIDsAndKinds(ids, "to_id", kinds, func(e *graph.Edge) string { return e.To })
 }
 
 // GetInEdgesByNodeIDsContext is the bounded, cancellable incoming-edge read
@@ -590,16 +612,78 @@ func (s *Store) queryEdgeCandidatesSQL(query string, args ...any) ([]*graph.Edge
 // edgesByNodeIDs runs the chunked IN-list edge fetch keyed on the given
 // column (from_id or to_id), grouping results by the supplied key extractor.
 func (s *Store) edgesByNodeIDs(ids []string, col string, key func(*graph.Edge) string) map[string][]*graph.Edge {
+	return s.edgesByNodeIDsAndKinds(ids, col, nil, key)
+}
+
+// edgesByNodeIDsAndKinds is edgesByNodeIDs with an optional kind predicate.
+// A NIL kind set keeps the unfiltered projection (what edgesByNodeIDs wants);
+// a non-nil set that names nothing usable returns nil rather than falling
+// through to it.
+//
+// The predicate is pushed into SQL rather than applied to the rows, because
+// the whole point is not to transfer them: edges_by_from and edges_by_to are
+// both (endpoint, kind) composites, so a kind list turns a scan over a hub
+// node's entire degree into one range seek per kind. Unlike the node-side
+// nodesInFilesByKindQuery, `kind` is NOT prefixed with `+` here — there the
+// unary plus exists to keep the file_path index chosen while the kind index
+// is droppable during a bulk load; here kind is the second column of the
+// SAME index the endpoint predicate already drives.
+//
+// The kind conjunct is deliberately NOT pinned with INDEXED BY, even though
+// bounded_adjacency.go pins the same two indexes for its single-endpoint
+// reads. bulkDroppableIndexes drops edges_by_to and edges_by_from for the
+// head of a cold load, and an INDEXED BY naming a dropped index is a HARD
+// ERROR, not a slow plan — which is exactly why bulk_load.go keeps
+// nodes_by_qual live ("resolver lookups use INDEXED BY and must fail
+// closed") and why nodesInFilesByKindQuery reaches for `+kind` instead. This
+// helper serves the general batch path, including enrichment applies that can
+// overlap an indexing window, so the plan is pinned by a test
+// (TestEdgesByNodeIDsAndKindsPlanUsesEndpointKindIndex) rather than by a hint
+// the store can invalidate at runtime.
+func (s *Store) edgesByNodeIDsAndKinds(ids []string, col string, kinds []graph.EdgeKind, key func(*graph.Edge) string) map[string][]*graph.Edge {
 	uniq := dedupeNonEmpty(ids)
 	if len(uniq) == 0 {
 		return nil
 	}
+	kindArgs := make([]any, 0, len(kinds))
+	seenKinds := make(map[graph.EdgeKind]struct{}, len(kinds))
+	for _, kind := range kinds {
+		if kind == "" {
+			continue
+		}
+		if _, duplicate := seenKinds[kind]; duplicate {
+			continue
+		}
+		seenKinds[kind] = struct{}{}
+		kindArgs = append(kindArgs, string(kind))
+	}
+	if len(kindArgs) == 0 && len(kinds) > 0 {
+		// Every supplied kind sanitised away — an empty-string kind, say.
+		// The caller reached for the NARROWED read and named nothing that
+		// can match, so the answer is nothing. Falling through to the
+		// unfiltered query would hand back precisely the hub-sized inbound
+		// projection the narrowing exists to prevent, and would diverge
+		// from Graph.GetInEdgesByNodeIDsAndKinds, which returns nil.
+		return nil
+	}
+	// Reserve the kind placeholders out of the chunk so the per-statement
+	// bind count stays what it was before this predicate existed: at most
+	// lookupChunkSize endpoint binds plus the single view_gen bind.
+	chunkSize := lookupChunkSize - len(kindArgs)
+	if chunkSize < 1 {
+		// A kind list that large is not a real call shape, but a
+		// non-positive stride would spin the loop below forever rather
+		// than degrade.
+		chunkSize = 1
+	}
 	out := make(map[string][]*graph.Edge, len(uniq))
-	for i := 0; i < len(uniq); i += lookupChunkSize {
-		end := minInt(i+lookupChunkSize, len(uniq))
+	for i := 0; i < len(uniq); i += chunkSize {
+		end := minInt(i+chunkSize, len(uniq))
 		chunk := uniq[i:end]
-		q := `SELECT ` + lookupEdgeCols + ` FROM edges WHERE ` + col + ` IN (` + inPlaceholders(len(chunk)) + `) AND view_gen = ?`
-		for _, e := range s.queryEdgesSQL(q, append(toAnyArgs(chunk), s.viewGen)...) {
+		q := edgesByEndpointKindsQuery(col, len(chunk), len(kindArgs))
+		args := append(toAnyArgs(chunk), kindArgs...)
+		args = append(args, s.viewGen)
+		for _, e := range s.queryEdgesSQL(q, args...) {
 			if e == nil {
 				continue
 			}
@@ -608,6 +692,21 @@ func (s *Store) edgesByNodeIDs(ids []string, col string, key func(*graph.Edge) s
 		}
 	}
 	return out
+}
+
+// edgesByEndpointKindsQuery is the SQL edgesByNodeIDsAndKinds runs, named so
+// the plan-lock test can EXPLAIN the exact production string rather than a
+// hand-copied lookalike. kinds == 0 emits the unfiltered shape.
+//
+// The generation predicate trails the indexed conjuncts, the same ordering
+// bounded_adjacency.go relies on, so it filters rows the endpoint/kind index
+// has already produced instead of competing for the access path.
+func edgesByEndpointKindsQuery(col string, ids, kinds int) string {
+	q := `SELECT ` + lookupEdgeCols + ` FROM edges WHERE ` + col + ` IN (` + inPlaceholders(ids) + `)`
+	if kinds > 0 {
+		q += ` AND kind IN (` + inPlaceholders(kinds) + `)`
+	}
+	return q + ` AND view_gen = ?`
 }
 
 // dedupeNonEmpty drops empties and duplicates, preserving first-seen order.

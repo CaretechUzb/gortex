@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 
+	"go.uber.org/zap"
+
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/semantic"
@@ -194,18 +196,33 @@ type applier struct {
 	// both adjacency directions in batches. These maps keep every ordered phase
 	// query-free; the loaded sets preserve a one-shot fallback for direct unit
 	// exercises that invoke an individual helper without applyAll.
-	nodesByFile          map[string][]*graph.Node
-	nodesByID            map[string]*graph.Node
-	nodesByName          map[typeCandidateKey][]*graph.Node
-	outByID              map[string][]*graph.Edge
-	inByID               map[string][]*graph.Edge
-	fileLoaded           map[string]bool
-	nodeLoaded           map[string]bool
-	nameLoaded           map[typeCandidateKey]bool
+	nodesByFile map[string][]*graph.Node
+	nodesByID   map[string]*graph.Node
+	nodesByName map[typeCandidateKey][]*graph.Node
+	outByID     map[string][]*graph.Edge
+	inByID      map[string][]*graph.Edge
+	fileLoaded  map[string]bool
+	nodeLoaded  map[string]bool
+	// nameLoaded records, per (repo, name), WHICH candidate roles have already
+	// been materialised — not merely that the name was asked once. The page
+	// preload filters each name's candidates by the kinds its roles can
+	// consume, so a later lookup in a role that filter excluded has to be able
+	// to top the group up rather than silently read a narrowed set.
+	nameLoaded map[typeCandidateKey]nameRole
+	// candidateKindsByRole memoizes candidateKinds: only a handful of role
+	// masks exist and each answer is immutable for the applier's life.
+	candidateKindsByRole map[nameRole]map[graph.NodeKind]bool
 	repoProjectionLoaded map[string]bool
 	outLoaded            map[string]bool
 	inLoaded             map[string]bool
 	allNodes             []*graph.Node
+	// logger is the pass logger, nil outside the driven paths. Only the
+	// miss-path top-up diagnostics use it; see boundTopUpSeeds.
+	logger *zap.Logger
+	// topUps counts the namedNodes miss-path frontier walks this page's
+	// applier ran. Per-applier, so it resets every page — which is the unit
+	// topUpLogThreshold is expressed in.
+	topUps int
 }
 
 // extKey indexes an extension function by its receiver type name and its
@@ -250,7 +267,8 @@ func newApplier(g graph.Store, spec *LangSpec, provider string) *applier {
 		inByID:               make(map[string][]*graph.Edge),
 		fileLoaded:           make(map[string]bool),
 		nodeLoaded:           make(map[string]bool),
-		nameLoaded:           make(map[typeCandidateKey]bool),
+		nameLoaded:           make(map[typeCandidateKey]nameRole),
+		candidateKindsByRole: make(map[nameRole]map[graph.NodeKind]bool),
 		repoProjectionLoaded: make(map[string]bool),
 		outLoaded:            make(map[string]bool),
 		inLoaded:             make(map[string]bool),
@@ -398,13 +416,53 @@ func (a *applier) loadAdjacency(ids []string) {
 		}
 	}
 	if len(inMissing) > 0 {
-		loaded := a.g.GetInEdgesByNodeIDs(inMissing)
+		loaded := a.structuralInEdges(inMissing)
 		for _, id := range inMissing {
 			a.inByID[id] = loaded[id]
 			a.inLoaded[id] = true
 			a.hot.putIn(id, loaded[id])
 		}
 	}
+}
+
+// applierInEdgeKinds is the CLOSED set of inbound edge kinds this engine can
+// consume. Every reader of applier.inEdges filters to exactly these two:
+// preloadApplicationFrontier and relevantEndpointIDs (member_of / param_of),
+// methodOn and typeHasRealMember (member_of), paramArity (param_of). Nothing
+// reads an inbound `calls`, `references` or dataflow edge, and the out-edge
+// side deliberately stays unfiltered because call retargeting
+// (upgradeExistingCall / strongerEdge / reindexEdge) walks it.
+//
+// Loading the rest was the whole-repo pass's O(repo)-per-page term. A page is
+// 32 files, but its frontier lands on hub nodes — in an Odoo-shaped tree a
+// base model class and its `create` / `write` overrides — whose inbound degree
+// is a function of the REPOSITORY, not of the page. Measured on `addons`
+// (11,970 Python files) before this filter: one page pulled 860,270 inbound
+// edges to use 6,809 of them (0.8%), a single hub method contributing 10,255,
+// at ~12.6 s of random B-tree page reads per page. The kinds here are served
+// by the existing edges_by_to(to_id, kind) index, so this needs no new index.
+var applierInEdgeKinds = []graph.EdgeKind{graph.EdgeMemberOf, graph.EdgeParamOf}
+
+// structuralInEdges is the inbound projection narrowed to applierInEdgeKinds.
+// The filter is applied on EVERY backend — a store without the pushdown
+// capability still must not leave a hub node's full inbound degree resident in
+// the page's working set — and pushed into SQL where the backend supports it.
+func (a *applier) structuralInEdges(ids []string) map[string][]*graph.Edge {
+	if finder, ok := a.g.(graph.InEdgesByKindFinder); ok {
+		return finder.GetInEdgesByNodeIDsAndKinds(ids, applierInEdgeKinds)
+	}
+	loaded := a.g.GetInEdgesByNodeIDs(ids)
+	out := make(map[string][]*graph.Edge, len(loaded))
+	for id, edges := range loaded {
+		var kept []*graph.Edge
+		for _, edge := range edges {
+			if edge != nil && edgeKindIn(edge.Kind, applierInEdgeKinds) {
+				kept = append(kept, edge)
+			}
+		}
+		out[id] = kept
+	}
+	return out
 }
 
 func (a *applier) relevantEndpointIDs(ids []string, inheritKinds []graph.EdgeKind) []string {
@@ -462,6 +520,63 @@ func (a *applier) fileNodes(filePath string) []*graph.Node {
 		a.fileLoaded[filePath] = true
 	}
 	return a.nodesByFile[filePath]
+}
+
+// topUpFrontierSeedCap bounds the frontier walk namedNodes runs on its miss
+// path. Unlike the page preload's walk, that one happens INSIDE the apply,
+// under the graph-wide resolve mutex, with no yield point before the next page
+// boundary — the shape that once stalled every other pass for 24m45s. So its
+// seed set is capped rather than left to the candidate count of whatever name
+// missed. Truncation can only bite a name carrying more than this many
+// type-kind candidates in one repository; resolveNodeOfKinds already refuses
+// to guess among several unless an import hint selects exactly one, so the
+// worst case is a missing edge, never a wrong one — and it is logged.
+const topUpFrontierSeedCap = 128
+
+// topUpLogThreshold is how many miss-path walks one page's applier may run
+// before the pass says so at debug. A page whose facts the preload covers
+// should run none; a steady stream of them means a name role is mis-tagged,
+// and that regression should be visible in a log rather than only in a
+// profile.
+const topUpLogThreshold = 8
+
+// boundTopUpSeeds caps and orders one miss-path frontier seed set, and reports
+// at debug when the cap bites or when a single page keeps missing. Ordering is
+// deterministic so a capped walk is reproducible rather than map-order luck.
+func (a *applier) boundTopUpSeeds(name string, seeds []string) []string {
+	if len(seeds) == 0 {
+		return nil
+	}
+	a.topUps++
+	seeds = uniqueSortedIDs(seeds)
+	if len(seeds) > topUpFrontierSeedCap {
+		a.logDebug("tstypes: name top-up frontier capped",
+			zap.String("name", name),
+			zap.Int("candidates", len(seeds)),
+			zap.Int("cap", topUpFrontierSeedCap))
+		seeds = seeds[:topUpFrontierSeedCap]
+	}
+	if a.topUps == topUpLogThreshold {
+		a.logDebug("tstypes: page repeatedly walked a name top-up frontier mid-apply",
+			zap.String("name", name),
+			zap.Int("top_ups", a.topUps))
+	}
+	return seeds
+}
+
+func (a *applier) logDebug(msg string, fields ...zap.Field) {
+	if a.logger == nil {
+		return
+	}
+	a.logger.Debug(msg, append(fields, zap.String("provider", a.provider))...)
+}
+
+// withLogger attaches the pass logger, so the miss-path diagnostics above
+// reach the daemon log. Chainable beside withHotCache; a nil logger (every
+// direct unit exercise) simply silences them.
+func (a *applier) withLogger(logger *zap.Logger) *applier {
+	a.logger = logger
+	return a
 }
 
 // withHotCache attaches the pass-scoped read-through cache. Chainable so the
@@ -867,7 +982,7 @@ func (a *applier) typeCandidates(idx *fileIndex, name string, kinds map[graph.No
 	key := typeCandidateKey{repoPrefix: idx.facts.repoPrefix, name: name}
 	raw, ok := a.typeCandidatesCache[key]
 	if !ok {
-		raw = a.namedNodes(idx.facts.repoPrefix, name)
+		raw = a.namedNodes(idx.facts.repoPrefix, name, roleType)
 		a.typeCandidatesCache[key] = raw
 	}
 	lang := a.languageSet()
@@ -884,9 +999,13 @@ func (a *applier) typeCandidates(idx *fileIndex, name string, kinds map[graph.No
 	return out
 }
 
-func (a *applier) namedNodes(repoPrefix, name string) []*graph.Node {
+// namedNodes returns every candidate hydrated for this name, topping the group
+// up from the store when the caller's role was never materialised by the page
+// preload. want names the role the CALLER filters for, so a resolver can never
+// read a group the preload narrowed past it.
+func (a *applier) namedNodes(repoPrefix, name string, want nameRole) []*graph.Node {
 	key := typeCandidateKey{repoPrefix: repoPrefix, name: name}
-	if !a.nameLoaded[key] {
+	if a.nameLoaded[key]&want != want {
 		if !a.repoProjectionLoaded[repoPrefix] {
 			var nodes []*graph.Node
 			if repoPrefix != "" {
@@ -894,11 +1013,29 @@ func (a *applier) namedNodes(repoPrefix, name string) []*graph.Node {
 			} else {
 				nodes = a.g.FindNodesByName(name)
 			}
+			frontierKinds := a.candidateKinds(roleType)
+			var seeds []string
 			for _, node := range nodes {
 				a.rememberNode(node)
+				if node != nil && frontierKinds[node.Kind] {
+					seeds = append(seeds, node.ID)
+				}
+			}
+			seeds = a.boundTopUpSeeds(name, seeds)
+			// A type reached by a name the page's facts never mentioned — the
+			// container type a stdlib return-type seed names, say — still has to
+			// answer methodOn, and methodOn reads members and ancestry ONLY from
+			// the preloaded adjacency maps (outEdges / inEdges never query). So
+			// walk its frontier here, the same bounded walk the page preload
+			// runs for the candidates it did know about — bounded harder, see
+			// boundTopUpSeeds, because this one runs mid-apply.
+			if len(seeds) > 0 {
+				a.preloadApplicationFrontier(seeds)
 			}
 		}
-		a.nameLoaded[key] = true
+		// This one-shot fallback filters by no kind at all, so it satisfies
+		// every role at once.
+		a.nameLoaded[key] = roleAll
 	}
 	return a.nodesByName[key]
 }
@@ -1125,7 +1262,7 @@ func (a *applier) callableReturnType(idx *fileIndex, callee string) (string, boo
 		}
 	}
 	if match == nil {
-		raw := a.namedNodes(idx.facts.repoPrefix, callee)
+		raw := a.namedNodes(idx.facts.repoPrefix, callee, roleCallee)
 		lang := a.languageSet()
 		for _, c := range raw {
 			if c.Kind != graph.KindFunction && c.Kind != graph.KindMethod {

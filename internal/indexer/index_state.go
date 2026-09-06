@@ -137,10 +137,16 @@ func (idx *Indexer) reconcileRepoIndexStateIfBehind(rootAbs string) {
 // whether it has uncommitted changes. Best-effort: a non-git directory or
 // any git error yields ("", false) — freshness provenance never blocks
 // indexing. Git shell-outs route through the shared concurrency limiter.
+//
+// The SHA comes from checkoutHeadSHA, not a bare rev-parse, so a checkout
+// whose `.git` link has been unlinked yields "" rather than the HEAD of
+// whatever repository encloses it. Every caller already treats "" as "no git
+// answer, skip the stamp"; stamping a freshness row at another repository's
+// commit is the outcome that has no honest reading.
 func repoHeadAndDirty(rootAbs string) (sha string, dirty bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	sha, err := gitcmd.Output(ctx, rootAbs, "rev-parse", "HEAD")
+	sha, err := checkoutHeadSHA(ctx, rootAbs, "")
 	if err != nil {
 		return "", false
 	}
@@ -162,7 +168,7 @@ func repoHeadAndDirty(rootAbs string) (sha string, dirty bool) {
 func repoHead(rootAbs string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	sha, err := gitcmd.Output(ctx, rootAbs, "rev-parse", "HEAD")
+	sha, err := checkoutHeadSHA(ctx, rootAbs, "")
 	if err != nil {
 		return ""
 	}

@@ -87,7 +87,18 @@ func TestCheckoutLifecyclePaginatesReadyLayersPastServedRows(t *testing.T) {
 	request.GenerationKind = CommitLayerGenerationKind
 	request.CheckoutID = "orphan-ready-layer"
 	request.LayerID = "ready-layer-orphan"
-	orphan := seedLifecycleListingGeneration(t, fixture.store, request, store_sqlite.ViewGenerationReady)
+	// One layer past the reuse window the sweep keeps per commit layer, so the
+	// oldest of them is a candidate and the pagination claim still has
+	// something to find behind the served page.
+	baseTreeOID := request.TreeOID
+	var orphanLayers []int64
+	for i := range defaultRetainedCommitLayers + 1 {
+		request.TreeOID = fmt.Sprintf("%s-orphan-%d", baseTreeOID, i)
+		orphanLayers = append(orphanLayers,
+			seedLifecycleListingGeneration(t, fixture.store, request, store_sqlite.ViewGenerationReady))
+	}
+	orphan := orphanLayers[0]
+	request.TreeOID = baseTreeOID
 
 	request.CheckoutID = "served-ready-layer"
 	for i := 0; i <= retirementPaginationTestPageSize; i++ {
@@ -98,6 +109,9 @@ func TestCheckoutLifecyclePaginatesReadyLayersPastServedRows(t *testing.T) {
 	lifecycle := newGenerationRetirementLifecycle(fixture.store, time.Now())
 	candidates := lifecycle.orphanedGenerations(ctx, map[string]struct{}{"served-ready-layer": {}}, nil)
 	requireOnlyRetirementCandidate(t, candidates, orphan)
+	for _, generationID := range orphanLayers[1:] {
+		requireCatalogGenerationPresent(t, fixture.store, generationID)
+	}
 }
 
 func TestCheckoutLifecycleRetirementPreservesRouteRefBaseAndLease(t *testing.T) {
@@ -236,11 +250,14 @@ func TestReadyLayerRetirementCandidatesReadOncePerPageAndCacheMissing(t *testing
 		return resolved, nil
 	}
 	routes := map[string]store_sqlite.CheckoutRoute{}
-	first, err := readyLayerRetirementCandidates(context.Background(), pageOne, nil, routes, lookup)
+	// No reuse window: these rows carry no layer id, which is what the window
+	// is keyed by, so it cannot change what this pagination case measures.
+	kept := map[string]int{}
+	first, err := readyLayerRetirementCandidates(context.Background(), pageOne, nil, routes, kept, lookup)
 	if err != nil {
 		t.Fatalf("first ready-layer page: %v", err)
 	}
-	second, err := readyLayerRetirementCandidates(context.Background(), pageTwo, nil, routes, lookup)
+	second, err := readyLayerRetirementCandidates(context.Background(), pageTwo, nil, routes, kept, lookup)
 	if err != nil {
 		t.Fatalf("second ready-layer page: %v", err)
 	}
@@ -343,7 +360,7 @@ func TestCheckoutLifecycleRouteFlipAfterBatchProtectsGeneration(t *testing.T) {
 		GenerationID:   candidate,
 		CheckoutID:     checkoutID,
 		GenerationKind: CommitLayerGenerationKind,
-	}}, nil, map[string]store_sqlite.CheckoutRoute{}, lookup)
+	}}, nil, map[string]store_sqlite.CheckoutRoute{}, map[string]int{}, lookup)
 	if err != nil {
 		t.Fatalf("classify stale route snapshot: %v", err)
 	}

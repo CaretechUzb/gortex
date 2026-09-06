@@ -3,6 +3,9 @@ package indexer
 import (
 	"context"
 	"fmt"
+	"time"
+
+	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/reach"
 	"github.com/zzet/gortex/internal/search"
@@ -198,9 +201,7 @@ func (mi *MultiIndexer) untrackRepoChecked(
 		}
 		state.configFinalized = true
 	}
-	if !state.contract.Empty() {
-		mi.ReconcileContractEdgesForFrontier(state.contract)
-	}
+	mi.reconcileContractEdgesForTeardown(repoPrefix, state.contract)
 
 	// Delete the continuation before opening admission. A caller that already
 	// holds its pointer observes completed=true; a fresh track cannot enter
@@ -213,6 +214,42 @@ func (mi *MultiIndexer) untrackRepoChecked(
 	mi.mu.Unlock()
 	mi.detachRepositoryMutationCoordinator(repoPrefix, coordinator)
 	return state.nodesRemoved, state.edgesRemoved, nil
+}
+
+// reconcileContractEdgesForTeardown runs the departing repository's contract
+// reconciliation, bracketed by one log line on each side.
+//
+// It is the teardown's long pole and the only step in it that neither bounds
+// its own work nor says anything while it runs. It holds the graph's resolve
+// lane across a merged-registry match and an incident-edge scan over every
+// tracked repository, not just the one leaving, so on a large workspace the
+// whole daemon queues behind it. A demotion was measured spending 33 minutes
+// here with the repository's rows already purged and its config entry already
+// removed, while the graph row it was still holding open said nothing had
+// happened — and the daemon log had not one line to attribute any of it to.
+//
+// The bracket is what makes that window attributable rather than silent. The
+// start line carries the frontier's size because that is what predicts the
+// cost, and the completion line carries the elapsed time because that is the
+// number an operator is actually looking for.
+func (mi *MultiIndexer) reconcileContractEdgesForTeardown(
+	repoPrefix string, plan DerivedInvalidationPlan,
+) {
+	if plan.Empty() {
+		return
+	}
+	mi.logger.Info("repository teardown: contract reconciliation starting",
+		zap.String("repo", repoPrefix),
+		zap.Int("contract_groups", len(plan.ContractGroups)),
+		zap.Int("contract_symbol_ids", len(plan.ContractSymbolIDs)),
+		zap.Int("contract_bridge_node_ids", len(plan.ContractBridgeNodeIDs)))
+	started := time.Now()
+	replaced := mi.ReconcileContractEdgesForFrontier(plan)
+	mi.logger.Info("repository teardown: contract reconciliation complete",
+		zap.String("repo", repoPrefix),
+		zap.Int("contract_groups", len(plan.ContractGroups)),
+		zap.Int("edges_replaced", replaced),
+		zap.Duration("elapsed", time.Since(started)))
 }
 
 func (mi *MultiIndexer) purgeRepositoryPayload(

@@ -101,7 +101,7 @@ func applyWithContender(t *testing.T, yielding, queued bool) bool {
 			return mutated
 		}
 	}
-	err := p.applyStagedFacts(context.Background(), g, "repo", spool, &semantic.EnrichResult{}, yield)
+	err := p.applyStagedFacts(context.Background(), g, "repo", spool, &semantic.EnrichResult{}, repoWideSymbolTotal, yield)
 	mu.Unlock()
 	contender.Wait()
 	require.NoError(t, err)

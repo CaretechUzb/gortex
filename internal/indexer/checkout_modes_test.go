@@ -425,9 +425,10 @@ func TestUntrackDemotesADedicatedWorktree(t *testing.T) {
 	route, routed := f.routeOf(tracked.CheckoutID)
 	require.True(t, routed)
 	assert.Equal(t, f.primaryGraph, route.GraphID, "it is served from the family primary now")
-	assert.NotZero(t, route.CommitGenerationID)
-	assert.NotZero(t, route.DirtyGenerationID)
-	assert.Equal(t, store_sqlite.RouteActive, route.State)
+	assert.Zero(t, route.CommitGenerationID, "the demotion builds no layers of its own")
+	assert.Zero(t, route.DirtyGenerationID)
+	assert.Equal(t, store_sqlite.RoutePending, route.State,
+		"a route with no layers says so rather than claiming to serve them")
 
 	_, bound, err := f.catalog.GetDedicatedGraph(ctx, GraphIDFor(tracked.Prefix))
 	require.NoError(t, err)
@@ -437,10 +438,117 @@ func TestUntrackDemotesADedicatedWorktree(t *testing.T) {
 	assert.True(t, f.lc.SignalCheckout(tracked.CheckoutID, "test"),
 		"an automatic checkout has a coordinator listening")
 
+	// The demotion builds nothing and demands nothing. A commit layer over the
+	// family base is the same whole-tree build here as anywhere else, and
+	// untracking a worktree is usually the step before deleting it — so the
+	// first build waits for a reader like any other unread checkout's, and the
+	// cost of that is one exact:false answer to whoever reads it first.
+	coordinator := lifecycleCoordinator(t, f.lc, tracked.CheckoutID)
+	coordinator.mu.Lock()
+	demanded := coordinator.demanded
+	coordinator.mu.Unlock()
+	assert.False(t, demanded, "a demotion must not demand a build nobody asked for")
+
+	// The deferral is the loop's decision, not the reconcile's (see
+	// TestCoordinatorDefersTheFirstBuildUntilTheCheckoutIsRead), so the gate
+	// itself is what this asks — driving reconcile directly would build past
+	// it and prove nothing.
+	assert.True(t, coordinator.firstBuildDeferred(ctx),
+		"the loop would defer the first build of a checkout nothing has read")
+
+	// The read is what pays for the layers. What they compose to has to be what
+	// the dedicated corpus held: the working tree did not move, only where it
+	// is read from.
+	coordinator.Demand("a read routed to the checkout")
+	assert.False(t, coordinator.firstBuildDeferred(ctx), "a demanded build is not speculative")
+	cycle := f.runCoordinator(tracked.CheckoutID)
+	assert.False(t, cycle.Deferred, "a demanded cycle builds")
+	assert.True(t, cycle.CommitBuilt || cycle.CommitReused)
+	route, routed = f.routeOf(tracked.CheckoutID)
+	require.True(t, routed)
+	assert.Equal(t, store_sqlite.RouteActive, route.State)
+	assert.NotZero(t, route.CommitGenerationID)
+	assert.NotZero(t, route.DirtyGenerationID)
+
 	view := f.materialize(tracked.CheckoutID)
 	defer view.Close()
 	assert.Equal(t, dedicatedContent, contentIdentities(view.Reader, f.mainPrefix),
 		"the composed stack carries what the dedicated corpus carried")
+}
+
+// TestUntrackRefusesADemotionThePrimaryCannotServe is the pre-flight.
+//
+// A demotion that registers a route and retires the corpus, only to find that
+// nothing can build over the primary, leaves the worst state in the system: a
+// checkout that is automatic, routed to a graph with no layers, and with no
+// coordinator to make any. It has to be refused BEFORE the first write, while
+// refusing still costs nothing — and the checkout has to come out of it
+// exactly as it went in.
+func TestUntrackRefusesADemotionThePrimaryCannotServe(t *testing.T) {
+	f := newFamilyFixture(t, "unservable")
+	defer f.close()
+	ctx := context.Background()
+
+	tracked, err := f.lc.Register(ctx, config.RepoEntry{Path: f.worktree}, TrackSourceCLI)
+	require.NoError(t, err)
+	require.NoError(t, tracked.CatalogErr)
+
+	preview, err := f.lc.PreviewUntrack(ctx, f.worktree)
+	require.NoError(t, err)
+	require.Equal(t, UntrackPlanDemote, preview.Plan)
+
+	// The primary's corpus leaves the live index between the preview and the
+	// confirm. Its catalog rows all still say ready, so nothing before the
+	// pre-flight can tell.
+	f.mi.UntrackRepo(f.mainPrefix)
+	require.Nil(t, f.mi.GetIndexer(f.mainPrefix))
+
+	_, err = f.lc.ApplyUntrack(ctx, preview)
+	require.Error(t, err, "a demotion onto a primary nothing serves must be refused")
+	assert.Contains(t, err.Error(), "cannot serve checkout")
+
+	still, found, err := f.catalog.GetCheckout(ctx, tracked.CheckoutID)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, store_sqlite.CheckoutModeDedicated, still.EffectiveMode,
+		"the refusal left the checkout where it was")
+	_, routed := f.routeOf(tracked.CheckoutID)
+	assert.False(t, routed, "and wrote no route it cannot serve")
+	_, bound, err := f.catalog.GetDedicatedGraph(ctx, GraphIDFor(tracked.Prefix))
+	require.NoError(t, err)
+	assert.True(t, bound, "and left the corpus it was going to give up")
+}
+
+// TestEnsureCoordinatorSkipsACheckoutServedByItsOwnCorpus pins the containment
+// rule: a checkout that owns a dedicated graph reads its own corpus, and an
+// automatic coordinator over it would spend a whole commit-layer build
+// composing the primary's content under a view nothing reads it through.
+//
+// The row is presented as automatic on purpose. That is the window the guard
+// exists for — a mode column and a graph binding that disagree, which is what a
+// reconciliation racing a mode change sees — and the binding is the authority,
+// because it is what the materializer resolves the view from.
+func TestEnsureCoordinatorSkipsACheckoutServedByItsOwnCorpus(t *testing.T) {
+	f := newFamilyFixture(t, "owned")
+	defer f.close()
+	ctx := context.Background()
+
+	tracked, err := f.lc.Register(ctx, config.RepoEntry{Path: f.worktree}, TrackSourceCLI)
+	require.NoError(t, err)
+	require.NoError(t, tracked.CatalogErr)
+	f.lc.dropCoordinator(tracked.CheckoutID)
+	require.False(t, f.lc.hasCoordinator(tracked.CheckoutID))
+
+	checkout, found, err := f.catalog.GetCheckout(ctx, tracked.CheckoutID)
+	require.NoError(t, err)
+	require.True(t, found)
+	checkout.EffectiveMode = store_sqlite.CheckoutModeAutomatic
+
+	f.lc.ensureCoordinator(ctx, f.primaryGraph, checkout)
+	assert.False(t, f.lc.hasCoordinator(tracked.CheckoutID),
+		"a checkout with a corpus of its own must not get an automatic coordinator")
+	_, routed := f.routeOf(tracked.CheckoutID)
+	assert.False(t, routed, "and nothing routes it into the automatic lane")
 }
 
 // TestUntrackIsBlockedWithoutAnotherReadyPrimary states the rule that stops an

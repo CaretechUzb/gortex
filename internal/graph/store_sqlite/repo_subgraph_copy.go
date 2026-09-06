@@ -455,35 +455,48 @@ func (s *Store) repoPrefixOccupied(prefix string) (bool, error) {
 	return n != 0, nil
 }
 
-// RestampCopiedReadiness declares the carried stage stamps current for a
-// destination checkout, AFTER its own file bookkeeping has been written.
+// RestampCopiedReadiness declares the given stage(s) of the carried readiness
+// stamps current for a destination checkout, AFTER its own file bookkeeping
+// has been written.
 //
-// This is a semantic assertion, not metadata tidying. The copy carries the
-// source's derive_state and enrichment_state rows verbatim along with its
-// counters, so at the instant the copy commits the two already agree and there
-// is nothing to do. What breaks them apart comes next: registering the copied
-// checkout restats its files and calls ReplaceFileMtimes, and a worktree's
-// on-disk mtimes differ from the source's even at the identical commit. That
-// spurious content change advances the destination's content_gen past every
-// carried stamp, and a copied worktree would then read "partial" from the
-// moment it lands and stay there permanently — nothing re-derives it, because
-// avoiding that derive is the entire reason the copy exists.
+// This is a semantic assertion, not metadata tidying, and it is scoped by
+// `stages` because the two stamps are not always proved by the same evidence.
+// The copy carries the source's derive_state and enrichment_state rows
+// verbatim along with its counters, so for an IDENTICAL copy (stages ==
+// CopiedReadinessAllStages) the instant the copy commits the two already
+// agree and there is nothing to do. What breaks them apart next is
+// registration: registering the copied checkout restats its files and calls
+// ReplaceFileMtimes, and a worktree's on-disk mtimes differ from the source's
+// even at the identical commit. That spurious content change advances the
+// destination's content_gen past every carried stamp, and a copied worktree
+// would then read "partial" from the moment it lands and stay there
+// permanently — nothing re-derives it, because avoiding that derive is the
+// entire reason the copy exists.
 //
-// So it must run after registration, not inside the copy transaction. The cost
-// is a window: a crash between the two leaves the destination reading partial.
-// That is a false alarm, which is the safe direction, and re-tracking clears it.
+// A DIVERGED copy is different: its caller has just re-derived the changed
+// files via a reconcile's scoped tail, so derive_state truly does describe the
+// destination and CopiedReadinessDerive alone is warranted — but nothing has
+// re-enriched it. Restamping enrichment there would declare complete a pass
+// that has not run; CompleteScopedEnrichment (via
+// AdvanceContentGenForCompletedProviders) is what brings enrichment_state
+// forward once that scoped pass actually completes.
 //
-// What makes the assertion true is the exact-copy invariant: the destination
-// holds the same nodes and edges as the source, at the same commit, so the
-// derived and enriched edges carried across describe it exactly as well as they
-// describe the source. If that invariant ever has a blind spot, this re-stamp
-// hides it — which is why it is tied to a test that asserts the invariant
-// rather than the re-stamp.
+// Either way this must run after registration, not inside the copy
+// transaction. The cost is a window: a crash between the two leaves the
+// destination reading partial. That is a false alarm, which is the safe
+// direction, and re-tracking clears it.
 //
-// Rows still at content_gen 0 are left alone: those are providers declared
-// applicable that have never run, and laundering them into current would be the
-// one thing the applicability model exists to prevent.
-func (s *Store) RestampCopiedReadiness(dstPrefix string) error {
+// What makes the AllStages assertion true is the exact-copy invariant: the
+// destination holds the same nodes and edges as the source, at the same
+// commit, so the derived and enriched edges carried across describe it
+// exactly as well as they describe the source. If that invariant ever has a
+// blind spot, this re-stamp hides it — which is why it is tied to a test that
+// asserts the invariant rather than the re-stamp.
+//
+// Rows still at content_gen 0 are left alone regardless of `stages`: those are
+// providers declared applicable that have never run, and laundering them into
+// current would be the one thing the applicability model exists to prevent.
+func (s *Store) RestampCopiedReadiness(dstPrefix string, stages graph.CopiedReadinessStage) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	tx, err := s.beginWrite()
@@ -491,7 +504,7 @@ func (s *Store) RestampCopiedReadiness(dstPrefix string) error {
 		return err
 	}
 	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
-	if err := restampCopiedReadiness(tx, s.viewGen, dstPrefix); err != nil {
+	if err := restampCopiedReadiness(tx, s.viewGen, dstPrefix, stages); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -508,28 +521,33 @@ func (s *Store) RestampCopiedReadiness(dstPrefix string) error {
 // generation through the whole copy, which is a change of its own; it is inert
 // while a store has only the base generation 0, which is every store that has
 // not opted into a second view.
-func restampCopiedReadiness(tx *sql.Tx, viewGen int64, dstPrefix string) error {
-	// Each statement carries its OWN bindings: derive_state is not
+func restampCopiedReadiness(tx *sql.Tx, viewGen int64, dstPrefix string, stages graph.CopiedReadinessStage) error {
+	// stmt pairs a statement with its OWN bindings: derive_state is not
 	// generation-keyed and names ?1 alone, so handing it the generation too
 	// would be one argument more than it has placeholders.
-	for _, stmt := range []struct {
+	type stmt struct {
 		sql  string
 		args []any
-	}{
-		{`UPDATE derive_state
+	}
+	var stmts []stmt
+	if stages&graph.CopiedReadinessDerive != 0 {
+		stmts = append(stmts, stmt{`UPDATE derive_state
 		    SET derived_content_gen = COALESCE(
 		          (SELECT content_gen FROM repo_graph_gen WHERE repo_prefix = ?1), 0),
 		        derived_gen         = COALESCE(
 		          (SELECT gen         FROM repo_graph_gen WHERE repo_prefix = ?1), 0)
-		  WHERE repo_prefix = ?1 AND legacy = 0`, []any{dstPrefix}},
-		{`UPDATE enrichment_state
+		  WHERE repo_prefix = ?1 AND legacy = 0`, []any{dstPrefix}})
+	}
+	if stages&graph.CopiedReadinessEnrich != 0 {
+		stmts = append(stmts, stmt{`UPDATE enrichment_state
 		    SET content_gen = COALESCE(
 		          (SELECT content_gen FROM repo_graph_gen WHERE repo_prefix = ?1), 0),
 		        gen         = COALESCE(
 		          (SELECT gen         FROM repo_graph_gen WHERE repo_prefix = ?1), 0)
 		  WHERE repo_prefix = ?1 AND content_gen > 0 AND view_gen = ?2`,
-			[]any{dstPrefix, viewGen}},
-	} {
+			[]any{dstPrefix, viewGen}})
+	}
+	for _, stmt := range stmts {
 		if _, err := tx.Exec(stmt.sql, stmt.args...); err != nil {
 			return fmt.Errorf("store_sqlite: CopyRepoSubgraph re-stamp readiness: %w", err)
 		}

@@ -153,7 +153,7 @@ func TestGitWatcher_ReconcileSingleFlight(t *testing.T) {
 
 	gw, err := NewGitWatcher(repoDir, idx, zap.NewNop())
 	require.NoError(t, err)
-	gw.lastSHA, err = gw.currentSHA(testCtx())
+	gw.lastSHA, err = gw.ownHeadSHA(testCtx())
 	require.NoError(t, err)
 
 	drained := make(chan int, 2)

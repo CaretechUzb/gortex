@@ -14,8 +14,99 @@ func (idx *Indexer) markPendingEnrichFull() {
 	idx.deferredEnrichGeneration++
 	idx.deferredEnrichFull = true
 	idx.deferredEnrichFiles = nil
+	// A full arm reaches EnrichAll, which records the whole-repo completion
+	// marker itself on a clean non-partial pass. The copied-marker promotion is
+	// the scoped path's substitute for exactly that write, so leaving it armed
+	// here would be a second writer of the same row on a path that already has
+	// one.
+	idx.copiedEnrichMarkerSHA = ""
+	// Same reasoning for the repair flag: it selects a deadline for a SCOPED
+	// dispatch and an escalation that a whole-repo pass already is. Leaving it
+	// set would let the next scoped frontier — a watcher save — inherit both.
+	idx.deferredEnrichRepair = false
 	idx.pendingEnrich.Store(true)
 	idx.deferredEnrichMu.Unlock()
+}
+
+// armCopiedEnrichRepair marks the pending scoped frontier as a worktree copy's
+// repair, so its dispatch runs under the repo-scaled deadline and escalates
+// itself to a whole-repo pass if it still does not complete.
+//
+// Only the copy path calls it, and only for a frontier that is still scoped —
+// see armCopiedRepoEnrich, and the field comment on deferredEnrichRepair for
+// why a repair is not just a large save.
+func (idx *Indexer) armCopiedEnrichRepair() {
+	idx.deferredEnrichMu.Lock()
+	idx.deferredEnrichRepair = true
+	idx.deferredEnrichMu.Unlock()
+}
+
+// deferredEnrichIsRepair peeks at the repair flag without consuming it. The
+// dispatcher takes it through takeDeferredEnrichScope; this is for callers that
+// only need to know whether one is queued.
+func (idx *Indexer) deferredEnrichIsRepair() bool {
+	idx.deferredEnrichMu.Lock()
+	defer idx.deferredEnrichMu.Unlock()
+	return idx.deferredEnrichRepair
+}
+
+// armCopiedEnrichMarkerPromotion records that a scoped repair pass over a
+// worktree copy's divergence is entitled to promote the inherited whole-repo
+// completion marker to sha (this checkout's HEAD) when it completes cleanly.
+//
+// Only the copy path calls it, and only after checking the inherited marker —
+// see armCopiedRepoEnrich for the evidence, and the field comment on
+// copiedEnrichMarkerSHA for why the entitlement is deliberately not durable.
+func (idx *Indexer) armCopiedEnrichMarkerPromotion(sha string) {
+	if sha == "" {
+		return
+	}
+	idx.deferredEnrichMu.Lock()
+	idx.copiedEnrichMarkerSHA = sha
+	idx.deferredEnrichMu.Unlock()
+}
+
+// deferredEnrichIsFull reports whether the pending pass is currently scoped to
+// the whole repository — either because it was armed that way, or because a
+// scoped arm silently widened (see the legacy-marker branch in
+// markPendingEnrichFiles). Callers that are about to arm a copied-marker
+// promotion on the strength of "this frontier is scoped" must check this
+// AFTER calling markPendingEnrichFiles, or a race between the widen and a
+// stale `ev` from before it would re-entitle a promotion the widen just
+// disqualified.
+func (idx *Indexer) deferredEnrichIsFull() bool {
+	idx.deferredEnrichMu.Lock()
+	defer idx.deferredEnrichMu.Unlock()
+	return idx.deferredEnrichFull
+}
+
+// takeCopiedEnrichMarkerPromotion reads and clears the entitlement in one step.
+//
+// One-shot by construction: the entitlement describes ONE armed frontier, and a
+// later scoped pass over some other frontier — a watcher save, say — carries
+// none of the evidence that made the promotion sound. Reading without clearing
+// would let the second pass inherit the first one's proof.
+func (idx *Indexer) takeCopiedEnrichMarkerPromotion() string {
+	idx.deferredEnrichMu.Lock()
+	defer idx.deferredEnrichMu.Unlock()
+	sha := idx.copiedEnrichMarkerSHA
+	idx.copiedEnrichMarkerSHA = ""
+	return sha
+}
+
+// copiedMarkerPromotionAllowed is the promotion predicate, pulled out so it can
+// be read (and tested) as one statement of what completes an inherited
+// whole-repo assertion.
+//
+// want is the entitlement takeCopiedEnrichMarkerPromotion returned; sha and
+// dirty are the repo's git state as the pass observed it BEFORE dispatching;
+// withheld is the set of providers whose language was in the frontier and which
+// produced nothing. Every clause is a way the two proofs stop composing: no
+// entitlement, HEAD moved out from under the pass, the tree is no longer the
+// committed state sha names, or some provider's edges are gone and nothing put
+// them back.
+func copiedMarkerPromotionAllowed(want, sha string, dirty bool, withheld []string) bool {
+	return want != "" && want == sha && !dirty && len(withheld) == 0
 }
 
 // markPendingEnrichFiles merges a known repo-scoped frontier. The complete set
@@ -31,6 +122,20 @@ func (idx *Indexer) markPendingEnrichFiles(filePaths []string) {
 	if idx.pendingEnrich.Load() && !idx.deferredEnrichFull && len(idx.deferredEnrichFiles) == 0 {
 		// A caller using the legacy atomic-only marker queued work whose scope is
 		// unknown. Preserve it as a full pass instead of silently narrowing it.
+		//
+		// Clear the copied-marker entitlement for the same reason
+		// markPendingEnrichFull does: what runs after this is a whole-repo pass,
+		// which writes the marker itself. This arm is unreachable from the copy
+		// path today — that path installs a repository WITHOUT indexing its
+		// files, so nothing has raised pendingEnrich when it arms — but if it
+		// ever starts indexing first, the widening below would silently turn the
+		// promotion flag into dead state that no scoped pass ever consumes.
+		//
+		// The repair flag goes for the same reason: it selects a deadline for a
+		// scoped dispatch and an escalation to the very pass this widen just
+		// scheduled.
+		idx.copiedEnrichMarkerSHA = ""
+		idx.deferredEnrichRepair = false
 		idx.deferredEnrichFull = true
 	}
 	if !idx.deferredEnrichFull {
@@ -49,9 +154,34 @@ func (idx *Indexer) markPendingEnrichFiles(filePaths []string) {
 
 // deferredEnrichScope snapshots pending work. An empty frontier is always
 // treated as full for compatibility with older/direct pendingEnrich writers.
+//
+// A pure peek: it consumes nothing, so a reader that only wants to see the
+// queued frontier (the watcher's batch coalescer) cannot disarm the repair
+// disposition out from under the pass that is going to run it.
 func (idx *Indexer) deferredEnrichScope() (filePaths []string, full bool, generation uint64) {
 	idx.deferredEnrichMu.Lock()
 	defer idx.deferredEnrichMu.Unlock()
+	return idx.deferredEnrichScopeLocked()
+}
+
+// takeDeferredEnrichScope is deferredEnrichScope for the dispatcher: it also
+// reads and clears the copy-repair disposition, in the SAME critical section as
+// the snapshot. One lock matters — a dispatch that read the frontier and the
+// flag separately could run a save's frontier under a repair's deadline, or a
+// repair's frontier under a save's, depending on which arm landed between the
+// two reads.
+func (idx *Indexer) takeDeferredEnrichScope() (filePaths []string, full bool, generation uint64, repair bool) {
+	idx.deferredEnrichMu.Lock()
+	defer idx.deferredEnrichMu.Unlock()
+	filePaths, full, generation = idx.deferredEnrichScopeLocked()
+	repair = idx.deferredEnrichRepair
+	idx.deferredEnrichRepair = false
+	return filePaths, full, generation, repair
+}
+
+// deferredEnrichScopeLocked is the snapshot both entry points share.
+// deferredEnrichMu must be held.
+func (idx *Indexer) deferredEnrichScopeLocked() (filePaths []string, full bool, generation uint64) {
 	filePaths = make([]string, 0, len(idx.deferredEnrichFiles))
 	for filePath := range idx.deferredEnrichFiles {
 		filePaths = append(filePaths, filePath)

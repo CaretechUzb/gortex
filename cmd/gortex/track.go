@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -26,6 +27,11 @@ var (
 	trackWaitTimeout time.Duration
 	untrackConfirm   bool
 	untrackFormat    string
+	// untrackWait and untrackWaitTimeout mirror trackWait / trackWaitTimeout:
+	// block until a demotion's automatic-lane build settles instead of
+	// returning as soon as the daemon has admitted and started it.
+	untrackWait        bool
+	untrackWaitTimeout time.Duration
 )
 
 // untrackDaemonTool is the daemon-tool relay seam. Untrack goes through the
@@ -33,7 +39,21 @@ var (
 // the family: a checkout the family can still serve is demoted outright, and a
 // plan that removes rows is previewed and needs --confirm. Both decisions are
 // the tool's, so the CLI and an agent see the same one.
-var untrackDaemonTool = requireDaemonTool
+//
+// requireCheckoutTool — what checkoutsDaemonTool is bound to — rather than
+// requireDaemonTool, for the same reason the checkout verbs use it and the
+// --wait poller now does: untrack is a verb ABOUT a working copy's binding to
+// its family, so the binding must not decide whether it may run. A worktree
+// this command has already demoted has no view of its own until something
+// reads it, and routed on its own path a second `gortex untrack` is refused by
+// the coverage pre-flight with the reconcile remedy (worktreeCWDErr,
+// cli_daemon.go). The subject rides in the tool's `path` argument, so which
+// member of the family carries the connection cannot change the answer.
+//
+// Named directly rather than aliasing the checkoutsDaemonTool var: these are
+// two independent seams, and a test stubbing one must not silently move the
+// other.
+var untrackDaemonTool = requireCheckoutTool
 
 // Injectable seams keep the --wait orchestration testable without a live
 // daemon. The real notification receives the absolute deadline so dialing and
@@ -83,6 +103,16 @@ func init() {
 	untrackCmd.Flags().BoolVar(&untrackConfirm, "confirm", false,
 		"Run a plan that removes rows. Without it such a plan is only previewed.")
 	untrackCmd.Flags().StringVar(&untrackFormat, "format", "text", "output format: text|json")
+	untrackCmd.Flags().BoolVar(&untrackWait, "wait", false,
+		"Block until a demotion (untracking a worktree the family can still serve) finishes building its automatic-lane view")
+	// 30m, not track's 10m. What --wait waits for here is a whole repository's
+	// teardown — the corpus retired, every node/edge/file row evicted and the
+	// vector corpus republished around them — measured at 28 minutes for a
+	// ~9.8k-file worktree on a busy daemon. A default that expires before the
+	// median case turns --wait into a command that usually errors while the
+	// work it asked about succeeds.
+	untrackCmd.Flags().DurationVar(&untrackWaitTimeout, "wait-timeout", 30*time.Minute,
+		"With --wait, fail if the demotion has not settled within this duration (0 = wait forever)")
 	rootCmd.AddCommand(trackCmd)
 	rootCmd.AddCommand(untrackCmd)
 }
@@ -552,6 +582,15 @@ func untrackDaemonIndex(target string) (string, bool) {
 
 // untrackViaDaemon runs the untrack tool and renders what it decided: a
 // preview the caller has to confirm, or the plan it carried out.
+//
+// A demotion (untracking a worktree its family can still serve) is admitted
+// and started without waiting for it — retiring the corpus it gives up runs
+// far past the MCP tool deadline (see StartApplyUntrack). With --wait, this
+// then polls the read-only list_checkouts view until the checkout has reached
+// the end of that teardown — automatic mode and no transition still in flight
+// — rather than calling untrack_repository again: a repeat call re-derives
+// its plan from live catalog rows the running worker is still moving, where
+// list_checkouts only reads them.
 func untrackViaDaemon(cmd *cobra.Command, w io.Writer, index, target string) error {
 	toolArgs := map[string]any{"path": target}
 	if untrackConfirm {
@@ -561,9 +600,6 @@ func untrackViaDaemon(cmd *cobra.Command, w io.Writer, index, target string) err
 	if err != nil {
 		return err
 	}
-	if untrackFormat == "json" {
-		return emitDaemonJSON(cmd, raw)
-	}
 	var payload checkoutOutcome
 	if err := json.Unmarshal(raw, &payload); err != nil || payload.Status == "" {
 		// Anything that is not one of this tool's own answers — the
@@ -572,12 +608,358 @@ func untrackViaDaemon(cmd *cobra.Command, w io.Writer, index, target string) err
 		return emitDaemonJSON(cmd, raw)
 	}
 	if payload.Status == "preview" {
+		// --format json wins regardless of --wait: nothing has run yet, so
+		// there is nothing to wait for either way.
+		if untrackFormat == "json" {
+			return emitDaemonJSON(cmd, raw)
+		}
 		renderCheckoutOutcome(cmd.OutOrStdout(), target, payload,
 			"gortex untrack "+target+" --confirm")
 		return nil
 	}
-	emitUntrackSummary(w, target, untrackResult{viaDaemon: true, demoted: payload.Demoted})
+	if payload.Status != "demoting" || !untrackWait {
+		// Either already settled (nothing to wait for) or --wait was not
+		// asked for: render raw, unpatched — see the --wait branch below for
+		// why the response is never round-tripped through the typed struct
+		// when it doesn't have to be (fields checkoutOutcome does not model,
+		// such as dependents, must survive).
+		if untrackFormat == "json" {
+			return emitDaemonJSON(cmd, raw)
+		}
+		if payload.Status == "demoting" {
+			emitUntrackSummary(w, target, untrackResult{viaDaemon: true, pending: true})
+			return nil
+		}
+		emitUntrackSummary(w, target, untrackResult{viaDaemon: true, demoted: payload.Demoted})
+		return nil
+	}
+
+	// payload.Status == "demoting" && untrackWait: the daemon admitted the
+	// demotion but did not name a checkout to poll for — refuse rather than
+	// pretend a first empty-string poll match is a real answer.
+	if payload.CheckoutID == "" {
+		return fmt.Errorf("--wait: the daemon's answer did not include a checkout_id to poll for %s; "+
+			"rerun without --wait and check `gortex repos families`", target)
+	}
+	deadline := time.Time{}
+	if untrackWaitTimeout > 0 {
+		deadline = time.Now().Add(untrackWaitTimeout)
+	}
+	if err := waitForDemotionSettled(w, index, target, payload.CheckoutID, deadline, untrackWaitTimeout); err != nil {
+		return err
+	}
+	if untrackFormat == "json" {
+		// Patch a generic map, not the typed struct: checkoutOutcome does not
+		// model every field the tool can send (e.g. dependents), and
+		// round-tripping through it would silently drop them.
+		var generic map[string]any
+		if jerr := json.Unmarshal(raw, &generic); jerr == nil {
+			generic["status"] = "demoted"
+			generic["demoted"] = true
+			delete(generic, "pending")
+			if out, merr := json.Marshal(generic); merr == nil {
+				return emitDaemonJSON(cmd, out)
+			}
+		}
+		return emitDaemonJSON(cmd, raw)
+	}
+	emitUntrackSummary(w, target, untrackResult{viaDaemon: true, demoted: true})
 	return nil
+}
+
+// untrackPollInterval is how often --wait re-queries list_checkouts for a
+// demotion still in flight. A package var so tests can drop it to a
+// sub-millisecond tick instead of waiting whole seconds.
+var untrackPollInterval = time.Second
+
+type demotionPollResult struct {
+	// settled is the demotion's END state: automatic mode AND no transition
+	// left in flight. Both halves are required — see waitForDemotionSettled.
+	settled bool
+	failed  bool // the in-flight transition's state is "failed"
+	found   bool // the checkout is still listed by list_checkouts
+	// retiring is the half-way state: the mode flip is published but the
+	// transition is still standing, so the dedicated corpus, the repository's
+	// rows and the tracked-repo entry are all still on their way out.
+	retiring bool
+	// unbound reports that the lookup itself was refused because the checkout
+	// has no view of its own (ErrUnboundWorktreeView). That is not a poll
+	// failure: it is the state a demotion PUTS the checkout in and holds it in
+	// until something reads it, so it is deterministic for the whole teardown.
+	unbound bool
+	err     error
+}
+
+// checkoutsRelayFn is how the poller turns the path it was handed into the
+// one the checkout verbs would relay through. A package var so a test can
+// reproduce a relay that declines to move the path — which is what a slow
+// daemon produces, see demotionPollPath.
+var checkoutsRelayFn = checkoutsRelayPath
+
+// demotionPollPath picks the working directory the --wait poller opens its
+// list_checkouts connection on. Resolved once, before the loop.
+//
+// NOT the checkout being demoted. That path is the one directory the routing
+// pre-flight is guaranteed to refuse for the whole of the window being waited
+// on: a demoted checkout is served through its family with a pending route and
+// no layer until a read arrives, so probeCWDReach classifies it
+// reachUnboundWorktree and worktreeCWDErr is the answer to every lookup aimed
+// at it.
+//
+// Relaying through the family — what the checkout verbs do — is not enough on
+// its own. checkoutsRelayPath decides with a control probe that FAILS OPEN on
+// a slow daemon (probeCWDReach returns reachDaemon and no family when Status
+// misses its 3s budget), and the daemon is at its slowest precisely while it
+// is retiring a corpus. The relay therefore stops relaying exactly when it is
+// needed, leaving the path unmoved for the pre-flight's own second probe to
+// refuse. Measured live: the same command printed the "daemon did not answer
+// within 3s" fail-open notice AND the unbound-view refusal.
+//
+// list_checkouts reads the catalog, not the connection's view — every family
+// is in the answer whichever tracked repository carries the call (verified
+// live from an unrelated repo). So the poller asks for the one shape the
+// pre-flight always accepts, a tracked repository root (trackedReposReach),
+// and prefers the family's own working copy when the relay can still name it
+// so the call stays where a reader would expect to find it.
+func demotionPollPath(index string) string {
+	if relayed := checkoutsRelayFn(index); relayed != "" && relayed != index {
+		return relayed
+	}
+	st, err := trackStatusFn()
+	if err != nil {
+		return index
+	}
+	fallback := ""
+	for _, repo := range st.TrackedRepos {
+		if repo.Path == "" {
+			continue
+		}
+		// A tracked root the checkout lives under is the closest stand-in for
+		// the subject. Any other tracked root answers identically, so one is
+		// kept rather than refusing to poll at all.
+		if pathkey.CanonicalHasPathPrefix(index, repo.Path) {
+			return repo.Path
+		}
+		if fallback == "" {
+			fallback = repo.Path
+		}
+	}
+	if fallback != "" {
+		return fallback
+	}
+	return index
+}
+
+// listCheckoutsFn is the injectable seam checkoutEffectiveMode calls through
+// (mirrors trackStatusFn): tests stub it to avoid a live daemon.
+//
+// checkoutsDaemonTool, NOT requireDaemonTool. The path the poller is handed is
+// the worktree being demoted, and a demotion's whole middle is the state in
+// which that path has no view of its own: the route is pending, it names no
+// generation, and the first layer is deferred until something reads it. Routed
+// on its own path every poll is refused by the coverage pre-flight — "the
+// gortex daemon tracks X but has not bound the worktree Y to a view yet"
+// (worktreeCWDErr, cli_daemon.go) — so the poller counted its own subject's
+// expected state as a daemon failure and gave up seconds into the wait.
+//
+// The checkout verbs relay through the family's tracked working copy for
+// exactly this reason (checkoutsRelayPath), and list_checkouts answers about
+// the whole catalog rather than about the connection's view, so which member
+// of the family carries the connection changes nothing about the answer.
+var listCheckoutsFn = func(index string) (json.RawMessage, error) {
+	return checkoutsDaemonTool(index, "list_checkouts", map[string]any{})
+}
+
+// checkoutEffectiveMode looks up one checkout's mode from the read-only
+// list_checkouts view. found is false when no checkout with this ID is
+// listed (forgotten, or the daemon restarted mid-transition and has not
+// resumed it yet). transition is the in-flight mode change's state — one of
+// "pending", "running", "failed" (store_sqlite.IntentTransitionState) — or
+// "" when no transition is in flight. A failed transition is retained by the
+// catalog deliberately rather than cleared, so it is a reliable signal a
+// demotion did not land; an empty one means the row is gone, which for a
+// demotion is CompleteIntentTransition having deleted it as its last act.
+func checkoutEffectiveMode(index, checkoutID string) (mode, transition string, found bool, err error) {
+	raw, err := listCheckoutsFn(index)
+	if err != nil {
+		return "", "", false, err
+	}
+	var payload familiesPayload
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return "", "", false, err
+	}
+	for _, family := range payload.Families {
+		for _, checkout := range family.Checkouts {
+			if checkout.CheckoutID == checkoutID {
+				return checkout.EffectiveMode, checkout.Transition, true, nil
+			}
+		}
+	}
+	return "", "", false, nil
+}
+
+// waitForDemotionSettled polls list_checkouts until the checkout named by
+// checkoutID has reached the demotion's END state — the family's automatic
+// lane as its effective mode AND no transition left in flight — or deadline
+// elapses. It never re-invokes untrack_repository — see untrackViaDaemon.
+//
+// Both halves are the point. The mode flip is the FIRST durable write of a
+// demotion, not the last: CommitAuthorizedDemotion publishes it, and only
+// then does the worker retire the dedicated corpus, evict the repository's
+// rows, drop the tracked-repo entry from the global config and complete the
+// transition — which is what deletes the row this reads. Settling on the mode
+// alone announced "demoted" three seconds into a teardown that still had all
+// of that ahead of it, and the config, `gortex repos` and the catalog then
+// disagreed with the CLI for as long as the retirement took.
+//
+// Two anomalies end the wait before the timeout: the transition's own state
+// (not just the mode) reports "failed" — a retained, deliberate signal (see
+// checkoutEffectiveMode) — or the poll itself errors or stops finding the
+// checkout for longer than untrackPollAnomalyWindow without a healthy poll in
+// between. A healthy poll clears the streak.
+func waitForDemotionSettled(w io.Writer, index, target, checkoutID string, deadline time.Time, timeout time.Duration) error {
+	tr := progress.NewTracker(w)
+	if noProgress {
+		tr = progress.NewTracker(w, progress.WithoutAnimation())
+	}
+	tr.Start("waiting for the demotion to settle (--wait)")
+	step := tr.StartStep("demoting " + filepath.Base(target))
+
+	// Once: the answer cannot change while the demotion runs, and re-deriving
+	// it would pay two control round trips on every tick.
+	pollPath := demotionPollPath(index)
+
+	var lastErr error
+	// The first poll of an unbroken run of failures. Zero means the last poll
+	// was healthy.
+	var anomalySince time.Time
+	retiring := false
+	unbound := false
+	fail := func(err error) error {
+		tr.Fail(err)
+		return err
+	}
+	failTimeout := func() error {
+		return fail(untrackWaitTimeoutError(target, timeout, lastErr))
+	}
+	for {
+		result, timedOut := beforeTrackDeadline(deadline, func() demotionPollResult {
+			mode, transition, found, err := checkoutEffectiveMode(pollPath, checkoutID)
+			if err != nil {
+				if errors.Is(err, ErrUnboundWorktreeView) {
+					// The demotion's own state, not a broken poller — and
+					// deterministic for as long as it lasts, so counting it
+					// against an anomaly budget ends the wait on the very
+					// signal that says the work is under way. --wait-timeout
+					// still bounds it.
+					return demotionPollResult{unbound: true}
+				}
+				return demotionPollResult{err: err}
+			}
+			if !found {
+				return demotionPollResult{}
+			}
+			if transition == "failed" {
+				return demotionPollResult{found: true, failed: true}
+			}
+			if mode == "automatic" && transition == "" {
+				return demotionPollResult{found: true, settled: true}
+			}
+			return demotionPollResult{found: true, retiring: mode == "automatic"}
+		})
+		if timedOut {
+			return failTimeout()
+		}
+		switch {
+		case result.settled:
+			step.DoneAs("demotion landed")
+			tr.Done("demoted", "served from the family primary")
+			return nil
+		case result.failed:
+			return fail(fmt.Errorf(
+				"--wait: the demotion of %s failed; rerun `gortex untrack %s` to retry, "+
+					"or inspect `gortex repos families` for why", target, target))
+		case result.unbound:
+			// A healthy observation of an expected state: clear the streak.
+			if !unbound {
+				unbound = true
+				step.Note("the demoted worktree has no view of its own yet")
+			}
+			anomalySince = time.Time{}
+		case result.err != nil:
+			lastErr = result.err
+			if anomalySince.IsZero() {
+				anomalySince = time.Now()
+			}
+		case !result.found:
+			lastErr = fmt.Errorf("checkout %s is no longer listed by list_checkouts", checkoutID)
+			if anomalySince.IsZero() {
+				anomalySince = time.Now()
+			}
+		default:
+			// Still running: either the mode flip has not been published yet,
+			// or it has and the corpus retirement behind it is still going.
+			// Both are healthy polls, so any anomaly streak resets.
+			if result.retiring && !retiring {
+				retiring = true
+				step.Note("mode flipped; retiring the dedicated corpus")
+			}
+			anomalySince = time.Time{}
+		}
+		if !anomalySince.IsZero() && time.Since(anomalySince) >= untrackPollAnomalyWindow {
+			return fail(fmt.Errorf("--wait: giving up on %s after %s of consecutive poll failures: %w",
+				target, untrackPollAnomalyWindow, lastErr))
+		}
+		if trackDeadlineExpired(deadline) {
+			return failTimeout()
+		}
+		delay := untrackPollInterval
+		if !deadline.IsZero() {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				return failTimeout()
+			}
+			if delay > remaining {
+				delay = remaining
+			}
+		}
+		if delay > 0 {
+			timer := time.NewTimer(delay)
+			<-timer.C
+		}
+	}
+}
+
+// untrackPollAnomalyWindow bounds how LONG waitForDemotionSettled tolerates
+// an unbroken run of poll errors or checkout-not-found answers before giving
+// up, rather than burning the whole --wait-timeout on a checkout that may
+// never resolve.
+//
+// A window, not a count. A count is measured in polls and therefore in the
+// poll interval: three of them gave the whole wait four seconds to survive a
+// transient, and the transient this has to survive is the demotion's own
+// middle — the window in which the checkout has no view and a lookup routed
+// at it is legitimately refused. The rule ended the wait almost exactly when
+// it was needed. A duration says what is actually meant: a failure that
+// clears inside a minute is a blip, one that does not is a broken poller. A
+// package var so tests can shrink it, like untrackPollInterval.
+var untrackPollAnomalyWindow = time.Minute
+
+func untrackWaitTimeoutError(target string, timeout time.Duration, lastErr error) error {
+	if lastErr != nil {
+		return fmt.Errorf("--wait: timed out after %s waiting for %s's demotion to settle "+
+			"(last poll error: %v); the daemon's transition worker keeps running in the "+
+			"background — `gortex repos families` shows whether it has finished, and "+
+			"--wait-timeout raises the bound",
+			timeout, target, lastErr)
+	}
+	// Retiring a worktree-sized corpus is minutes of work, so the default bound
+	// is reachable on a big checkout or a busy daemon. Nothing is lost when it
+	// is hit — the wait gave up, not the demotion — so the message names both
+	// the way to look and the way to wait longer.
+	return fmt.Errorf("--wait: timed out after %s waiting for %s's demotion to settle; "+
+		"the daemon's transition worker keeps running in the background — `gortex repos families` "+
+		"shows whether it has finished, and --wait-timeout raises the bound", timeout, target)
 }
 
 // untrackResult mirrors trackResult — kept distinct so the two summaries can
@@ -588,7 +970,12 @@ type untrackResult struct {
 	configOnly bool
 	// demoted reports that the checkout kept its identity and moved to the
 	// family's automatic lane instead of being removed.
-	demoted   bool
+	demoted bool
+	// pending reports that a demotion is still being carried out in the
+	// background — the mode flip is admitted, the corpus retirement and the
+	// config removal behind it are not done (no --wait was given, so this
+	// call did not stay to watch it land).
+	pending   bool
 	repoCount int // tracked repo count *after* removal (configOnly path)
 }
 
@@ -617,6 +1004,8 @@ func emitUntrackBanner(w io.Writer, target string, daemonUp bool) {
 func emitUntrackSummary(w io.Writer, target string, r untrackResult) {
 	if !progress.IsTTY(w) {
 		switch {
+		case r.pending:
+			fmt.Fprintf(w, "[gortex] demoting %s to its family's automatic lane (via daemon, still retiring its dedicated corpus — rerun with --wait to block until it settles)\n", target)
 		case r.demoted:
 			fmt.Fprintf(w, "[gortex] demoted %s to its family's automatic lane (via daemon)\n", target)
 		case r.viaDaemon:
@@ -629,6 +1018,9 @@ func emitUntrackSummary(w io.Writer, target string, r untrackResult) {
 
 	var stats []string
 	switch {
+	case r.pending:
+		stats = append(stats, progress.Stat("via daemon", "", progress.StatGood))
+		stats = append(stats, progress.Stat("corpus retirement", "in progress", progress.StatNeutral))
 	case r.demoted:
 		stats = append(stats, progress.Stat("via daemon", "", progress.StatGood))
 		stats = append(stats, progress.Stat("served from", "the family primary", progress.StatGood))

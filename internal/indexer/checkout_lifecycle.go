@@ -212,6 +212,13 @@ type CheckoutLifecycle struct {
 	// worktree-heavy trees that never want an unselected view built. Off by
 	// default: a runtime `git worktree add` builds eagerly on discovery.
 	cfgLazyWorktrees bool
+	// cfgFirstBuildDelay decides when a new coordinator may build the first
+	// layer for a checkout nothing has read yet, in
+	// CheckoutCoordinatorConfig.FirstBuildDelay's vocabulary: 0 (the default)
+	// waits for a reader, a positive value also builds unprompted after that
+	// long, a negative one does not wait at all. Set from
+	// GORTEX_CHECKOUT_FIRST_BUILD_DELAY.
+	cfgFirstBuildDelay time.Duration
 
 	// refViewMu guards the per-repository ref-view manager cache alone. A
 	// manager holds no per-request state, so the lock covers only the map.
@@ -225,6 +232,13 @@ type CheckoutLifecycle struct {
 	// the mode flip, which is the one write no fixture can make the catalog
 	// refuse. A test seam; nil in production.
 	routeBarrier func(context.Context, string) error
+	// demoteBarrier runs inside a demotion, in the window between the
+	// publication of the mode flip and the coordinator the automatic lane is
+	// served through. That window is the one a fixture cannot otherwise reach
+	// and the one every post-commit failure lives in: everything before it can
+	// still refuse, everything after it is committed. A test seam; nil in
+	// production.
+	demoteBarrier func()
 
 	// mu guards only the late-bound collaborators. None of them is held
 	// across a saga: the hooks re-enter the lifecycle, and holding a lock
@@ -276,18 +290,18 @@ func NewCheckoutLifecycle(cfg CheckoutLifecycleConfig) (*CheckoutLifecycle, erro
 		now:                    now,
 		buildingRecoveryCutoff: now().Unix(),
 		leases:                 cfg.ViewLeases,
-		coordinators:          map[string]*CheckoutCoordinator{},
-		coordinatorHeads:      map[string]checkoutHeadIdentity{},
-		coordinatorActivating: map[string]struct{}{},
-		initialInventoryTaken: map[string]bool{},
-		started:               map[string][]*CheckoutCoordinator{},
-		owed:                  map[int64]struct{}{},
-		familyRetries:     map[string]familyRetry{},
-		refViewRetention:  cfg.RefViews.withDefaults(),
-		indexBarrier:      cfg.indexBarrier,
-		transitionCtx:     transitionCtx,
-		cancelTransitions: cancelTransitions,
-		transitionRuns:    map[string]*modeTransitionRun{},
+		coordinators:           map[string]*CheckoutCoordinator{},
+		coordinatorHeads:       map[string]checkoutHeadIdentity{},
+		coordinatorActivating:  map[string]struct{}{},
+		initialInventoryTaken:  map[string]bool{},
+		started:                map[string][]*CheckoutCoordinator{},
+		owed:                   map[int64]struct{}{},
+		familyRetries:          map[string]familyRetry{},
+		refViewRetention:       cfg.RefViews.withDefaults(),
+		indexBarrier:           cfg.indexBarrier,
+		transitionCtx:          transitionCtx,
+		cancelTransitions:      cancelTransitions,
+		transitionRuns:         map[string]*modeTransitionRun{},
 	}
 	// The env override wins over the config-file setting either way, so a
 	// worktree-heavy tree can opt every discovered worktree into dormancy — or
@@ -295,6 +309,9 @@ func NewCheckoutLifecycle(cfg CheckoutLifecycleConfig) (*CheckoutLifecycle, erro
 	l.cfgLazyWorktrees = cfg.LazyWorktrees
 	if value, ok := worktreeLazyActivationEnv(); ok {
 		l.cfgLazyWorktrees = value
+	}
+	if value, ok := l.checkoutFirstBuildDelayEnv(); ok {
+		l.cfgFirstBuildDelay = value
 	}
 	if l.leases == nil {
 		l.leases = graphview.NewLeaseManager()
@@ -1651,6 +1668,34 @@ func worktreeLazyActivationEnv() (value, ok bool) {
 	}
 }
 
+// checkoutFirstBuildDelayEnv reads GORTEX_CHECKOUT_FIRST_BUILD_DELAY as a Go
+// duration, in CheckoutCoordinatorConfig.FirstBuildDelay's own vocabulary: a
+// positive value builds an unread checkout's first layer unprompted after that
+// long, "0" restates the default of waiting for a reader, and a negative value
+// opts out of the wait entirely.
+//
+// It is the other half of GORTEX_WORKTREE_LAZY_ACTIVATION, and the two answer
+// different questions on purpose. Lazy activation decides whether a
+// runtime-discovered worktree gets a COORDINATOR at all — a dormant checkout
+// has no build loop, no watcher signal and no poll. This decides what the
+// coordinator a checkout does have may build before anything reads it. A
+// worktree-heavy tree that wants neither cost sets both; a tree that wants its
+// worktrees watched but not indexed ahead of demand needs only this one, which
+// is why the default here is a wait rather than a timer.
+func (l *CheckoutLifecycle) checkoutFirstBuildDelayEnv() (time.Duration, bool) {
+	raw := strings.TrimSpace(os.Getenv("GORTEX_CHECKOUT_FIRST_BUILD_DELAY"))
+	if raw == "" {
+		return 0, false
+	}
+	value, err := time.ParseDuration(raw)
+	if err != nil {
+		l.logger.Warn("checkout lifecycle: ignoring an unparsable GORTEX_CHECKOUT_FIRST_BUILD_DELAY",
+			zap.String("value", raw), zap.Error(err))
+		return 0, false
+	}
+	return value, true
+}
+
 // ActivateCheckout brings a dormant automatic checkout's coordinator up on
 // demand — the selection path's answer to a worktree the startup inventory left
 // dormant. It is fire-and-forget: the build runs under the lifecycle's own
@@ -1676,6 +1721,11 @@ func (l *CheckoutLifecycle) ActivateCheckout(checkoutID, reason string) bool {
 	// closing or the id is empty (nudgeCheckout's fallback relies on false).
 	started, already := l.beginCheckoutActivation(checkoutID)
 	if already {
+		// A live coordinator may still be sitting out its first-build window,
+		// which exists precisely because nothing had asked for the view. This
+		// call is that request. Demand raises its wake exactly once, so the
+		// livelock above is not reintroduced by lifting the deferral.
+		l.demandCheckout(checkoutID, reason)
 		return true
 	}
 	if !started {
@@ -1752,6 +1802,24 @@ func (l *CheckoutLifecycle) activateCheckout(ctx context.Context, checkoutID str
 	// coordinator's quiet window and delay that build — the same starvation
 	// ActivateCheckout avoids on a live coordinator.
 	l.ensureCoordinator(ctx, primary.GraphID, checkout)
+	// A cold coordinator starts inside its first-build window like any other.
+	// This one was brought up because something selected the checkout, so the
+	// build it is about to arm is not speculative and must not wait it out.
+	l.demandCheckout(checkoutID, "checkout selected")
+}
+
+// demandCheckout tells one checkout's coordinator that its view is actually
+// being read, which lifts the deferral on a first build. A checkout with no
+// coordinator has nothing to tell; the activation that brings one up demands
+// it itself.
+func (l *CheckoutLifecycle) demandCheckout(checkoutID, reason string) {
+	if l == nil {
+		return
+	}
+	l.coordMu.Lock()
+	coordinator := l.coordinators[checkoutID]
+	l.coordMu.Unlock()
+	coordinator.Demand(reason)
 }
 
 // ensureCoordinator brings up the coordinator for one automatic checkout, or
@@ -1763,6 +1831,22 @@ func (l *CheckoutLifecycle) activateCheckout(ctx context.Context, checkoutID str
 // anything else would land beside that corpus instead of over it.
 func (l *CheckoutLifecycle) ensureCoordinator(
 	ctx context.Context, primaryGraphID string, checkout store_sqlite.Checkout,
+) {
+	l.ensureCoordinatorDespite(ctx, primaryGraphID, checkout, "")
+}
+
+// ensureCoordinatorDespite is ensureCoordinator with one binding declared
+// irrelevant.
+//
+// retiringGraphID names a dedicated graph that is on its way out. The
+// demotion's partial-commit path can leave that row standing after the mode
+// has already flipped, and a coordinator refused because of it would never be
+// installed at all: the checkout is automatic, its corpus is gone, and the
+// binding that vetoes the coordinator is the very one the failed cleanup was
+// supposed to remove. Empty means no binding is excused, which is what every
+// spontaneous caller passes.
+func (l *CheckoutLifecycle) ensureCoordinatorDespite(
+	ctx context.Context, primaryGraphID string, checkout store_sqlite.Checkout, retiringGraphID string,
 ) {
 	nextHead := checkoutHeadIdentity{ref: checkout.HeadRef, commit: checkout.HeadCommit}
 	l.coordMu.Lock()
@@ -1787,6 +1871,20 @@ func (l *CheckoutLifecycle) ensureCoordinator(
 	if current != nil {
 		l.dropCoordinator(checkout.CheckoutID)
 	}
+	// A checkout that owns a dedicated graph is served from its own corpus, and
+	// an automatic coordinator over it would spend a whole commit-layer build
+	// composing the primary's content under a view nothing reads it through.
+	// Both spontaneous callers — a family reconciliation and an on-demand
+	// activation — decide from the checkout's mode column, and a row whose mode
+	// says automatic while the binding still stands is exactly the window that
+	// build gets spent in. The binding is the authority here, because it is what
+	// the materializer resolves the view from. Asked only on the cold path: a
+	// coordinator that is already running was admitted against the same rule,
+	// and a checkout that gains a corpus afterwards has its coordinator dropped
+	// by the reconciliation that sees the mode change.
+	if l.ownsDedicatedGraph(ctx, checkout.CheckoutID, retiringGraphID) {
+		return
+	}
 	coordinator, err := l.buildCoordinator(ctx, primaryGraphID, checkout)
 	if err != nil {
 		l.logger.Warn("checkout lifecycle: could not start a checkout coordinator",
@@ -1801,6 +1899,29 @@ func (l *CheckoutLifecycle) ensureCoordinator(
 		return
 	}
 	coordinator.Signal("checkout registered")
+}
+
+// ownsDedicatedGraph reports that a checkout is served from a corpus of its
+// own. A read that fails is answered false: refusing a coordinator on a
+// catalog hiccup would leave an automatic checkout with no view at all, which
+// is the worse of the two mistakes. So is a binding the caller has named as
+// retiring — see ensureCoordinatorDespite.
+func (l *CheckoutLifecycle) ownsDedicatedGraph(ctx context.Context, checkoutID, retiringGraphID string) bool {
+	if l == nil || l.catalog == nil || checkoutID == "" {
+		return false
+	}
+	owned, found, err := l.catalog.GetDedicatedGraphByOwner(ctx, checkoutID)
+	if err != nil || !found {
+		return false
+	}
+	if retiringGraphID != "" && owned.GraphID == retiringGraphID {
+		l.logger.Warn("checkout lifecycle: a demoted checkout still carries its retiring graph binding",
+			zap.String("checkout", checkoutID), zap.String("graph", owned.GraphID))
+		return false
+	}
+	l.logger.Debug("checkout lifecycle: no automatic coordinator for a checkout with its own corpus",
+		zap.String("checkout", checkoutID), zap.String("graph", owned.GraphID))
+	return true
 }
 
 // buildCoordinator constructs one checkout's coordinator against a graph,
@@ -1866,7 +1987,8 @@ func (l *CheckoutLifecycle) buildCoordinator(
 		// The watcher's own debounce is the quiet window: both coalesce the
 		// same event storms, and a checkout whose watch configuration says how
 		// long to wait means it for its views too.
-		Debounce: time.Duration(watch.DebounceMs) * time.Millisecond,
+		Debounce:        time.Duration(watch.DebounceMs) * time.Millisecond,
+		FirstBuildDelay: l.cfgFirstBuildDelay,
 	})
 	if err != nil {
 		return nil, err
@@ -2385,6 +2507,10 @@ func (l *CheckoutLifecycle) orphanedGenerations(
 	// Cursor through every page so newer routed or served layers cannot hide an
 	// older orphan behind the catalog listing bound.
 	routes := map[string]store_sqlite.CheckoutRoute{}
+	// Carried across pages for the same reason routes is: the cohort arrives
+	// newest first in pages, and a per-page window would keep the newest few of
+	// every page rather than the newest few of the layer.
+	kept := map[string]int{}
 	var layerBeforeGenerationID int64
 	for {
 		layers, scanErr := l.catalog.ListViewGenerations(ctx, store_sqlite.ViewGenerationFilter{
@@ -2398,7 +2524,7 @@ func (l *CheckoutLifecycle) orphanedGenerations(
 			break
 		}
 		candidates, routeErr := readyLayerRetirementCandidates(
-			ctx, layers, served, routes, l.catalog.GetCheckoutRoutes,
+			ctx, layers, served, routes, kept, l.catalog.GetCheckoutRoutes,
 		)
 		if routeErr != nil {
 			// A failed catalog read is not evidence that every route is absent.
@@ -2417,11 +2543,29 @@ func (l *CheckoutLifecycle) orphanedGenerations(
 	return out
 }
 
+// readyLayerRetirementCandidates narrows one page of ready checkout layers to
+// the ones nothing is left to read.
+//
+// kept is the per-layer reuse window, carried across pages by the caller. It
+// is what keeps the branch-switch cache alive across a restart: a coordinator
+// re-routes a commit layer it built earlier instead of re-indexing that tree,
+// and after a restart the catalog rows ARE that memory — the in-process cache
+// is gone and the checkout may have no coordinator at all yet, so `served`
+// cannot speak for it. Without the window this scan collected exactly the
+// population the identity lookup exists to find, and every restart paid for a
+// rebuild of a payload it was still storing.
+//
+// Only commit layers get a slot. A working-tree layer is never reached by
+// identity — the coordinator always rebuilds one — so retaining any would be
+// storage spent on something nothing can reuse. A routed layer occupies a slot
+// exactly as it does in the in-process cache, so the window means the same
+// number of trees in both places.
 func readyLayerRetirementCandidates(
 	ctx context.Context,
 	layers []store_sqlite.ViewGeneration,
 	served map[string]struct{},
 	routes map[string]store_sqlite.CheckoutRoute,
+	kept map[string]int,
 	lookup func(context.Context, []string) (map[string]store_sqlite.CheckoutRoute, error),
 ) ([]store_sqlite.ViewGeneration, error) {
 	eligible := make([]store_sqlite.ViewGeneration, 0, len(layers))
@@ -2468,6 +2612,12 @@ func readyLayerRetirementCandidates(
 
 	candidates := eligible[:0]
 	for _, row := range eligible {
+		if kept != nil && row.LayerID != "" &&
+			row.GenerationKind == CommitLayerGenerationKind &&
+			kept[row.LayerID] < defaultRetainedCommitLayers {
+			kept[row.LayerID]++
+			continue
+		}
 		route := routes[row.CheckoutID]
 		if route.CommitGenerationID == row.GenerationID || route.DirtyGenerationID == row.GenerationID {
 			continue
@@ -2514,11 +2664,6 @@ func (l *CheckoutLifecycle) Seed(ctx context.Context) error {
 	if err := l.rec.Resume(ctx); err != nil {
 		errs = append(errs, err)
 	}
-	// A crash can leave a populated generation in building state before any
-	// cleanup journal exists. Drain prior-process residue during boot instead
-	// of leaving it for the hourly janitor.
-	l.sweepRetirements(ctx)
-
 	seeded := map[string]string{}
 	if l.cfgMgr != nil {
 		for _, entry := range l.cfgMgr.Global().Repos {
@@ -2555,6 +2700,16 @@ func (l *CheckoutLifecycle) Seed(ctx context.Context) error {
 	for familyID, probeDir := range seeded {
 		l.reconcileFamilyNow(ctx, familyID, probeDir)
 	}
+
+	// A crash can leave a populated generation in building state before any
+	// cleanup journal exists. Drain prior-process residue during boot instead
+	// of leaving it for the hourly janitor — but AFTER the reconciliation
+	// above, not before it. The sweep asks which checkouts this process is
+	// serving, and before the reconciliation the answer is "none": every
+	// resumed worktree's layers would look like a crash orphan and be
+	// collected, which is the one thing a boot must not do to the payload it
+	// is about to route.
+	l.sweepRetirements(ctx)
 	return errors.Join(errs...)
 }
 
@@ -2614,7 +2769,16 @@ func (h cleanupHooks) ReleaseGraph(ctx context.Context, graphID string) error {
 			rootPath = checkout.RootPath
 		}
 	}
+	// The eviction below is the longest step a demotion has — it drains the
+	// repository's mutation lane, purges its payload, republishes the aggregate
+	// vector corpus, removes its config entry and reconciles the contract edges
+	// it leaves dangling. The stamps around it are the only thing that
+	// distinguishes a worker still grinding through all that from one that died
+	// holding the transition open. Stamped after the call as well as before it
+	// even when it failed: reaching the far side is itself the news.
+	h.l.noteTransitionProgress(ctx, row.OwnerCheckoutID, "release_graph")
 	_, _, err = h.l.evictRepoChecked(ctx, row.RepoPrefix, rootPath)
+	h.l.noteTransitionProgress(ctx, row.OwnerCheckoutID, "repository_evicted")
 	return err
 }
 

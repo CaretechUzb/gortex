@@ -333,9 +333,13 @@ type checkoutOutcome struct {
 	Preserved       []dependentPayload `json:"preserved"`
 	Blockers        []string           `json:"blockers"`
 	Demoted         bool               `json:"demoted"`
-	NodesRemoved    int                `json:"nodes_removed"`
-	EdgesRemoved    int                `json:"edges_removed"`
-	RevokedIntents  []string           `json:"revoked_intents"`
+	// Pending reports that a demotion worker is still building the
+	// automatic-lane view (see StartApplyUntrack); TransitionID names it.
+	Pending        bool     `json:"pending,omitempty"`
+	TransitionID   string   `json:"transition_id,omitempty"`
+	NodesRemoved   int      `json:"nodes_removed"`
+	EdgesRemoved   int      `json:"edges_removed"`
+	RevokedIntents []string `json:"revoked_intents"`
 }
 
 type setPrimaryPayload struct {

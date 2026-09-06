@@ -305,11 +305,17 @@ func (gw *GitWatcher) Start() error {
 		return fmt.Errorf("start git state watcher: %w", err)
 	}
 
-	initialSHA, err := gw.currentSHA(context.Background())
+	// Guarded, not bare: commonDir was published a few lines up, so the same
+	// identity check the reconcile path uses applies to the BASELINE too. A
+	// `.git` link unlinked between resolveGitDir and here would otherwise seed
+	// lastSHA with the enclosing repository's commit, and the next (guarded)
+	// reconcile would faithfully diff foreign..own.
+	initialSHA, err := gw.ownHeadSHA(context.Background())
 	if err != nil {
 		// An unborn symbolic HEAD makes git print the token "HEAD" while
-		// returning an error. Do not publish that unresolved token as a commit
-		// baseline: the already-warm first observation is intentionally empty.
+		// returning an error, and a refused identity yields no commit at all.
+		// Do not publish either as a baseline: the already-warm first
+		// observation is intentionally empty.
 		initialSHA = ""
 	}
 	// Seed from the sha the graph was INDEXED at, not from HEAD, whenever the
@@ -1451,8 +1457,31 @@ func (gw *GitWatcher) reconcile(trigger string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	newSHA, err := gw.currentSHA(ctx)
-	if err != nil || newSHA == "" {
+	// Never diff against a commit this checkout does not own. ownHeadSHA
+	// refuses when the checkout root or its `.git` link is gone, and when the
+	// repository git resolves from the root is no longer the one this watcher
+	// was started against.
+	newSHA, err := gw.ownHeadSHA(ctx)
+	if err != nil {
+		switch refusal := gitIdentityRefusal(err); {
+		case errors.Is(err, errHeadIdentityUnparseable):
+			// Not a statement about this checkout: git answered in a shape this
+			// code does not understand, which is a tooling problem and reads as
+			// one.
+			gw.logger.Warn("git-watcher: refusing ref reconcile — git returned an unparseable HEAD identity",
+				zap.String("trigger", trigger),
+				zap.String("root", gw.repoPath),
+				zap.Error(err))
+		case refusal != "":
+			gw.logger.Warn("git-watcher: refusing ref reconcile — checkout no longer resolves to its own repository",
+				zap.String("trigger", trigger),
+				zap.String("root", gw.repoPath),
+				zap.String("refusal", refusal),
+				zap.Error(err))
+		}
+		return
+	}
+	if newSHA == "" {
 		return
 	}
 
@@ -1574,12 +1603,21 @@ func (gw *GitWatcher) applyChanges(changes []gitChange) int {
 	return result.StaleFileCount + result.DeletedFileCount
 }
 
-// currentSHA returns the resolved commit SHA of HEAD. Shells out to
-// git rather than parsing .git/HEAD directly so symbolic refs,
-// packed-refs, and worktree indirection all work without us
-// reimplementing git's ref resolution.
-func (gw *GitWatcher) currentSHA(ctx context.Context) (string, error) {
-	return gitcmd.Output(ctx, gw.repoPath, "rev-parse", "HEAD")
+// ownHeadSHA is the watcher's entry into the shared checkout-identity guard
+// (see checkout_head_identity.go for the failure it exists to prevent).
+//
+// The watcher is the one caller that can pass a baseline: Start recorded the
+// family this checkout was admitted under, which is stronger than re-deriving
+// it, because it also catches a `.git` link rewritten to point at a different
+// family after admission. A watcher that was never started -- the in-package
+// construction used by tests, and the shape Start itself runs in before it
+// publishes a baseline -- passes "" and lets the guard resolve the checkout's
+// own link instead.
+func (gw *GitWatcher) ownHeadSHA(ctx context.Context) (string, error) {
+	gw.mu.Lock()
+	expected := gw.commonDir
+	gw.mu.Unlock()
+	return checkoutHeadSHA(ctx, gw.repoPath, expected)
 }
 
 // diffNameStatus shells out to `git diff --name-status -M -C oldSHA..newSHA`

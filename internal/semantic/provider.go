@@ -161,6 +161,42 @@ type EnrichResult struct {
 	// another pass's work — so a 400s duration with 390s of lock wait reads
 	// as the queueing it was, not as this provider's cost.
 	LockWaitMs int64 `json:"lock_wait_ms,omitempty"`
+	// StagingMs is the time stageRepoFacts spent parsing and staging the
+	// selected files' facts to the spool, before the apply phase's mutex
+	// wait or graph mutation. Split out from DurationMs so a Partial pass
+	// reads as "cut during staging" vs "cut during apply" without
+	// re-deriving it from LockWaitMs and guesswork.
+	StagingMs int64 `json:"staging_ms,omitempty"`
+	// ApplyMs is the time applyStagedFacts spent inside the graph-wide
+	// resolve mutex: hydrating the hot cache, the coverage walk, and the
+	// four fact-apply phases. DurationMs ~= LockWaitMs + StagingMs +
+	// ApplyMs (plus any budget-paused wait applyBudget refunded), so the
+	// split is auditable from the log alone.
+	ApplyMs int64 `json:"apply_ms,omitempty"`
+	// Phase is the apply sub-phase applyStagedFacts STOPPED in:
+	// "coverage" (the pre-apply coverage/warm walk), "supers", "metas",
+	// "aliases", or "calls". Empty when the pass never reached
+	// applyStagedFacts (cut during staging) AND when it finished every
+	// phase — applyStagedFacts clears it on the success return, because a
+	// sticky "calls" would make a normal completion indistinguishable from
+	// a cut in the last phase, which is the only thing this field is for.
+	Phase string `json:"phase,omitempty"`
+	// PagesApplied counts the 32-file pages applyStagedFacts finished
+	// across the coverage walk and all four phases combined before this
+	// pass ended — the clearest available signal of how far a Partial
+	// pass got. There is no total to divide it by (the page count depends
+	// on which phase, and coverFiles chunks the frontier differently than
+	// the phase loops), but it is monotonic and comparable run to run.
+	// Never omitempty: zero is the interesting value ("cut before the first
+	// page landed"), and an absent field reads as "not measured".
+	PagesApplied int `json:"pages_applied"`
+	// FileCount is len(files) as EnrichRepoContext/EnrichFilesContext
+	// selected it — the candidate count enrichRepoTimeout scaled this
+	// pass's deadline from. Logged alongside BudgetSeconds so the deadline
+	// arithmetic (10min + 40ms*FileCount, capped) is auditable without a
+	// store query. Never omitempty: zero means "the frontier held no file
+	// of this language", a complete and load-bearing answer.
+	FileCount int `json:"file_count"`
 	// Partial reports that the pass was cut short (per-repo deadline /
 	// context cancellation) after landing some — but not all — of its
 	// work. The counters above reflect only what actually reached the

@@ -32,6 +32,77 @@ func copyReadinessFixture(t *testing.T) *Store {
 	return store
 }
 
+// TestEnrichmentCurrentForRepoSeparatesNeverRanFromFellBehind pins the
+// predicate the worktree-copy source ranking asks each candidate.
+//
+// It is READY's enrichment column, asked about another repo, and it has to
+// answer with the same two independent facts: whether any provider has ever
+// completed a pass here, and whether the MINIMUM across the real provider rows
+// has caught up with the repo's content counter. Collapsing them would make a
+// never-enriched source and a source whose pass is unfinished indistinguishable
+// — and only the second is the one that laundered a "partial" into a copy's
+// "ready".
+func TestEnrichmentCurrentForRepoSeparatesNeverRanFromFellBehind(t *testing.T) {
+	t.Parallel()
+	store := copyReadinessFixture(t)
+
+	current, hasRun, err := store.EnrichmentCurrentForRepo("src")
+	require.NoError(t, err)
+	require.True(t, hasRun)
+	require.True(t, current, "the fixture's provider completed over exactly this content")
+
+	// Content moves; the provider row does not. This is the live shape: a
+	// python-types row at content_gen 104 against a repo at 107.
+	require.NoError(t, store.ReplaceFileMtimes("src", map[string]int64{"a.go": 555, "b.go": 666}))
+	current, hasRun, err = store.EnrichmentCurrentForRepo("src")
+	require.NoError(t, err)
+	require.True(t, hasRun, "the pass really ran — gen is monotone and nothing walks it back")
+	require.False(t, current, "and it ran over content this repo has since moved past")
+
+	// One fresh provider must not speak for a sibling that never started.
+	require.NoError(t, store.CompleteEnrichmentProvider("src", "go-types",
+		mustContentGen(t, store, "src")))
+	require.NoError(t, store.DeclareEnrichmentProviders("src", []string{"go-types", "python-types"}))
+	current, hasRun, err = store.EnrichmentCurrentForRepo("src")
+	require.NoError(t, err)
+	require.True(t, hasRun)
+	require.False(t, current,
+		"the verdict is the MINIMUM across providers, so a declared-but-never-run "+
+			"sibling holds the whole repo back")
+}
+
+// The two absences are not the same absence, and neither is vacuously current:
+// a repo nobody has enriched must not be read as a repo whose enrichment is
+// finished, or the copy ranking would prefer it to a source that really is.
+func TestEnrichmentCurrentForRepoIsNotVacuouslyTrueWithoutAProviderThatRan(t *testing.T) {
+	t.Parallel()
+	store := copyReadinessFixture(t)
+
+	current, hasRun, err := store.EnrichmentCurrentForRepo("never-heard-of-it")
+	require.NoError(t, err)
+	require.False(t, current)
+	require.False(t, hasRun, "no rows at all is nobody having looked")
+
+	require.NoError(t, store.DeclareEnrichmentProviders("declared", []string{"go-types"}))
+	current, hasRun, err = store.EnrichmentCurrentForRepo("declared")
+	require.NoError(t, err)
+	require.False(t, current)
+	require.False(t, hasRun,
+		"a provider declared applicable and never run is a gen-0 row, which is "+
+			"exactly the state that must not be mistaken for completion")
+
+	// Sentinels are rollups, not providers. A repo carrying only __none__ has
+	// had nothing enriched, whatever its counters say.
+	require.NoError(t, store.DeclareEnrichmentProviders("sentinel", nil))
+	require.NoError(t, store.SetEnrichmentState(graph.EnrichmentState{
+		RepoPrefix: "sentinel", Provider: graph.EnrichProviderRepoMarker, IndexedSHA: "abc123",
+	}))
+	current, hasRun, err = store.EnrichmentCurrentForRepo("sentinel")
+	require.NoError(t, err)
+	require.False(t, current)
+	require.False(t, hasRun)
+}
+
 // The exact-copy invariant the re-stamp rests on: a destination that carries
 // the same nodes, edges and stage rows as its source is described by those
 // carried stamps exactly as well as the source is. If this ever stops holding,
@@ -95,7 +166,7 @@ func TestRegisteringACopiedCheckoutStrandsItsStampsUntilRestamped(t *testing.T) 
 	require.Less(t, derive.DerivedContentGen, contentGen,
 		"stranded — this is the permanent false alarm the re-stamp prevents")
 
-	require.NoError(t, store.RestampCopiedReadiness("dst"))
+	require.NoError(t, store.RestampCopiedReadiness("dst", graph.CopiedReadinessAllStages))
 
 	derive, _, err = store.GetDeriveState("dst")
 	require.NoError(t, err)
@@ -123,7 +194,7 @@ func TestRestampingDoesNotLaunderAProviderThatNeverRan(t *testing.T) {
 	_, err := store.CopyRepoSubgraph("src", "dst")
 	require.NoError(t, err)
 	require.NoError(t, store.ReplaceFileMtimes("dst", map[string]int64{"a.go": 555}))
-	require.NoError(t, store.RestampCopiedReadiness("dst"))
+	require.NoError(t, store.RestampCopiedReadiness("dst", graph.CopiedReadinessAllStages))
 
 	gens, err := store.EnrichmentContentGens("dst")
 	require.NoError(t, err)
@@ -148,7 +219,7 @@ func TestRestampingLeavesALegacyRowLegacy(t *testing.T) {
 	_, err = store.CopyRepoSubgraph("src", "dst")
 	require.NoError(t, err)
 	require.NoError(t, store.ReplaceFileMtimes("dst", map[string]int64{"a.go": 555}))
-	require.NoError(t, store.RestampCopiedReadiness("dst"))
+	require.NoError(t, store.RestampCopiedReadiness("dst", graph.CopiedReadinessAllStages))
 
 	derive, found, err := store.GetDeriveState("dst")
 	require.NoError(t, err)
@@ -176,7 +247,7 @@ func TestARestampWrittenBeforeTheRegisteringWriteIsDestroyedByIt(t *testing.T) {
 	require.NoError(t, err)
 
 	// The old order: stamp first, while the copy still looks self-consistent.
-	require.NoError(t, store.RestampCopiedReadiness("dst"))
+	require.NoError(t, store.RestampCopiedReadiness("dst", graph.CopiedReadinessAllStages))
 	derive, _, err := store.GetDeriveState("dst")
 	require.NoError(t, err)
 	_, stampedAt, _, err := store.GetRepoGraphGen("dst")
@@ -201,4 +272,83 @@ func TestARestampWrittenBeforeTheRegisteringWriteIsDestroyedByIt(t *testing.T) {
 	gens, err := store.EnrichmentContentGens("dst")
 	require.NoError(t, err)
 	require.Less(t, gens["go-types"], contentGen, "the enrichment stamp is stranded the same way")
+}
+
+// The stage-scoped half of the restamp, proven directly. A diverged copy's
+// scoped tail re-derives the changed files, so derive_state is sound to
+// declare current for a Derive-only restamp -- but nothing has re-enriched
+// anything yet, and the carried enrichment row must NOT be laundered into
+// looking current just because a derive happened. This must fail if the
+// restamp ever goes back to touching both stages unconditionally.
+func TestADivergedCopyRestampsDeriveWithoutBlessingItsCarriedEnrichment(t *testing.T) {
+	t.Parallel()
+	store := copyReadinessFixture(t)
+	_, err := store.CopyRepoSubgraph("src", "dst")
+	require.NoError(t, err)
+
+	carried, err := store.EnrichmentContentGens("dst")
+	require.NoError(t, err)
+	carriedGoTypes := carried["go-types"]
+
+	// The registering write -- same restat
+	// TestRegisteringACopiedCheckoutStrandsItsStampsUntilRestamped uses to
+	// strand the carried stamps.
+	require.NoError(t, store.ReplaceFileMtimes("dst", map[string]int64{"a.go": 555, "b.go": 666}))
+
+	_, dstContentGen, _, err := store.GetRepoGraphGen("dst")
+	require.NoError(t, err)
+
+	// The reconcile's scoped tail has re-derived the divergence; only derive
+	// is asserted.
+	require.NoError(t, store.RestampCopiedReadiness("dst", graph.CopiedReadinessDerive))
+
+	derive, _, err := store.GetDeriveState("dst")
+	require.NoError(t, err)
+	require.Equal(t, dstContentGen, derive.DerivedContentGen, "derive_state is declared current")
+
+	gens, err := store.EnrichmentContentGens("dst")
+	require.NoError(t, err)
+	require.Equal(t, carriedGoTypes, gens["go-types"],
+		"enrichment_state must be untouched by a Derive-only restamp")
+	require.Less(t, gens["go-types"], dstContentGen,
+		"the carried enrichment row must NOT read current -- nothing has re-enriched it yet")
+
+	// The scoped enrichment pass that eventually catches this up -- the real
+	// mechanism, not the restamp.
+	n, err := store.AdvanceContentGenForCompletedProviders("dst", dstContentGen, nil)
+	require.NoError(t, err)
+	require.Equal(t, 1, n)
+
+	gens, err = store.EnrichmentContentGens("dst")
+	require.NoError(t, err)
+	require.Equal(t, dstContentGen, gens["go-types"], "now current, via the scoped pass -- not the restamp")
+}
+
+// The Derive-only restamp must never touch enrichment rows at all, including
+// a provider that has never run. AllStages already refuses to launder such a
+// row via its content_gen > 0 guard; this pins the same refusal for
+// Derive-only, where the guard never even needs to fire because enrichment_state
+// is not part of the statement list at all.
+func TestADeriveOnlyRestampStillRefusesAProviderThatNeverRan(t *testing.T) {
+	t.Parallel()
+	store := copyReadinessFixture(t)
+	require.NoError(t, store.DeclareEnrichmentProviders("src", []string{"go-types", "python-types"}))
+
+	_, err := store.CopyRepoSubgraph("src", "dst")
+	require.NoError(t, err)
+	require.NoError(t, store.ReplaceFileMtimes("dst", map[string]int64{"a.go": 555}))
+	require.NoError(t, store.RestampCopiedReadiness("dst", graph.CopiedReadinessDerive))
+
+	gens, err := store.EnrichmentContentGens("dst")
+	require.NoError(t, err)
+	require.Zero(t, gens["python-types"], "declared applicable, never ran, still owed")
+
+	_, dstContentGen, _, err := store.GetRepoGraphGen("dst")
+	require.NoError(t, err)
+	require.Less(t, gens["go-types"], dstContentGen,
+		"a Derive-only restamp must not advance enrichment_state at all, even for a provider that DID run")
+
+	derive, _, err := store.GetDeriveState("dst")
+	require.NoError(t, err)
+	require.Equal(t, dstContentGen, derive.DerivedContentGen, "derive_state IS declared current")
 }

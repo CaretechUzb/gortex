@@ -57,7 +57,7 @@ func TestApplyHotCacheRotationBoundsBytes(t *testing.T) {
 func TestApplyHotCacheSharesLookupsAcrossAppliers(t *testing.T) {
 	store := &lookupCountingStore{Store: applyHotTestGraph()}
 	hot := newApplyHotCache(1 << 20)
-	wanted := map[string]struct{}{"Widget": {}, "DefinitelyMissing": {}}
+	wanted := map[string]nameRole{"Widget": roleType, "DefinitelyMissing": roleType}
 
 	first := newApplier(store, TypeScriptSpec(), "test-types").withHotCache(hot)
 	first.preloadNames("repo", wanted)
@@ -107,7 +107,7 @@ func TestApplyHotCacheFlushAdjacencyForcesRefetch(t *testing.T) {
 	hot := newApplyHotCache(1 << 20)
 
 	first := newApplier(store, TypeScriptSpec(), "test-types").withHotCache(hot)
-	first.preloadNames("repo", map[string]struct{}{"Widget": {}})
+	first.preloadNames("repo", map[string]nameRole{"Widget": roleType})
 	first.loadAdjacency([]string{"repo/ui.ts::Widget"})
 	nameCalls := store.repoNameBatchCalls
 	outCalls := store.outEdgeBatchCalls
@@ -117,7 +117,7 @@ func TestApplyHotCacheFlushAdjacencyForcesRefetch(t *testing.T) {
 	hot.flushAdjacency()
 
 	second := newApplier(store, TypeScriptSpec(), "test-types").withHotCache(hot)
-	second.preloadNames("repo", map[string]struct{}{"Widget": {}})
+	second.preloadNames("repo", map[string]nameRole{"Widget": roleType})
 	second.loadAdjacency([]string{"repo/ui.ts::Widget"})
 
 	if got := store.repoNameBatchCalls; got != nameCalls {
@@ -151,7 +151,7 @@ func TestApplyHotCacheDisabledIsNilSafe(t *testing.T) {
 	// An applier without a cache must behave exactly as before.
 	store := &lookupCountingStore{Store: applyHotTestGraph()}
 	ap := newApplier(store, TypeScriptSpec(), "test-types")
-	ap.preloadNames("repo", map[string]struct{}{"Widget": {}})
+	ap.preloadNames("repo", map[string]nameRole{"Widget": roleType})
 	ap.loadAdjacency([]string{"repo/ui.ts::Widget"})
 	if ap.node("repo/ui.ts::Widget") == nil {
 		t.Fatal("cacheless applier failed to hydrate")

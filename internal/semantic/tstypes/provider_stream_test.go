@@ -157,6 +157,13 @@ func TestStreamedRepoThousandsBoundPeakFactsAndApplierCaches(t *testing.T) {
 	assert.Less(t, maxStats.CacheNames, 256)
 	assert.Equal(t, result.SymbolsTotal, result.SymbolsCovered)
 	assert.Equal(t, 100.0, result.CoveragePercent)
+	// The phase split is only useful if it is actually populated on a pass big
+	// enough to register on a millisecond clock, and only trustworthy if the
+	// parts never claim more than the whole.
+	assert.Greater(t, result.StagingMs, int64(0), "staging 2049 files must register on the clock")
+	assert.Greater(t, result.ApplyMs, int64(0), "applying 2049 files must register on the clock")
+	assert.LessOrEqual(t, result.StagingMs+result.ApplyMs+result.LockWaitMs, result.DurationMs,
+		"the lock/staging/apply split must account for no more than the whole pass")
 }
 
 func TestStreamedRepoCancellationCleansSpoolAndHasNoPostReturnMutation(t *testing.T) {
@@ -178,6 +185,23 @@ export function main(): void { const s = new Svc(); s.run(); }
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	assert.True(t, result.Partial)
+	// Cancellation lands inside stageRepoFacts (observeSpool fires before any
+	// file is parsed), so the pass never reaches applyStagedFacts: FileCount
+	// is recorded (known before staging starts) and StagingMs is timed, but
+	// Phase/PagesApplied must stay at their zero value — nothing but staging
+	// ran.
+	assert.Equal(t, 2, result.FileCount)
+	// ApplyMs and LockWaitMs are stamped only past the mutex, so on this path
+	// they are exactly zero — an assertion that actually separates "cut before
+	// the apply" from "cut inside it". StagingMs is a real measurement of a
+	// staging that was cancelled before a single file was parsed, so it is
+	// bounded rather than exact; GreaterOrEqual(0) said nothing at all.
+	assert.Zero(t, result.ApplyMs, "apply never ran, so its timer must be untouched")
+	assert.Zero(t, result.LockWaitMs, "the resolve mutex was never taken")
+	assert.Less(t, result.StagingMs, int64(1000),
+		"staging was cancelled before any file was parsed; it cannot have run to completion")
+	assert.Empty(t, result.Phase)
+	assert.Zero(t, result.PagesApplied)
 	assert.NotEmpty(t, spoolPath)
 	_, statErr := os.Stat(spoolPath)
 	assert.ErrorIs(t, statErr, os.ErrNotExist)
@@ -239,4 +263,42 @@ func semanticSnapshot(g graph.Store) []string {
 	}
 	sort.Strings(snapshot)
 	return snapshot
+}
+
+// TestApplyPhaseIsClearedOnlyOnSuccess pins EnrichResult.Phase to the one
+// thing it is for: naming where a cut landed. applyStagedFacts assigns the
+// phase on entry and never reset it, so a pass that finished every phase
+// logged phase=calls — indistinguishable in the log from a pass the deadline
+// cut during the calls phase, which is the exact question the field was added
+// to answer.
+func TestApplyPhaseIsClearedOnlyOnSuccess(t *testing.T) {
+	p := NewProvider(TypeScriptSpec(), zap.NewNop())
+
+	// A cut pass keeps the sub-phase it stopped in. Cancelling up front stops
+	// it in the first one, deterministically.
+	spool, err := newFactSpool()
+	require.NoError(t, err)
+	defer spool.close()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	cut := &semantic.EnrichResult{}
+	err = p.applyStagedFacts(ctx, graph.New(), "", spool, cut, 0, nil)
+	require.Error(t, err)
+	assert.Equal(t, "coverage", cut.Phase, "a cut pass must name the sub-phase it stopped in")
+	assert.Zero(t, cut.PagesApplied)
+
+	// A pass that ran every phase to its last page must not.
+	g, dir := buildFixture(t, map[string]string{
+		"src/svc.ts": tsSvc,
+		"src/app.ts": `import { Svc } from "./svc";
+export function main(): void { const s = new Svc(); s.run(); }
+`,
+	})
+	done, err := p.EnrichRepo(g, "", dir)
+	require.NoError(t, err)
+	require.False(t, done.Partial)
+	assert.Empty(t, done.Phase,
+		"a completed pass must not be readable as a cut in its last phase")
+	assert.Greater(t, done.PagesApplied, 0,
+		"the phase loops really ran, so clearing Phase is not vacuous")
 }

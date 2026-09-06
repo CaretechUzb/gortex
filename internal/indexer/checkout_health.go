@@ -36,6 +36,12 @@ type ViewsHealth struct {
 	// Generations counts payload generations by state — the direct answer to
 	// "how much derived payload is this store holding, and why".
 	Generations map[string]int `json:"generations,omitempty"`
+	// Incomplete counts published generations by the completeness tag they
+	// carry: a generation that knows it is not a whole description of the
+	// state it claims, and publishes anyway because a partly-refreshed view is
+	// worth more than none. A generation that narrowed nothing is not counted,
+	// so an absent map means every generation here describes its state whole.
+	Incomplete map[string]int `json:"incomplete_generations,omitempty"`
 	// Leases is how many generations live views currently pin. A generation
 	// under a lease cannot be retired, so a lease count that does not fall is
 	// the reason a retiring generation is still there.
@@ -99,8 +105,12 @@ func (l *CheckoutLifecycle) ViewsHealth(ctx context.Context) (ViewsHealth, error
 		return out, err
 	}
 	out.Generations = map[string]int{}
+	out.Incomplete = map[string]int{}
 	for _, generation := range generations {
 		out.Generations[string(generation.State)]++
+		if generation.Completeness != store_sqlite.ViewGenerationCompleteTag {
+			out.Incomplete[generation.Completeness]++
+		}
 	}
 	return out, nil
 }

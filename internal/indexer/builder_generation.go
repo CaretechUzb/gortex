@@ -138,6 +138,28 @@ type GenerationIdentity struct {
 	CreatedAt int64 // unix seconds; 0 stamps the wall clock
 }
 
+// payloadRequest renders the identity the way the store spells it. Both the
+// begin that mints a generation for this identity and the lookup that asks
+// whether one already exists go through it, so the two cannot compare
+// different column sets.
+func (i GenerationIdentity) payloadRequest() store_sqlite.PayloadGenerationRequest {
+	return store_sqlite.PayloadGenerationRequest{
+		OwnerKind:            i.OwnerKind,
+		GraphID:              i.GraphID,
+		LayerID:              i.LayerID,
+		CheckoutID:           i.CheckoutID,
+		GenerationKind:       i.GenerationKind,
+		BaseGenerationID:     i.BaseGenerationID,
+		LowerViewFingerprint: i.LowerViewFingerprint,
+		TreeOID:              i.TreeOID,
+		ProvenanceCommitOID:  i.ProvenanceCommitOID,
+		ConfigHash:           i.ConfigHash,
+		ExtractorVersions:    i.ExtractorVersions,
+		ResolverVersion:      i.ResolverVersion,
+		CreatedAt:            i.CreatedAt,
+	}
+}
+
 // LayerBase is the reader a build computes its affected closure against: the
 // layer the generation will sit on.
 //
@@ -362,21 +384,7 @@ func (b *SparseGenerationBuilder) Build(ctx context.Context, req BuildRequest) (
 		return 0, report, err
 	}
 
-	generationID, handle, adopted, err := b.Store.BeginPayloadGenerationWithStatus(ctx, store_sqlite.PayloadGenerationRequest{
-		OwnerKind:            req.Identity.OwnerKind,
-		GraphID:              req.Identity.GraphID,
-		LayerID:              req.Identity.LayerID,
-		CheckoutID:           req.Identity.CheckoutID,
-		GenerationKind:       req.Identity.GenerationKind,
-		BaseGenerationID:     req.Identity.BaseGenerationID,
-		LowerViewFingerprint: req.Identity.LowerViewFingerprint,
-		TreeOID:              req.Identity.TreeOID,
-		ProvenanceCommitOID:  req.Identity.ProvenanceCommitOID,
-		ConfigHash:           req.Identity.ConfigHash,
-		ExtractorVersions:    req.Identity.ExtractorVersions,
-		ResolverVersion:      req.Identity.ResolverVersion,
-		CreatedAt:            req.Identity.CreatedAt,
-	})
+	generationID, handle, adopted, err := b.Store.BeginPayloadGenerationWithStatus(ctx, req.Identity.payloadRequest())
 	if err != nil {
 		return 0, BuildReport{}, fmt.Errorf("indexer: begin payload generation: %w", err)
 	}

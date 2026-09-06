@@ -788,16 +788,38 @@ func TestUntrackDemotesAWorktreeWithoutAConfirm(t *testing.T) {
 	require.NotNil(t, f.mi.GetMetadata(worktreePrefix))
 
 	var payload struct {
-		Status  string `json:"status"`
-		Plan    string `json:"plan"`
-		Demoted bool   `json:"demoted"`
+		Status       string `json:"status"`
+		Plan         string `json:"plan"`
+		Demoted      bool   `json:"demoted"`
+		Pending      bool   `json:"pending"`
+		TransitionID string `json:"transition_id"`
 	}
 	require.NoError(t, json.Unmarshal(
 		callAdminTool(t, f.srv.handleUntrackRepository, map[string]any{"path": f.worktree}),
 		&payload))
-	assert.Equal(t, "demoted", payload.Status)
+	// handleUntrackRepository now starts the demotion without waiting for it
+	// (StartApplyUntrack): the automatic-lane build runs on the lifecycle's
+	// own context, detached from this request, so the call reports "demoting"
+	// immediately rather than blocking here for however long that build takes.
+	assert.Equal(t, "demoting", payload.Status)
 	assert.Equal(t, "demote", payload.Plan)
-	assert.True(t, payload.Demoted)
+	assert.True(t, payload.Pending)
+	assert.NotEmpty(t, payload.TransitionID)
+
+	// Poll the catalog rather than calling the tool again: a repeat call
+	// would re-derive its plan from rows the running worker is still moving.
+	require.Eventually(t, func() bool {
+		checkouts, err := f.catalog.ListCheckouts(ctx, family.FamilyID)
+		if err != nil {
+			return false
+		}
+		for _, checkout := range checkouts {
+			if checkout.AdminName == "wt" {
+				return checkout.EffectiveMode == store_sqlite.CheckoutModeAutomatic
+			}
+		}
+		return false
+	}, 10*time.Second, 10*time.Millisecond, "demotion did not settle")
 
 	checkouts, err := f.catalog.ListCheckouts(ctx, family.FamilyID)
 	require.NoError(t, err)

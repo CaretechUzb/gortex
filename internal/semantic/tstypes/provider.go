@@ -23,7 +23,15 @@ type Provider struct {
 	observeSpool func(string)        // synchronous cleanup test hook
 }
 
-var _ semantic.ContextEnricher = (*Provider)(nil)
+var (
+	_ semantic.ContextEnricher = (*Provider)(nil)
+	// The batch faces are what keep a file frontier a file frontier. Without
+	// them Manager.EnrichFilesContext's dispatch ladder falls through to
+	// EnrichRepoContext, which re-collects every file of these languages in the
+	// repository and discards the frontier entirely.
+	_ semantic.ContextFileBatchEnricher = (*Provider)(nil)
+	_ semantic.FileBatchEnricher        = (*Provider)(nil)
+)
 
 // NewProvider wraps a LangSpec as a semantic provider.
 func NewProvider(spec *LangSpec, logger *zap.Logger) *Provider {
@@ -79,24 +87,108 @@ func (p *Provider) EnrichRepo(g graph.Store, repoPrefix, repoRoot string) (*sema
 
 func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPrefix, repoRoot string, deadline semantic.EnrichDeadlinePolicy) (*semantic.EnrichResult, error) {
 	start := time.Now()
-	res := &semantic.EnrichResult{
-		Provider: p.Name(),
-		Language: p.spec.Languages[0],
-	}
+	res := p.newResult()
 	if ctx == nil {
 		ctx = context.Background()
 	}
-
-	// Toolchain-fallback gate: a spec that suppresses itself on this host
-	// (its authoritative compiler-grade provider is available) contributes
-	// nothing — no parse, no graph mutation — so it can never alter, duplicate
-	// or downgrade that provider's resolutions.
-	if p.spec.Suppressed != nil && p.spec.Suppressed() {
+	if p.suppressed() {
 		res.DurationMs = time.Since(start).Milliseconds()
 		return res, nil
 	}
+	return p.runPass(ctx, g, repoPrefix, languageFiles(g, p.spec, repoPrefix, repoRoot),
+		deadline, repoWideSymbolTotal, res, start)
+}
 
-	files := languageFiles(g, p.spec, repoPrefix, repoRoot)
+// EnrichFiles is the un-contexted semantic.FileBatchEnricher face of
+// EnrichFilesContext, kept because the Manager's ladder tries
+// ContextFileBatchEnricher first and FileBatchEnricher second, and a caller
+// holding no context must still reach the frontier path rather than fall
+// through to the whole-repo one. With a Background root the pass is unbounded
+// — the same meaning EnrichRepo gives a nil EnrichDeadlinePolicy.
+func (p *Provider) EnrichFiles(g graph.Store, repoPrefix, repoRoot string, filePaths []string) (*semantic.EnrichResult, error) {
+	return p.EnrichFilesContext(context.Background(), g, repoPrefix, repoRoot, filePaths)
+}
+
+// EnrichFilesContext runs the pass over an explicit file frontier instead of
+// the whole repository — the semantic.ContextFileBatchEnricher entry
+// Manager.EnrichFilesContext's dispatch ladder prefers over every other rung.
+//
+// Without it that ladder fell through to EnrichRepoContext, which re-collects
+// languageFiles for the WHOLE repository and never looks at the frontier at
+// all. Measured on a 9.8k-file Python workspace: a worktree-copy repair over 82
+// files ran the full python-types pass — 488 s alone, 89 min under contention
+// — and under the watcher's 120 s save deadline every such pass was cut
+// Partial having stamped nothing.
+//
+// The selection is the intersection of languageFiles (which applies the repo
+// membership, language, low-value and on-disk gates the whole-repo pass
+// applies) with the caller's normalised frontier. An empty intersection is a
+// complete, non-Partial, empty result: nothing of this provider's languages was
+// in the frontier, which is an answer rather than a failure. It is never a
+// fallback to the whole repository — that fallback is the defect this entry
+// point exists to remove.
+//
+// Coverage is measured against the FRONTIER's candidates, not the repository's:
+// a pass reports the fraction of what it was asked to cover. Reusing the
+// whole-repo denominator would make a complete 2-file pass on a 9.8k-file repo
+// read as 0.02% coverage, which is indistinguishable from a pass that did
+// nothing.
+//
+// The deadline is ctx and only ctx. The Manager already wraps this call
+// (EnrichFilesWithDeadline sizes the bound: the configured save timeout, or a
+// copy repair's CopyRepairDeadline), so no EnrichDeadlinePolicy is derived
+// here and no phase narrows the caller's bound further. A ctx that expires
+// mid-pass surfaces as Partial with AbortReason set and BoundReason
+// EnrichBoundBudget, exactly as on the whole-repo path — which is what
+// Indexer.runScopedDeferredEnrich keys its copy-repair escalation on.
+//
+// The apply phase mutates only nodes owned by the staged files (every fact page
+// is anchored at one file's own index) and performs no repo-wide eviction, so a
+// frontier pass cannot drop edges belonging to files outside it.
+func (p *Provider) EnrichFilesContext(ctx context.Context, g graph.Store, repoPrefix, repoRoot string, filePaths []string) (*semantic.EnrichResult, error) {
+	start := time.Now()
+	res := p.newResult()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if p.suppressed() {
+		res.DurationMs = time.Since(start).Milliseconds()
+		return res, nil
+	}
+	files := frontierFiles(g, p.spec, repoPrefix, repoRoot, filePaths)
+	return p.runPass(ctx, g, repoPrefix, files, nil,
+		p.countSymbolsInFiles(g, repoPrefix, files), res, start)
+}
+
+// newResult is the empty result every entry point starts from.
+func (p *Provider) newResult() *semantic.EnrichResult {
+	return &semantic.EnrichResult{
+		Provider: p.Name(),
+		Language: p.spec.Languages[0],
+	}
+}
+
+// suppressed is the toolchain-fallback gate: a spec that suppresses itself on
+// this host (its authoritative compiler-grade provider is available)
+// contributes nothing — no parse, no graph mutation — so it can never alter,
+// duplicate or downgrade that provider's resolutions.
+func (p *Provider) suppressed() bool {
+	return p.spec.Suppressed != nil && p.spec.Suppressed()
+}
+
+// repoWideSymbolTotal is the symbolsTotal runPass reads as "count the whole
+// repository's symbols as the coverage denominator". A file-scoped pass passes
+// its own pre-counted frontier total instead.
+const repoWideSymbolTotal = -1
+
+// runPass is the pipeline both entry points share: stage the selected files'
+// facts off the graph, then apply them under the graph-wide resolve mutex. The
+// ONLY thing that differs between a whole-repo pass and a frontier pass is the
+// file selection and the coverage denominator — the deadline discipline, the
+// lock discipline, the yield discipline and the partial semantics are one
+// implementation on purpose, so a frontier pass cannot drift into a second set
+// of rules.
+func (p *Provider) runPass(ctx context.Context, g graph.Store, repoPrefix string, files []fileRef, deadline semantic.EnrichDeadlinePolicy, symbolsTotal int, res *semantic.EnrichResult, start time.Time) (*semantic.EnrichResult, error) {
 	// The budget is charged phase by phase against a movable deadline instead
 	// of arming one context up front: the wait for the graph-wide resolve
 	// mutex below is ANOTHER pass's work, and letting it burn this pass's
@@ -105,6 +197,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// compiler apply). A parent context's own deadline still caps every
 	// phase — WithDeadline never extends the parent.
 	var deadlineAt time.Time
+	res.FileCount = len(files)
 	if deadline != nil {
 		if d := deadline(len(files)); d > 0 {
 			deadlineAt = start.Add(d)
@@ -132,7 +225,9 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			p.observeSpool(spool.path)
 		}
 		parseCtx, cancelParse := phaseCtx()
+		stageStart := time.Now()
 		if err := p.stageRepoFacts(parseCtx, files, spool); err != nil {
+			res.StagingMs = time.Since(stageStart).Milliseconds()
 			parseErr := parseCtx.Err()
 			cancelParse()
 			if parseErr != nil {
@@ -142,6 +237,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			}
 			return nil, err
 		}
+		res.StagingMs = time.Since(stageStart).Milliseconds()
 		cancelParse()
 		// Parsing above is pure and fans out across workers; the apply
 		// phase mutates the shared graph (retargets edges, reindexes,
@@ -191,12 +287,14 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			res.DurationMs = time.Since(start).Milliseconds()
 			return res, nil
 		}
-		applyErr := p.applyStagedFacts(applyCtx, g, repoPrefix, spool, res, func() bool {
+		applyStart := time.Now()
+		applyErr := p.applyStagedFacts(applyCtx, g, repoPrefix, spool, res, symbolsTotal, func() bool {
 			budget.pause()
 			mutated, _ := yieldResolveMutex(g, mu)
 			budget.resume()
 			return mutated
 		})
+		res.ApplyMs = time.Since(applyStart).Milliseconds()
 		mu.Unlock()
 		budget.stop()
 		applyCtxErr := applyContextErr(applyCtx)
@@ -277,7 +375,7 @@ func (p *Provider) EnrichFile(g graph.Store, repoRoot, filePath string) (*semant
 		// race a concurrent watcher / resolver pass on another file.
 		mu := g.ResolveMutex()
 		mu.Lock()
-		ap := newApplier(g, p.spec, p.Name())
+		ap := newApplier(g, p.spec, p.Name()).withLogger(p.logger)
 		ap.applyAll([]*fileFacts{facts}, res)
 		ap.flush()
 		p.countCoverage(g, fileNode.RepoPrefix, map[string]bool{facts.file: true}, res)

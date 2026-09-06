@@ -119,7 +119,7 @@ func TestGitWatcherReconcileLogNamesItsTrigger(t *testing.T) {
 	// Seed the baseline before moving HEAD, exactly as Start's catch-up does.
 	// Without it lastSHA is empty, reconcile takes its first-observation path,
 	// and it returns before logging anything at all.
-	baseline, err := direct.currentSHA(testCtx())
+	baseline, err := direct.ownHeadSHA(testCtx())
 	require.NoError(t, err)
 	require.NotEmpty(t, baseline)
 	direct.mu.Lock()

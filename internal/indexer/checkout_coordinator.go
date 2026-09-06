@@ -167,6 +167,23 @@ type CheckoutCoordinatorConfig struct {
 	// Retain bounds the commit generations kept for re-routing; <= 0 takes
 	// defaultRetainedCommitLayers.
 	Retain int
+	// FirstBuildDelay decides when the loop may build the FIRST layer for a
+	// checkout that has never been served. Three meanings, and the default is
+	// the middle one:
+	//
+	//	< 0  build it like any other cycle — no deferral at all.
+	//	  0  build it when a read routes to the checkout, and not before.
+	//	> 0  build it on a read, or unprompted once this long has passed.
+	//
+	// A first build indexes the whole difference between the checkout's tree
+	// and the base corpus, and it is the one most likely to be wasted: a
+	// worktree that has just appeared is usually about to be tracked, moved or
+	// removed, and each of those discards the layer. Nothing is lost by
+	// waiting for a reader, because a checkout with no layer serves the base
+	// corpus at exact:false either way — so the default spends nothing until
+	// somebody actually looks. The positive form exists for an operator who
+	// would rather pay for a warm view than wait for the first query on it.
+	FirstBuildDelay time.Duration
 
 	// cycleDone is a test seam: it runs at the end of every reconcile cycle
 	// with what that cycle did. nil in production.
@@ -197,10 +214,11 @@ type CheckoutCycle struct {
 	// a lost route flip, or a working tree that moved under two builds in a
 	// row. The route is left exactly as the cycle found it.
 	Rescheduled bool
-	// Deferred reports that the cycle never ran: either daemon warmup has not
-	// opened the build lane, or its bounded background queue was saturated.
-	// Opening the gate or the 15-second coordinator poll retries the demand.
-	// Nothing was read or written, so every other field is zero.
+	// Deferred reports that the cycle never ran: daemon warmup has not opened
+	// the build lane, its bounded background queue was saturated, or the cycle
+	// would have been the speculative first build for a checkout nothing has
+	// read yet. Opening the gate, a Demand, or the 15-second coordinator poll
+	// retries the demand. Nothing was written, so every other field is zero.
 	Deferred bool
 	// Err is what stopped the cycle, nil when it settled both slots.
 	Err error
@@ -268,6 +286,20 @@ type CheckoutCoordinator struct {
 	// dirtyFingerprint is the working tree the last cycle sampled. It is what
 	// the checkout's text searcher is keyed by — see checkout_text_search.go.
 	dirtyFingerprint string
+
+	// firstBuildPending is true until this coordinator has established that
+	// its checkout is served — because a route already named a commit layer,
+	// because something demanded the view, or because an opt-in window ran out.
+	// Once it is false the deferral costs nothing: no route is read for it and
+	// no cycle is held back.
+	firstBuildPending bool
+	// firstBuildAfter is when an opt-in window lets the loop build unprompted.
+	// The zero time is the default and means there is no such window: only a
+	// Demand, or a route that already names a layer, ends the wait.
+	firstBuildAfter time.Time
+	// demanded records that something is waiting for this checkout's view, so
+	// the first build is no longer speculative and must not wait.
+	demanded bool
 
 	// textMu guards the checkout's own trigram searcher and is held across the
 	// build, so concurrent searches on one checkout pay for one index.
@@ -368,8 +400,37 @@ func NewCheckoutCoordinator(cfg CheckoutCoordinatorConfig) (*CheckoutCoordinator
 	if c.retain <= 0 {
 		c.retain = defaultRetainedCommitLayers
 	}
+	if cfg.FirstBuildDelay >= 0 {
+		c.firstBuildPending = true
+		if cfg.FirstBuildDelay > 0 {
+			c.firstBuildAfter = time.Now().Add(cfg.FirstBuildDelay)
+		}
+	}
 	go c.run()
 	return c, nil
+}
+
+// Demand records that something is actually waiting for this checkout's view
+// and lifts the first-build deferral.
+//
+// It is the read side of the lazy first build: the loop defers a speculative
+// first layer, and a query that routes here says the layer is not speculative
+// any more. The wake is raised exactly once, on the call that flips the flag.
+// Signalling on every demand would re-arm the quiet window on each one, and a
+// caller polling a not-yet-routed view faster than that window would starve
+// the very build it is waiting for — the livelock ActivateCheckout documents.
+func (c *CheckoutCoordinator) Demand(reason string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	already := c.demanded
+	c.demanded = true
+	c.mu.Unlock()
+	if already {
+		return
+	}
+	c.Signal(reason)
 }
 
 // Signal marks the checkout dirty. Any caller may signal, as often as it
@@ -561,6 +622,17 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 		return
 	}
 
+	if c.firstBuildDeferred(ctx) {
+		out := CheckoutCycle{Deferred: true}
+		recordCoordinatorCycle(out)
+		c.logger.Debug("checkout coordinator: first build deferred until the checkout is read",
+			zap.String("checkout", c.checkoutID), zap.String("reason", reason))
+		if c.cycleDone != nil {
+			c.cycleDone(out)
+		}
+		return
+	}
+
 	release, err := c.gate.Acquire(ctx, ViewBuildBackground)
 	if err != nil {
 		if errors.Is(err, ErrViewBuildQueueFull) {
@@ -655,6 +727,50 @@ func (c *CheckoutCoordinator) settledWithoutBuild(ctx context.Context) (Checkout
 	return out, true
 }
 
+// firstBuildDeferred reports that this cycle would be the speculative first
+// build for a checkout nothing has asked to read yet.
+//
+// It is asked only while the deferral can still bite. The three ways out are
+// permanent, and each of them clears the flag so no later cycle pays for the
+// route read: something demanded the view, an opt-in window ran out, or the
+// route already names a commit layer — which is what a checkout that was being
+// served before this process started looks like, and it must resume at once
+// rather than sit out a wait it never earned. With no window configured only
+// the first and third can happen, which is the point: an unread checkout costs
+// nothing for as long as it stays unread.
+func (c *CheckoutCoordinator) firstBuildDeferred(ctx context.Context) bool {
+	c.mu.Lock()
+	pending, demanded, after := c.firstBuildPending, c.demanded, c.firstBuildAfter
+	c.mu.Unlock()
+	if !pending {
+		return false
+	}
+	if demanded || (!after.IsZero() && !time.Now().Before(after)) {
+		c.firstBuildSettled()
+		return false
+	}
+	route, found, err := c.catalog.GetCheckoutRoute(ctx, c.checkoutID)
+	if err != nil {
+		// A route that could not be read is not evidence the checkout is
+		// unserved. Defer rather than guess: the next poll asks again, and the
+		// window ends the deferral whatever the catalog says.
+		return true
+	}
+	if found && route.CommitGenerationID > 0 {
+		c.firstBuildSettled()
+		return false
+	}
+	return true
+}
+
+// firstBuildSettled retires the deferral for the rest of this coordinator's
+// life.
+func (c *CheckoutCoordinator) firstBuildSettled() {
+	c.mu.Lock()
+	c.firstBuildPending = false
+	c.mu.Unlock()
+}
+
 func (c *CheckoutCoordinator) lifetimeContext() context.Context {
 	if c != nil && c.lifetime != nil {
 		return c.lifetime
@@ -674,6 +790,11 @@ func recordCoordinatorCycle(out CheckoutCycle) {
 	switch {
 	case out.Err != nil:
 		viewmetrics.Count(viewmetrics.CoordinatorCycleTotal, viewmetrics.OutcomeFailed)
+	case out.Deferred:
+		// The first-build deferral counts through here. The warmup gate and the
+		// saturated queue count their own, because each has something to log
+		// alongside it that this function has no access to.
+		viewmetrics.Count(viewmetrics.CoordinatorCycleTotal, viewmetrics.OutcomeDeferred)
 	case out.Rescheduled:
 	case out.CommitBuilt || out.CommitReused || out.DirtyBuilt:
 		if out.CommitBuilt {
@@ -1089,8 +1210,27 @@ func (c *CheckoutCoordinator) resolveCommitLayer(
 	ctx context.Context, base primaryBase, targetTree string,
 ) (generationID int64, reused bool, err error) {
 	identity := c.commitIdentity(base, targetTree)
-	if cached, ok := c.cachedCommit(ctx, generationIdentityKey(identity)); ok {
+	key := generationIdentityKey(identity)
+	if cached, ok := c.cachedCommit(ctx, key); ok {
 		return cached, true, nil
+	}
+	// The reuse cache is process-local, so a restart empties it while every
+	// generation it held is still in the database. Asking the catalog for the
+	// identity is what makes the cache survive the restart: a hit is a payload
+	// this call would have rebuilt column for column, and rebuilding it costs
+	// the whole of a commit-layer build for a row already stored. Retaining it
+	// puts it back under this coordinator's retirement bookkeeping, which is
+	// what keeps the sweep from collecting the layer the route is about to
+	// name. A failed lookup is not a reason to refuse the checkout a view: the
+	// build below is always the correct answer, only the expensive one.
+	stored, found, err := c.catalog.FindViewGenerationByIdentity(ctx, identity.payloadRequest())
+	switch {
+	case err != nil:
+		c.logger.Debug("checkout coordinator: could not look up a stored commit layer",
+			zap.String("checkout", c.checkoutID), zap.Error(err))
+	case found:
+		c.retainCommit(ctx, key, stored.GenerationID)
+		return stored.GenerationID, true, nil
 	}
 	started := time.Now()
 	generationID, report, err := c.builder.BuildCommitLayer(ctx, CommitLayerRequest{
@@ -1112,6 +1252,17 @@ func (c *CheckoutCoordinator) resolveCommitLayer(
 		c.logger.Warn("checkout coordinator: commit layer closure truncated",
 			zap.String("checkout", c.checkoutID), zap.Int64("generation", generationID),
 			zap.Int("cap", report.ClosureCap))
+		// A log line is not a property of the generation. The row is, and it
+		// is what ViewsHealth's incomplete_generations census counts — a
+		// generation that publishes ready while a dependent past the cap still
+		// reads the layer below must not answer "whole" to a later process
+		// asking what this store is holding.
+		if err := c.catalog.SetViewGenerationCompleteness(ctx, generationID,
+			store_sqlite.ViewGenerationClosureTruncated); err != nil {
+			c.logger.Warn("checkout coordinator: could not record a truncated closure",
+				zap.String("checkout", c.checkoutID), zap.Int64("generation", generationID),
+				zap.Error(err))
+		}
 	}
 	return generationID, false, nil
 }

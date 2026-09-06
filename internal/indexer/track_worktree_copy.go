@@ -8,11 +8,13 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/semantic"
 )
 
 // Installing a worktree by copying its sibling's subgraph.
@@ -33,15 +35,38 @@ import (
 // and no edge may cross between two checkouts of one repository anyway (see
 // graph/checkout_groups.go), so there is nothing for a derivation to add.
 
-// gitHeadSHA reads a checkout's HEAD. Empty when the path is not a checkout
-// or git cannot answer, which disables the copy path rather than guessing.
+// gitHeadSHACheckoutDeadline bounds gitHeadSHA. It is generous on purpose: the
+// deadline covers the gitcmd limiter's Acquire as well as the subprocess, and
+// a copy-track happens exactly when the daemon is busiest -- warmup, a storm
+// drain, another repository's blame fan-out -- so a queued acquire can eat the
+// whole budget. Losing that race is not a small loss: gitHeadSHA returning ""
+// makes worktreeCopySource decline, and the checkout then pays the ~1,800s
+// cold index instead of the ~105s subgraph copy. 30s is far longer than the
+// resolution needs and still finite.
+const gitHeadSHACheckoutDeadline = 30 * time.Second
+
+// gitHeadSHA reads a checkout's HEAD, discarding the reason it could not.
+// Retained for callers that only branch on "answer or no answer"; the copy
+// gate itself uses gitHeadSHAWithReason so a decline can say why.
 func gitHeadSHA(root string) string {
-	cmd := exec.Command("git", "-C", root, "rev-parse", "HEAD")
-	out, err := cmd.Output()
+	sha, _ := gitHeadSHAWithReason(root)
+	return sha
+}
+
+// gitHeadSHAWithReason reads a checkout's HEAD. Empty when the path is not a
+// checkout, when git cannot answer, or when the answer would have come from a
+// repository other than this checkout's own (see checkoutHeadSHA) — all of
+// which disable the copy path rather than guessing. A copy keyed on an
+// enclosing repository's commit would duplicate a subgraph that describes a
+// tree this checkout has never had.
+func gitHeadSHAWithReason(root string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), gitHeadSHACheckoutDeadline)
+	defer cancel()
+	sha, err := checkoutHeadSHA(ctx, root, "")
 	if err != nil {
-		return ""
+		return "", err
 	}
-	return strings.TrimSpace(string(out))
+	return sha, nil
 }
 
 // copySourceCommit reports the commit a tracked repository's SUBGRAPH describes,
@@ -176,9 +201,9 @@ func gitChangedPaths(root, from, to string) ([]string, bool) {
 // Every comparison is against the candidate's INDEXED commit, never its HEAD —
 // see copySourceCommit for why, and for why a source dirty at index time is
 // refused outright. A candidate whose indexed commit already equals this
-// checkout's HEAD is the free case and is preferred whenever one is available:
-// the copied rows describe exactly this code, so the copy stands alone and the
-// returned change set is empty. Otherwise a sibling within
+// checkout's HEAD is the free case, and an enrichment-current one ends the
+// search on the spot: the copied rows describe exactly this code, so the copy
+// stands alone and the returned change set is empty. Otherwise a sibling within
 // worktreeCopyMaxDivergence still qualifies, and the caller reconciles exactly
 // the disagreeing paths afterwards. That covers the case this gate used to
 // refuse and which cost the most: a merge-request worktree branched a few
@@ -194,20 +219,33 @@ func gitChangedPaths(root, from, to string) ([]string, bool) {
 //
 // A larger candidate never displaces a smaller one, and ties break on the
 // sorted prefix, so the choice cannot depend on map iteration order.
-func (mi *MultiIndexer) worktreeCopySource(absPath string) (string, []string, bool) {
+//
+// An ENRICHMENT-CURRENT candidate outranks a lagging one before closeness is
+// consulted at all, and that ordering is not an efficiency tweak — see
+// copySource.enrichCurrent for what a lagging source costs the copy.
+func (mi *MultiIndexer) worktreeCopySource(absPath string) (copySource, bool) {
 	if mi == nil || mi.graph == nil {
-		return "", nil, false
+		return copySource{}, false
 	}
 	if !ResolveWorktree(absPath).IsWorktree {
-		return "", nil, false
+		return copySource{}, false
 	}
 	group := resolvedMainRepo(absPath)
 	if group == "" {
-		return "", nil, false
+		return copySource{}, false
 	}
-	head := gitHeadSHA(absPath)
+	head, headErr := gitHeadSHAWithReason(absPath)
 	if head == "" {
-		return "", nil, false
+		// Say why. A silent decline here is indistinguishable from "no candidate
+		// was close enough", and the two have opposite fixes: one is a checkout
+		// that cannot prove its identity, the other is ordinary divergence.
+		if mi.logger != nil {
+			mi.logger.Warn("worktree copy: declined, the checkout would not report its own HEAD",
+				zap.String("root", absPath),
+				zap.String("refusal", gitIdentityRefusal(headErr)),
+				zap.Error(headErr))
+		}
+		return copySource{}, false
 	}
 
 	mi.mu.RLock()
@@ -227,36 +265,64 @@ func (mi *MultiIndexer) worktreeCopySource(absPath string) (string, []string, bo
 	}
 	sort.Strings(prefixes)
 
+	// Two bests rather than one comparison function: the ranking is
+	// lexicographic — currency first, closeness second — and keeping the best
+	// of each class is what lets the choice SAY what it gave up. A current
+	// source 200 files away really is preferred to a lagging one at 2, and a
+	// line that only named the winner would make that look like a bug.
 	var (
-		bestPrefix  string
-		bestChanged []string
-		found       bool
+		bestCurrent copySource
+		bestLagging copySource
 		siblings    int
 		declined    []string
 	)
+	consider := func(cand copySource) {
+		best := &bestLagging
+		if cand.enrichCurrent {
+			best = &bestCurrent
+		}
+		if best.prefix == "" || len(cand.changed) < len(best.changed) {
+			*best = cand
+		}
+	}
 	for _, prefix := range prefixes {
 		root := candidates[prefix]
 		if resolvedMainRepo(root) != group {
 			continue
 		}
 		siblings++
-		srcSHA, ok := mi.copySourceCommit(prefix)
+		candidateSHA, ok := mi.copySourceCommit(prefix)
 		if !ok {
 			declined = append(declined, prefix+": no clean indexed commit")
 			continue
 		}
-		if srcSHA == head {
-			// Nothing beats a source whose rows already describe this commit,
-			// and taking it here keeps that path free of any git diff at all.
-			return prefix, nil, true
+		current, hasRun := mi.enrichmentCurrent(prefix)
+		if candidateSHA == head {
+			// Nothing at this distance beats a source whose rows already
+			// describe this commit, and taking it without a diff keeps that
+			// path free of any git call at all. It is still only the best of
+			// its OWN class: a lagging sibling at the identical commit does not
+			// outrank a current one a few files away, because what it saves is
+			// a reconcile of a few files and what it costs is a whole-repo
+			// enrichment pass.
+			consider(copySource{prefix: prefix, srcSHA: candidateSHA, dstSHA: head,
+				enrichCurrent: current, enrichEverRan: hasRun})
+			if current {
+				// Nothing can outrank current at zero distance, so the
+				// remaining candidates cost one git diff each and can only
+				// lose. This is the old early return, kept as a break so the
+				// choice still goes through the logging below.
+				break
+			}
+			continue
 		}
-		changed, ok := gitChangedPaths(absPath, srcSHA, head)
+		changed, ok := gitChangedPaths(absPath, candidateSHA, head)
 		if !ok {
 			// The source's indexed commit does not resolve in this checkout —
 			// rebased away, or garbage collected. There is no diff to compute
 			// and no sound fallback, so decline; HEAD is exactly the proxy
 			// copySourceCommit exists to remove.
-			declined = append(declined, prefix+": indexed commit "+srcSHA+" does not resolve here")
+			declined = append(declined, prefix+": indexed commit "+candidateSHA+" does not resolve here")
 			continue
 		}
 		if len(changed) > worktreeCopyMaxDivergence {
@@ -264,9 +330,16 @@ func (mi *MultiIndexer) worktreeCopySource(absPath string) (string, []string, bo
 				prefix, len(changed), worktreeCopyMaxDivergence))
 			continue
 		}
-		if !found || len(changed) < len(bestChanged) {
-			bestPrefix, bestChanged, found = prefix, changed, true
-		}
+		consider(copySource{
+			prefix: prefix, changed: changed,
+			srcSHA: candidateSHA, dstSHA: head,
+			enrichCurrent: current, enrichEverRan: hasRun,
+		})
+	}
+
+	chosen, found := bestCurrent, bestCurrent.prefix != ""
+	if !found {
+		chosen, found = bestLagging, bestLagging.prefix != ""
 	}
 	// A worktree that had siblings and copied from none of them is about to pay
 	// a full cold index. That is correct but slow, and without this line it is
@@ -277,7 +350,100 @@ func (mi *MultiIndexer) worktreeCopySource(absPath string) (string, []string, bo
 			zap.Int("siblings", siblings),
 			zap.Strings("declined", declined))
 	}
-	return bestPrefix, bestChanged, found
+	if found && mi.logger != nil {
+		mi.logger.Info("worktree copy source chosen",
+			zap.String("path", absPath),
+			zap.String("from", chosen.prefix),
+			zap.Int("changed", len(chosen.changed)),
+			zap.Bool("enrichment_current", chosen.enrichCurrent))
+		// The trade this ranking made, spelled out. Without it the copy looks
+		// as though it ignored the obvious source, and the extra reconcile
+		// cost has no visible reason.
+		if chosen.enrichCurrent && bestLagging.prefix != "" &&
+			len(bestLagging.changed) < len(chosen.changed) {
+			mi.logger.Info("worktree copy: passed over a closer sibling whose enrichment is behind",
+				zap.String("chosen", chosen.prefix),
+				zap.Int("chosen_changed", len(chosen.changed)),
+				zap.String("passed_over", bestLagging.prefix),
+				zap.Int("passed_over_changed", len(bestLagging.changed)))
+		}
+	}
+	return chosen, found
+}
+
+// copySource is one candidate's whole answer: which tracked checkout to copy
+// from, how far this one has drifted from what that checkout's rows describe,
+// the two commits the marker promotion is decided on, and whether the source's
+// own semantic enrichment was finished.
+//
+// A struct rather than five return values because they are read together and
+// three of them are the same type — a caller that transposed srcSHA and dstSHA
+// would still compile, and the bug would be a marker naming the wrong commit.
+type copySource struct {
+	// prefix is the tracked repository the subgraph is copied from; changed is
+	// the set of repository-relative paths on which it and this checkout
+	// disagree, empty for the identical case.
+	prefix  string
+	changed []string
+
+	// srcSHA is the commit the SOURCE's rows describe (its indexed commit, per
+	// copySourceCommit); dstSHA is this checkout's HEAD. See
+	// copiedMarkerEvidence, which is built from exactly this pair.
+	srcSHA string
+	dstSHA string
+
+	// enrichCurrent is whether the source's semantic enrichment had caught up
+	// with its own content when this decision was made
+	// (graph.EnrichmentCurrencyReader).
+	//
+	// False is not a small penalty, which is why it outranks closeness. The
+	// copy carries enrichment_state verbatim, so a lagging source's rows arrive
+	// describing a corpus the SOURCE had not finished — and no file frontier
+	// can complete them, because the files they are behind on are not the files
+	// this checkout changed. Worse, the scoped repair's
+	// AdvanceContentGenForCompletedProviders advances every gen > 0 row to the
+	// destination's counter, which turns the source's honest "partial" into the
+	// copy's "ready" over enrichment that was never finished anywhere.
+	// Measured live 2026-09-05: a sibling one commit closer, whose python-types
+	// row sat at content_gen 104 against its repo's 107, was chosen on
+	// closeness alone and the copy read ready.
+	//
+	// enrichEverRan separates the two ways of not being current — nobody has
+	// enriched that source at all, versus somebody did and its content has
+	// moved on since. Both owe the copy the same whole-repo pass, so the
+	// ranking does not read it; it is carried purely so the log line that
+	// explains those extra minutes can say which one happened.
+	//
+	// So a lagging source is still copyable — the structural graph it carries
+	// is sound, and copying it saves the whole parse and derive — but the copy
+	// owes a WHOLE-REPO enrichment pass rather than a scoped repair, and must
+	// not restamp the enrichment stamp it inherited. See trackWorktreeByCopy.
+	enrichCurrent bool
+	enrichEverRan bool
+}
+
+// enrichmentCurrent asks the store whether prefix's semantic enrichment had
+// caught up with its own content.
+//
+// A backend that cannot answer — the in-memory graph, or any future store
+// without the reader — is reported as NOT current, and so is a read that
+// errors. That is the fail-safe direction: the cost of being wrong here is one
+// whole-repo enrichment pass the copy might not have needed, against a graph
+// that reads "ready" over enrichment nothing ever finished.
+func (mi *MultiIndexer) enrichmentCurrent(prefix string) (current, hasRun bool) {
+	reader, ok := mi.graph.(graph.EnrichmentCurrencyReader)
+	if !ok {
+		return false, false
+	}
+	current, hasRun, err := reader.EnrichmentCurrentForRepo(prefix)
+	if err != nil {
+		if mi.logger != nil {
+			mi.logger.Warn("could not read a copy candidate's enrichment currency",
+				zap.String("repo", prefix), zap.Error(err))
+		}
+		return false, false
+	}
+	return current, hasRun
 }
 
 // restatWorktreeMtimes re-reads from disk the mtimes of the files the copy
@@ -363,10 +529,11 @@ func (mi *MultiIndexer) trackWorktreeByCopy(
 	entry config.RepoEntry,
 	absPath, prefix string,
 ) (*IndexResult, bool, error) {
-	src, changed, ok := mi.worktreeCopySource(absPath)
-	if !ok || src == prefix {
+	source, ok := mi.worktreeCopySource(absPath)
+	if !ok || source.prefix == prefix {
 		return nil, false, nil
 	}
+	src, changed := source.prefix, source.changed
 
 	// Publish the grouping before copying, not only after. The copy's inbound
 	// pass asks the store which prefixes are sibling checkouts of the source,
@@ -459,8 +626,19 @@ func (mi *MultiIndexer) trackWorktreeByCopy(
 	//
 	// Skipped entirely when the reconcile returned an error: there is no landed
 	// mutation to stamp over, and "partial" is then the truth.
+	//
+	// Both stages only for a source whose OWN enrichment was current. A lagging
+	// source's carried enrichment rows describe a corpus it had not finished
+	// itself, so declaring them current for the destination would launder its
+	// honest "partial" into this checkout's "ready"; the identical copy then
+	// owes the whole-repo pass armed below, and derive is all that may be
+	// asserted here.
 	if restamper, ok := mi.graph.(graph.CopiedReadinessRestamper); ok && len(changed) == 0 {
-		if err := restamper.RestampCopiedReadiness(prefix); err != nil && mi.logger != nil {
+		stages := graph.CopiedReadinessAllStages
+		if !source.enrichCurrent {
+			stages = graph.CopiedReadinessDerive
+		}
+		if err := restamper.RestampCopiedReadiness(prefix, stages); err != nil && mi.logger != nil {
 			mi.logger.Warn("worktree copy: could not declare carried stage stamps current",
 				zap.String("repo", prefix), zap.Error(err))
 		}
@@ -470,6 +648,18 @@ func (mi *MultiIndexer) trackWorktreeByCopy(
 	// it, since an identical-checkout copy schedules no derivation to
 	// republish it.
 	mi.publishCheckoutGroups()
+
+	// An identical copy owes nothing — unless what it carried was already
+	// incomplete. Then the debt is the SOURCE's unfinished pass, inherited
+	// whole, and no file frontier can discharge it: the rows are behind on
+	// files this checkout has not changed, and it has not changed any. So the
+	// whole repository is the only honest frontier, and the pass that covers it
+	// writes its own completion marker — there is no evidence to carry here and
+	// nothing for a scoped repair to promote.
+	if len(changed) == 0 && !source.enrichCurrent {
+		mi.logCopySourceIsBehind(prefix, source)
+		mi.scheduleCopiedRepoEnrich(prefix, nil, copiedMarkerEvidence{})
+	}
 
 	// A diverged copy still owes derivation and enrichment for the files the
 	// reconcile touched — and only for those. The copy carried every derived
@@ -484,16 +674,26 @@ func (mi *MultiIndexer) trackWorktreeByCopy(
 	// dominated by framework synthesizers whose cost tracks their corpus
 	// rather than the frontier.
 	//
-	// So when the tail ran: declare the carried stamps current — sound for
-	// the same reason it is sound in the identical case above, because the
+	// So when the tail ran: declare the carried DERIVE stamp current — sound
+	// for the same reason it is sound in the identical case above, because the
 	// changed files HAVE been re-derived — and arm enrichment for just the
-	// reconciled files. The repo-wide rederive remains only as the fallback
-	// for a reconcile whose tail was deferred to a batch transition or
-	// replaced by a forced full retrack; that path still owes everything.
+	// reconciled files. That narrowing is conditional on the source having
+	// finished its own enrichment: from a lagging source the carried rows are
+	// behind on files outside this divergence, which no frontier drawn from it
+	// can reach, so the copy owes the whole repository instead. The repo-wide
+	// rederive remains only as the fallback for a reconcile whose tail was
+	// deferred to a batch transition or replaced by a forced full retrack; that
+	// path still owes everything.
 	if len(changed) > 0 {
 		if copiedDivergenceRepaired(result) {
+			// Derive only. The scoped tail re-derived exactly the reconciled
+			// files, so derive_state truly describes the destination now —
+			// but nothing has re-enriched it yet. Enrichment_state is brought
+			// forward by the scoped pass armed just below
+			// (scheduleCopiedRepoEnrich) via CompleteScopedEnrichment; until
+			// that pass completes the repo truthfully reads "partial".
 			if restamper, ok := mi.graph.(graph.CopiedReadinessRestamper); ok {
-				if err := restamper.RestampCopiedReadiness(prefix); err != nil && mi.logger != nil {
+				if err := restamper.RestampCopiedReadiness(prefix, graph.CopiedReadinessDerive); err != nil && mi.logger != nil {
 					mi.logger.Warn("worktree copy: could not declare repaired stage stamps current",
 						zap.String("repo", prefix), zap.Error(err))
 				}
@@ -503,11 +703,34 @@ func (mi *MultiIndexer) trackWorktreeByCopy(
 					zap.String("repo", prefix),
 					zap.Int("files", len(result.DerivedInvalidation.Files)))
 			}
-			// An empty frontier here is the proven-no-work case: nothing
-			// was reindexed, so the carried enrichment rows are exact and
-			// arming anything would re-enrich a bit-identical graph.
-			if len(result.DerivedInvalidation.Files) > 0 {
-				mi.scheduleCopiedRepoEnrich(prefix, result.DerivedInvalidation.Files)
+			switch {
+			case !source.enrichCurrent:
+				// A scoped repair cannot finish what the source never
+				// finished. Its frontier is the divergence, and the carried
+				// rows are behind on files OUTSIDE it — so completing it would
+				// advance every one of them (CompleteScopedEnrichment ->
+				// AdvanceContentGenForCompletedProviders stamps every gen > 0
+				// row) and report coverage nothing produced. The whole-repo
+				// pass is the only frontier that covers what is actually owed,
+				// and it writes its own marker, so there is no evidence to
+				// carry and nothing to promote.
+				mi.logCopySourceIsBehind(prefix, source)
+				mi.scheduleCopiedRepoEnrich(prefix, nil, copiedMarkerEvidence{})
+			case len(result.DerivedInvalidation.Files) > 0:
+				// The only call site with both commits in hand, and so the only
+				// one that can offer the marker evidence. Both commits come
+				// from the single reading worktreeCopySource took before the
+				// copy started — nothing re-reads the source's index state
+				// after CopyRepoSubgraph, the restat, or ReconcileRepoCtx, any
+				// of which a sibling watcher can race and move the source's
+				// indexed sha out from under a re-read.
+				mi.scheduleCopiedRepoEnrich(prefix, result.DerivedInvalidation.Files,
+					copiedMarkerEvidence{srcSHA: source.srcSHA, dstSHA: source.dstSHA})
+			default:
+				// A current source and an empty frontier is the proven-no-work
+				// case: nothing was reindexed, so the carried enrichment rows
+				// are exact and arming anything would re-enrich a
+				// bit-identical graph.
 			}
 		} else if result.deferredTail != nil {
 			// The tail did not run, but not because it could not: a batch was
@@ -526,7 +749,9 @@ func (mi *MultiIndexer) trackWorktreeByCopy(
 			// derive-then-enrich order the fallback path has always had.
 			mi.deferCopiedReconcileTail(prefix, result.deferredTail)
 			mi.deferWorkspaceRederive(prefix)
-			mi.armCopiedRepoEnrich(prefix, nil)
+			// Whole-repo arm: EnrichAll writes the marker itself, so there is
+			// no promotion to entitle and no evidence to carry.
+			mi.armCopiedRepoEnrich(prefix, nil, copiedMarkerEvidence{})
 			if mi.logger != nil {
 				mi.logger.Info("worktree copy: reconcile tail deferred to the batch transition; no repo-wide rederive scheduled",
 					zap.String("repo", prefix),
@@ -534,7 +759,7 @@ func (mi *MultiIndexer) trackWorktreeByCopy(
 			}
 		} else {
 			mi.scheduleWorkspaceRederive(prefix)
-			mi.scheduleCopiedRepoEnrich(prefix, nil)
+			mi.scheduleCopiedRepoEnrich(prefix, nil, copiedMarkerEvidence{})
 		}
 	}
 	return result, true, nil
@@ -562,6 +787,44 @@ func copiedDivergenceRepaired(result *IndexResult) bool {
 		return true
 	}
 	return result.DerivedTailRan && len(result.DerivedInvalidation.Files) > 0
+}
+
+// copiedMarkerEvidence names the two commits that decide whether a scoped
+// repair pass may promote the whole-repo enrichment completion marker the copy
+// inherited: srcSHA, the commit the subgraph was copied AT (the source's
+// indexed commit, per copySourceCommit), and dstSHA, this checkout's HEAD.
+//
+// Passed as a struct rather than two strings because only the pair means
+// anything — srcSHA is what the inherited marker has to name for the source's
+// completion to describe the carried corpus, and dstSHA is the revision the
+// marker would be rewritten to. The zero value is the honest default for every
+// caller that cannot supply both: no evidence, no promotion, and the restart
+// re-arms a full pass exactly as it did before.
+type copiedMarkerEvidence struct {
+	srcSHA string
+	dstSHA string
+}
+
+// logCopySourceIsBehind records that this copy was taken from a source whose
+// own semantic enrichment was unfinished, which is what turns a scoped repair
+// into a whole-repo pass.
+//
+// Worth a line of its own because the two costs it sits between are minutes
+// apart and otherwise indistinguishable in the log: a copy that arms a scoped
+// repair and one that arms a whole-repo pass produce the same "worktree
+// installed by subgraph copy" line, and the difference only becomes visible
+// much later, as an enrichment pass nobody asked for.
+func (mi *MultiIndexer) logCopySourceIsBehind(prefix string, source copySource) {
+	if mi.logger == nil {
+		return
+	}
+	mi.logger.Info("worktree copy: source enrichment is behind; copy owes a whole-repo pass",
+		zap.String("repo", prefix),
+		zap.String("from", source.prefix),
+		// Which of the two ways it is behind. "false" is a source nothing has
+		// ever enriched; "true" is one whose pass ran and did not keep up —
+		// the shape that laundered a partial into a ready.
+		zap.Bool("source_enrichment_ever_ran", source.enrichEverRan))
 }
 
 // scheduleCopiedRepoEnrich arms and runs semantic enrichment for a worktree
@@ -615,8 +878,8 @@ func copiedDivergenceRepaired(result *IndexResult) bool {
 // just declared those rows current via RestampCopiedReadiness. An empty
 // files arms the whole repository — the fallback path, where nothing has
 // vouched for the carried rows.
-func (mi *MultiIndexer) scheduleCopiedRepoEnrich(prefix string, files []string) {
-	idx := mi.armCopiedRepoEnrich(prefix, files)
+func (mi *MultiIndexer) scheduleCopiedRepoEnrich(prefix string, files []string, ev copiedMarkerEvidence) {
+	idx := mi.armCopiedRepoEnrich(prefix, files, ev)
 	if idx == nil || idx.semanticMgr == nil {
 		// Nothing here can run the pass. The armed gate costs nothing and a
 		// later daemon start still honours it; returning also keeps this
@@ -637,7 +900,12 @@ func (mi *MultiIndexer) scheduleCopiedRepoEnrich(prefix string, files []string) 
 // derivation replay. Arming immediately anyway is deliberate: the gate is the
 // only durable record that this repository owes a pass, and a transition that
 // never comes must still leave a later daemon start able to see it.
-func (mi *MultiIndexer) armCopiedRepoEnrich(prefix string, files []string) *Indexer {
+//
+// ev is the marker evidence, and it is consulted only on the SCOPED arm — see
+// the block at the end. The zero value means "no evidence", which is what every
+// whole-repo caller passes and what a caller that cannot name both commits must
+// pass: it costs nothing but the restart this promotion exists to avoid.
+func (mi *MultiIndexer) armCopiedRepoEnrich(prefix string, files []string, ev copiedMarkerEvidence) *Indexer {
 	idx := mi.GetIndexer(prefix)
 	if idx == nil {
 		return nil
@@ -669,8 +937,65 @@ func (mi *MultiIndexer) armCopiedRepoEnrich(prefix string, files []string) *Inde
 	// current, which for identical content they are.
 	if len(files) > 0 {
 		idx.markPendingEnrichFiles(files)
+		if idx.deferredEnrichIsFull() {
+			// markPendingEnrichFiles silently widened this arm to a full pass
+			// (the legacy-atomic-marker branch) and already cleared
+			// copiedEnrichMarkerSHA for exactly this reason: a full pass reaches
+			// EnrichAll, which writes the __repo__ marker itself, and a partial
+			// full pass must not leave a scoped promotion armed to rubber-stamp
+			// it if some later single-file pass happens to match ev.dstSHA. The
+			// marker check below is for a SCOPED frontier only, so skip it.
+			if mi.logger != nil {
+				mi.logger.Info("worktree copy: scoped arm widened to a full pass; inherited marker not eligible for promotion",
+					zap.String("repo", prefix))
+			}
+			return idx
+		}
+		// Still scoped, so this dispatch is a repair rather than a save: it
+		// covers a whole divergence, and the provider that runs it loads the
+		// whole project first. Say so now, while the caller is still the copy
+		// path — the dispatcher cannot tell the two frontiers apart later, and
+		// under the save-sized deadline a repair here ends Partial having
+		// covered nothing. See deferredEnrichRepair.
+		idx.armCopiedEnrichRepair()
 	} else {
 		idx.markPendingEnrichFull()
+		return idx
+	}
+
+	// A SCOPED arm may additionally be entitled to promote the inherited
+	// whole-repo completion marker when it completes — but only once the marker
+	// has been read and found to name the exact commit the subgraph was copied
+	// at. It is not guaranteed to: the row records the source's last COMPLETE
+	// enrichment, which can sit behind the source's indexed commit, and a marker
+	// naming any other revision describes a corpus this checkout did not
+	// inherit. Checking here rather than at completion time is deliberate — this
+	// is the only place that still knows which commit was copied from where.
+	//
+	// Read through the package-level RepoEnrichmentMarkerAt, not the Manager's
+	// method: the track path may have no semantic Manager at all yet, and the
+	// question is about a persisted row rather than about any running pass.
+	if ev.srcSHA == "" || ev.dstSHA == "" {
+		return idx
+	}
+	matches, persisted := semantic.RepoEnrichmentMarkerAt(idx.graph, prefix, ev.srcSHA)
+	switch {
+	case persisted && matches:
+		idx.armCopiedEnrichMarkerPromotion(ev.dstSHA)
+		if mi.logger != nil {
+			mi.logger.Info("worktree copy: inherited enrichment marker names the copied commit; scoped repair may promote it",
+				zap.String("repo", prefix),
+				zap.String("src_sha", ev.srcSHA),
+				zap.String("dst_sha", ev.dstSHA))
+		}
+	case mi.logger != nil:
+		// Not a fault, and not silent either: this is the difference between a
+		// copy whose restart costs nothing and one that pays a whole-repo pass,
+		// and without a line here the two are indistinguishable in the log.
+		mi.logger.Info("worktree copy: inherited enrichment marker does not name the copied commit; no promotion armed",
+			zap.String("repo", prefix),
+			zap.String("src_sha", ev.srcSHA),
+			zap.Bool("marker_persisted", persisted))
 	}
 	return idx
 }

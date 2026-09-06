@@ -149,11 +149,17 @@ func (mi *MultiIndexer) flushDeferredCopiedReconcileTails(ctx context.Context) [
 			// The whole-repo arm the copy path already raised stands; the
 			// fallback derivation the caller is about to schedule is what this
 			// pass waits behind.
-			mi.scheduleCopiedRepoEnrich(tail.prefix, nil)
+			mi.scheduleCopiedRepoEnrich(tail.prefix, nil, copiedMarkerEvidence{})
 			continue
 		}
+		// Derive only, same reasoning as the inline diverged branch in
+		// trackWorktreeByCopy: the replayed tail re-derived exactly the
+		// files it covers, so derive_state describes the destination now,
+		// but nothing has re-enriched it yet. The scheduleCopiedRepoEnrich
+		// call below arms the pass that will bring enrichment_state
+		// forward; until it completes the repo truthfully reads "partial".
 		if restamper, ok := mi.graph.(graph.CopiedReadinessRestamper); ok {
-			if err := restamper.RestampCopiedReadiness(tail.prefix); err != nil && mi.logger != nil {
+			if err := restamper.RestampCopiedReadiness(tail.prefix, graph.CopiedReadinessDerive); err != nil && mi.logger != nil {
 				mi.logger.Warn("worktree copy: could not declare repaired stage stamps current",
 					zap.String("repo", tail.prefix), zap.Error(err))
 			}
@@ -175,7 +181,9 @@ func (mi *MultiIndexer) flushDeferredCopiedReconcileTails(ctx context.Context) [
 		// rows with nothing armed to correct them — the failure this arming was
 		// added for. Narrowing it would mean arming late, and a whole-repo pass
 		// costs minutes against a derivation that used to cost an hour.
-		mi.scheduleCopiedRepoEnrich(tail.prefix, nil)
+		// Whole-repo, so no marker evidence: the pass this runs writes the
+		// completion marker itself.
+		mi.scheduleCopiedRepoEnrich(tail.prefix, nil, copiedMarkerEvidence{})
 		repaired = append(repaired, tail.prefix)
 	}
 	return repaired

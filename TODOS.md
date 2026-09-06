@@ -135,6 +135,78 @@ so most of the data a merged-branch check needs is already collected.
 **Depends on:** Per-worktree tracking being the adopted workflow — without it
 this barely matters.
 
+### Elect the family's primary base from mainline, and seed the submodule's main checkout
+
+**What:** `CheckoutLifecycle.bindDedicatedGraph` elects `IsPrimaryBase: len(graphs) == 0` —
+the FIRST dedicated graph bound in a family, permanently. On docker-env that is
+`local@aurora-redesign`, a feature branch 1,382 files off mainline, so every automatic
+checkout of `local` composes its commit layer over it: 1,667 masked paths, a closure that
+hits the 200-file cap every time, 477 files re-parsed and 14–20 min of resolve + derived
+tail + FTS rebuild per build (7 builds on 2026-09-05, ~83 min, 5 of 7 discarded).
+`local`'s own mainline checkout cannot compete because the seeder rejects it at every
+start: `daemon: seeding the checkout catalog was incomplete: seed …/src/local: git does not
+list …/src/local as a worktree of …/.git/modules/src/local` (a submodule's main worktree,
+listed by `git worktree list` from the module gitdir under its gitdir-file root).
+
+**What shipped instead (2026-09-06, decision D6-A):** reuse across restarts
+(`Catalog.FindViewGenerationByIdentity`; the boot sweep now runs after coordinators exist
+and keeps the newest `defaultRetainedCommitLayers` commit layers per checkout out of the
+retirement cohort), containment (no coordinator for a checkout that owns a dedicated
+graph; a new automatic checkout's first build is demand-only — `FirstBuildDelay` 0 =
+build when a read routes to it, >0 = also after that long, <0 = never defer; env
+`GORTEX_CHECKOUT_FIRST_BUILD_DELAY`; the untrack demotion registers the route and does not
+build), and honesty (`view_generations.completeness = closure_truncated` persisted, counted
+in `ViewsHealth.Incomplete`). Reuse is sound only because everything that decides
+truncation rides `config_hash`; a time- or budget-based truncation must also require an
+empty completeness.
+
+**Still open:** the election itself and the seeder. Elect only the family's base checkout
+(`@main`), leave a family primary-less until `set-primary` otherwise, fall back to the base
+checkout's own corpus when no dedicated primary exists, and make the seeder accept a
+submodule main worktree (compare after `EvalSymlinks`, accept the gitdir-file root). This
+re-bases every existing automatic checkout's layers on this workspace, so it needs its own
+live verification. Raising `defaultAffectedByMax` (200) would make each build slower, not
+cheaper — the cap is a symptom of the wrong base.
+
+**Effort:** M **Priority:** P2 **Depends on:** nothing.
+
+### Corpus retirement holds the batch-mutation gate for the whole eviction
+
+**What:** untracking (demoting) a 125k-node / 1M-edge copied worktree took 28 min on
+2026-09-06 02:46 and 55 min on 2026-09-06 06:24. Measured on the second run: everything up
+to the file purge and the config removal was done within 20 min; the remaining ~35 min was
+ONE call, `untrackRepoChecked` → `ReconcileContractEdgesForFrontier`
+(`internal/indexer/repository_untrack.go`, `incremental_contract_reconcile.go`), which
+holds `g.ResolveMutex()` for its entire body — `InlineWrappersForFiles`,
+`persistScopedInlinedContracts`, `BindProviderSymbols`, `contracts.Match` over the MERGED
+registry of all eight tracked repos (the "ForFrontier" name notwithstanding), the
+incident-edge scan and `ReplaceDerivedContracts` — plus `mi.reconcileMu`, under the
+caller's `batchMutationGate.RLock()` and the reachability topology writer, and logs nothing
+but a failure warning. It competed with two back-to-back post-warmup analysis suites
+(30 min, then 47.5 min); in the 28-min control the suite's publications were abandoned
+after concurrent mutations and released early. While it ran, control requests exceeded
+their 30 s budgets, `edit` tool calls were abandoned at 59 s, and one watcher patch took
+8.7 min. `demote` also used to call `evictRepoChecked` a second time after the saga had
+released the graph, re-paying the vector republish and a topology mutation on an empty
+prefix — that second call is now skipped when the owned binding is already gone.
+
+**Why:** the untrack path is now asynchronous and honest about this, but the cost itself is
+the same as before and lands on every session on the daemon.
+
+**Context:** three fixes, in order of value. (1) Narrow the resolve-lane hold in
+`ReconcileContractEdgesForFrontier` to the incident-edge scan and the replace (the
+function's own comment says the lock exists for the scan), with a page yield in the scan —
+the same remedy the tstypes apply uses. (2) Give the analysis suite a yield point or extend
+`preemptWorkspaceRederive`'s stand-down to it, so a teardown does not queue behind a
+47-minute pass. (3) Page the purge itself and yield the gate between pages. Note that
+`intent_transitions.last_progress` used to be stamped only at worker entry and on deferral,
+so a frozen `last_progress` was NORMAL for a healthy demotion — do not read it as a stall
+(stamps per saga phase and a start/finish log around the contract reconcile were added on
+2026-09-06). Recovery if a demotion really stalls: a daemon restart resumes the transition
+(`resumeModeTransitions`) and re-entering `demote` is idempotent; no catalog surgery.
+
+**Effort:** M **Priority:** P3 **Depends on:** nothing.
+
 ### Persist per-path dirty provenance so a dirty checkout can still be copied from
 
 **What:** Record WHICH paths were dirty when a repository was indexed, not just
@@ -264,6 +336,62 @@ which is why this is a judgement call rather than a bug.
 **Priority:** P3 — downgraded from P2 once the GitWatcher fix closed the
 concrete case that motivated it.
 **Depends on:** Nothing.
+
+### A checkout's HEAD is now verified against its own repository before it is written anywhere
+
+**What:** closed 2026-09-05. `git -C <root> rev-parse HEAD` is directory-scoped: when a
+linked worktree's `.git` link is already unlinked but the directory still exists (the
+window every `git worktree remove` and `rm -rf` passes through), git walks up to the
+enclosing repository and answers ITS HEAD with exit 0. That is how `local@MR6410`'s
+ref-change reconcile adopted the docker-env superproject's `038bba933ed0` on 2026-09-04
+(docker-env and `src/local` share history, so the cross-repository diff was even valid),
+re-rooted 13,791 paths under the vanishing worktree, evicted 2,845 files and published the
+foreign commit as its baseline. `src/addons` has no `.git` at all (it is gitignored by
+docker-env), so its `gortex repos` HEAD was the superproject's too.
+
+**Fix:** one shared guard, `checkoutHeadSHA` (`internal/indexer/checkout_head_identity.go`),
+resolves the common dir and the commit in ONE `git rev-parse --path-format=absolute
+--git-common-dir HEAD` and refuses when the root is gone, `<root>/.git` cannot be Lstat'd,
+the common dir differs from the admitted baseline, or the output is unparseable (three
+sentinels, each with its own log line). All four HEAD-stamping sites go through it:
+`GitWatcher.Start`/`reconcile`, `repoHeadAndDirty`/`repoHead`, `pollerHeadSHA`, and the
+copy-source probe `gitHeadSHA` (30 s bound, because the gitcmd semaphore wait counts against
+it and a refusal would silently push a copy onto the 30-min cold index; refusals are now
+logged). Every caller already treated an empty HEAD as "skip". Tests:
+`TestGitWatcher_RefusesForeignRepositoryHeadDuringWorktreeRemoval`,
+`TestRepoHeadAndDirty_RefusesForeignRepositoryHead`,
+`TestCheckoutHeadIdentity_RefusesRelinkedGitDir`, `…SameGitPathThroughSymlink`.
+Visible consequence: `addons`' HEAD column is now empty, which is honest — the poller
+would otherwise have diffed docker-env's history against the addons graph.
+
+**Residual:** subdirectory tracking is not a supported shape (track accepts any directory;
+a non-git root already takes the "no git head" path), so the guard makes no allowance for
+it. If that ever changes, derive the expected common dir from the root admitted at track
+time rather than requiring `<root>/.git`.
+
+**Effort:** — **Priority:** done
+
+### `gortex untrack` is asynchronous; `--wait` polls to the true end state
+
+**What:** closed 2026-09-06. `untrack_repository` blocked on `ApplyUntrack`, whose demote
+plan ran a synchronous commit-layer build for the demoted checkout (14–20 min on this
+workspace, see the coordinator entry below), so every untrack of a worktree was abandoned
+at the 59 s tool deadline while the work kept running detached. The handler now calls
+`StartApplyUntrack` and answers `pending` with the `transition_id` and `checkout_id`;
+`gortex untrack --wait [--wait-timeout 30m]` polls the read-only `list_checkouts` until
+`effective_mode=automatic` AND no transition is in flight (the transition row is deleted by
+`CompleteIntentTransition`, after the dedicated corpus is retired and the config entry
+removed), fails fast on a `failed` transition or a checkout that disappears, gives up after
+three consecutive poll errors, and shows "mode flipped; retiring the dedicated corpus"
+in between. A demotion no longer fails after its commit when no coordinator can be started.
+
+**Measured:** probe copy 125k nodes: `--wait` returned "landed" in 3.6 s on the mode flip
+alone (the bug the end-state predicate fixes); the real teardown took 28 min because
+`purgeRepoChecked` holds the batch-mutation gate and the reachability writer for the whole
+eviction (`watcher: mutation admission timed out; deferring patch` during it). That cost is
+pre-existing and unchanged — a 30-minute `--wait-timeout` is the honest default here.
+
+**Effort:** — **Priority:** done. Follow-up (P3): the corpus retirement's gate hold time.
 
 ## Readiness
 
@@ -528,53 +656,58 @@ rather than to sample harder.
 **Priority:** P3
 **Depends on:** Nothing.
 
-### Find out why `addons` python-types cannot finish, and give it a budget it can
+### The tstypes whole-repo pass was O(N²) on Odoo-shaped corpora — fixed twice over
 
-**What:** the `addons` python-types enrichment pass has never completed. Every
-run exhausts its deadline, lands zero edges and covers zero symbols, then
-records nothing — so the whole-repo completion marker stays absent and the next
-warm restart re-arms it.
+**What:** record of the 2026-09-05/06 investigation; residuals below. Three compounding
+causes, all measured:
+1. `tstypes.Provider` had no file-batch entry, so every "scoped" copy repair was the
+   whole-repo pass (fixed 2026-09-05: frontier-scoped `EnrichFilesContext`).
+2. The enforced per-pass budget is `enrichRepoTimeout(len(files))` — a python FILE count
+   fed to a formula calibrated for symbol-NODE counts (10 min + 40 ms × N): 11,970 files →
+   1,079 s, and the 5,400 s `deadline` logged at start is the outer ceiling, not the budget.
+   The budget and the pass progress (`budget_s`, `file_count`, `phase`, `pages_applied`,
+   `staging_ms`, `apply_ms`, `symbols_covered`) now ride on `semantic enrichment complete`.
+   The formula itself is deliberately unchanged: with the fixes below the pass fits.
+3. Per-page preload was repo-sized twice: (a) every call's METHOD name was hydrated
+   repo-wide and seeded the frontier walk (2M+1 nodes per page for M classes sharing
+   `create`/`write`); (b) `loadAdjacency` fetched EVERY inbound edge of every frontier node
+   while the applier reads only `member_of`/`param_of` — 860,270 inbound edges on page 0 of
+   `addons` for 6,809 used (0.8%), `AccountMove.create` alone 10,255 in-edges. Fixed by the
+   `nameRole`-scoped preload (synthetic 12k files 165 s → 17 s) and by pushing the kind
+   filter into SQL on the existing `edges_by_to(to_id, kind)` index
+   (`InEdgesByKindFinder`; conformance-tested on both backends). On a copy of the live
+   store the `addons` pass went from cut at 1,079 s in phase `supers` to complete in 88 s
+   at 93.7% coverage with an identical resolution digest.
 
-| when | pass | of which lock wait | apply | outcome |
-|---|---|---|---|---|
-| 2026-09-01 23:44 | 1,495s | 1,217s | ~1,088s | partial, coverage 0 |
-| 2026-09-02 18:04 | 1,495s | 407s | ~1,088s | partial, coverage 0 |
+**Residual checks:** (1) confirm the live `addons` pass completes and writes its marker on
+the next restart; (2) three sibling readers still take the unfiltered inbound projection
+and filter in Go — `lsp/provider.go::addOverrideEdges`, `store_traversal.go::GetFileSubGraph`,
+`query/engine.go::GetFileSymbols` — same hub exposure, untouched; (3) the in-memory
+`graph.Graph.NodesInFilesByKind` scans every node × 14 kinds despite `byFile` (a fixture
+cost on SQLite, a live O(N²) if that backend ever runs a pass); (4) the 2026-09-01 cliff
+(the same pass completed in 194 s on 08-30) is most plausibly hub in-degree growth from the
+framework/odoo synthesizer edges, not a tstypes change — the 08-31 `buildIndex` commits
+were benchmarked at 5–9% and cleared; (5) the analysis suite (`analysis_persistence.go`)
+still contends with enrichment applies for the resolve mutex.
 
-The apply itself is the fixed ~1,088s in both, against 418s for
-`local@MR6373` at 122k nodes — a LARGER repo. So this is not simply "addons is
-big"; something about that repository's shape makes the apply super-linear, and
-the answer is worth knowing before the budget is raised to cover it.
+**Effort:** S (residuals) **Priority:** P3
 
-Read `coverage: 0` with care: `CoveragePercent` is computed only on
-`applyStagedFacts`'s success path (`provider_stream.go`), so ANY pass cut at a
-page boundary logs 0 no matter how many symbols its coverage walk counted. What
-these runs establish is "budget exhausted", not "covered nothing" — and
-`SymbolsCovered`, which the futile-pass detector uses, is not in the log. Start
-by logging it.
+### `addons` python-types: cause found and fixed; verify the marker lands live
 
-The missing `python-types` row for `addons` was the declared-vs-started gap;
-`declareApplicableProviders` now declares supplemental providers too, so an
-unfinished pass leaves a gen-0 row instead of no row.
+**What:** the pass never finished because (a) its enforced budget was a file count in a
+per-node formula (1,079 s, never logged) and (b) the per-page preload was O(hub in-degree):
+see "The tstypes whole-repo pass was O(N²)…" above for the measurements and the fix. The
+table of cut passes (2,308 s / 1,495 s / 1,087–1,924 s, apply ≈ 1,080 s in every one,
+four of them with zero lock wait and alone in the pool) is explained by the budget alone;
+the "super-linear shape" hypothesis was right but the term was inbound degree, not a
+mega-file or a deep hierarchy (largest addons python file: 194 nodes).
 
-**Why:** it is pure loss — a fixed ~18 minutes of work per daemon life for a
-result that is empty, and (before the yield below) 18 minutes of the store-wide
-resolve mutex denied to every other pass. `internal/semantic/futile_pass.go`
-now stops the repeat WITHIN one daemon life, and the tstypes apply yields the
-mutex at page boundaries so the cost is no longer charged to everyone else. The
-pass itself is still dead work.
+**Remaining:** after the next restart, confirm `semantic enrichment complete
+provider=python-types repo=addons partial=false` and that `deferred enrichment re-armed`
+no longer names `addons`. Note `addons` has no `.git` (it is gitignored by docker-env), so
+its re-arm marker reads `no git head` and the whole-repo marker is keyed on that path.
 
-**Context:** measurements above are from `~/.gortex/cache/daemon.log`. Start
-with `tstypes: apply hot cache` for the two runs and compare miss rates against
-`local@MR6373`'s — but note both rows predate the yield, so neither is polluted
-by the cache thrash measured on 2026-09-02 (three concurrent applies, 89.8% ->
-61.0% node hit rate, 2.7x slower for identical work). That thrash is fixed:
-the apply now yields only to a pass registered in the resolve queue, and the
-time it spends yielded is refunded to its budget. `addons` was slow before any
-of that and is still unexplained.
-
-**Effort:** M
-**Priority:** P2
-**Depends on:** Nothing.
+**Effort:** S **Priority:** P3
 
 ### Make the futile-enrichment record survive a restart
 
@@ -600,8 +733,9 @@ daemon-owned file with an explicit lifetime. Decide which before implementing.
 
 **Effort:** M
 **Priority:** P3
-**Depends on:** the investigation above — if the pass can be made to finish,
-this record stops mattering.
+**Depends on:** the `addons` fix above landed 2026-09-06 and the pass now finishes on a
+store copy in 88 s, so on this workspace the record no longer matters; keep the entry for
+a corpus that genuinely cannot finish.
 
 
 ## Analysis

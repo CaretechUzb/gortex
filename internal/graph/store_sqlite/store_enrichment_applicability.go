@@ -224,6 +224,65 @@ SELECT NOT EXISTS(SELECT 1 FROM enrichment_state WHERE view_gen = ? AND repo_pre
 	return owed, nil
 }
 
+// EnrichmentCurrentForRepo answers, about one repo, the same question READY's
+// enrichment column answers about the repo it is reporting on: is the recorded
+// semantic enrichment a description of the content the graph currently holds?
+//
+// Two bools because the two ways of not being current are different facts and
+// the caller acts on them differently. hasRun is whether ANY real provider has
+// completed a pass here at all -- gen > 0, the monotone signal
+// CompleteEnrichmentProvider writes and nothing walks back. current is that
+// plus the MINIMUM content_gen across the real provider rows having caught up
+// to the repo's own counter. So (false, false) is "nobody has ever enriched
+// this", (false, true) is "somebody did, and the content has moved since", and
+// only (true, true) says the rows describe this corpus.
+//
+// The MINIMUM, never the maximum, for the same reason readiness takes it: one
+// fresh provider must not speak for a sibling that never ran. The sentinels are
+// excluded because neither is a provider -- __repo__ is the whole-repo rollup
+// and __none__ is "nothing applies" -- which is also why a repo carrying only
+// sentinels reports (false, false) rather than vacuously current.
+//
+// The caller this was added for is the worktree-copy source ranking, which must
+// not copy a subgraph whose enrichment rows the source itself had not finished:
+// the copy carries those rows verbatim, and a scoped repair's
+// AdvanceContentGenForCompletedProviders then advances every gen > 0 row to the
+// DESTINATION's counter -- laundering the source's honest "partial" into the
+// copy's "ready". Measured live 2026-09-05: a sibling whose python-types row sat
+// at content_gen 104 against its repo's 107 was chosen as the copy source purely
+// on HEAD closeness, and the copy read ready over a graph whose python
+// enrichment had never finished anywhere.
+//
+// Read-only, and on the read pool: nothing here writes, so it is safe to call
+// while a pass is running -- the answer is simply a snapshot, which is all a
+// ranking decision needs.
+func (s *Store) EnrichmentCurrentForRepo(repoPrefix string) (current, hasRun bool, err error) {
+	if s == nil || s.db == nil || repoPrefix == "" {
+		return false, false, nil
+	}
+	var providers int
+	var ran, minContentGen sql.NullInt64
+	if err := s.db.QueryRow(`
+SELECT COUNT(*),
+       SUM(CASE WHEN gen > 0 THEN 1 ELSE 0 END),
+       MIN(content_gen)
+  FROM enrichment_state
+ WHERE view_gen = ? AND repo_prefix = ? AND provider NOT IN (?, ?)`,
+		s.viewGen, repoPrefix,
+		graph.EnrichProviderRepoMarker, graph.EnrichProviderNone,
+	).Scan(&providers, &ran, &minContentGen); err != nil {
+		return false, false, err
+	}
+	if providers == 0 || ran.Int64 == 0 {
+		return false, false, nil
+	}
+	repoContentGen, err := s.RepoContentGen(repoPrefix)
+	if err != nil {
+		return false, true, err
+	}
+	return minContentGen.Int64 >= repoContentGen, true, nil
+}
+
 // DeclareNoEnrichmentProvidersIfUnrecorded writes the EnrichProviderNone
 // sentinel for a repo that has NO enrichment rows at all, and does nothing for
 // one that has any.

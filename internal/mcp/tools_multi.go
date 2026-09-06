@@ -249,12 +249,29 @@ func (s *Server) handleUntrackRepository(ctx context.Context, req mcp.CallToolRe
 	// The lifecycle revokes the tracking intents, runs the plan's saga and
 	// drives every side effect from it: watcher detach, graph eviction,
 	// config persist, session invalidation, analysis rerun.
-	result, err := s.lifecycle.ApplyUntrack(ctx, preview)
+	//
+	// StartApplyUntrack, not the wait-by-default ApplyUntrack: a demotion's
+	// saga retires the corpus the checkout gives up, which evicts every node,
+	// edge and file row of a whole repository and rewrites the search corpus
+	// around them — minutes on a real worktree, and far past the MCP tool
+	// deadline (mcp/tool_deadline.go). The transition runs on the lifecycle's
+	// own context, not this request's, so abandoning the wait here does not
+	// stop it — it only stops this request from being the one blocked on it.
+	// A caller that wants to know when it lands polls list_checkouts for
+	// result.CheckoutID until its effective mode is automatic AND its
+	// transition slot is empty (see cmd/gortex --wait) rather than calling
+	// this tool again, which would re-authorize against catalog rows the
+	// running worker is still moving. The mode alone is not the end state:
+	// it is published first and the teardown runs behind it.
+	result, err := s.lifecycle.StartApplyUntrack(ctx, preview)
 	if err != nil {
 		return untrackFailure(path, err), nil
 	}
 	status := "untracked"
-	if result.Demoted {
+	switch {
+	case result.Pending:
+		status = "demoting"
+	case result.Demoted:
 		status = "demoted"
 	}
 	return s.respondJSONOrTOON(ctx, req, untrackResultPayload(status, result))

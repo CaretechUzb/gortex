@@ -30,4 +30,14 @@ public class App { public void main() { new Svc().run(); } }
 	assert.Equal(t, semantic.EnrichBoundBudget, result.BoundReason)
 	assert.Zero(t, result.EdgesAdded)
 	assert.Zero(t, result.EdgesConfirmed)
+	// A pass cancelled before runPass's first ctx.Err() check still records
+	// the file count it was about to stage (len(files) is known before the
+	// cancellation check), but never enters staging or apply: StagingMs,
+	// ApplyMs, Phase and PagesApplied must all stay at their zero value so a
+	// Partial read from this branch cannot be misread as "cut mid-apply".
+	assert.Equal(t, 2, result.FileCount)
+	assert.Zero(t, result.StagingMs)
+	assert.Zero(t, result.ApplyMs)
+	assert.Empty(t, result.Phase)
+	assert.Zero(t, result.PagesApplied)
 }

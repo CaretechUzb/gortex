@@ -354,6 +354,25 @@ type DedicatedGraph struct {
 	State              string
 }
 
+// The completeness vocabulary. The column is a short, comma-free tag naming
+// the one way a finished generation knows it is not a whole description of
+// the state it claims; empty — the default — means nothing was narrowed.
+//
+// It is deliberately coarser than generation_producer_completeness, which says
+// which CAPABILITIES a generation can answer. This says whether the payload
+// itself was cut short, which is a property of the build rather than of any
+// one reader's question.
+const (
+	// ViewGenerationCompleteTag is the value a build that reached every file
+	// it planned to leaves. It is the column's default, so it is never
+	// written; the constant exists so a reader can name the case.
+	ViewGenerationCompleteTag = ""
+	// ViewGenerationClosureTruncated says the affected closure hit its cap:
+	// a dependent past the cut was never re-derived and still reads the layer
+	// below, so the generation is knowingly stale at those paths.
+	ViewGenerationClosureTruncated = "closure_truncated"
+)
+
 // ViewGeneration is one build of a view. GenerationID is assigned by the
 // store; BaseGenerationID is 0 when the generation has no lower layer.
 type ViewGeneration struct {

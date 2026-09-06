@@ -288,32 +288,45 @@ func (l *CheckoutLifecycle) PreviewForget(ctx context.Context, pathOrPrefix stri
 
 // demote hands one dedicated checkout to the family's automatic lane.
 //
-// The whole automatic stack is built while the checkout is still being served
-// from its own corpus, and the route that installs it is one write. Nothing a
-// reader can see moves until that write lands: before it the checkout is
-// dedicated and reads its own corpus, after it the checkout is automatic and
-// reads the primary's corpus under its own layers, and there is no state in
-// between in which it is neither.
+// It registers the automatic route and builds nothing. The layers a demoted
+// checkout will be served through are exactly the ones its coordinator builds
+// on any other day, and building them here would put a whole commit layer plus
+// a working-tree layer inside the untrack — for a checkout the caller has just
+// said it does not want tracked, and which a burst of track/untrack may move
+// again before anything reads it. The route therefore lands in the pending
+// state: it names the primary graph and no generations, which is the honest
+// description of a checkout that is served by the base corpus with exact:false
+// until its first layer exists. A read that routes here demands that layer and
+// the coordinator builds it; nothing that reads is left waiting on a build
+// nobody asked for.
 //
 // The corpus it is leaving goes last, after the flip and through the guarded
 // retirement path, so a view materialized just before the flip keeps its lease
 // on what it is reading.
+//
+// The order of what remains is what an observer keys on. The mode flip is
+// published FIRST and everything expensive happens behind it — the dedicated
+// graph retired, the repository's rows evicted, its entry removed from the
+// global config — with CompleteIntentTransition last. So the transition row
+// disappearing, not the mode column, is what says a demotion is done; a
+// caller that waits on the mode alone (gortex untrack --wait) declares success
+// seconds into a teardown that has minutes left to run.
 func (l *CheckoutLifecycle) demote(
 	ctx context.Context,
 	checkout store_sqlite.Checkout,
 	owned *store_sqlite.DedicatedGraph,
 	authorization reconcile.DemotionAuthorization,
 ) error {
-	coordinator, err := l.buildCoordinator(ctx, authorization.PrimaryGraphID, checkout)
-	if err != nil {
+	// The pre-flight the synchronous rehome used to perform as a side effect of
+	// constructing a coordinator. Nothing has been written yet, so a primary
+	// that cannot serve this checkout refuses the demotion here rather than
+	// leaving it half-done: without it a demotion completes with the corpus
+	// retired, a pending route and no coordinator, and the checkout is unserved
+	// until the hourly janitor notices.
+	if err := l.primaryCanServe(ctx, authorization.PrimaryGraphID, checkout); err != nil {
 		return err
 	}
-	if coordinator == nil {
-		return fmt.Errorf("indexer: the primary graph %s cannot serve checkout %s yet",
-			authorization.PrimaryGraphID, checkout.CheckoutID)
-	}
-	if _, err := coordinator.RehomeTo(ctx, authorization.PrimaryGraphID); err != nil {
-		_ = coordinator.Close()
+	if err := l.registerAutomaticRoute(ctx, checkout.CheckoutID, authorization.PrimaryGraphID); err != nil {
 		return err
 	}
 
@@ -325,22 +338,56 @@ func (l *CheckoutLifecycle) demote(
 	}
 	commit, commitErr := l.rec.CommitAuthorizedDemotion(ctx, checkout, authorization)
 	if commitErr != nil && !commit.Committed {
-		// The route the rehome installed describes a checkout that is still
-		// dedicated, so it is withdrawn again and the payload it named is
-		// offered back. Intent revocation is not lost: the durable transition
-		// remains and a retry adopts it.
-		l.oweRetirement(coordinator.DrainRetirements()...)
-		l.oweRoutedGenerations(ctx, checkout.CheckoutID)
+		// The route just registered describes a checkout that is still
+		// dedicated, so it is withdrawn again. Nothing was built under it, so
+		// there is no payload to hand back. Intent revocation is not lost: the
+		// durable transition remains and a retry adopts it.
 		if deleteErr := l.catalog.DeleteCheckoutRoute(ctx, checkout.CheckoutID); deleteErr != nil &&
 			!errors.Is(deleteErr, store_sqlite.ErrCatalogNotFound) {
 			l.logger.Warn("checkout lifecycle: could not withdraw a rolled-back route",
 				zap.String("checkout", checkout.CheckoutID), zap.Error(deleteErr))
 		}
-		_ = coordinator.Close()
 		l.sweepRetirements(ctx)
 		return commitErr
 	}
-	l.installCoordinator(checkout.CheckoutID, coordinator)
+	if l.demoteBarrier != nil {
+		l.demoteBarrier()
+	}
+	// The commit is through, and with it the retirement saga that ran inside
+	// it: the mode flip, the repository purge and DeleteDedicatedGraph are all
+	// durable now. Stamped on this side of the barrier rather than immediately
+	// after the commit call, so the barrier stays a true mid-teardown
+	// observation point — everything a fixture reads there was stamped from
+	// inside the saga, which is the part that can run for tens of minutes.
+	l.noteTransitionProgress(ctx, checkout.CheckoutID, "graph_retired")
+	// The binding is gone now, so the automatic lane will accept the checkout —
+	// and where the commit journalled but its cleanup did not, the row it left
+	// standing is named as retiring so it cannot veto the coordinator forever.
+	l.ensureCoordinatorDespite(ctx, authorization.PrimaryGraphID, checkout, authorization.OwnedGraphID)
+	if !l.coordinatorRegistered(checkout.CheckoutID) {
+		// The checkout is automatic with a pending route and nothing building
+		// for it. That is a SERVING gap, not an unfinished demotion: the mode
+		// flip, the corpus retirement and the repository eviction have all
+		// committed, and the only thing left below is the durable finish. So it
+		// is reported and the finish still runs — failing here instead left the
+		// transition standing with everything already torn down, which is a
+		// demotion that reads as half-done to every observer (the config entry
+		// gone, the corpus gone, the transition still in flight) until the
+		// hourly sweep resumed it. The coordinator is what the automatic lane
+		// brings up on its own: the first read of this checkout activates one,
+		// and the family reconciliation installs one regardless.
+		l.logger.Warn("checkout lifecycle: demoted checkout has no coordinator yet",
+			zap.String("checkout", checkout.CheckoutID),
+			zap.String("primary", authorization.PrimaryGraphID))
+	}
+	// And it is deliberately NOT demanded. The coordinator is registered so the
+	// checkout is watched and a read can wake it, but the first commit layer
+	// over the family base costs the same whole-tree build here as anywhere
+	// else — and untracking a worktree is, more often than not, the step before
+	// deleting it. Demanding here bought that build for a checkout nobody was
+	// going to read. The read seam demands instead (ActivateCheckout, and
+	// activateCheckout for a cold one), so the only thing not demanding costs
+	// is one exact:false answer to whoever reads this checkout first.
 
 	if commitErr != nil {
 		// The mode flip and graph-retirement journal committed together.
@@ -355,11 +402,31 @@ func (l *CheckoutLifecycle) demote(
 	if owned != nil {
 		prefix = owned.RepoPrefix
 	}
-	if _, _, err := l.evictRepoChecked(ctx, prefix, checkout.RootPath); err != nil {
-		// Publication already committed. Keep the automatic route live and the
-		// transition standing so restart can retry only the external cleanup.
-		l.sweepRetirements(ctx)
-		return fmt.Errorf("indexer: persist demoted checkout configuration: %w", err)
+	// Only when the retirement did not get to it. The eviction is one call
+	// deep inside the saga above — releaseGraph runs cleanupHooks.ReleaseGraph,
+	// which is this exact evictRepoChecked on this exact prefix and root path,
+	// and DELETES THE GRAPH ROW ON THE NEXT LINE. So a binding that is gone is
+	// proof the eviction ran: nothing else in the daemon deletes a demotion's
+	// owned binding (the promotion path's DeleteDedicatedGraph unwinds a graph
+	// its own in-flight promotion just minted, and a checkout cannot hold a
+	// promotion and a demotion transition at once). Running it anyway paid a
+	// second whole-repository teardown — a fresh mutation lane, the reachability
+	// topology writer and a republish of the aggregate vector corpus — for a
+	// prefix with nothing left in it.
+	//
+	// A binding that is still standing is the partial-commit and resume path,
+	// where the saga journalled the retirement but did not execute it, and this
+	// call is the retry that persists the external cleanup. An existence check
+	// that errors is answered the same way, because skipping an eviction on a
+	// catalog hiccup is the worse of the two mistakes.
+	if l.ownedBindingStanding(ctx, authorization.OwnedGraphID) {
+		if _, _, err := l.evictRepoChecked(ctx, prefix, checkout.RootPath); err != nil {
+			// Publication already committed. Keep the automatic route live and
+			// the transition standing so restart can retry only the external
+			// cleanup.
+			l.sweepRetirements(ctx)
+			return fmt.Errorf("indexer: persist demoted checkout configuration: %w", err)
+		}
 	}
 	if err := l.catalog.CompleteIntentTransition(ctx, checkout.CheckoutID,
 		authorization.Transition.TransitionID); err != nil {
@@ -367,6 +434,91 @@ func (l *CheckoutLifecycle) demote(
 		return fmt.Errorf("indexer: complete demotion transition: %w", err)
 	}
 	l.sweepRetirements(ctx)
+	return nil
+}
+
+// ownedBindingStanding reports that the dedicated-graph row a demotion is
+// retiring is still there — i.e. that the retirement saga has not released it,
+// and the repository it names has therefore not been evicted yet.
+//
+// An empty id is a demotion with no corpus to give up, which needs no
+// eviction. A failed read answers true: re-running an eviction that already
+// happened costs work, skipping one that did not costs correctness.
+func (l *CheckoutLifecycle) ownedBindingStanding(ctx context.Context, ownedGraphID string) bool {
+	if ownedGraphID == "" {
+		return false
+	}
+	if l == nil || l.catalog == nil {
+		return true
+	}
+	_, found, err := l.catalog.GetDedicatedGraph(ctx, ownedGraphID)
+	if err != nil {
+		return true
+	}
+	return found
+}
+
+// primaryCanServe refuses a demotion onto a primary that cannot back a
+// coordinator.
+//
+// It asks the two questions buildCoordinator answers with a silent (nil, nil):
+// whether the graph is there with a repo prefix, and whether that prefix is
+// actually served by an indexer. Both are properties of the family rather than
+// of the checkout, and both leave the automatic lane unable to compose
+// anything — so they belong in front of the first write, where a refusal costs
+// nothing.
+func (l *CheckoutLifecycle) primaryCanServe(
+	ctx context.Context, primaryGraphID string, checkout store_sqlite.Checkout,
+) error {
+	if l.store == nil || l.catalog == nil || l.mi == nil {
+		return fmt.Errorf("indexer: this daemon cannot serve checkout %s from a shared corpus",
+			checkout.CheckoutID)
+	}
+	primary, found, err := l.catalog.GetDedicatedGraph(ctx, primaryGraphID)
+	if err != nil {
+		return err
+	}
+	if !found || primary.RepoPrefix == "" || l.mi.GetIndexer(primary.RepoPrefix) == nil {
+		return fmt.Errorf("indexer: the primary graph %s cannot serve checkout %s yet",
+			primaryGraphID, checkout.CheckoutID)
+	}
+	return nil
+}
+
+// registerAutomaticRoute points a checkout at a graph with no layers over it
+// yet.
+//
+// Pending is the state that says exactly that, and it is the same one an
+// ordinary cycle leaves while it rebuilds: the reader takes its base-corpus
+// fallback and is told the view it asked for was not served. A checkout that
+// has never been routed gets its row installed; one that still holds a row
+// from an earlier life is repointed under its own epoch, so a coordinator that
+// is somehow still writing it loses the compare-and-set rather than being
+// overwritten.
+func (l *CheckoutLifecycle) registerAutomaticRoute(ctx context.Context, checkoutID, graphID string) error {
+	route, routed, err := l.catalog.GetCheckoutRoute(ctx, checkoutID)
+	if err != nil {
+		return err
+	}
+	if !routed {
+		return l.catalog.UpsertCheckoutRoute(ctx, store_sqlite.CheckoutRoute{
+			CheckoutID: checkoutID,
+			GraphID:    graphID,
+			State:      store_sqlite.RoutePending,
+		})
+	}
+	previousCommit, previousDirty := route.CommitGenerationID, route.DirtyGenerationID
+	if err := l.catalog.FlipCheckoutRoute(ctx, store_sqlite.FlipCheckoutRouteRequest{
+		CheckoutID:         checkoutID,
+		ExpectedRouteEpoch: route.RouteEpoch,
+		GraphID:            graphID,
+		State:              store_sqlite.RoutePending,
+	}); err != nil {
+		return err
+	}
+	// Whatever the old route named was built over the corpus the checkout is
+	// leaving and composes over nothing here, so it is owed a retirement.
+	l.oweRetirement(previousDirty, previousCommit)
 	return nil
 }
 

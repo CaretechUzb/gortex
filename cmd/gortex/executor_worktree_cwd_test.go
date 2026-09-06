@@ -385,6 +385,47 @@ func TestCheckoutVerbs_UnboundWorktreeCWDRelaysThroughTheFamily(t *testing.T) {
 	})
 }
 
+// TestUntrack_UnboundWorktreeCWDRelaysThroughTheFamily extends the same rule
+// to `gortex untrack`.
+//
+// Untrack is the verb that CREATES this state: a demoted checkout is served
+// through its family with a pending route and no layer until something reads
+// it, so the path the user just untracked is unbound for as long as that
+// lasts. Routed on its own path, a second untrack of it is refused by the very
+// pre-flight whose remedy is a different command. The subject rides in the
+// tool's `path` argument, so relaying the connection through the family's
+// tracked working copy cannot change what is untracked.
+func TestUntrack_UnboundWorktreeCWDRelaysThroughTheFamily(t *testing.T) {
+	dir := t.TempDir()
+	mainRepo, worktree := fakeLinkedWorktree(t, dir)
+	stub := startStubDaemon(t, []string{mainRepo})
+	stub.mcpResult = []byte(`{"status":"untracked","plan":"forget","prefix":"repo@wt"}`)
+
+	// The wiring this replaced: the pre-flight refuses the unbound worktree
+	// with the remedy for a different command.
+	if _, err := requireDaemonTool(worktree, "untrack_repository",
+		map[string]any{"path": worktree}); err == nil ||
+		!strings.Contains(err.Error(), "has not bound the worktree") {
+		t.Fatalf("the fixture must reproduce the unbound-view refusal, got %v", err)
+	}
+
+	if _, err := untrackDaemonTool(worktree, "untrack_repository",
+		map[string]any{"path": worktree}); err != nil {
+		t.Fatalf("untracking a worktree this command already demoted must reach the tool: %v", err)
+	}
+	if hs := stub.seenMCPHandshake(); hs.CWD != mainRepo {
+		t.Fatalf("untrack must relay through the family's tracked repo, daemon saw %q want %q",
+			hs.CWD, mainRepo)
+	}
+	tool, args := stub.seenTool()
+	if tool != "untrack_repository" {
+		t.Fatalf("relayed the wrong tool: %q", tool)
+	}
+	if got, _ := args["path"].(string); got != worktree {
+		t.Fatalf("the relay moved the subject: tool asked about %q, want %q", got, worktree)
+	}
+}
+
 // TestResolveExecutor_BusyCoverageProbeKeepsAskingTheDaemon pins the
 // fail-open the routing probe documents for its status half onto its coverage
 // half. A daemon too busy to answer "which view serves this path" has not

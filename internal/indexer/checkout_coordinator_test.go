@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"sync"
 	"testing"
 	"testing/synctest"
@@ -43,6 +44,13 @@ type coordinatorFixture struct {
 	primary string
 	// worktree is the automatic checkout the coordinator serves.
 	worktree string
+
+	// deferFirstBuild leaves the production first-build deferral in place for
+	// the coordinators this fixture builds. Off by default for the same reason
+	// the self-signal is: these tests decide when a cycle runs, and a cycle
+	// waiting for a reader that never arrives would never run at all. The tests
+	// that are ABOUT the deferral turn it back on.
+	deferFirstBuild bool
 
 	familyID   string
 	graphID    string
@@ -178,6 +186,9 @@ func (f *coordinatorFixture) coordinator(t testing.TB, cfg CheckoutCoordinatorCo
 	cfg.Logger = zap.NewNop()
 	if cfg.PollInterval == 0 {
 		cfg.PollInterval = -1
+	}
+	if cfg.FirstBuildDelay == 0 && !f.deferFirstBuild {
+		cfg.FirstBuildDelay = -1
 	}
 	coordinator, err := NewCheckoutCoordinator(cfg)
 	if err != nil {
@@ -521,6 +532,187 @@ func TestCoordinatorFreshProcessRetainsRoutedCommitForSwitchBack(t *testing.T) {
 	}
 	if commits != 2 {
 		t.Fatalf("%d commit generations exist for two trees across restart", commits)
+	}
+}
+
+// TestCoordinatorReusesAStoredCommitLayerAcrossARestart is the durable half of
+// the branch-switch cache.
+//
+// The in-process cache remembers what THIS coordinator built, and a restart
+// empties it while every generation it held is still in the database. A fresh
+// coordinator that finds the route naming B and is asked for A therefore has
+// nothing in memory to reuse — and must find A in the catalog rather than
+// spending a whole commit-layer build on a payload already stored.
+func TestCoordinatorReusesAStoredCommitLayerAcrossARestart(t *testing.T) {
+	f := newCoordinatorFixture(t)
+	first := f.inertCoordinator(t, CheckoutCoordinatorConfig{})
+	commitA := builderGit(t, f.worktree, "rev-parse", "HEAD")
+
+	initial := coordinatorReconcile(t, first)
+	if !initial.CommitBuilt || initial.CommitGenerationID == 0 {
+		t.Fatalf("the first cycle did not build A: %+v", initial)
+	}
+	generationA := initial.CommitGenerationID
+
+	f.commitTreeB()
+	if second := coordinatorReconcile(t, first); !second.CommitBuilt {
+		t.Fatalf("the switch to B did not build B: %+v", second)
+	}
+
+	// The daemon restarts here — and a restart sweeps. It runs the way a boot
+	// runs it: nothing is registered yet, so no checkout counts as served and
+	// every ready layer the route does not name looks like a crash orphan. A's
+	// layer is exactly that, and collecting it is what made every restart pay
+	// to rebuild a payload the store was still holding.
+	if _, err := newSweepLifecycle(t, f.store).Sweep(context.Background()); err != nil {
+		t.Fatalf("the boot sweep failed: %v", err)
+	}
+	if _, found := f.generation(generationA); !found {
+		t.Fatalf("the boot sweep collected the reusable commit layer %d", generationA)
+	}
+
+	// The replacement's reuse cache is empty and the route names B, so nothing
+	// in this process remembers A.
+	restarted := f.inertCoordinator(t, CheckoutCoordinatorConfig{})
+	builderGit(t, f.worktree, "checkout", "--detach", commitA)
+	third := coordinatorReconcile(t, restarted)
+	if third.CommitBuilt {
+		t.Fatal("the post-restart switch back re-indexed A's tree — the stored generation was not found")
+	}
+	if !third.CommitReused {
+		t.Fatalf("the post-restart switch back did not report a reuse: %+v", third)
+	}
+	if third.CommitGenerationID != generationA {
+		t.Fatalf("the switch back routed generation %d, want the stored %d",
+			third.CommitGenerationID, generationA)
+	}
+
+	commits := 0
+	for _, row := range f.generations() {
+		if row.GenerationKind == CommitLayerGenerationKind {
+			commits++
+		}
+	}
+	if commits != 2 {
+		t.Fatalf("%d commit generations exist for two trees visited across a restart", commits)
+	}
+}
+
+// TestCoordinatorDefersTheFirstBuildUntilTheCheckoutIsRead pins the lazy first
+// build: a checkout nothing has read yet costs no build, and the read that
+// routes to it is what buys one.
+//
+// The deferral is the loop's decision, not the reconcile's — a transition that
+// drives a rebuild deliberately still builds — so the cycle entry point is what
+// this drives.
+func TestCoordinatorDefersTheFirstBuildUntilTheCheckoutIsRead(t *testing.T) {
+	f := newCoordinatorFixture(t)
+	f.deferFirstBuild = true
+	var cycles []CheckoutCycle
+	c := f.inertCoordinator(t, CheckoutCoordinatorConfig{
+		cycleDone: func(out CheckoutCycle) { cycles = append(cycles, out) },
+	})
+
+	c.mu.Lock()
+	pending, after := c.firstBuildPending, c.firstBuildAfter
+	c.mu.Unlock()
+	if !pending {
+		t.Fatal("an unset delay left the first build unarmed; the default must wait for a reader")
+	}
+	if !after.IsZero() {
+		t.Fatalf("an unset delay armed a deadline at %s; the default is demand-only", after)
+	}
+
+	// Two cycles, not one: a timer would let the second through, and the whole
+	// point of the default is that no amount of waiting does.
+	c.cycle(context.Background())
+	c.cycle(context.Background())
+	if len(cycles) != 2 || !cycles[0].Deferred || !cycles[1].Deferred {
+		t.Fatalf("cycles for an unread checkout were not all deferred: %+v", cycles)
+	}
+	if _, routed, err := f.catalog.GetCheckoutRoute(context.Background(), f.checkoutID); err != nil || routed {
+		t.Fatalf("a deferred cycle wrote a route: routed=%v err=%v", routed, err)
+	}
+	if rows := f.generations(); len(rows) != 0 {
+		t.Fatalf("a deferred cycle built %d generations", len(rows))
+	}
+
+	// A read routes to the checkout: the build is no longer speculative.
+	c.Demand("a read selected the checkout")
+	c.cycle(context.Background())
+	if len(cycles) != 3 {
+		t.Fatalf("the demanded cycle did not report: %+v", cycles)
+	}
+	built := cycles[2]
+	if built.Deferred || !built.CommitBuilt || built.CommitGenerationID == 0 {
+		t.Fatalf("the demanded cycle did not build the first commit layer: %+v", built)
+	}
+}
+
+// TestCoordinatorOptInWindowBuildsAnUnreadCheckout is the other arm of the
+// same setting: an operator who would rather pay for a warm view than wait for
+// the first query on it configures a positive delay, and once it has passed
+// the loop builds without anyone asking.
+//
+// The deadline is moved rather than waited out. What is pinned is that a
+// window exists and that reaching it ends the deferral; sleeping for a real
+// one would make the assertion a race against the machine.
+func TestCoordinatorOptInWindowBuildsAnUnreadCheckout(t *testing.T) {
+	f := newCoordinatorFixture(t)
+	var cycles []CheckoutCycle
+	c := f.inertCoordinator(t, CheckoutCoordinatorConfig{
+		FirstBuildDelay: time.Hour,
+		cycleDone:       func(out CheckoutCycle) { cycles = append(cycles, out) },
+	})
+
+	c.cycle(context.Background())
+	if len(cycles) != 1 || !cycles[0].Deferred {
+		t.Fatalf("the cycle inside the window was not deferred: %+v", cycles)
+	}
+
+	c.mu.Lock()
+	c.firstBuildAfter = time.Now().Add(-time.Second)
+	c.mu.Unlock()
+
+	c.cycle(context.Background())
+	if len(cycles) != 2 {
+		t.Fatalf("the cycle past the window did not report: %+v", cycles)
+	}
+	past := cycles[1]
+	if past.Deferred || !past.CommitBuilt || past.CommitGenerationID == 0 {
+		t.Fatalf("the cycle past the window did not build, with nobody having read the checkout: %+v", past)
+	}
+}
+
+// TestCoordinatorRecordsATruncatedClosureOnTheGeneration pins the honesty half
+// of a cut closure. The build reports it and the coordinator logs it; neither
+// survives the process. The generation row is what a later reader — another
+// daemon life, a health surface — can ask, and a generation that publishes
+// ready while a dependent past the cap still reads the layer below has to say
+// so there.
+func TestCoordinatorRecordsATruncatedClosureOnTheGeneration(t *testing.T) {
+	f := newCoordinatorFixture(t)
+	builder := builderNewBuilder(f.store)
+	// core.go's change reaches two files — its dependent and its dependency —
+	// so a cap of one has to cut the closure.
+	builder.Config.AffectedByReresolveMax = 1
+	c := f.inertCoordinator(t, CheckoutCoordinatorConfig{Builder: builder})
+
+	f.commitTreeB()
+	cycle := coordinatorReconcile(t, c)
+	if !cycle.CommitBuilt || cycle.CommitGenerationID == 0 {
+		t.Fatalf("the cycle did not build a commit layer: %+v", cycle)
+	}
+	row, found := f.generation(cycle.CommitGenerationID)
+	if !found {
+		t.Fatalf("commit generation %d is gone", cycle.CommitGenerationID)
+	}
+	if row.Completeness != store_sqlite.ViewGenerationClosureTruncated {
+		t.Fatalf("commit generation %d records completeness %q, want %q",
+			row.GenerationID, row.Completeness, store_sqlite.ViewGenerationClosureTruncated)
+	}
+	if row.State != store_sqlite.ViewGenerationReady {
+		t.Fatalf("a truncated generation is %q, want it published anyway", row.State)
 	}
 }
 
@@ -1039,8 +1231,12 @@ func TestCoordinatorRescheduleWhenTheRouteMovesUnderIt(t *testing.T) {
 	if !errors.Is(err, errRouteMoved) {
 		t.Fatalf("the loser failed with %v, want a lost route flip", err)
 	}
-	if !out.CommitBuilt {
-		t.Fatalf("the loser did not build before losing the flip: %+v", out)
+	// The loser wants the tree the winner has just published a layer for, so
+	// it reaches that generation through the catalog and mints nothing. It
+	// reports neither built nor reused: reuse is what a cycle says once the
+	// slot has actually moved, and this one's flip is about to be refused.
+	if out.CommitBuilt {
+		t.Fatalf("the loser rebuilt the layer the winner had just published: %+v", out)
 	}
 
 	route := f.route()
@@ -1049,10 +1245,14 @@ func TestCoordinatorRescheduleWhenTheRouteMovesUnderIt(t *testing.T) {
 			route.CommitGenerationID, won.CommitGenerationID)
 	}
 
-	// What the loser built is whole, published and routed by nobody. Nothing
-	// refuses its retirement — no route names it, no layer sits on it, no view
-	// leases it — so the offer that follows the supersede collects it outright
-	// and only the winner's generations are left.
+	// Both endings leave the same database. The loser is asking for the tree
+	// the winner has just published a layer for, so it re-routes that
+	// generation instead of minting a second copy — and a generation it did
+	// not build belongs to the cycle that did, which a lost flip leaves
+	// untouched. Had it built one, that payload would be whole, published and
+	// routed by nobody: no route names it, no layer sits on it, no view leases
+	// it, so the offer that follows the supersede collects it outright. Either
+	// way only the winner's generations survive.
 	for _, row := range f.generations() {
 		if row.State == store_sqlite.ViewGenerationBuilding {
 			t.Fatalf("generation %d was left building", row.GenerationID)
@@ -1060,6 +1260,10 @@ func TestCoordinatorRescheduleWhenTheRouteMovesUnderIt(t *testing.T) {
 		if row.GenerationID != route.CommitGenerationID && row.GenerationID != route.DirtyGenerationID {
 			t.Fatalf("the loser's generation %d (%s) was left in the database",
 				row.GenerationID, row.State)
+		}
+		if row.GenerationKind == CommitLayerGenerationKind &&
+			row.GenerationID != route.CommitGenerationID {
+			t.Fatalf("a second commit layer %d exists for one tree", row.GenerationID)
 		}
 	}
 }
@@ -1884,21 +2088,29 @@ func TestSweepCollectsCrashOrphanedGenerations(t *testing.T) {
 		t.Fatalf("seed the superseded generation: %v", err)
 	}
 
-	// And a published commit layer for a checkout nothing routes any more —
-	// what a coordinator's reuse cache was holding when it stopped.
+	// And published commit layers for a checkout nothing routes any more —
+	// what a coordinator's reuse cache was holding when it stopped. The newest
+	// few of those are the branch-switch cache a restart re-routes from, so the
+	// sweep keeps them; one MORE than that window is what has to be collected,
+	// and it is the oldest — the tree the cache would have evicted next.
 	stranded := f.siblingCheckout("stranded")
-	orphan, err := f.catalog.CreateViewGeneration(ctx, store_sqlite.ViewGeneration{
-		OwnerKind:      checkoutLayerOwnerKind,
-		GraphID:        f.graphID,
-		LayerID:        commitLayerID(stranded),
-		CheckoutID:     stranded,
-		GenerationKind: CommitLayerGenerationKind,
-		TreeOID:        f.treeA,
-		State:          store_sqlite.ViewGenerationReady,
-	})
-	if err != nil {
-		t.Fatalf("seed the stranded commit layer: %v", err)
+	var strandedLayers []int64
+	for i := range defaultRetainedCommitLayers + 1 {
+		generationID, err := f.catalog.CreateViewGeneration(ctx, store_sqlite.ViewGeneration{
+			OwnerKind:      checkoutLayerOwnerKind,
+			GraphID:        f.graphID,
+			LayerID:        commitLayerID(stranded),
+			CheckoutID:     stranded,
+			GenerationKind: CommitLayerGenerationKind,
+			TreeOID:        "tree-stranded-" + strconv.Itoa(i),
+			State:          store_sqlite.ViewGenerationReady,
+		})
+		if err != nil {
+			t.Fatalf("seed stranded commit layer %d: %v", i, err)
+		}
+		strandedLayers = append(strandedLayers, generationID)
 	}
+	orphan := strandedLayers[0]
 
 	report, err := newSweepLifecycle(t, f.store).Sweep(ctx)
 	if err != nil {
@@ -1913,6 +2125,11 @@ func TestSweepCollectsCrashOrphanedGenerations(t *testing.T) {
 	} {
 		if _, found, err := f.catalog.GetViewGeneration(ctx, generationID); err != nil || found {
 			t.Fatalf("the %s generation %d survived the sweep (err=%v)", name, generationID, err)
+		}
+	}
+	for _, generationID := range strandedLayers[1:] {
+		if _, found, err := f.catalog.GetViewGeneration(ctx, generationID); err != nil || !found {
+			t.Fatalf("the sweep collected retained commit layer %d (err=%v)", generationID, err)
 		}
 	}
 	for name, generationID := range map[string]int64{

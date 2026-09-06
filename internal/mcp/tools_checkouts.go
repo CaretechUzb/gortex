@@ -698,6 +698,25 @@ func untrackResultPayload(status string, result indexer.UntrackResult) map[strin
 		"nodes_removed": result.NodesRemoved,
 		"edges_removed": result.EdgesRemoved,
 	}
+	if result.CheckoutID != "" {
+		// A poller (untrackViaDaemon --wait) matches this against list_checkouts
+		// rows by checkout_id; without it there is nothing to poll for.
+		payload["checkout_id"] = result.CheckoutID
+	}
+	if result.Pending {
+		// Deliberately NOT "demoted": at this point the demotion has been
+		// admitted and nothing more. The worker still has to publish the mode
+		// flip, retire the dedicated corpus, evict the repository's rows, drop
+		// the tracked-repo entry from the config and complete the transition.
+		// The caller polls list_checkouts for this checkout until its effective
+		// mode is automatic AND its transition slot is empty, rather than
+		// calling untrack_repository again (see StartApplyUntrack).
+		payload["pending"] = true
+		payload["transition_id"] = result.TransitionID
+		payload["detail"] = "the demotion was admitted and is running server-side; " +
+			"it is done when list_checkouts reports this checkout as effective_mode=automatic " +
+			"with no transition in flight (gortex untrack --wait blocks until then)"
+	}
 	if result.Demoted {
 		payload["demoted"] = true
 	}

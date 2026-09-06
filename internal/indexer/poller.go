@@ -815,8 +815,13 @@ func (p *Poller) receiptStat(path string) (os.FileInfo, error) {
 // indirection resolve without re-implementing git ref logic. A repo
 // with no .git directory yields an empty string and no error from the
 // caller's perspective — the poller simply skips the HEAD check.
+//
+// It goes through checkoutHeadSHA for the same reason the git watcher does:
+// a bare rev-parse from a checkout whose `.git` link is gone answers with the
+// ENCLOSING repository's HEAD, and the poller would then diff this checkout
+// against a commit it never had.
 func pollerHeadSHA(repoPath string) (string, error) {
-	return gitcmd.Output(context.Background(), repoPath, "rev-parse", "HEAD")
+	return checkoutHeadSHA(context.Background(), repoPath, "")
 }
 
 // pollerDiffNameStatus runs `git diff --name-status -M -C -z` between

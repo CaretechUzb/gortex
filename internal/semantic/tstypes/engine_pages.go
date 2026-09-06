@@ -8,21 +8,83 @@ import (
 	"github.com/zzet/gortex/internal/semantic"
 )
 
+// nameRole records WHY a name was collected from a page's facts, and so which
+// node kinds a candidate lookup for it can ever hand to a resolver. It is the
+// difference between a page-sized working set and a repository-sized one: a
+// name that appears only as a call's method name is resolved STRUCTURALLY —
+// methodOn walks the receiver type's member_of edges — and is never looked up
+// by name at all, so materialising every same-named node in the repository for
+// it is pure waste. On an Odoo-shaped tree, where thousands of classes each
+// declare `create` / `write` / `_compute_*`, that waste WAS the cost: a single
+// page's handful of method names dragged in O(repo) method nodes, which then
+// seeded the frontier walk, making the whole-repo pass quadratic in file count.
+type nameRole uint8
+
+const (
+	// roleType — the name may denote a type / interface / (spec-widened)
+	// supertype: resolveTypeNode and resolveSuperNode, through typeCandidates.
+	roleType nameRole = 1 << iota
+	// roleCallee — the name may denote a free function or method whose declared
+	// return type types a receiver: callableReturnType.
+	roleCallee
+	// roleMember — the name may denote a member reached THROUGH a receiver.
+	// Member resolution is structural (methodOn / resolveAlias walk member_of
+	// from an already-resolved type), so this role needs no name candidates at
+	// all. The one exception is a spec with extension functions, whose
+	// cross-file extension nodes carry a member_of edge to a same-file phantom
+	// of their receiver and are therefore reachable only by their own name.
+	roleMember
+)
+
+// roleAll is every role at once — what namedNodes' one-shot compatibility
+// lookup materialises, since that path filters by nothing.
+const roleAll = roleType | roleCallee | roleMember
+
+// candidateKinds returns the node kinds a name lookup in these roles can ever
+// hand to a resolver. Every resolver filters its candidates by kind, so a
+// candidate outside this set can never be selected by anything — loading it
+// only inflates the page's working set and the frontier walk seeded from it.
+func (a *applier) candidateKinds(roles nameRole) map[graph.NodeKind]bool {
+	if kinds, ok := a.candidateKindsByRole[roles]; ok {
+		return kinds
+	}
+	kinds := make(map[graph.NodeKind]bool, 4)
+	if roles&roleType != 0 {
+		for kind := range receiverTypeKinds {
+			kinds[kind] = true
+		}
+		if a.spec != nil {
+			for kind := range a.supertypeKinds() {
+				kinds[kind] = true
+			}
+		}
+	}
+	if roles&roleCallee != 0 {
+		kinds[graph.KindFunction] = true
+		kinds[graph.KindMethod] = true
+	}
+	if roles&roleMember != 0 && a.spec != nil && a.spec.ExtensionFunctions {
+		kinds[graph.KindMethod] = true
+	}
+	a.candidateKindsByRole[roles] = kinds
+	return kinds
+}
+
 // preloadBounded prepares only the current fact page. Cross-file name
 // candidates are fetched in one scoped batch and graph adjacency is expanded
-// only from those candidates and the page's files. A full-repository language
-// projection is never retained.
+// only from the page's own files and the candidates a receiver / supertype can
+// actually resolve to. A full-repository language projection is never retained.
 func (a *applier) preloadBounded(all []*fileFacts) {
 	files := make([]string, 0, len(all))
 	fileSet := make(map[string]struct{}, len(all))
-	repoNames := make(map[string]map[string]struct{})
+	repoNames := make(map[string]map[string]nameRole)
 	maxRounds := extendsWalkDepth + 3
 	for _, facts := range all {
 		if facts == nil {
 			continue
 		}
 		if _, ok := repoNames[facts.repoPrefix]; !ok {
-			repoNames[facts.repoPrefix] = make(map[string]struct{})
+			repoNames[facts.repoPrefix] = make(map[string]nameRole)
 		}
 		collectFactNames(a.spec, facts, repoNames[facts.repoPrefix])
 		if depth := factCallChainDepth(facts); depth+extendsWalkDepth+3 > maxRounds {
@@ -41,28 +103,43 @@ func (a *applier) preloadBounded(all []*fileFacts) {
 		a.fileLoaded[file] = true
 	}
 
+	// The frontier walk is seeded from the page's OWN symbols plus the
+	// cross-file candidates that can carry a member or inheritance frontier —
+	// never from every node that merely shares a name with something the page
+	// mentions. Only a receiver/supertype-kind node is ever walked: methodOn,
+	// typeHasRealMember and resolveAlias all start from an already-resolved
+	// type node, and a method candidate reached by name is never one. Seeding
+	// the walk from a popular name's other candidates re-expanded the whole
+	// repository on every 32-file page.
+	seeds := a.pageFileNodeIDs(files)
 	for repoPrefix, names := range repoNames {
-		a.preloadNames(repoPrefix, names)
+		seeds = append(seeds, a.preloadNames(repoPrefix, names)...)
 	}
-	// Each round seeds the frontier walk with only the nodes added since the
+	// Each round seeds the frontier walk with only the seeds added since the
 	// previous round: adjacency and node loads are gated by their loaded-sets,
 	// so re-walking an old seed can never discover anything its first walk
 	// did not, and re-passing the full accumulated set each round was pure
 	// re-sort/re-scan churn.
-	seededFrontier := make(map[string]struct{}, len(a.nodesByID))
+	seededFrontier := make(map[string]struct{}, len(seeds))
+	scanned := 0
 	for round := 0; round < maxRounds; round++ {
-		ids := make([]string, 0, len(a.nodesByID)-len(seededFrontier))
-		for id := range a.nodesByID {
+		ids := make([]string, 0, len(seeds))
+		for _, id := range seeds {
 			if _, done := seededFrontier[id]; done {
 				continue
 			}
 			seededFrontier[id] = struct{}{}
 			ids = append(ids, id)
 		}
+		seeds = seeds[:0]
 		a.preloadApplicationFrontier(ids)
 
+		// Only nodes hydrated since the previous round can name a type the
+		// previous round did not already ask for, and allNodes is append-only —
+		// so its tail is exactly the new arrivals. Rescanning the head found
+		// nothing and cost one full pass over the working set per round.
 		addedName := false
-		for _, node := range a.allNodes {
+		for _, node := range a.allNodes[scanned:] {
 			if node == nil || node.Meta == nil {
 				continue
 			}
@@ -76,21 +153,39 @@ func (a *applier) preloadBounded(all []*fileFacts) {
 				if names == nil {
 					continue
 				}
-				if _, exists := names[value]; !exists {
-					names[value] = struct{}{}
+				// A name already collected in another role still needs its
+				// TYPE candidates hydrated, so widen the role rather than
+				// treating mere presence as loaded.
+				if names[value]&roleType == 0 {
+					names[value] |= roleType
 					addedName = true
 				}
 			}
 		}
-		if addedName {
-			for repoPrefix, names := range repoNames {
-				a.preloadNames(repoPrefix, names)
-			}
-		}
+		scanned = len(a.allNodes)
 		if !addedName {
 			break
 		}
+		for repoPrefix, names := range repoNames {
+			seeds = append(seeds, a.preloadNames(repoPrefix, names)...)
+		}
 	}
+}
+
+// pageFileNodeIDs is the page's own symbol set: every node the file projection
+// hydrated for the files this page applies. buildIndex reads adjacency for all
+// of them and applySuper / applyCall start from the types among them, so they
+// always seed the frontier walk.
+func (a *applier) pageFileNodeIDs(files []string) []string {
+	ids := make([]string, 0, len(files)*8)
+	for _, file := range files {
+		for _, node := range a.nodesByFile[file] {
+			if node != nil {
+				ids = append(ids, node.ID)
+			}
+		}
+	}
+	return ids
 }
 
 // loadPageFileNodes hydrates the page's per-file node groups through the
@@ -101,7 +196,7 @@ func (a *applier) preloadBounded(all []*fileFacts) {
 // still one full store round-trip per page × phase after it). Groups are
 // shared node pointers under the same safety model as the nodes funnel, and
 // files the store yields nothing for are cached as empty groups.
-func (a *applier) loadPageFileNodes(files []string, fileSet map[string]struct{}, repoNames map[string]map[string]struct{}) {
+func (a *applier) loadPageFileNodes(files []string, fileSet map[string]struct{}, repoNames map[string]map[string]nameRole) {
 	missing := files
 	if a.hot != nil {
 		missing = make([]string, 0, len(files))
@@ -162,29 +257,60 @@ func (a *applier) loadPageFileNodes(files []string, fileSet map[string]struct{},
 	}
 }
 
-func (a *applier) preloadNames(repoPrefix string, wanted map[string]struct{}) {
+// preloadNames hydrates one repo's page-name candidates and returns the IDs of
+// those a frontier walk can start from. Each name is filtered to the kinds the
+// roles it was collected in can actually consume, so a name that only ever
+// appeared as a call's method name (resolved structurally, never by name)
+// contributes nothing — which is what keeps a page's working set proportional
+// to the page rather than to the repository's most popular identifier.
+func (a *applier) preloadNames(repoPrefix string, wanted map[string]nameRole) []string {
 	missing := make([]string, 0, len(wanted))
-	for name := range wanted {
-		key := typeCandidateKey{repoPrefix: repoPrefix, name: name}
-		if name != "" && !a.nameLoaded[key] {
-			missing = append(missing, name)
+	for name, roles := range wanted {
+		if name == "" {
+			continue
 		}
+		key := typeCandidateKey{repoPrefix: repoPrefix, name: name}
+		if a.nameLoaded[key]&roles == roles {
+			continue
+		}
+		// A role set that admits no node kind has nothing to fetch. Asking
+		// anyway is neither free nor harmless: the batched store lookup still
+		// runs for the name, and a.hot.putNames then retains its FULL raw
+		// group for the rest of the pass — which for an Odoo-shaped `create`
+		// or `write` is every same-named method in the repository, resident in
+		// the pass-wide cache. That residency is exactly what the role split
+		// exists to remove, so skip the name entirely and leave it UNLOADED;
+		// namedNodes tops it up if some later role ever does need it.
+		if len(a.candidateKinds(roles|a.nameLoaded[key])) == 0 {
+			continue
+		}
+		missing = append(missing, name)
 	}
 	if len(missing) == 0 {
-		return
+		return nil
 	}
 	sort.Strings(missing)
+	frontierKinds := a.candidateKinds(roleType)
+	var seeds []string
 	// Serve pass-cached name groups first (including cached NEGATIVE groups
 	// — common inferred names that bind nothing are re-asked by almost every
-	// page). The cache stores the raw store result; the residency filter
-	// below runs identically on both paths.
+	// page). The cache stores the raw store result; the residency filters
+	// below run identically on both paths.
 	remember := func(name string, group []*graph.Node) {
+		key := typeCandidateKey{repoPrefix: repoPrefix, name: name}
+		roles := wanted[name] | a.nameLoaded[key]
+		kinds := a.candidateKinds(roles)
 		for _, node := range group {
-			if node != nil && node.RepoPrefix == repoPrefix && a.spec.allowsCandidateLanguage(node.Language) {
-				a.rememberNode(node)
+			if node == nil || node.RepoPrefix != repoPrefix || !kinds[node.Kind] ||
+				!a.spec.allowsCandidateLanguage(node.Language) {
+				continue
+			}
+			a.rememberNode(node)
+			if frontierKinds[node.Kind] {
+				seeds = append(seeds, node.ID)
 			}
 		}
-		a.nameLoaded[typeCandidateKey{repoPrefix: repoPrefix, name: name}] = true
+		a.nameLoaded[key] = roles
 	}
 	residue := missing[:0]
 	for _, name := range missing {
@@ -195,7 +321,7 @@ func (a *applier) preloadNames(repoPrefix string, wanted map[string]struct{}) {
 		residue = append(residue, name)
 	}
 	if len(residue) == 0 {
-		return
+		return seeds
 	}
 	// Language-scoped candidate hydration: a type name inferred from this
 	// spec's grammars can only bind nodes of the spec's languages (plus
@@ -208,54 +334,72 @@ func (a *applier) preloadNames(repoPrefix string, wanted map[string]struct{}) {
 		remember(name, matches[name])
 		a.hot.putNames(typeCandidateKey{repoPrefix: repoPrefix, name: name}, matches[name])
 	}
+	return seeds
 }
 
-func collectFactNames(spec *LangSpec, facts *fileFacts, out map[string]struct{}) {
-	add := func(name string) {
+// collectFactNames records every name a page's facts can ask the graph about,
+// tagged with the role it was asked in. The role decides which node kinds the
+// candidate lookup materialises; see nameRole.
+func collectFactNames(spec *LangSpec, facts *fileFacts, out map[string]nameRole) {
+	add := func(name string, role nameRole) {
 		if spec != nil {
 			name = spec.normalize(name)
 		}
 		if name != "" {
-			out[name] = struct{}{}
+			out[name] |= role
 		}
 	}
 	for _, imp := range facts.imports {
-		add(imp.Local)
+		add(imp.Local, roleType)
 	}
 	for _, fact := range facts.supers {
-		add(fact.typeName)
-		add(fact.superName)
+		add(fact.typeName, roleType)
+		add(fact.superName, roleType)
 	}
 	for _, fact := range facts.metas {
-		add(fact.owner)
-		add(fact.name)
+		// owner names a receiver type; name is a field, matched same-file by
+		// findMember and never looked up across the repository.
+		add(fact.owner, roleType)
+		add(fact.name, roleMember)
 		if fact.key == "return_type" || fact.key == "semantic_type" {
-			add(fact.value)
+			add(fact.value, roleType)
 		}
 	}
 	for _, fact := range facts.aliases {
-		add(fact.typeName)
-		add(fact.trait)
-		add(fact.alias)
-		add(fact.method)
+		add(fact.typeName, roleType)
+		add(fact.trait, roleType)
+		// The alias and its target are resolved by methodOn against the using
+		// type's own member set — structurally, not by name.
+		add(fact.alias, roleMember)
+		add(fact.method, roleMember)
 	}
 	for i := range facts.calls {
 		collectCallNames(spec, &facts.calls[i], out)
 	}
 }
 
-func collectCallNames(spec *LangSpec, fact *callFact, out map[string]struct{}) {
+func collectCallNames(spec *LangSpec, fact *callFact, out map[string]nameRole) {
 	if fact == nil {
 		return
 	}
-	for _, name := range []string{fact.method, fact.recvType, fact.recvPendingCallee, fact.recvCallTypeArg, fact.recvIdent} {
+	add := func(name string, role nameRole) {
 		if spec != nil {
 			name = spec.normalize(name)
 		}
 		if name != "" {
-			out[name] = struct{}{}
+			out[name] |= role
 		}
 	}
+	// The called member is resolved by walking the RESOLVED receiver type's
+	// members (methodOn / resolveAlias / extensionMethod), never through the
+	// name index — only a spec with extension functions needs its candidates.
+	add(fact.method, roleMember)
+	add(fact.recvType, roleType)
+	// A bare callee in receiver position is grounded by callableReturnType,
+	// which reads the declared return type of a repo-unique function/method.
+	add(fact.recvPendingCallee, roleCallee)
+	add(fact.recvCallTypeArg, roleType)
+	add(fact.recvIdent, roleType)
 	collectCallNames(spec, fact.recvChain, out)
 }
 
@@ -283,7 +427,7 @@ func factCallChainDepth(facts *fileFacts) int {
 func (a *applier) coverFiles(page []*fileFacts) int {
 	files := make([]string, 0, len(page))
 	fileSet := make(map[string]struct{}, len(page))
-	repoNames := make(map[string]map[string]struct{})
+	repoNames := make(map[string]map[string]nameRole)
 	for _, facts := range page {
 		if facts == nil || facts.file == "" {
 			continue
@@ -294,7 +438,7 @@ func (a *applier) coverFiles(page []*fileFacts) int {
 		fileSet[facts.file] = struct{}{}
 		files = append(files, facts.file)
 		if _, ok := repoNames[facts.repoPrefix]; !ok {
-			repoNames[facts.repoPrefix] = make(map[string]struct{})
+			repoNames[facts.repoPrefix] = make(map[string]nameRole)
 		}
 	}
 	sort.Strings(files)

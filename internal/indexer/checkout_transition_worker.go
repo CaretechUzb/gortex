@@ -198,6 +198,18 @@ func (l *CheckoutLifecycle) executeDemotionTransition(
 			store_sqlite.ErrCatalogStaleGuard, transition.TransitionID)
 	}
 	transition = standing
+	// The first of this transition's liveness stamps.
+	//
+	// last_progress is a LIVENESS signal, not a progress percentage. It says a
+	// worker was still on this transition as of that second, and nothing
+	// whatever about how far through it is. The distinction is not pedantry:
+	// the steps between two stamps are wildly unequal — the repository purge
+	// inside the retirement saga below can run for tens of minutes on a large
+	// workspace while the catalog writes on either side of it take
+	// milliseconds — so the gap between stamps bounds staleness and nothing
+	// else. A watcher may conclude "no worker is on this any more" from a stamp
+	// that has stopped moving. It may never conclude "this is halfway done"
+	// from one that is still moving.
 	if err := l.catalog.UpdateIntentTransitionProgress(ctx, transition.CheckoutID,
 		transition.TransitionID, store_sqlite.IntentTransitionRunning, "", l.now().Unix()); err != nil {
 		return err
@@ -271,4 +283,50 @@ func (l *CheckoutLifecycle) deferModeTransition(
 			zap.String("transition", transition.TransitionID), zap.Error(err))
 	}
 	return cause
+}
+
+// noteTransitionProgress re-stamps the running transition of one checkout, so
+// last_progress keeps moving while a long teardown works.
+//
+// See executeDemotionTransition for what the stamp means — liveness, not
+// progress. Without these a demotion stamps once, on the way in, and then goes
+// quiet for however long the retirement saga takes: one was measured standing
+// at running with last_progress one second after created_at for 55 minutes
+// while it was in fact working the whole time. Every observer that can see the
+// row — an operator, the janitor, a --wait poller — reads that as a dead
+// worker.
+//
+// Best-effort by construction: a demotion must never fail because its
+// heartbeat could not be written. It touches nothing but a transition that is
+// already running, so it can neither revive one a failure has parked as
+// pending nor stamp over a transition that replaced the one its caller owns.
+//
+// The transition id is re-read rather than carried in, because the mode flip
+// clears the checkout's active_intent_transition_id while the teardown behind
+// it is still running: by the time these callers reach the store the checkout
+// row no longer names the transition they belong to. intent_transitions is
+// keyed by checkout id and is the authority.
+func (l *CheckoutLifecycle) noteTransitionProgress(ctx context.Context, checkoutID, step string) {
+	if l == nil || l.catalog == nil || checkoutID == "" {
+		return
+	}
+	transition, inFlight, err := l.catalog.GetIntentTransition(ctx, checkoutID)
+	if err != nil || !inFlight || transition.State != store_sqlite.IntentTransitionRunning {
+		return
+	}
+	// The error the row carries is preserved rather than cleared. A heartbeat
+	// records that the worker is alive; it is not evidence that the last
+	// attempt's diagnosis has stopped being true.
+	if err := l.catalog.UpdateIntentTransitionProgress(ctx, checkoutID,
+		transition.TransitionID, store_sqlite.IntentTransitionRunning,
+		transition.LastError, l.now().Unix()); err != nil &&
+		!errors.Is(err, context.Canceled) {
+		l.logger.Debug("checkout lifecycle: could not stamp transition liveness",
+			zap.String("transition", transition.TransitionID),
+			zap.String("step", step), zap.Error(err))
+		return
+	}
+	l.logger.Debug("checkout lifecycle: transition still working",
+		zap.String("transition", transition.TransitionID),
+		zap.String("checkout", checkoutID), zap.String("step", step))
 }

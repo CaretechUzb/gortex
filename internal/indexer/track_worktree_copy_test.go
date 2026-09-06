@@ -7,6 +7,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/zzet/gortex/internal/graph"
 )
@@ -23,11 +24,29 @@ import (
 type copyGateGraph struct {
 	*graph.Graph
 	state map[string]graph.RepoIndexState
+
+	// enrichCurrent is the second question, added when the ranking learned to
+	// prefer a source whose own enrichment had finished. Absent means "no
+	// provider has ever completed a pass here", which is what every fixture
+	// that says nothing about enrichment gets — and which ranks the same as a
+	// lagging source, so the closeness-only tests below still measure closeness.
+	enrichCurrent map[string]bool
 }
 
 func (g *copyGateGraph) GetRepoIndexState(prefix string) (graph.RepoIndexState, bool, error) {
 	st, ok := g.state[prefix]
 	return st, ok, nil
+}
+
+func (g *copyGateGraph) EnrichmentCurrentForRepo(prefix string) (bool, bool, error) {
+	current, known := g.enrichCurrent[prefix]
+	return current, known, nil
+}
+
+// declareEnrichmentCurrent marks a candidate's semantic enrichment as finished
+// over its own content, which is what lets it outrank a closer sibling.
+func declareEnrichmentCurrent(mi *MultiIndexer, prefix string) {
+	mi.graph.(*copyGateGraph).enrichCurrent[prefix] = true
 }
 
 // copyGateIndexer builds an indexer that knows about one already-tracked
@@ -65,7 +84,11 @@ func copyGateIndexerAt(t *testing.T, prefix, root, indexedSHA string, dirty bool
 func copyGateIndexerNoState(t *testing.T, prefix, root string) *MultiIndexer {
 	t.Helper()
 	return &MultiIndexer{
-		graph:    &copyGateGraph{Graph: graph.New(), state: map[string]graph.RepoIndexState{}},
+		graph: &copyGateGraph{
+			Graph:         graph.New(),
+			state:         map[string]graph.RepoIndexState{},
+			enrichCurrent: map[string]bool{},
+		},
 		repos:    map[string]*RepoMetadata{prefix: {RepoPrefix: prefix, RootPath: root}},
 		indexers: map[string]*Indexer{prefix: {repoPrefix: prefix}},
 		logger:   zap.NewNop(),
@@ -104,11 +127,11 @@ func TestCopySourceAtTheSameCommitReportsNothingChanged(t *testing.T) {
 	wt := addWorktree(t, repo, "same")
 
 	mi := copyGateIndexer(t, "base", repo)
-	src, changed, ok := mi.worktreeCopySource(wt)
+	source, ok := mi.worktreeCopySource(wt)
 
 	require.True(t, ok, "a sibling checkout at the same commit must be copyable")
-	require.Equal(t, "base", src)
-	require.Empty(t, changed, "identical checkouts disagree on nothing")
+	require.Equal(t, "base", source.prefix)
+	require.Empty(t, source.changed, "identical checkouts disagree on nothing")
 }
 
 // The case the gate used to refuse outright, and the one that cost the most: a
@@ -126,11 +149,11 @@ func TestCopySourceAcceptsASmallDivergenceAndNamesTheChangedFiles(t *testing.T) 
 	runGit(t, wt, "commit", "-q", "-m", "feature")
 
 	mi := copyGateIndexer(t, "base", repo)
-	src, changed, ok := mi.worktreeCopySource(wt)
+	source, ok := mi.worktreeCopySource(wt)
 
 	require.True(t, ok, "a small divergence must not fall back to a cold index")
-	require.Equal(t, "base", src)
-	require.Equal(t, []string{"a.go", "b.go"}, changed,
+	require.Equal(t, "base", source.prefix)
+	require.Equal(t, []string{"a.go", "b.go"}, source.changed,
 		"both the edited and the added file must reach the reconcile; a path "+
 			"missing here keeps the source's nodes under this prefix forever")
 }
@@ -149,13 +172,13 @@ func TestCopySourceReportsUncommittedWorkAsChanged(t *testing.T) {
 	writeFile(t, filepath.Join(wt, "untracked.go"), "package main\n")
 
 	mi := copyGateIndexer(t, "base", repo)
-	_, changed, ok := mi.worktreeCopySource(wt)
+	source, ok := mi.worktreeCopySource(wt)
 
 	require.True(t, ok)
 	// Same HEAD short-circuits before any diff, which is what keeps the
 	// historical path free of git work — so dirtiness is invisible here.
 	// Pinned as the known limit of this gate, not asserted as desirable.
-	require.Empty(t, changed,
+	require.Empty(t, source.changed,
 		"documented gap: an identical HEAD short-circuits before the diff, so "+
 			"uncommitted edits are left to the watcher, exactly as before this change")
 }
@@ -177,13 +200,13 @@ func TestCopySourceDeclinesBeyondTheDivergenceCap(t *testing.T) {
 	worktreeCopyMaxDivergence = 1
 
 	mi := copyGateIndexer(t, "base", repo)
-	_, _, ok := mi.worktreeCopySource(wt)
+	source, ok := mi.worktreeCopySource(wt)
 	require.False(t, ok, "a divergence over the cap must fall back to indexing")
 
 	worktreeCopyMaxDivergence = 2
-	_, changed, ok := mi.worktreeCopySource(wt)
+	source, ok = mi.worktreeCopySource(wt)
 	require.True(t, ok, "exactly at the cap is still a copy")
-	require.Len(t, changed, 2)
+	require.Len(t, source.changed, 2)
 }
 
 // Same checkout group is the condition nothing substitutes for: it is what
@@ -198,7 +221,7 @@ func TestCopySourceRefusesAnUnrelatedRepository(t *testing.T) {
 	initTestRepo(t, other, "main")
 
 	mi := copyGateIndexer(t, "unrelated", other)
-	_, _, ok := mi.worktreeCopySource(wt)
+	_, ok := mi.worktreeCopySource(wt)
 	require.False(t, ok, "a different repository shares no checkout group")
 }
 
@@ -268,7 +291,7 @@ func TestRestatDoesNotTreatAnUnreadablePathAsDeleted(t *testing.T) {
 // repo content_gen of 4.
 func TestCopiedRepoEnrichIsANoOpForAnUnknownPrefix(t *testing.T) {
 	mi := copyGateIndexer(t, "base", realpath(t, t.TempDir()))
-	require.NotPanics(t, func() { mi.scheduleCopiedRepoEnrich("no-such-prefix", nil) },
+	require.NotPanics(t, func() { mi.scheduleCopiedRepoEnrich("no-such-prefix", nil, copiedMarkerEvidence{}) },
 		"the copy path names a prefix the indexer map may not carry; a panic here kills the track")
 }
 
@@ -295,7 +318,7 @@ func TestCopiedRepoEnrichArmsTheGateUnconditionally(t *testing.T) {
 
 	require.False(t, idx.pendingEnrich.Load(), "precondition: the gate starts closed")
 
-	mi.scheduleCopiedRepoEnrich("base", nil)
+	mi.scheduleCopiedRepoEnrich("base", nil, copiedMarkerEvidence{})
 
 	require.True(t, idx.pendingEnrich.Load(),
 		"a diverged copy carries another checkout's enrichment rows, so the pass "+
@@ -309,7 +332,7 @@ func TestCopySourceRefusesANonWorktree(t *testing.T) {
 	initTestRepo(t, repo, "main")
 
 	mi := copyGateIndexer(t, "base", repo)
-	_, _, ok := mi.worktreeCopySource(repo)
+	_, ok := mi.worktreeCopySource(repo)
 	require.False(t, ok)
 }
 
@@ -337,11 +360,11 @@ func TestCopySourceRanksOnTheIndexedCommitNotHEAD(t *testing.T) {
 	runGit(t, wt, "commit", "-q", "-m", "feature")
 
 	mi := copyGateIndexerAt(t, "base", repo, indexed, false)
-	src, changed, ok := mi.worktreeCopySource(wt)
+	source, ok := mi.worktreeCopySource(wt)
 
 	require.True(t, ok)
-	require.Equal(t, "base", src)
-	require.Equal(t, []string{"b.go"}, changed,
+	require.Equal(t, "base", source.prefix)
+	require.Equal(t, []string{"b.go"}, source.changed,
 		"the reconcile set must be measured against the commit the copied rows "+
 			"describe; ranking on the source's HEAD would have named its three "+
 			"advanced files too and reindexed them for nothing")
@@ -369,10 +392,10 @@ func TestCopySourceKeepsAFileMatchingSourceHEADButNotItsGraph(t *testing.T) {
 	runGit(t, wt, "commit", "-q", "-m", "same content, different commit")
 
 	mi := copyGateIndexerAt(t, "base", repo, indexed, false)
-	_, changed, ok := mi.worktreeCopySource(wt)
+	source, ok := mi.worktreeCopySource(wt)
 
 	require.True(t, ok)
-	require.Contains(t, changed, "a.go",
+	require.Contains(t, source.changed, "a.go",
 		"a.go matches the source's HEAD, so a HEAD-ranked diff omits it — but the "+
 			"copied rows hold the pre-advance content, and a path left out of "+
 			"`changed` is one the reconcile never looks at again")
@@ -390,7 +413,7 @@ func TestCopySourceDeclinesASourceDirtyWhenItWasIndexed(t *testing.T) {
 	wt := addWorktree(t, repo, "branch")
 
 	mi := copyGateIndexerAt(t, "base", repo, gitHeadSHA(repo), true)
-	_, _, ok := mi.worktreeCopySource(wt)
+	_, ok := mi.worktreeCopySource(wt)
 
 	require.False(t, ok,
 		"a source dirty at index time describes a working tree nobody recorded; "+
@@ -406,7 +429,7 @@ func TestCopySourceDeclinesADirtySourceEvenAtTheSameCommit(t *testing.T) {
 	wt := addWorktree(t, repo, "same")
 
 	mi := copyGateIndexerAt(t, "base", repo, gitHeadSHA(wt), true)
-	_, _, ok := mi.worktreeCopySource(wt)
+	_, ok := mi.worktreeCopySource(wt)
 
 	require.False(t, ok,
 		"the identical fast path must consult Dirty before short-circuiting, or "+
@@ -422,7 +445,7 @@ func TestCopySourceDeclinesWhenTheIndexStateIsUnknown(t *testing.T) {
 	wt := addWorktree(t, repo, "branch")
 
 	mi := copyGateIndexerNoState(t, "base", repo)
-	_, _, ok := mi.worktreeCopySource(wt)
+	_, ok := mi.worktreeCopySource(wt)
 
 	require.False(t, ok,
 		"an unknown indexed commit must decline, not silently rank on HEAD")
@@ -442,7 +465,7 @@ func TestCopySourceDeclinesWhenTheBackendCannotAnswer(t *testing.T) {
 		indexers: map[string]*Indexer{"base": {repoPrefix: "base"}},
 		logger:   zap.NewNop(),
 	}
-	_, _, ok := mi.worktreeCopySource(wt)
+	_, ok := mi.worktreeCopySource(wt)
 
 	require.False(t, ok,
 		"a backend that cannot report an indexed commit gets no copy; indexing "+
@@ -458,7 +481,7 @@ func TestCopySourceDeclinesAnIndexedCommitThisCheckoutCannotResolve(t *testing.T
 	wt := addWorktree(t, repo, "branch")
 
 	mi := copyGateIndexerAt(t, "base", repo, "0123456789abcdef0123456789abcdef01234567", false)
-	_, _, ok := mi.worktreeCopySource(wt)
+	_, ok := mi.worktreeCopySource(wt)
 
 	require.False(t, ok,
 		"an unresolvable indexed commit must decline rather than diff against HEAD")
@@ -479,11 +502,11 @@ func TestCopySourceIdenticalPathKeysOnTheIndexedCommit(t *testing.T) {
 	runGit(t, repo, "commit", "-q", "-m", "source moves on")
 
 	mi := copyGateIndexerAt(t, "base", repo, indexed, false)
-	src, changed, ok := mi.worktreeCopySource(wt)
+	source, ok := mi.worktreeCopySource(wt)
 
 	require.True(t, ok)
-	require.Equal(t, "base", src)
-	require.Empty(t, changed,
+	require.Equal(t, "base", source.prefix)
+	require.Empty(t, source.changed,
 		"the copied rows describe exactly this commit, so there is nothing to "+
 			"reconcile — the source's checkout having moved on is irrelevant")
 }
@@ -513,14 +536,117 @@ func TestCopySourcePrefersAStaleCandidateThatIsActuallyCloser(t *testing.T) {
 	runGit(t, stale, "add", ".")
 	runGit(t, stale, "commit", "-q", "-m", "stale checkout wanders")
 
-	src, changed, ok := mi.worktreeCopySource(dest)
+	source, ok := mi.worktreeCopySource(dest)
 
 	require.True(t, ok)
-	require.Equal(t, "stale", src,
+	require.Equal(t, "stale", source.prefix,
 		"the stale candidate's ROWS describe this checkout exactly; the fresh "+
 			"one's are two files away. Divergence is measured against what was "+
 			"indexed, so stale wins")
-	require.Empty(t, changed)
+	require.Empty(t, source.changed)
+}
+
+// TestACopySourcePrefersAnEnrichmentCurrentSiblingOverACloserLaggingOne pins
+// the one thing that outranks closeness.
+//
+// Measured live 2026-09-05: a worktree two commits off `local` chose a sibling
+// copy one commit closer, whose python-types row sat at content_gen 104 against
+// its repo's 107 because that pass had never finished. The copy carried the
+// lagging row verbatim, its scoped repair advanced every gen > 0 row to the
+// copy's own counter, and READY read `ready` over a graph whose python
+// enrichment had been finished nowhere. Closeness buys a shorter reconcile;
+// currency is what makes the rows the copy carries mean anything, so it is
+// consulted first.
+func TestACopySourcePrefersAnEnrichmentCurrentSiblingOverACloserLaggingOne(t *testing.T) {
+	repo := realpath(t, t.TempDir())
+	initTestRepo(t, repo, "main")
+	base := gitHeadSHA(repo)
+
+	// The destination sits two files off `base` — so `base` is the FARTHER
+	// candidate of the two.
+	dest := addWorktree(t, repo, "dest")
+	writeFile(t, filepath.Join(dest, "d1.go"), "package main\n")
+	writeFile(t, filepath.Join(dest, "d2.go"), "package main\n")
+	runGit(t, dest, "add", ".")
+	runGit(t, dest, "commit", "-q", "-m", "dest")
+	destHead := gitHeadSHA(dest)
+
+	// The CLOSER candidate: its rows describe this checkout exactly, zero
+	// files away — and its own enrichment never finished.
+	mi := copyGateIndexerAt(t, "current", repo, base, false)
+	addTrackedWorktree(t, mi, repo, "lagging", "laggingbranch", destHead)
+	declareEnrichmentCurrent(mi, "current")
+
+	source, ok := mi.worktreeCopySource(dest)
+
+	require.True(t, ok)
+	require.Equal(t, "current", source.prefix,
+		"a source whose enrichment is behind hands the copy rows no frontier can "+
+			"complete, so two files of reconcile is the cheaper half of that trade")
+	require.True(t, source.enrichCurrent)
+	require.Len(t, source.changed, 2,
+		"and the caller is told the real distance it paid for that currency")
+}
+
+// The trade the ranking made has to be legible, or a copy that skipped the
+// obvious source looks like a bug and its extra reconcile has no visible cause.
+func TestACopySourceSaysWhichLaggingSiblingItPassedOver(t *testing.T) {
+	repo := realpath(t, t.TempDir())
+	initTestRepo(t, repo, "main")
+	base := gitHeadSHA(repo)
+
+	dest := addWorktree(t, repo, "dest")
+	writeFile(t, filepath.Join(dest, "d1.go"), "package main\n")
+	runGit(t, dest, "add", ".")
+	runGit(t, dest, "commit", "-q", "-m", "dest")
+	destHead := gitHeadSHA(dest)
+
+	core, logs := observer.New(zap.InfoLevel)
+	mi := copyGateIndexerAt(t, "current", repo, base, false)
+	mi.logger = zap.New(core)
+	addTrackedWorktree(t, mi, repo, "lagging", "laggingbranch", destHead)
+	declareEnrichmentCurrent(mi, "current")
+
+	source, ok := mi.worktreeCopySource(dest)
+	require.True(t, ok)
+	require.Equal(t, "current", source.prefix)
+
+	chosen := logs.FilterMessage("worktree copy source chosen").All()
+	require.Len(t, chosen, 1)
+	require.Equal(t, true, chosen[0].ContextMap()["enrichment_current"])
+
+	passed := logs.FilterMessage(
+		"worktree copy: passed over a closer sibling whose enrichment is behind").All()
+	require.Len(t, passed, 1,
+		"the sibling that lost on currency alone must be named, with both distances")
+	fields := passed[0].ContextMap()
+	require.Equal(t, "lagging", fields["passed_over"])
+	require.Equal(t, int64(0), fields["passed_over_changed"])
+	require.Equal(t, int64(1), fields["chosen_changed"])
+}
+
+// Currency is the FIRST key, not the only one: among candidates that agree on
+// it the ranking is the closeness it always was.
+func TestACopySourceStillRanksOnClosenessAmongCurrentSiblings(t *testing.T) {
+	repo := realpath(t, t.TempDir())
+	initTestRepo(t, repo, "main")
+	base := gitHeadSHA(repo)
+
+	dest := addWorktree(t, repo, "dest")
+	writeFile(t, filepath.Join(dest, "d1.go"), "package main\n")
+	runGit(t, dest, "add", ".")
+	runGit(t, dest, "commit", "-q", "-m", "dest")
+	destHead := gitHeadSHA(dest)
+
+	mi := copyGateIndexerAt(t, "far", repo, base, false)
+	addTrackedWorktree(t, mi, repo, "near", "nearbranch", destHead)
+	declareEnrichmentCurrent(mi, "far")
+	declareEnrichmentCurrent(mi, "near")
+
+	source, ok := mi.worktreeCopySource(dest)
+	require.True(t, ok)
+	require.Equal(t, "near", source.prefix)
+	require.Empty(t, source.changed)
 }
 
 // A diverged copy whose reconcile ran its synchronous scoped tail owes no
@@ -572,7 +698,7 @@ func TestCopiedRepoEnrichNarrowsToAGivenFrontier(t *testing.T) {
 	idx.graph = mi.graph
 	idx.logger = zap.NewNop()
 
-	mi.scheduleCopiedRepoEnrich("base", []string{"base/models/hr.py"})
+	mi.scheduleCopiedRepoEnrich("base", []string{"base/models/hr.py"}, copiedMarkerEvidence{})
 
 	require.True(t, idx.pendingEnrich.Load())
 	idx.deferredEnrichMu.Lock()
@@ -594,7 +720,7 @@ func TestCopiedRepoEnrichWithoutAFrontierArmsTheFullPass(t *testing.T) {
 	idx.graph = mi.graph
 	idx.logger = zap.NewNop()
 
-	mi.scheduleCopiedRepoEnrich("base", nil)
+	mi.scheduleCopiedRepoEnrich("base", nil, copiedMarkerEvidence{})
 
 	require.True(t, idx.pendingEnrich.Load())
 	idx.deferredEnrichMu.Lock()

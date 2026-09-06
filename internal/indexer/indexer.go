@@ -430,6 +430,41 @@ type Indexer struct {
 	deferredEnrichFull       bool
 	deferredEnrichGeneration uint64
 
+	// copiedEnrichMarkerSHA is this checkout's HEAD, recorded when a subgraph
+	// copy armed a SCOPED repair pass over a divergence AND the __repo__
+	// completion marker the copy inherited was verified to name the source's
+	// copied commit. Guarded by deferredEnrichMu.
+	//
+	// Non-empty is a conjunction of two proofs. The carried marker proves the
+	// SOURCE completed a whole-repo pass over exactly the corpus this checkout
+	// inherited verbatim; the armed frontier is the reconcile's own list of the
+	// only files the two checkouts disagree on. So a non-partial, non-withholding
+	// completion of that frontier, on a clean tree still at this sha, completes
+	// the whole-repo assertion here too — and may rewrite the marker to this
+	// checkout's HEAD, after which a restart is owed nothing.
+	//
+	// In memory on purpose. A daemon that dies before the scoped pass finishes
+	// leaves the SOURCE's sha in the marker, and the next warm start re-arms a
+	// full pass exactly as it does today. That is the fail-safe, not a gap: the
+	// promotion is an optimisation over a correct-but-slow default, and losing
+	// it can only cost time.
+	copiedEnrichMarkerSHA string
+
+	// deferredEnrichRepair marks the pending scoped frontier as a worktree
+	// copy's repair rather than a watcher save. Guarded by deferredEnrichMu and
+	// consumed by the dispatch that runs it.
+	//
+	// The two differ in cost, not in shape. A save's frontier is the handful of
+	// files someone just wrote, and semantic.timeout_seconds is sized for it. A
+	// repair's frontier is everything two checkouts disagree on, and its
+	// provider still loads the WHOLE project before it can answer for one file
+	// — measured at 12 of 12 copies on a 9.8k-file Python workspace ending
+	// Partial with zero coverage at the 120 s save deadline, silently, forever.
+	// So a repair runs under the repo-scaled whole-repo deadline, and a repair
+	// that ends partial or errored escalates itself to a whole-repo pass rather
+	// than waiting for a restart to notice.
+	deferredEnrichRepair bool
+
 	// fullReindexed is raised by a whole-repo (re-)parse — IndexCtx, reached
 	// via a full re-track, a cold TrackRepo, or a snapshot-partial forced full
 	// walk — which evicts and re-creates every node and edge for the repo. That
@@ -1086,10 +1121,13 @@ func (idx *Indexer) runDeferredEnrich() {
 		idx.logger.Info("deferred enrichment forced despite no pending changes",
 			zap.String("repo", idx.repoPrefix))
 	}
-	pendingFiles, fullScope, pendingGeneration := idx.deferredEnrichScope()
+	pendingFiles, fullScope, pendingGeneration, repair := idx.takeDeferredEnrichScope()
 	if forced {
 		pendingFiles = nil
 		fullScope = true
+		// A forced pass IS the whole-repo pass a repair would escalate to, so
+		// the disposition it just consumed has nothing left to select.
+		repair = false
 	}
 	// Lease compiler-backed provider state before enrichment creates it. The
 	// matching release runs after this repo's contract pass, including failure
@@ -1104,108 +1142,19 @@ func (idx *Indexer) runDeferredEnrich() {
 	// HEAD on a clean tree is skipped instead of re-running its hover pass.
 	sha, dirty := repoHeadAndDirty(idx.rootPath)
 	if !fullScope && len(pendingFiles) > 0 {
-		// Read the content counter BEFORE any provider runs. Enrichment holds
-		// no write gate, so the watcher can reindex a file while a provider is
-		// still working; content that lands mid-pass belongs to the NEXT pass,
-		// and stamping the counter as it stands at completion would claim
-		// coverage of an edit this pass never saw.
-		contentGen := idx.semanticMgr.ObserveContentGen(idx.graph, idx.repoPrefix)
-		byLanguage := idx.deferredEnrichFrontiers(pendingFiles)
-		// Providers whose language was in this frontier but which produced
-		// nothing. Their rows must not be stamped -- see the nil-result comment
-		// in the loop below.
-		var withheld []string
-		languages := make([]string, 0, len(byLanguage))
-		for language := range byLanguage {
-			languages = append(languages, language)
+		if !idx.runScopedDeferredEnrich(pendingFiles, pendingGeneration, sha, dirty, repair) {
+			return
 		}
-		sort.Strings(languages)
-		for _, language := range languages {
-			files := byLanguage[language]
-			result, err := idx.semanticMgr.EnrichFiles(
-				idx.graph, idx.repoPrefix, idx.rootPath, language, files,
-			)
-			if err != nil {
-				idx.logger.Warn("file-scoped deferred semantic enrichment failed",
-					zap.String("repo", idx.repoPrefix),
-					zap.String("language", language),
-					zap.Int("files", len(files)),
-					zap.Error(err))
-				return
-			}
-			if result != nil {
-				idx.logger.Info("semantic enrichment result",
-					zap.String("provider", result.Provider),
-					zap.String("language", result.Language),
-					zap.Int("confirmed", result.EdgesConfirmed),
-					zap.Int("added", result.EdgesAdded),
-					zap.Int("refuted", result.EdgesRefuted),
-					zap.Int("rebound", result.EdgesRebound),
-					zap.Float64("coverage", result.CoveragePercent),
-				)
-				if result.Partial {
-					return
-				}
-			} else if provider := idx.semanticMgr.ProviderForLanguage(language); provider != nil {
-				// A nil result is two outcomes wearing one shape, and only the
-				// lookup above tells them apart:
-				//
-				//   no provider registered   nothing was evicted that any
-				//                            provider would restore, so this
-				//                            language is current -> STAMP
-				//   registered, ran nothing  most often an unavailable
-				//                            provider, screened out after
-				//                            selection: the re-parse dropped
-				//                            its edges and nothing put them
-				//                            back -> WITHHOLD
-				//
-				// Withholding on BOTH would strand a repo whose frontier is
-				// only .md or .yaml forever, which is the disease being cured.
-				// Stamping on both would publish a repo that reads ready while
-				// silently missing a provider's edges, which is worse than an
-				// honest "partial".
-				withheld = append(withheld, provider.Name())
-			}
-		}
-		// A file frontier proves only that the affected language/file batches
-		// were refreshed. It must never publish the whole-repository completion
-		// marker: files and packages outside this exact frontier did not run.
-		if idx.clearPendingEnrich(pendingGeneration) {
-			// Stamp first, discharge second, and the order is load-bearing.
-			// The ledger is the only thing that re-arms this pass; discharging
-			// before a stamp that then fails would consume the retry signal and
-			// strand the repo in exactly the state the stamp exists to prevent.
-			//
-			// Reaching here means every language succeeded non-partial -- the
-			// err and result.Partial arms above both return -- so what is being
-			// recorded is a completed pass over a known frontier. The whole-repo
-			// SHA marker stays withheld below, because that one really does
-			// assert every file was enriched at a revision.
-			stamped, err := idx.semanticMgr.CompleteScopedEnrichment(
-				idx.graph, idx.repoPrefix, contentGen, withheld)
-			if err != nil {
-				idx.logger.Warn("file-scoped enrichment stamp failed; leaving ledger armed",
-					zap.String("repo", idx.repoPrefix),
-					zap.Error(err))
-				idx.markPendingEnrichFiles(pendingFiles)
-				return
-			}
-			// The whole dispatched frontier is discharged, not just the paths a
-			// provider claimed: a file whose language no provider covers still
-			// had its deferred pass run, and leaving it marked would re-arm it
-			// on every restart forever. A newer generation (the watcher queued
-			// work mid-pass) keeps its own markers — clearPendingEnrich already
-			// declined, so this does not run.
-			idx.dischargePendingEnrichFrontier(pendingFiles)
-			if stamped > 0 {
-				idx.logger.Info("file-scoped enrichment recorded content coverage",
-					zap.String("repo", idx.repoPrefix),
-					zap.Int64("content_gen", contentGen),
-					zap.Int("providers_renewed", stamped),
-					zap.Strings("withheld", withheld))
-			}
-		}
-		return
+		// The scoped pass escalated itself. A worktree copy's repair that ended
+		// partial or errored has just armed a whole-repo pass, and falls through
+		// to it HERE rather than leaving the repository stranded until some later
+		// restart notices the missing marker and pays for it then.
+		//
+		// Re-read the generation markPendingEnrichFull bumped: the pass below
+		// clears the ledger against it, and the stale one would decline. Falling
+		// back can happen at most once per call — this is a branch, not a loop,
+		// and the arm it falls through to is full by construction.
+		_, _, pendingGeneration = idx.deferredEnrichScope()
 	}
 	// A re-parse this run evicted the persisted hover edges of the re-parsed
 	// files, so force the pass past the completion-marker gate — an unchanged
@@ -1255,6 +1204,254 @@ func (idx *Indexer) runDeferredEnrich() {
 		// re-arms the pass on the next start. No-op on a dirty tree / empty sha.
 		idx.semanticMgr.RecordRepoEnrichmentComplete(idx.graph, idx.repoPrefix, sha, dirty)
 	}
+}
+
+// runScopedDeferredEnrich runs the file-scoped half of runDeferredEnrich over
+// one already-snapshotted frontier, and reports whether the caller should fall
+// through to a whole-repo pass.
+//
+// Only a worktree copy's repair ever asks for that fallback (repair), and only
+// when it did not complete. A watcher save that ends partial keeps today's
+// behaviour — the ledger stays armed and the next save retries — because its
+// frontier is small, cheap to redo, and a whole-repo pass would be wildly out
+// of proportion to it. A copy repair has no next save to ride on: its frontier
+// was armed once, by a track that has already returned.
+func (idx *Indexer) runScopedDeferredEnrich(pendingFiles []string, pendingGeneration uint64, sha string, dirty, repair bool) (escalate bool) {
+	// The scoped path bypasses runEnrichOne (the only setEnrichStatus
+	// caller), so nothing else publishes this repo as enriching; the
+	// defer covers every return in this block, including the err and
+	// result.Partial early returns below. Placed here rather than in
+	// EnrichFilesContext because that is also the watcher's per-save
+	// entry point, and publishing there would make the READY column
+	// flap on every keystroke-triggered save.
+	releaseEnriching := idx.semanticMgr.BeginScopedEnrichment(idx.repoPrefix)
+	defer releaseEnriching()
+	// Read the content counter BEFORE any provider runs. Enrichment holds
+	// no write gate, so the watcher can reindex a file while a provider is
+	// still working; content that lands mid-pass belongs to the NEXT pass,
+	// and stamping the counter as it stands at completion would claim
+	// coverage of an edit this pass never saw.
+	contentGen := idx.semanticMgr.ObserveContentGen(idx.graph, idx.repoPrefix)
+	byLanguage := idx.deferredEnrichFrontiers(pendingFiles)
+	// Providers whose language was in this frontier but which produced
+	// nothing. Their rows must not be stamped -- see the nil-result comment
+	// in the loop below.
+	var withheld []string
+	languages := make([]string, 0, len(byLanguage))
+	for language := range byLanguage {
+		languages = append(languages, language)
+	}
+	sort.Strings(languages)
+	// The deadline this frontier runs under. A watcher save keeps the
+	// configured semantic.timeout_seconds — EnrichFiles' own default, passed
+	// explicitly here only so the logs below can name the budget a pass
+	// actually had. A copy repair borrows the whole-repo path's size-scaled
+	// bound instead: an LSP- or compiler-backed provider pays the whole-project
+	// load before it can answer for a single file, and the save-sized deadline
+	// cuts it before that load finishes, every time, on a large repository.
+	// That size-scaled bound is itself capped near the save deadline by
+	// CopyRepairDeadline, so a provider that cannot be scoped reaches the
+	// cheaper whole-repo fallback instead of grinding. The 89-minute
+	// file-batch pass that motivated the cap was a different defect —
+	// tstypes had no batch entry and the dispatch silently enriched the whole
+	// repository — and is fixed at the provider now.
+	deadline := idx.semanticMgr.ScopedEnrichTimeout()
+	if repair {
+		nodeCount := idx.semanticMgr.RepoEnrichableNodes(idx.graph, idx.repoPrefix, idx.rootPath)
+		repoDeadline := idx.semanticMgr.RepoEnrichDeadline(nodeCount)
+		deadline = idx.semanticMgr.CopyRepairDeadline(nodeCount)
+		idx.logger.Info("file-scoped deferred semantic enrichment: copy repair deadline",
+			zap.String("repo", idx.repoPrefix),
+			zap.Int("files", len(pendingFiles)),
+			zap.Duration("deadline", deadline),
+			zap.Duration("repo_deadline", repoDeadline),
+			zap.Duration("save_deadline", idx.semanticMgr.ScopedEnrichTimeout()))
+	}
+	for _, language := range languages {
+		files := byLanguage[language]
+		start := time.Now()
+		result, err := idx.semanticMgr.EnrichFilesWithDeadline(
+			idx.graph, idx.repoPrefix, idx.rootPath, language, files, deadline,
+		)
+		if err != nil {
+			idx.logger.Warn("file-scoped deferred semantic enrichment failed",
+				zap.String("repo", idx.repoPrefix),
+				zap.String("language", language),
+				zap.Int("files", len(files)),
+				zap.Duration("elapsed", time.Since(start)),
+				zap.Duration("deadline", deadline),
+				zap.Bool("copy_repair", repair),
+				zap.Error(err))
+			if !repair {
+				return false
+			}
+			// An errored repair is no better off than a partial one — see the
+			// Partial arm below for why a repair, unlike a save, cannot be left
+			// to retry on its own.
+			idx.logger.Info("worktree copy: scoped repair failed; falling back to a whole-repo pass",
+				zap.String("repo", idx.repoPrefix),
+				zap.String("language", language),
+				zap.Error(err))
+			idx.markPendingEnrichFull()
+			return true
+		}
+		if result != nil {
+			idx.logger.Info("semantic enrichment result",
+				zap.String("provider", result.Provider),
+				zap.String("language", result.Language),
+				zap.Int("confirmed", result.EdgesConfirmed),
+				zap.Int("added", result.EdgesAdded),
+				zap.Int("refuted", result.EdgesRefuted),
+				zap.Int("rebound", result.EdgesRebound),
+				zap.Float64("coverage", result.CoveragePercent),
+			)
+			if result.Partial {
+				// Never silent. A partial scoped pass stamps nothing, promotes
+				// nothing, and leaves an in-memory arm that nothing re-dispatches
+				// — measured on a 9.8k-file Python workspace, every copy repair
+				// ended here, and the only trace was a READY column that read
+				// `partial` until the next restart. The budget is logged beside
+				// the outcome because "partial" alone cannot distinguish a
+				// provider that needed more time from one that could not work.
+				idx.logger.Warn("file-scoped deferred semantic enrichment ended partial",
+					zap.String("repo", idx.repoPrefix),
+					zap.String("provider", result.Provider),
+					zap.String("language", language),
+					zap.Int("files", len(files)),
+					zap.Duration("elapsed", time.Since(start)),
+					zap.Duration("deadline", deadline),
+					zap.Float64("coverage", result.CoveragePercent),
+					zap.String("abort_reason", result.AbortReason),
+					zap.Bool("copy_repair", repair))
+				if !repair {
+					// A watcher save is retried by the next save, and its
+					// frontier is small enough that waiting for one costs less
+					// than a whole-repo pass. The ledger stays armed.
+					return false
+				}
+				// A copy repair has no next save to ride on: it was armed once,
+				// by a track that has already returned. Escalating here is what
+				// converges the copy to ready inside this daemon's life rather
+				// than the next one's. The whole-repo pass writes the __repo__
+				// marker itself, which is exactly why markPendingEnrichFull
+				// retires the scoped promotion entitlement on its way out.
+				idx.logger.Info("worktree copy: scoped repair ended partial; falling back to a whole-repo pass",
+					zap.String("repo", idx.repoPrefix),
+					zap.String("language", language))
+				idx.markPendingEnrichFull()
+				return true
+			}
+		} else if provider := idx.semanticMgr.ProviderForLanguage(language); provider != nil {
+			// A nil result is two outcomes wearing one shape, and only the
+			// lookup above tells them apart:
+			//
+			//   no provider registered   nothing was evicted that any
+			//                            provider would restore, so this
+			//                            language is current -> STAMP
+			//   registered, ran nothing  most often an unavailable
+			//                            provider, screened out after
+			//                            selection: the re-parse dropped
+			//                            its edges and nothing put them
+			//                            back -> WITHHOLD
+			//
+			// Withholding on BOTH would strand a repo whose frontier is
+			// only .md or .yaml forever, which is the disease being cured.
+			// Stamping on both would publish a repo that reads ready while
+			// silently missing a provider's edges, which is worse than an
+			// honest "partial".
+			withheld = append(withheld, provider.Name())
+		}
+	}
+	// A file frontier proves only that the affected language/file batches
+	// were refreshed. It must never publish the whole-repository completion
+	// marker: files and packages outside this exact frontier did not run.
+	//
+	// The worktree-copy promotion below is not an exception to that — it is
+	// the one case where something ELSE has already proved the rest of the
+	// repository, and the frontier supplies only the remainder. See the
+	// block after the discharge.
+	if idx.clearPendingEnrich(pendingGeneration) {
+		// Stamp first, discharge second, and the order is load-bearing.
+		// The ledger is the only thing that re-arms this pass; discharging
+		// before a stamp that then fails would consume the retry signal and
+		// strand the repo in exactly the state the stamp exists to prevent.
+		//
+		// Reaching here means every language succeeded non-partial -- the
+		// err and result.Partial arms above both return -- so what is being
+		// recorded is a completed pass over a known frontier. The whole-repo
+		// SHA marker stays withheld below, because that one really does
+		// assert every file was enriched at a revision.
+		stamped, err := idx.semanticMgr.CompleteScopedEnrichment(
+			idx.graph, idx.repoPrefix, contentGen, withheld)
+		if err != nil {
+			idx.logger.Warn("file-scoped enrichment stamp failed; leaving ledger armed",
+				zap.String("repo", idx.repoPrefix),
+				zap.Error(err))
+			idx.markPendingEnrichFiles(pendingFiles)
+			if repair && !idx.deferredEnrichIsFull() {
+				// The re-armed frontier is still the copy's divergence, so it
+				// must keep the disposition this dispatch consumed — otherwise
+				// the retry silently drops to the save deadline.
+				idx.armCopiedEnrichRepair()
+			}
+			// Not an escalation. The providers all completed; only the stamp
+			// failed, and re-arming the same frontier retries exactly that.
+			return false
+		}
+		// The whole dispatched frontier is discharged, not just the paths a
+		// provider claimed: a file whose language no provider covers still
+		// had its deferred pass run, and leaving it marked would re-arm it
+		// on every restart forever. A newer generation (the watcher queued
+		// work mid-pass) keeps its own markers — clearPendingEnrich already
+		// declined, so this does not run.
+		idx.dischargePendingEnrichFrontier(pendingFiles)
+		// The one shape in which a file frontier DOES complete the
+		// whole-repo assertion the rule above withholds, and it takes two
+		// proofs, neither sufficient alone:
+		//
+		//   source completion    the subgraph copy inherited a __repo__
+		//                        marker naming the exact commit it was
+		//                        copied at, so every file this checkout
+		//                        carries verbatim was enriched there;
+		//   divergence completion this pass covered the reconcile's own
+		//                        list of the only files the two checkouts
+		//                        disagree on, non-partial, withholding
+		//                        nothing.
+		//
+		// Together they say every file in the repository has been enriched
+		// at this revision — which is precisely what the marker asserts.
+		// armCopiedRepoEnrich verified the first half before arming; the
+		// guards here are the second, plus the requirement that HEAD has
+		// not moved and the tree is still clean, because the marker names a
+		// committed state. Any guard failing leaves the marker at the
+		// source's sha, and the next restart re-arms a full pass.
+		want := idx.takeCopiedEnrichMarkerPromotion()
+		switch {
+		case copiedMarkerPromotionAllowed(want, sha, dirty, withheld):
+			idx.semanticMgr.RecordRepoEnrichmentComplete(idx.graph, idx.repoPrefix, sha, dirty)
+			idx.logger.Info("worktree copy: scoped repair completed the inherited whole-repo enrichment",
+				zap.String("repo", idx.repoPrefix),
+				zap.String("sha", sha))
+		case want != "":
+			// Entitled but declined. Say which clause declined it, so the
+			// full pass the next restart pays for is explainable rather
+			// than looking like the promotion never worked.
+			idx.logger.Info("worktree copy: inherited enrichment marker not promoted",
+				zap.String("repo", idx.repoPrefix),
+				zap.String("armed_at", want),
+				zap.String("sha", sha),
+				zap.Bool("dirty", dirty),
+				zap.Strings("withheld", withheld))
+		}
+		if stamped > 0 {
+			idx.logger.Info("file-scoped enrichment recorded content coverage",
+				zap.String("repo", idx.repoPrefix),
+				zap.Int64("content_gen", contentGen),
+				zap.Int("providers_renewed", stamped),
+				zap.Strings("withheld", withheld))
+		}
+	}
+	return false
 }
 
 // MaybeSeedPendingEnrich re-arms the deferred-enrichment gate for a repo whose

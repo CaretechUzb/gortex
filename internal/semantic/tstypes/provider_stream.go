@@ -143,8 +143,16 @@ const (
 // this is the apply learning the same manners.
 type applyYield func() (graphMutated bool)
 
-func (p *Provider) applyStagedFacts(ctx context.Context, g graph.Store, repoPrefix string, spool *factSpool, res *semantic.EnrichResult, yield applyYield) error {
-	if counter, ok := g.(graph.RepoLanguageSymbolCounter); ok {
+// symbolsTotal is the coverage denominator: repoWideSymbolTotal asks for the
+// whole repository's count (the whole-repo pass), anything >= 0 is a
+// pre-counted frontier total supplied by the file-scoped pass. A frontier pass
+// MUST NOT use the repository's count — a complete 2-file pass on a 9.8k-file
+// repository would then report ~0% coverage, which every caller reads as a pass
+// that achieved nothing.
+func (p *Provider) applyStagedFacts(ctx context.Context, g graph.Store, repoPrefix string, spool *factSpool, res *semantic.EnrichResult, symbolsTotal int, yield applyYield) error {
+	if symbolsTotal >= 0 {
+		res.SymbolsTotal = symbolsTotal
+	} else if counter, ok := g.(graph.RepoLanguageSymbolCounter); ok {
 		res.SymbolsTotal = counter.CountRepoLanguageSymbols(repoPrefix, p.spec.Languages)
 	} else {
 		// Compatibility-only stores may lack the count projection. Production
@@ -173,6 +181,7 @@ func (p *Provider) applyStagedFacts(ctx context.Context, g graph.Store, repoPref
 	// flushes no edges, so an expiry during it yields a zero-edge partial —
 	// accepted because the walk is decode-free: a budget too small for it
 	// could not have completed any apply phase either.
+	res.Phase = "coverage"
 	after := ""
 	for {
 		if err := ctx.Err(); err != nil {
@@ -185,8 +194,9 @@ func (p *Provider) applyStagedFacts(ctx context.Context, g graph.Store, repoPref
 		if len(page) == 0 {
 			break
 		}
-		ap := newApplier(g, p.spec, p.Name()).withHotCache(hot)
+		ap := newApplier(g, p.spec, p.Name()).withHotCache(hot).withLogger(p.logger)
 		res.SymbolsCovered += ap.coverFiles(page)
+		res.PagesApplied++
 		after = last
 		// The coverage walk flushes no edges, but it is the longest single
 		// stretch of the apply on a large repo and holding the mutex through it
@@ -203,7 +213,14 @@ func (p *Provider) applyStagedFacts(ctx context.Context, g graph.Store, repoPref
 		stagedAliases: classAliases,
 		stagedCalls:   classCalls,
 	}
+	phaseNames := map[stagedFactPhase]string{
+		stagedSupers:  "supers",
+		stagedMetas:   "metas",
+		stagedAliases: "aliases",
+		stagedCalls:   "calls",
+	}
 	for phase := stagedSupers; phase <= stagedCalls; phase++ {
+		res.Phase = phaseNames[phase]
 		// Adjacency is only valid within one phase: the supers phase
 		// synthesizes inheritance edges that later phases' frontier walks
 		// must observe. Nodes and name groups survive phase boundaries —
@@ -222,7 +239,7 @@ func (p *Provider) applyStagedFacts(ctx context.Context, g graph.Store, repoPref
 			if len(page) == 0 {
 				break
 			}
-			ap := newApplier(g, p.spec, p.Name()).withHotCache(hot)
+			ap := newApplier(g, p.spec, p.Name()).withHotCache(hot).withLogger(p.logger)
 			switch phase {
 			case stagedSupers:
 				err = ap.applySupersPage(ctx, page, res)
@@ -255,6 +272,7 @@ func (p *Provider) applyStagedFacts(ctx context.Context, g graph.Store, repoPref
 				return err
 			}
 			after = last
+			res.PagesApplied++
 			// Page boundary: this page's edges are flushed and the next page's
 			// applier has not been built, so the only state crossing here is the
 			// hot cache — and flushAll covers it whenever the graph moved.
@@ -277,5 +295,11 @@ func (p *Provider) applyStagedFacts(ctx context.Context, g graph.Store, repoPref
 	if res.SymbolsTotal > 0 {
 		res.CoveragePercent = float64(res.SymbolsCovered) / float64(res.SymbolsTotal) * 100
 	}
+	// Every phase ran to its last page. Phase exists to name where a cut
+	// landed, so leaving the last phase's name on a completed pass would make
+	// "finished" and "cut in the calls phase" read identically in the log —
+	// clear it, which is the state the field documents for a normal
+	// completion. Every early return above keeps the phase it stopped in.
+	res.Phase = ""
 	return nil
 }

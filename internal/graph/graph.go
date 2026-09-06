@@ -619,6 +619,10 @@ var (
 	_ ReleaseEnrichmentReader  = (*Graph)(nil)
 	_ ConstantValueWriter      = (*Graph)(nil)
 	_ ConstantValueReader      = (*Graph)(nil)
+	// The conformance suite SKIPS a backend that fails the capability type
+	// assertion, so a signature drift here would go green rather than red
+	// without this line.
+	_ InEdgesByKindFinder = (*Graph)(nil)
 )
 
 // New creates an empty in-memory Store with a shard fan-out derived from the
@@ -3224,6 +3228,65 @@ func (g *Graph) GetInEdgesByNodeIDs(ids []string) map[string][]*Edge {
 		out[id] = g.GetInEdges(id)
 	}
 	return out
+}
+
+// GetInEdgesByNodeIDsAndKinds implements InEdgesByKindFinder. The in-memory
+// graph pays no I/O for the rows it drops, but it still owes callers the
+// same BOUNDED result the SQLite backend returns — a hub node's inbound
+// degree is what the kind predicate exists to keep out of the caller's
+// working set, and that is backend-independent.
+//
+// The filter runs INSIDE the shard read lock rather than over GetInEdges'
+// return value: GetInEdges copies the whole inbound slice before returning,
+// so filtering afterwards would still materialise a hub node's full degree
+// (transiently, and under the same lock) on every page — the allocation this
+// capability exists to avoid, merely moved off the wire.
+func (g *Graph) GetInEdgesByNodeIDsAndKinds(ids []string, kinds []EdgeKind) map[string][]*Edge {
+	if len(ids) == 0 || len(kinds) == 0 {
+		return nil
+	}
+	want := make(map[EdgeKind]struct{}, len(kinds))
+	for _, kind := range kinds {
+		if kind == "" {
+			continue
+		}
+		want[kind] = struct{}{}
+	}
+	if len(want) == 0 {
+		// A kind set that names nothing usable is the same "asked for
+		// nothing" case as an empty one; never the unfiltered projection.
+		return nil
+	}
+	out := make(map[string][]*Edge, len(ids))
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		if _, ok := out[id]; ok {
+			continue
+		}
+		out[id] = g.inEdgesOfKinds(id, want)
+	}
+	return out
+}
+
+// inEdgesOfKinds is the shard-local half of GetInEdgesByNodeIDsAndKinds: one
+// RLock, one pass over the shard's own slice, and only the wanted kinds ever
+// leave it.
+func (g *Graph) inEdgesOfKinds(nodeID string, want map[EdgeKind]struct{}) []*Edge {
+	s := g.shardFor(nodeID)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var kept []*Edge
+	for _, edge := range s.inEdges[nodeID] {
+		if edge == nil {
+			continue
+		}
+		if _, ok := want[edge.Kind]; ok {
+			kept = append(kept, edge)
+		}
+	}
+	return kept
 }
 
 // EvictFile removes all nodes and edges belonging to the given file

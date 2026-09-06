@@ -608,6 +608,20 @@ func generationReadProbes() []genProbe {
 		{name: "GetInEdgesByNodeIDs", run: func(t *testing.T, s *Store) []string {
 			return edgeSliceMapTokens(s.GetInEdgesByNodeIDs(genReadProbeIDs()))
 		}},
+		// The kind-narrowed sibling binds view_gen through the SAME builder,
+		// but behind an extra `kind IN (...)` conjunct — which is exactly the
+		// shape where a generation predicate is easiest to lose, because the
+		// kind seek alone already returns plausible rows. The kind set pairs
+		// member_of (the structural kind the tstypes apply actually consumes,
+		// so the probe covers the production shape) with calls (the only
+		// inbound kind on these ids whose rows DIVERGE between generations, so
+		// the fence has something to catch).
+		{name: "GetInEdgesByNodeIDsAndKinds", run: func(t *testing.T, s *Store) []string {
+			return edgeSliceMapTokens(s.GetInEdgesByNodeIDsAndKinds(
+				genReadProbeIDs(),
+				[]graph.EdgeKind{graph.EdgeMemberOf, graph.EdgeCalls},
+			))
+		}},
 		{name: "GetOutEdgesByNodeIDsContext", run: func(t *testing.T, s *Store) []string {
 			m, _, err := s.GetOutEdgesByNodeIDsContext(context.Background(), genReadProbeIDs(), 64)
 			if err != nil {
@@ -1783,6 +1797,7 @@ func generationCapabilityChecklist() []capabilityCase {
 		{iface: (*graph.InDegreeForNodes)(nil), probe: "InDegreeForNodes"},
 		{iface: (*graph.InEdgeCounter)(nil), probe: "InEdgeCountsByKind"},
 		{iface: (*graph.InEdgeIdentityBatchReader)(nil), probe: "GetInEdgeIdentitiesByNodeIDs"},
+		{iface: (*graph.InEdgesByKindFinder)(nil), probe: "GetInEdgesByNodeIDsAndKinds"},
 		{iface: (*graph.LightEdgeScanner)(nil), probe: "AllEdgesLight"},
 		{iface: (*graph.LightEdgeSequencer)(nil), probe: "EdgesLightSeq"},
 		{iface: (*graph.MemberMethodsByType)(nil), probe: "MemberMethodsByType"},

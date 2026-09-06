@@ -439,9 +439,9 @@ func trackedFamilyRepo(fam worktreeFamily) string {
 // worktree would also be naming it as its own main.
 func worktreeCWDErr(worktree string, fam worktreeFamily, familyRepo string) error {
 	if familyRepo != "" {
-		return fmt.Errorf(
+		return &unboundWorktreeViewError{msg: fmt.Sprintf(
 			"the gortex daemon tracks %s but has not bound the worktree %s to a view yet — run `gortex repos reconcile %s` and retry",
-			familyRepo, worktree, familyRepo)
+			familyRepo, worktree, familyRepo)}
 	}
 	remedy := fmt.Sprintf("track its main checkout with `gortex track %s`", fam.mainRepo)
 	if fam.mainRepo == "" {
@@ -458,6 +458,26 @@ func worktreeCWDErr(worktree string, fam worktreeFamily, familyRepo string) erro
 		"the gortex daemon does not track the family %s is a linked worktree of — %s; the worktree is then served through it",
 		worktree, remedy)
 }
+
+// ErrUnboundWorktreeView is the sentinel behind the "has not bound the
+// worktree … to a view yet" refusal.
+//
+// A caller sometimes needs to recognise that answer rather than merely report
+// it, because for some operations it is not a failure but the expected shape
+// of the state being waited on: a demotion leaves its checkout served through
+// the family with a pending route and no layer until something reads it, and
+// every lookup aimed at that path is refused this way for the whole teardown.
+// Matching on the prose would break the first time the remedy is reworded, so
+// the error carries an identity instead. The rendered text is unchanged.
+var ErrUnboundWorktreeView = errors.New("the worktree is not bound to a view yet")
+
+// unboundWorktreeViewError renders exactly what worktreeCWDErr has always
+// rendered and unwraps to ErrUnboundWorktreeView.
+type unboundWorktreeViewError struct{ msg string }
+
+func (e *unboundWorktreeViewError) Error() string { return e.msg }
+
+func (e *unboundWorktreeViewError) Unwrap() error { return ErrUnboundWorktreeView }
 
 // checkoutsRelayPath resolves the repository path the checkout verbs relay
 // through.

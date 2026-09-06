@@ -155,6 +155,7 @@ func RunConformance(t *testing.T, factory Factory, semantics Semantics) {
 	t.Run("FileImporters", func(t *testing.T) { testFileImporters(t, factory) })
 	t.Run("InEdgeCounter", func(t *testing.T) { testInEdgeCounter(t, factory) })
 	t.Run("NodesInFilesByKindFinder", func(t *testing.T) { testNodesInFilesByKindFinder(t, factory) })
+	t.Run("InEdgesByKindFinder", func(t *testing.T) { testInEdgesByKindFinder(t, factory) })
 	t.Run("EdgesByKindsScanner", func(t *testing.T) { testEdgesByKindsScanner(t, factory) })
 	t.Run("NodesByKindsScanner", func(t *testing.T) { testNodesByKindsScanner(t, factory) })
 	t.Run("EdgeKindCounter", func(t *testing.T) { testEdgeKindCounter(t, factory) })
@@ -2312,6 +2313,75 @@ func testNodesInFilesByKindFinder(t *testing.T, factory Factory) {
 	)
 	if len(gotDup) != 1 || gotDup[0].ID != "f1::T1" {
 		t.Fatalf("NodesInFilesByKind(dup) = %v, want [f1::T1]", sortNodeIDs(gotDup))
+	}
+}
+
+// testInEdgesByKindFinder exercises the optional graph.InEdgesByKindFinder
+// capability: the grouped inbound projection narrowed to the kinds the caller
+// consumes. The hub node here is the shape the capability exists for — one
+// target with a large, structurally irrelevant inbound degree (`calls`) beside
+// the one edge a type-resolution walk reads (`member_of`).
+func testInEdgesByKindFinder(t *testing.T, factory Factory) {
+	t.Helper()
+	s := factory(t)
+	fn, ok := s.(graph.InEdgesByKindFinder)
+	if !ok {
+		t.Skip("backend does not implement graph.InEdgesByKindFinder")
+	}
+
+	s.AddNode(mkNode("hub::Base", "Base", "base.go", graph.KindType))
+	s.AddNode(mkNode("hub::Base.M", "M", "base.go", graph.KindMethod))
+	s.AddNode(mkNode("hub::P", "p", "base.go", graph.KindParam))
+	s.AddNode(mkNode("hub::Other", "Other", "other.go", graph.KindType))
+	s.AddEdge(mkEdge("hub::Base.M", "hub::Base", graph.EdgeMemberOf))
+	s.AddEdge(mkEdge("hub::P", "hub::Base.M", graph.EdgeParamOf))
+	for i := 0; i < 8; i++ {
+		caller := fmt.Sprintf("hub::caller%d", i)
+		s.AddNode(mkNode(caller, fmt.Sprintf("caller%d", i), "callers.go", graph.KindFunction))
+		s.AddEdge(mkEdge(caller, "hub::Base", graph.EdgeCalls))
+		s.AddEdge(mkEdge(caller, "hub::Base", graph.EdgeReferences))
+	}
+
+	got := fn.GetInEdgesByNodeIDsAndKinds(
+		[]string{"hub::Base", "hub::Base.M", "hub::Other"},
+		[]graph.EdgeKind{graph.EdgeMemberOf, graph.EdgeParamOf},
+	)
+	if n := len(got["hub::Base"]); n != 1 {
+		t.Fatalf("hub inbound = %d edges, want 1 (member_of only): the 16 inbound "+
+			"calls/references edges must never be transferred", n)
+	}
+	if e := got["hub::Base"][0]; e.From != "hub::Base.M" || e.Kind != graph.EdgeMemberOf {
+		t.Fatalf("hub inbound edge = %s -%s-> %s, want hub::Base.M -member_of->", e.From, e.Kind, e.To)
+	}
+	if n := len(got["hub::Base.M"]); n != 1 || got["hub::Base.M"][0].Kind != graph.EdgeParamOf {
+		t.Fatalf("member inbound = %v, want one param_of", got["hub::Base.M"])
+	}
+	// A node with no matching inbound edge is a NEGATIVE result, not a
+	// missing one — callers cache emptiness to avoid re-asking.
+	if n := len(got["hub::Other"]); n != 0 {
+		t.Fatalf("unrelated node inbound = %d edges, want 0", n)
+	}
+
+	// The full projection still sees everything: narrowing is the caller's
+	// choice, not a change to the store's contents.
+	if n := len(s.GetInEdgesByNodeIDs([]string{"hub::Base"})["hub::Base"]); n != 17 {
+		t.Fatalf("unnarrowed hub inbound = %d edges, want 17", n)
+	}
+
+	// Empty ids / kinds return nil — never a whole-graph scan.
+	if got := fn.GetInEdgesByNodeIDsAndKinds(nil, []graph.EdgeKind{graph.EdgeMemberOf}); got != nil {
+		t.Fatalf("GetInEdgesByNodeIDsAndKinds(nil ids) = %v, want nil", got)
+	}
+	if got := fn.GetInEdgesByNodeIDsAndKinds([]string{"hub::Base"}, nil); got != nil {
+		t.Fatalf("GetInEdgesByNodeIDsAndKinds(nil kinds) = %v, want nil", got)
+	}
+	// A kind set that SANITISES to empty is the same "asked for nothing"
+	// case as an empty one. A backend that drops the unusable kind and then
+	// tests the surviving list for emptiness falls through to the
+	// UNFILTERED read — handing back the whole hub degree from the entry
+	// point that exists to prevent exactly that.
+	if got := fn.GetInEdgesByNodeIDsAndKinds([]string{"hub::Base"}, []graph.EdgeKind{""}); got != nil {
+		t.Fatalf("GetInEdgesByNodeIDsAndKinds(empty-string kind) = %v, want nil", got)
 	}
 }
 

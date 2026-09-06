@@ -76,9 +76,53 @@ gortex daemon uninstall-service
 gortex track ~/projects/backend
 gortex untrack backend
 
+# --wait blocks until the daemon has actually finished the work rather than
+# just admitted it, so a following query sees a complete graph:
+gortex track ~/projects/backend --wait                        # block until indexed (10m default timeout)
+gortex track ~/projects/backend --wait --wait-timeout 20m      # 0 waits forever
+gortex untrack ~/projects/worktree --wait                      # block until a demotion settles (30m default)
+gortex untrack ~/projects/worktree --wait --wait-timeout 0     # 0 waits forever
+
 # Per-repo status + daemon-wide status share the same command — it picks:
 gortex status
 ```
+
+**`track --wait`** blocks until the repo is indexed and the graph is
+queryable, polling daemon status rather than holding one request open — the
+config write that makes the track durable happens first and unconditionally,
+so a `--wait` timeout still leaves the repo tracked; only the wait itself gave
+up.
+
+**`untrack --wait`** matters specifically for a **demotion** — untracking a
+worktree its family can still serve, which is folded into the family's
+automatic lane rather than removed outright (see
+[Worktrees and checkouts](#worktrees-and-checkouts)). The daemon starts that
+demotion and answers `"status":"demoting"` as soon as it is admitted, without
+waiting for it: retiring the corpus the checkout gives up evicts every node,
+edge and file row of a whole repository and rewrites the search corpus around
+them, which runs well past typical request deadlines. Without `--wait`,
+`gortex untrack` reports the demotion is running in the background and returns
+immediately — harmless, and `gortex repos families` later shows whether it
+landed.
+
+With `--wait`, the CLI polls the read-only `list_checkouts` view until the
+checkout reaches the demotion's **end state** — `effective_mode: automatic`
+**and** no transition still in flight — or the transition reports `failed`, or
+`--wait-timeout` (default 30m, higher than `track`'s because a teardown of a
+worktree-sized corpus was measured at 28 minutes; 0 waits forever) elapses.
+
+Both halves matter: the mode flip is the *first* durable write of a demotion,
+not the last, and everything expensive happens behind it (corpus retirement,
+row eviction, removal of the tracked-repo entry from the global config, and
+finally the completion of the transition, which is what clears the transition
+slot).
+Waiting on the mode alone reports a demotion landed while the daemon still has
+all of that to do, so `gortex repos` and `~/.gortex/config.yaml` disagree with
+the CLI for as long as the teardown takes. A timeout is not a failure: the
+worker keeps going, and re-checking `gortex repos families` shows where it
+got to. A plan that removes rows instead of demoting (see `repos forget`
+above) always runs — or previews — synchronously and is unaffected by
+`--wait`.
 
 ## Per-repo setup
 

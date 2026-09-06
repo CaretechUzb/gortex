@@ -1336,6 +1336,25 @@ type NodesInFilesByKindStreamer interface {
 	NodesInFilesByKindSeq(files []string, kinds []NodeKind) iter.Seq2[string, []*Node]
 }
 
+// InEdgesByKindFinder is GetInEdgesByNodeIDs narrowed to the inbound edge
+// kinds the caller can actually consume, grouped the same way.
+//
+// Inbound degree is the one graph statistic with no local bound: a hub node
+// — a base class every model in a framework extends, a method every caller
+// invokes — collects incoming `calls` / `references` edges proportional to
+// the WHOLE repository, while the structural kinds a type-resolution walk
+// reads (`member_of`, `param_of`) stay proportional to the node itself.
+// Measured on an Odoo-shaped Python corpus: one 32-file page of the tstypes
+// apply pulled 860,270 inbound edges to consume 6,809 of them (0.8%), with a
+// single hub method contributing 10,255. Pushing the kind predicate into the
+// store turns that into a range scan on the existing (to_id, kind) index.
+//
+// Optional capability — callers fall back to GetInEdgesByNodeIDs plus an
+// in-memory filter, which bounds the retained working set but not the read.
+type InEdgesByKindFinder interface {
+	GetInEdgesByNodeIDsAndKinds(ids []string, kinds []EdgeKind) map[string][]*Edge
+}
+
 // FileMtimeWriter is an optional capability backends MAY implement to
 // persist the per-file modification time the indexer uses for its
 // incremental-reindex decisions. Lifting this state off the daemon's
@@ -1447,11 +1466,64 @@ const (
 // would look fully enriched -- one fresh provider masking a sibling that never
 // started. So the applicable set is written down before any of them runs, and a
 // provider that applies but has not completed is a visible gen-0 row.
+// CopiedReadinessStage names which stage stamp(s) a restamp declares current
+// for a copied checkout. It is a parameter rather than an implicit "both"
+// because the two stages are proved by different evidence: a reconcile's
+// scoped tail re-DERIVES the divergence, so the carried derive rows now
+// describe the destination exactly -- but nothing has re-ENRICHED it yet, and
+// the pass that will is armed by the same caller a few lines later
+// (scheduleCopiedRepoEnrich). Restamping enrichment too at that point would
+// declare a pass complete before it has run.
+type CopiedReadinessStage uint8
+
+const (
+	// CopiedReadinessDerive asserts that derive_state's carried stamp is
+	// current for the destination -- the changed files really have been
+	// re-derived, so the stamp merely catches up to that fact.
+	CopiedReadinessDerive CopiedReadinessStage = 1 << iota
+	// CopiedReadinessEnrich asserts that enrichment_state's carried stamp is
+	// current for the destination. Only sound when nothing about the copy's
+	// content has changed since the source was enriched -- i.e. the
+	// identical-copy case, never a diverged one.
+	CopiedReadinessEnrich
+)
+
+// CopiedReadinessAllStages is the identical-copy assertion: the destination
+// carries the same nodes, edges, derive and enrichment rows as the source at
+// the same commit, so both stage stamps are exactly as current for it as they
+// are for the source.
+const CopiedReadinessAllStages = CopiedReadinessDerive | CopiedReadinessEnrich
+
 // CopiedReadinessRestamper declares a subgraph copy's carried stage stamps
 // current for the destination checkout, once that checkout's own file
 // bookkeeping has been written. See store_sqlite.RestampCopiedReadiness.
 type CopiedReadinessRestamper interface {
-	RestampCopiedReadiness(dstPrefix string) error
+	RestampCopiedReadiness(dstPrefix string, stages CopiedReadinessStage) error
+}
+
+// EnrichmentCurrencyReader answers whether a repository's recorded semantic
+// enrichment describes the content its graph currently holds -- READY's
+// enrichment column, asked about some OTHER repo rather than about the one
+// being reported on.
+//
+// It is separate from EnrichmentApplicabilityStore because it asks a different
+// kind of question. Everything there is about writing or re-arming one repo's
+// own applicability; this is a pure read that one repo makes ABOUT another,
+// and its only caller is the worktree-copy source ranking: a subgraph copied
+// from a source whose own enrichment was unfinished carries that unfinished
+// state verbatim, and the copy's scoped repair then advances every completed
+// row to the DESTINATION's counter -- turning the source's honest "partial"
+// into the copy's "ready".
+//
+// hasRun and current are separate answers, not one answer and its reason.
+// (false, false) is "no provider has ever completed a pass here"; (false, true)
+// is "one did, and the content has moved on since"; (true, true) is the only
+// state in which the carried rows may be trusted. A backend that does not
+// implement this cannot be asked, and a caller that cannot ask must assume the
+// unfavourable answer -- copying is an optimisation, and re-enriching is merely
+// slow where laundering a stale stamp is wrong.
+type EnrichmentCurrencyReader interface {
+	EnrichmentCurrentForRepo(repoPrefix string) (current, hasRun bool, err error)
 }
 
 type EnrichmentApplicabilityStore interface {

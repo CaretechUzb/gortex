@@ -118,6 +118,17 @@ type Manager struct {
 	// failed) so index_health can surface an un-enriched graph instead
 	// of reporting green. Keyed by repo + "\x00" + provider name.
 	enrichStatus map[string]*EnrichmentStatus
+	// enrichScoped counts in-flight FILE-SCOPED enrichment passes per repo.
+	// A scoped pass (EnrichFiles/EnrichFilesContext, driven by
+	// runDeferredEnrich's file-frontier branch) dispatches providers
+	// directly and never reaches setEnrichStatus, so it has no per-(repo,
+	// provider) status row; without this counter the activity hook cannot
+	// see it, and a repo enriching for minutes reads `partial` instead of
+	// `enriching…`. Deliberately NOT folded into EnrichmentActive (gates the
+	// LLM cold-load): that gate cares about whole-repo passes
+	// contending for CPU/GPU/RAM, not a bounded per-file pass. Keyed by
+	// repo prefix; guarded by m.mu like enrichStatus.
+	enrichScoped map[string]int
 	// futilePasses records the (repo, provider, sha) triples whose last pass
 	// consumed its whole budget and produced zero coverage. See futile_pass.go.
 	futilePasses map[string]futilePass
@@ -152,6 +163,7 @@ func NewManager(cfg Config, logger *zap.Logger) *Manager {
 		checkouts:       NewCheckoutWorkspaces(cfg.checkoutWorkspaceCap(), logger),
 		lastResults:     make(map[string]*EnrichResult),
 		enrichStatus:    make(map[string]*EnrichmentStatus),
+		enrichScoped:    make(map[string]int),
 		lifecycleCtx:    lifecycleCtx,
 		lifecycleCancel: lifecycleCancel,
 	}
@@ -907,6 +919,41 @@ func RefreshCompletedProviders(g graph.Store, repoPrefix string) {
 	_, _ = store.RefreshEnrichmentProviders(repoPrefix)
 }
 
+// RepoEnrichmentMarkerAt reports the whole-repo enrichment completion marker
+// for repoPrefix against sha, for a caller that holds a graph but no Manager.
+//
+// The package-level sibling of Manager.RepoEnrichmentMarkerState, which
+// delegates here so there is one implementation of "does the __repo__ row name
+// this revision". The caller that needs the package-level form is the
+// worktree-copy arming in internal/indexer: it runs on the track path, where
+// the semantic Manager may not have been built yet (and under the copy-track
+// test harness is nil outright), and it must decide whether the __repo__ marker
+// the copy just INHERITED proves anything before letting a later scoped pass
+// promote it. The inherited row names the SOURCE's last complete enrichment,
+// which is not guaranteed to be the commit the subgraph was copied at — a
+// marker naming any other sha proves nothing about the carried corpus, and the
+// promotion must not be armed on it.
+//
+// persisted is false when the backend does not durably store enrichment state
+// (the in-memory graph): there is then no completeness signal to act on at all.
+// When persisted is true, matches reports whether a marker exists and records
+// exactly sha. A read error or an empty sha yields (false, true) — no positive
+// evidence, but the backend does persist state.
+func RepoEnrichmentMarkerAt(g graph.Store, repoPrefix, sha string) (matches, persisted bool) {
+	store, ok := durableStore(g).(graph.EnrichmentStateStore)
+	if !ok {
+		return false, false
+	}
+	if sha == "" {
+		return false, true
+	}
+	marker, found, err := store.GetEnrichmentState(repoPrefix, repoEnrichMarkerProvider)
+	if err != nil || !found {
+		return false, true
+	}
+	return marker.IndexedSHA == sha, true
+}
+
 // ObserveContentGen is observeContentGen for callers outside this package --
 // the indexer's file-scoped deferred pass, which must read the counter before
 // it dispatches any provider work and hand the same value back to
@@ -1243,13 +1290,69 @@ func (m *Manager) SetActivityHook(fn func(repos []string)) {
 	m.mu.Unlock()
 }
 
-// activeEnrichReposLocked lists the repos with a pass in flight, using the same
-// definition of "in flight" as EnrichmentActive. m.mu must be held.
+// BeginScopedEnrichment records one in-flight file-scoped enrichment pass for
+// repo and returns a release func to call when that pass ends. A scoped pass
+// (EnrichFiles/EnrichFilesContext) dispatches providers directly and never
+// calls setEnrichStatus, so without this the activity hook -- and therefore
+// the READY verdict's `enriching...` label -- cannot see it. release is safe
+// to call more than once; only the first call has any effect. repo == "" is
+// a no-op that still returns a callable release, and a nil activityHook is
+// tolerated the same way setEnrichStatus tolerates it.
+func (m *Manager) BeginScopedEnrichment(repo string) (release func()) {
+	if repo == "" {
+		return func() {}
+	}
+	m.mu.Lock()
+	m.enrichScoped[repo]++
+	hook := m.activityHook
+	var active []string
+	if hook != nil {
+		active = m.activeEnrichReposLocked()
+	}
+	m.mu.Unlock()
+	if hook != nil {
+		hook(active)
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			m.mu.Lock()
+			m.enrichScoped[repo]--
+			if m.enrichScoped[repo] <= 0 {
+				delete(m.enrichScoped, repo)
+			}
+			hook := m.activityHook
+			var active []string
+			if hook != nil {
+				active = m.activeEnrichReposLocked()
+			}
+			m.mu.Unlock()
+			if hook != nil {
+				hook(active)
+			}
+		})
+	}
+}
+
+// activeEnrichReposLocked lists the repos with a pass in flight: the union of
+// repos holding a running/draining whole-repo enrichStatus row and repos with
+// an in-flight scoped pass counted in enrichScoped. EnrichmentActive
+// deliberately reads only the former — see its own comment for why a scoped
+// pass must not gate the LLM cold-load. m.mu must be held.
 func (m *Manager) activeEnrichReposLocked() []string {
 	seen := make(map[string]struct{})
 	for _, st := range m.enrichStatus {
 		if st.State == EnrichStateRunning || st.State == EnrichStateDraining {
 			seen[st.Repo] = struct{}{}
+		}
+	}
+	// A file-scoped pass never writes an enrichStatus row (see enrichScoped's
+	// comment), so it must be unioned in here explicitly or it is invisible
+	// to every reader of this method, including callers reached only through
+	// the activity hook rather than the map directly.
+	for repo, count := range m.enrichScoped {
+		if count > 0 {
+			seen[repo] = struct{}{}
 		}
 	}
 	out := make([]string, 0, len(seen))
@@ -1452,19 +1555,13 @@ func (m *Manager) RecordRepoEnrichmentComplete(g graph.Store, repoPrefix, sha st
 // clean HEAD and need not be resumed on restart. A read error or an empty sha
 // yields (false, true): no positive evidence of completeness, but the backend
 // does persist state.
+//
+// The method form for the Manager-holding callers (the warm-restart gate). The
+// question is identical to RepoEnrichmentMarkerAt's, so it delegates rather
+// than keeping a second copy: two spellings of "does the __repo__ row name this
+// revision" is two places for a later edit to get one of them backwards.
 func (m *Manager) RepoEnrichmentMarkerState(g graph.Store, repoPrefix, sha string) (current, persisted bool) {
-	store, ok := m.enrichmentStateStore(g)
-	if !ok {
-		return false, false
-	}
-	if sha == "" {
-		return false, true
-	}
-	marker, found, err := store.GetEnrichmentState(repoPrefix, repoEnrichMarkerProvider)
-	if err != nil || !found {
-		return false, true
-	}
-	return marker.IndexedSHA == sha, true
+	return RepoEnrichmentMarkerAt(g, repoPrefix, sha)
 }
 
 // shortSHA truncates a git revision to its 7-char prefix for logging; a
@@ -1801,6 +1898,17 @@ func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, p
 			zap.Float64("coverage", result.CoveragePercent),
 			zap.Int64("duration_ms", result.DurationMs),
 			zap.Int64("lock_wait_ms", result.LockWaitMs),
+			// budget_s is the REAL per-pass deadline enrichRepoTimeout derived
+			// from file_count (10min + 40ms*file_count, capped) — distinct from
+			// the generous outer ceiling logged as "deadline" at pass start.
+			zap.Float64("budget_s", result.BudgetSeconds),
+			zap.Int("file_count", result.FileCount),
+			zap.Int("symbols_covered", result.SymbolsCovered),
+			zap.Int("symbols_total", result.SymbolsTotal),
+			zap.Int64("staging_ms", result.StagingMs),
+			zap.Int64("apply_ms", result.ApplyMs),
+			zap.String("phase", result.Phase),
+			zap.Int("pages_applied", result.PagesApplied),
 		)
 	} else {
 		m.setEnrichStatus(repoName, provider.Name(), lang, EnrichStateCompleted, d, nil, "")
@@ -1831,14 +1939,106 @@ func (m *Manager) EnrichFile(g graph.Store, repoRoot, filePath string) (*EnrichR
 // frontier. Batch-capable providers receive every path together. A provider
 // without that capability gets one repository call for multi-file work, never
 // an N+1 loop of EnrichFile calls.
+//
+// "Batch-capable" is a real filter, not a formality: the whole-repository rung
+// is a fallback that DISCARDS the frontier, and a provider landing on it pays
+// the full repository cost for a two-file save. The in-process tstypes
+// providers (python-types, typescript-types, go-types, …) implement
+// ContextFileBatchEnricher for exactly that reason; a new provider that walks
+// graph file nodes to pick its work should too.
+//
+// The pass runs under ScopedEnrichTimeout — the configured
+// semantic.timeout_seconds — which is sized for the watcher's per-save
+// frontier. A caller whose frontier is not a save (a worktree copy's repair
+// over a whole divergence, say) should size its own deadline and call
+// EnrichFilesWithDeadline instead.
 func (m *Manager) EnrichFiles(g graph.Store, repoPrefix, repoRoot, language string, filePaths []string) (*EnrichResult, error) {
+	return m.EnrichFilesWithDeadline(g, repoPrefix, repoRoot, language, filePaths, m.ScopedEnrichTimeout())
+}
+
+// EnrichFilesWithDeadline is EnrichFiles under an explicit deadline instead of
+// the configured one. A deadline of 0 imposes no bound at all — the same
+// meaning ScopedEnrichTimeout gives an unset/non-positive config value, and the
+// same meaning GORTEX_LSP_ENRICH_TIMEOUT=off gives the whole-repo path.
+//
+// It exists because a scoped frontier is not always small. semantic
+// .timeout_seconds is tuned for the watcher's handful of saved files; a
+// subgraph copy's repair covers everything two checkouts disagree on, and its
+// provider still has to load the WHOLE project before it can answer for one
+// file — a cost that scales with the repository, not with the frontier. Under
+// the save-sized deadline such a pass returns Partial having covered nothing,
+// which is indistinguishable from a real failure and stamps nothing.
+func (m *Manager) EnrichFilesWithDeadline(g graph.Store, repoPrefix, repoRoot, language string, filePaths []string, deadline time.Duration) (*EnrichResult, error) {
 	ctx := context.Background()
-	var cancel context.CancelFunc
-	if m.config.TimeoutSeconds > 0 {
-		ctx, cancel = context.WithTimeout(ctx, time.Duration(m.config.TimeoutSeconds)*time.Second)
+	if deadline > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, deadline)
 		defer cancel()
 	}
 	return m.EnrichFilesContext(ctx, g, repoPrefix, repoRoot, language, filePaths)
+}
+
+// ScopedEnrichTimeout is the deadline a file-scoped pass runs under by
+// default: the configured semantic.timeout_seconds, or 0 (unbounded) when that
+// is unset or non-positive. Exported so a caller that overrides the deadline
+// can still name the default it replaced when it logs.
+func (m *Manager) ScopedEnrichTimeout() time.Duration {
+	if m.config.TimeoutSeconds <= 0 {
+		return 0
+	}
+	return time.Duration(m.config.TimeoutSeconds) * time.Second
+}
+
+// RepoEnrichDeadline is the per-repo enrichment deadline for a repo with
+// nodeCount enrichable nodes — exactly the bound the whole-repo path applies
+// (see enrichRepoTimeout: size-scaled, capped at maxEnrichRepoTimeout, and
+// pinned verbatim by GORTEX_LSP_ENRICH_TIMEOUT). Exported so a file-scoped
+// caller whose provider must still load the whole project can borrow it rather
+// than reinvent the scaling.
+func (m *Manager) RepoEnrichDeadline(nodeCount int) time.Duration {
+	return enrichRepoTimeout(nodeCount)
+}
+
+// copyRepairDeadlineMultiplier bounds CopyRepairDeadline: a small integer
+// factor over the save (scoped) deadline, not a new config knob.
+const copyRepairDeadlineMultiplier = 5
+
+// CopyRepairDeadline is the deadline a worktree-copy repair pass runs under.
+// It starts from RepoEnrichDeadline(nodeCount) — the same size-scaled bound
+// the whole-repo path uses — but caps it at copyRepairDeadlineMultiplier
+// times ScopedEnrichTimeout().
+//
+// The cap was introduced against a measurement that has since been fixed at its
+// root: on a 9.8k-file repo an 82-file python repair ran 89 minutes where the
+// whole-repo python pass it stands in for takes ~8 min. That was not the
+// frontier being expensive — python-types implemented no batch entry, so the
+// scoped dispatch fell through to EnrichRepoContext and ran the WHOLE
+// repository under a bound sized for 82 files. tstypes now implements
+// ContextFileBatchEnricher, so a frontier pass costs the frontier.
+//
+// The cap stays regardless, as a bound rather than as a fix. A repair may
+// dispatch a provider that genuinely must load the whole project before it can
+// answer for one file (LSP- and compiler-backed ones do), and for those the
+// repo scaling alone mostly delays the partial→full fallback instead of
+// bounding it — the fallback is the cheaper outcome, so the budget should
+// reach it. A non-positive ScopedEnrichTimeout means the operator opted out of
+// bounds entirely, so in that case the repo scaling is left as the only bound.
+func (m *Manager) CopyRepairDeadline(nodeCount int) time.Duration {
+	repo := m.RepoEnrichDeadline(nodeCount)
+	save := m.ScopedEnrichTimeout()
+	if save <= 0 {
+		return repo
+	}
+	return min(repo, copyRepairDeadlineMultiplier*save)
+}
+
+// RepoEnrichableNodes counts one repository's enrichable nodes — the number
+// RepoEnrichDeadline scales on, computed by the same census EnrichAll uses, so
+// a scoped caller and the whole-repo path cannot derive different deadlines for
+// the same repository. One grouped projection; no Meta decode.
+func (m *Manager) RepoEnrichableNodes(g graph.Store, repoPrefix, repoRoot string) int {
+	_, counts, _, _ := m.repoLanguages(g, map[string]string{repoPrefix: repoRoot})
+	return counts[repoPrefix]
 }
 
 // EnrichFilesContext is EnrichFiles with an explicit parent context. The
@@ -1876,6 +2076,9 @@ func (m *Manager) EnrichFilesContext(ctx context.Context, g graph.Store, repoPre
 	}
 	sort.Strings(files)
 
+	// Rung order is cost order, and the last three rungs are the cliff: they
+	// enrich the WHOLE repository and the frontier is thrown away. Anything
+	// that can answer for a file set must therefore be caught above them.
 	run := func(provider Provider) (*EnrichResult, error) {
 		if batch, ok := provider.(ContextFileBatchEnricher); ok {
 			return batch.EnrichFilesContext(ctx, g, repoPrefix, repoRoot, files)
@@ -1886,6 +2089,8 @@ func (m *Manager) EnrichFilesContext(ctx context.Context, g graph.Store, repoPre
 		if len(files) == 1 {
 			return provider.EnrichFile(g, repoRoot, files[0])
 		}
+		// Whole-repository fallback. Correct but not scoped: the provider
+		// re-selects its own files and this frontier is not consulted again.
 		if contextual, ok := provider.(ContextEnricher); ok {
 			return contextual.EnrichRepoContext(ctx, g, repoPrefix, repoRoot, nil)
 		}
