@@ -3,7 +3,6 @@ package resolver
 import (
 	"context"
 	"os"
-	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
@@ -732,7 +731,7 @@ func (cr *CrossRepoResolver) resolveScopedLocked(edges []*graph.Edge) *CrossRepo
 // used by resolveImport — the only resolution path that previously
 // scanned every node per edge.
 //
-//   - dirIndex     keys on filepath.Dir(file.FilePath) for exact matches
+//   - dirIndex     keys on filePathDir(file.FilePath) for exact matches
 //     (importPath equal to the file's directory).
 //   - lastDirIndex keys on the last path component of that directory,
 //     covering the common case where an import path is a single name
@@ -744,7 +743,7 @@ func (cr *CrossRepoResolver) buildDirIndexes() {
 	cr.dirIndex = make(map[string][]graph.FileNodeIdentity, 128)
 	cr.lastDirIndex = make(map[string][]graph.FileNodeIdentity, 128)
 	for file := range graph.FileNodeIdentitiesSeq(cr.graph, nil) {
-		dir := filepath.Dir(file.FilePath)
+		dir := filePathDir(file.FilePath)
 		cr.dirIndex[dir] = append(cr.dirIndex[dir], file)
 		last := lastPathComponent(dir)
 		if last != "" && last != dir {
@@ -1464,7 +1463,7 @@ func (cr *CrossRepoResolver) resolveImport(e *graph.Edge, importPath string, sta
 		// `*/bindings/go` directory sorts first. Collect every match so
 		// the workspace-aware pick below can prefer the importer's own
 		// workspace instead of the first one encountered.
-		if dirMatchesImport(filepath.Dir(file.FilePath), importPath) {
+		if dirMatchesImport(filePathDir(file.FilePath), importPath) {
 			crossRepoAll = append(crossRepoAll, file)
 		}
 	}
@@ -1488,7 +1487,7 @@ func (cr *CrossRepoResolver) resolveImport(e *graph.Edge, importPath string, sta
 		}
 	} else {
 		for file := range graph.FileNodeIdentitiesSeq(cr.graph, nil) {
-			dir := filepath.Dir(file.FilePath)
+			dir := filePathDir(file.FilePath)
 			if strings.HasSuffix(dir, lastPathComponent(importPath)) || dir == importPath {
 				consider(file)
 				if stop() {

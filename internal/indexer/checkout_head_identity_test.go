@@ -199,9 +199,21 @@ func TestCheckoutHeadIdentity_SameGitPathThroughSymlink(t *testing.T) {
 	assert.False(t, sameGitPath(filepath.Join(link, ".git"), filepath.Join(other, ".git")),
 		"resolving symlinks must not make two different directories equal")
 	assert.False(t, sameGitPath(filepath.Join(root, "gone", ".git"), filepath.Join(real, ".git")),
-		"a path that cannot be resolved is never equal: unverifiable means refuse")
+		"an unresolvable path falls back to its lexical form, which still names a different directory")
 	assert.False(t, sameGitPath("", filepath.Join(real, ".git")),
 		"an empty baseline can never match")
+
+	// The comparison is pathkey.EqualPaths, not string equality, so the two
+	// spellings a Unicode-normalising filesystem hands back for ONE directory
+	// compare equal. macOS returns decomposed (NFD) names for paths created
+	// with composed (NFC) ones; a string compare read those as two different
+	// repositories and refused a checkout that was its own. Asserted with a
+	// literal NFD/NFC pair rather than by creating the directory, so it pins
+	// the fold on every platform instead of only on the ones that decompose.
+	assert.True(t, sameGitPath(
+		filepath.Join(root, "\u00e9cole", ".git"),
+		filepath.Join(root, "e\u0301cole", ".git")),
+		"one directory spelled NFC and NFD is one directory")
 
 	// End to end: a real checkout reached through a symlinked root. git reports
 	// the physical common dir, the caller's derived baseline carries the

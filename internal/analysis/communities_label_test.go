@@ -6,14 +6,15 @@ import (
 	"testing"
 )
 
-// The cases above spell their inputs with forward slashes, which is what a
-// POSIX graph stores — but graphRelKey keeps OS-native separators, so on
-// Windows a real graph path reads "gortex/internal\parser\languages\cpp.go":
-// the repo prefix is joined with "/" and the repo-relative remainder is not.
-// Feeding that shape in is what distinguishes "normalises first" from "happens
-// to work because the test used slashes". filepath.FromSlash makes the input
-// native on whichever platform runs it, so this is a real assertion on Windows
-// and an identity on POSIX rather than a skip.
+// The cases above spell their inputs with forward slashes, which is what the
+// indexer stamps today on every platform (Indexer.relKey). Stores written
+// before that migration still hold the older Windows shape —
+// "gortex/internal\parser\languages\cpp.go", the repo prefix joined with "/"
+// and the repo-relative remainder not — and the labeller has to keep reading
+// them. Feeding that shape in is what distinguishes "normalises first" from
+// "happens to work because the test used slashes". filepath.FromSlash makes
+// the input native on whichever platform runs it, so this is a real assertion
+// on Windows and an identity on POSIX rather than a skip.
 func TestClusterLabelsNormaliseOSNativeGraphPaths(t *testing.T) {
 	// Mirror the "<prefix>/<os-native remainder>" shape graph nodes carry.
 	native := func(prefix, rel string) string {

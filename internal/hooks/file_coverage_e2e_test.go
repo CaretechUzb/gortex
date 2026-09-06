@@ -2,13 +2,13 @@ package hooks
 
 import (
 	"context"
-	"os"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/zzet/gortex/internal/daemon"
+	"github.com/zzet/gortex/internal/testenv"
 )
 
 // coverageController answers the coverage verb over the real control socket
@@ -85,12 +85,7 @@ func TestFileIndexedViaDaemonFailsOpenOnAnUnroutedWorktree(t *testing.T) {
 // a probe that started reporting "covered" — or blocking — when the daemon is
 // down would deny every read on a machine with no daemon at all.
 func TestFileIndexedViaDaemonFailsOpenWithNoDaemon(t *testing.T) {
-	dir, err := os.MkdirTemp("/tmp", "gx-hook-nocov")
-	if err != nil {
-		t.Fatalf("mktemp: %v", err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(dir) })
-	t.Setenv("GORTEX_DAEMON_SOCKET", filepath.Join(dir, "missing"))
+	t.Setenv("GORTEX_DAEMON_SOCKET", filepath.Join(testenv.ShortTempDir(t), "missing"))
 
 	start := time.Now()
 	indexed, symbols := fileIndexedViaDaemon("/wt", "internal/live.go")

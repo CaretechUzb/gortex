@@ -289,12 +289,13 @@ func TestCSharpNamespaceNarrow_ExternalImportShape(t *testing.T) {
 		"an already-resolved external:: using edge still carries the namespace")
 }
 
-// TestCSharpGlobalUsings_WindowsPathIDs: production Windows stores join
-// the repo prefix with "/" but keep OS-native "\" below it (the
-// indexer's graphRelKey shape, e.g. `repo/App\Mod\File.cs`). The
-// directory walk must honour both separators — splitting on "/" alone
-// collapses every project to the repo root and leaks one project's
-// global usings into its siblings.
+// TestCSharpGlobalUsings_WindowsPathIDs: Windows stores written before the
+// slash-path migration join the repo prefix with "/" but keep OS-native "\"
+// below it (e.g. `repo/App\Mod\File.cs`); the indexer stamps slashes on every
+// platform now (Indexer.relKey), but such a store is still readable and this
+// resolver has to keep reading it. The directory walk must honour both
+// separators — splitting on "/" alone collapses every project to the repo root
+// and leaks one project's global usings into its siblings.
 func TestCSharpGlobalUsings_WindowsPathIDs(t *testing.T) {
 	g := graph.New()
 	add := func(id string, meta map[string]any) {

@@ -9,12 +9,21 @@ import (
 )
 
 // repoSubgraphSidecarTables are the prefix-keyed tables a copy carries under
-// the new prefix. They are exactly rekeyMoveTables, for the same reason
-// recorded there: every one is keyed by (repo_prefix, file_path) or
-// (repo_prefix, provider), never by node_id. Row content is carried verbatim
-// except for the columns named in repoSubgraphSidecarPathColumns. The FTS
-// corpora are handled separately by copyFTSCorpora, which has to rewrite ids
-// and re-map docids.
+// the new prefix. Every one is keyed by (repo_prefix, file_path) or
+// (repo_prefix, provider), never by node_id, which is what makes a row
+// carryable at all. Row content is carried verbatim except for the columns
+// named in repoSubgraphSidecarPathColumns. The FTS corpora are handled
+// separately by copyFTSCorpora, which has to rewrite ids and re-map docids.
+//
+// This is rekeyMoveTables plus file_index_failures. The two lists differ on
+// that one table on purpose: a re-key DROPS the failure ledger (see
+// rekeyDropTables) because a re-key is a re-index, and the re-index rewrites
+// the ledger from scratch. A copy is the opposite — it exists precisely so no
+// re-index runs — so dropping the ledger would publish a destination that
+// reads CLEAN over a source with unreadable or unparseable files, and
+// `gortex daemon status` would report a degraded checkout as healthy. The
+// rows carry a prefixed `file_path`, so they travel through the same pathExpr
+// rewrite the `files` rows do.
 //
 // repo_graph_gen and derive_state ride along so a copied checkout does not read
 // "never derived" — the state readiness reserves for a repo whose queries
@@ -32,6 +41,7 @@ import (
 var repoSubgraphSidecarTables = []string{
 	"file_mtimes",
 	"files",
+	"file_index_failures",
 	"repo_index_state",
 	"enrichment_state",
 	"contract_state",
@@ -47,8 +57,17 @@ var repoSubgraphSidecarTables = []string{
 // `file_mtimes.file_path` reads "his/models/x.py" — repo-relative, no prefix.
 // Rewriting the latter would prefix every path and break the mtime restat that
 // registers the copied checkout.
+//
+// `file_index_failures.file_path` follows the `files` convention, not the
+// `file_mtimes` one: the indexer stores idx.prefixPath(idx.relKey(path)) there
+// (noteFileIndexFailure). Left un-rewritten the copied rows would name the
+// SOURCE checkout's paths under the destination prefix, so every consumer that
+// joins the ledger back to a file — the health rollup, the daemon status
+// table — would report failures against paths that do not exist in this
+// checkout.
 var repoSubgraphSidecarPathColumns = map[string][]string{
-	"files": {"file_path"},
+	"files":               {"file_path"},
+	"file_index_failures": {"file_path"},
 }
 
 // realColumns lists a table's stored columns, skipping generated ones —

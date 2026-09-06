@@ -269,7 +269,7 @@ func (gw *GitWatcher) finalizeReconcile(ctx context.Context, newSHA string) erro
 		if idx == nil {
 			return fmt.Errorf("git-watcher: repository indexer is no longer registered")
 		}
-		idx.reconcileRepoIndexState(gw.repoPath)
+		idx.reconcileRepoIndexState(ctx, gw.repoPath)
 		gw.mu.Lock()
 		gw.lastSHA = newSHA
 		gw.mu.Unlock()

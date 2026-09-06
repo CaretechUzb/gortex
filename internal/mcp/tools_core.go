@@ -2293,13 +2293,14 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 		nextCursor = encodeCursor(end)
 	}
 
+	indexWarning := s.indexFileFailureWarning(ctx, resolved, pathFilter)
 	if isCompact(req) {
-		return decorateResultWithScope(mcp.NewToolResultText(compactNodes(page)), resolved), nil
+		return decorateResultWithScope(decorateIndexFileFailureResult(mcp.NewToolResultText(compactNodes(page)), indexWarning), resolved), nil
 	}
 
 	if s.isGCX(ctx, req) {
 		res, err := s.gcxResponseWithBudget(req)(encodeSearchSymbols(page, total, len(page)))
-		return withScopeResult(res, err, resolved)
+		return withScopeResult(decorateIndexFileFailureResult(res, indexWarning), err, resolved)
 	}
 
 	if s.isTOON(ctx, req) {
@@ -2310,7 +2311,7 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 		}
 		data, err := toon.Marshal(result)
 		if err == nil {
-			return decorateResultWithScope(mcp.NewToolResultText(string(data)), resolved), nil
+			return decorateResultWithScope(decorateIndexFileFailureResult(mcp.NewToolResultText(string(data)), indexWarning), resolved), nil
 		}
 	}
 
@@ -2324,6 +2325,7 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 		"truncated":   end < total,
 		"query_class": queryClass.String(),
 	}
+	stampIndexFileFailureWarning(resp, indexWarning)
 	if nextCursor != "" {
 		resp["next_cursor"] = nextCursor
 	}

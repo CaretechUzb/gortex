@@ -715,39 +715,68 @@ var checkoutsRelayFn = checkoutsRelayPath
 // refuse. Measured live: the same command printed the "daemon did not answer
 // within 3s" fail-open notice AND the unbound-view refusal.
 //
-// list_checkouts reads the catalog, not the connection's view — every family
-// is in the answer whichever tracked repository carries the call (verified
-// live from an unrelated repo). So the poller asks for the one shape the
-// pre-flight always accepts, a tracked repository root (trackedReposReach),
-// and prefers the family's own working copy when the relay can still name it
-// so the call stays where a reader would expect to find it.
-func demotionPollPath(index string) string {
+// So the poller asks for the one shape the pre-flight always accepts, a
+// tracked repository root (trackedReposReach), and prefers the family's own
+// working copy when the relay can still name it.
+//
+// inFamily is why the preference is now a requirement rather than a courtesy.
+// list_checkouts reads the catalog, but the ANSWER is clamped to the calling
+// session's workspace (checkoutOverviewInScope, added upstream to stop a
+// session in one workspace enumerating another's checkout paths). "Every
+// family is in the answer whichever tracked repository carries the call" was
+// true when this poller was written and is not true any more: a poll carried
+// by an unrelated tracked root can be handed an answer with the demoted
+// checkout's family filtered out of it, and the poller would read a healthy
+// demotion as "the checkout is no longer listed".
+//
+// inFamily reports whether the chosen path is guaranteed to see that family:
+// the relay's answer IS the family's tracked working copy, and a tracked root
+// the checkout lives under is the family's own repository. Anything else is a
+// last-resort connection whose scope may or may not include the subject, so
+// waitForDemotionSettled re-asks for a path on the first answer that does not
+// list the checkout, and only counts that answer against the anomaly window
+// once the relay has been given its second chance and still cannot help.
+func demotionPollPath(index string) (path string, inFamily bool) {
 	if relayed := checkoutsRelayFn(index); relayed != "" && relayed != index {
-		return relayed
+		return relayed, true
 	}
 	st, err := trackStatusFn()
 	if err != nil {
-		return index
+		return index, false
+	}
+	// The relay's own answer, recomputed here without its control probe. The
+	// probe is the half that fails open on a slow daemon; the classification
+	// under it is filesystem work (read the `.git` link, read its commondir)
+	// plus the tracked-repo list this function already holds, and neither can
+	// time out. It is what recovers the family connection in the one case the
+	// relay drops it — which is also the case the workspace clamp punishes,
+	// because a family that is merely a SIBLING of every tracked root matches
+	// none of the containment checks below.
+	if abs, absErr := filepath.Abs(index); absErr == nil {
+		if fam, ok := linkedWorktreeAt(abs); ok {
+			if repo := familyRepoIn(st, fam); repo != "" {
+				return repo, true
+			}
+		}
 	}
 	fallback := ""
 	for _, repo := range st.TrackedRepos {
 		if repo.Path == "" {
 			continue
 		}
-		// A tracked root the checkout lives under is the closest stand-in for
-		// the subject. Any other tracked root answers identically, so one is
-		// kept rather than refusing to poll at all.
+		// A tracked root the checkout lives under is the family's own
+		// repository, so its workspace contains the subject.
 		if pathkey.CanonicalHasPathPrefix(index, repo.Path) {
-			return repo.Path
+			return repo.Path, true
 		}
 		if fallback == "" {
 			fallback = repo.Path
 		}
 	}
 	if fallback != "" {
-		return fallback
+		return fallback, false
 	}
-	return index
+	return index, false
 }
 
 // listCheckoutsFn is the injectable seam checkoutEffectiveMode calls through
@@ -763,9 +792,11 @@ func demotionPollPath(index string) string {
 // expected state as a daemon failure and gave up seconds into the wait.
 //
 // The checkout verbs relay through the family's tracked working copy for
-// exactly this reason (checkoutsRelayPath), and list_checkouts answers about
-// the whole catalog rather than about the connection's view, so which member
-// of the family carries the connection changes nothing about the answer.
+// exactly this reason (checkoutsRelayPath). Which member of the FAMILY carries
+// the connection changes nothing about the answer — but which WORKSPACE does
+// is not free any more: the answer is clamped to the calling session's
+// workspace (checkoutOverviewInScope), so the connection has to be one that can
+// see the subject's family. demotionPollPath is what guarantees that.
 var listCheckoutsFn = func(index string) (json.RawMessage, error) {
 	return checkoutsDaemonTool(index, "list_checkouts", map[string]any{})
 }
@@ -825,9 +856,17 @@ func waitForDemotionSettled(w io.Writer, index, target, checkoutID string, deadl
 	tr.Start("waiting for the demotion to settle (--wait)")
 	step := tr.StartStep("demoting " + filepath.Base(target))
 
-	// Once: the answer cannot change while the demotion runs, and re-deriving
+	// Resolved once when it lands on a connection that can see the subject's
+	// family: the answer cannot change while the demotion runs, and re-deriving
 	// it would pay two control round trips on every tick.
-	pollPath := demotionPollPath(index)
+	//
+	// A path that is NOT in the family is re-resolved on the polls that come
+	// back empty. The only way to get one is the relay failing open on a
+	// daemon too busy to answer Status in 3s — which is a transient, and the
+	// demotion outlives it, so the relay is worth asking again rather than
+	// spending the whole wait on a connection that may be scoped away from the
+	// answer.
+	pollPath, inFamily := demotionPollPath(index)
 
 	var lastErr error
 	// The first poll of an unbroken run of failures. Zero means the last poll
@@ -835,6 +874,9 @@ func waitForDemotionSettled(w io.Writer, index, target, checkoutID string, deadl
 	var anomalySince time.Time
 	retiring := false
 	unbound := false
+	// scopeBlind keeps the "this connection cannot see the family" note to one
+	// line, the way retiring and unbound do for theirs.
+	scopeBlind := false
 	fail := func(err error) error {
 		tr.Fail(err)
 		return err
@@ -892,7 +934,38 @@ func waitForDemotionSettled(w io.Writer, index, target, checkoutID string, deadl
 				anomalySince = time.Now()
 			}
 		case !result.found:
+			// An absent checkout is not unambiguous evidence when the
+			// connection carrying the poll is not in the subject's family:
+			// list_checkouts clamps its answer to the calling session's
+			// workspace (checkoutOverviewInScope), so a family outside it is
+			// filtered out of the answer and reads exactly like a checkout
+			// that is gone. The only way to be on such a connection is the
+			// relay failing open on a daemon too busy to answer Status in 3s,
+			// which is a transient the demotion outlives — so ask it again.
+			// A relay that now names the family upgrades the connection, and
+			// THAT is a healthy poll: the streak clears and the next answer is
+			// authoritative.
+			//
+			// A relay that still cannot help falls through to the anomaly
+			// window unchanged. Suppressing the window instead would trade a
+			// wrong verdict for a wait that only ever ends at --wait-timeout,
+			// which is worse: the window at least says what it could not see.
+			if !inFamily {
+				if path, ok := demotionPollPath(index); ok {
+					pollPath, inFamily = path, true
+					anomalySince = time.Time{}
+					if !scopeBlind {
+						scopeBlind = true
+						step.Note("polling moved to the family's own working copy")
+					}
+					break
+				}
+			}
 			lastErr = fmt.Errorf("checkout %s is no longer listed by list_checkouts", checkoutID)
+			if !inFamily {
+				lastErr = fmt.Errorf("%w (polled through %s, which may be outside the checkout's workspace)",
+					lastErr, pollPath)
+			}
 			if anomalySince.IsZero() {
 				anomalySince = time.Now()
 			}

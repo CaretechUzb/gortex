@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -170,7 +171,9 @@ type IndexError struct {
 
 // Indexer walks a repository and populates the graph.
 type Indexer struct {
-	graph graph.Store
+	graph             graph.Store
+	fileIndexFailures fileIndexFailureState
+	parseErrorsMu     sync.RWMutex
 
 	// shadowAdmission is shared by every Indexer in the process. Cold repos
 	// acquire a weighted lease before constructing an in-memory shadow; when the
@@ -1718,6 +1721,15 @@ func (idx *Indexer) ResolveFilePath(graphPath string) string {
 // repo-relative key the graph and the mtime map are indexed by: forward
 // slashes, and Unicode NFC.
 //
+// One key, every platform. A graph key — a file node's FilePath, the
+// prefix of every symbol ID under it, a contract bridge endpoint — is
+// slash-separated by contract, so the bulk walk, the single-file delta
+// and the watcher all stamp the same spelling. Keying the cold walk in
+// OS-native separators instead would mint "pkg\sub\thing.go" on Windows
+// and split every downstream lookup (GetFileNodes / EvictFile match the
+// exact string, with no separator folding) from the ID a caller builds
+// with '/'.
+//
 // The NFC fold is load-bearing. A file with a non-ASCII name is handed
 // to the indexer in different byte forms depending on the source — the
 // filesystem walk (filepath.WalkDir) yields decomposed NFD on macOS,
@@ -1738,27 +1750,6 @@ func (idx *Indexer) relKey(absPath string) string {
 		return pathkey.Normalize(filepath.ToSlash(absPath))
 	}
 	return pathkey.Normalize(filepath.ToSlash(rel))
-}
-
-// graphRelKey reduces an absolute path to the key the GRAPH stores a
-// file's nodes under: repo-relative, OS-native separators (the exact
-// form the bulk-walk extractor stamps on node IDs / FilePaths),
-// NFC-folded. It is the graph-node analogue of relKey — relKey
-// slash-normalises for the mtime map, graphRelKey keeps the OS-native
-// separators so an incremental re-index's evict lookup actually matches
-// the nodes the cold walk created (graph.GetFileNodes / EvictFile key on
-// the exact string, with no separator folding). On POSIX the two are
-// identical (filepath.Rel already yields '/'); they diverge only on
-// Windows, where relKey's ToSlash would key the lookup as
-// "repo/a/b.go" while the cold walk stored "repo/a\b.go" — the miss
-// leaves the stale nodes un-evicted and the re-parse leaks a duplicate
-// set on every save (issue: slash-path duplicate indexing).
-func (idx *Indexer) graphRelKey(absPath string) string {
-	rel, err := filepath.Rel(idx.rootPath, absPath)
-	if err != nil {
-		return pathkey.Normalize(absPath)
-	}
-	return pathkey.Normalize(rel)
 }
 
 // RelKey exposes relKey to in-package collaborators (the watcher) that
@@ -1869,7 +1860,7 @@ func (idx *Indexer) graphFilePaths(files []string) []string {
 		if !filepath.IsAbs(abs) && idx.rootPath != "" {
 			abs = filepath.Join(idx.rootPath, f)
 		}
-		out = append(out, idx.prefixPath(idx.graphRelKey(abs)))
+		out = append(out, idx.prefixPath(idx.relKey(abs)))
 	}
 	return out
 }
@@ -2682,6 +2673,39 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, er
 // indexCtxRaw performs full-tree indexing while the caller holds the
 // repository mutation lane.
 func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *IndexResult, retErr error) {
+	idx.loadFileIndexFailures()
+	var successfulFiles sync.Map
+	recordFileOutcome := func(path string, err error) {
+		if err != nil {
+			successfulFiles.Delete(path)
+			idx.noteFileIndexFailure(path, err)
+		} else {
+			successfulFiles.Store(path, struct{}{})
+		}
+	}
+	// Register before panic recovery and shadow restoration: failures remain
+	// durable even when a full pass fails, while recovery is acknowledged only
+	// after its replacement graph has committed to the original store.
+	defer func() {
+		if retErr == nil && result != nil {
+			successfulFiles.Range(func(path, _ any) bool {
+				idx.noteFileIndexFailure(path.(string), nil)
+				return true
+			})
+			idx.pruneMissingFileIndexFailures()
+			// A shadow drain evicts the generation's old sidecars. Rewrite even
+			// unchanged failures after restoring the destination graph.
+			idx.fileIndexFailures.mu.Lock()
+			idx.fileIndexFailures.dirty = idx.fileIndexFailures.dirty || len(idx.fileIndexFailures.rows) > 0
+			idx.fileIndexFailures.mu.Unlock()
+			for _, path := range idx.fileIndexFailurePaths() {
+				if rel, ok := idx.graphPathRelKey(path); ok {
+					result.FailedFiles = append(result.FailedFiles, filepath.Join(idx.rootPath, filepath.FromSlash(rel)))
+				}
+			}
+		}
+		idx.flushFileIndexFailures()
+	}()
 	defer recoverIndexCtxRawStoragePanic(&result, &retErr)
 
 	start := time.Now()
@@ -2733,6 +2757,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	var skippedByContent []skippedFile
 	var skippedContentBytes int64
 	var parseFailedFiles []skippedFile
+	var walkFailures []IndexError
 	// admitWalkedFile applies the two gates that sit above the shared walk
 	// admission: the git-aware untracked-asset gate and the content-admission
 	// gate. Both walks below feed it, and both account for an over-cap file the
@@ -2743,17 +2768,17 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	admitWalkedFile := func(wf walkedFile) {
 		if reason, skip := untrackedGate.skip(wf.lang, wf.path); skip {
 			skippedContentBytes += wf.size
-			rel, _ := filepath.Rel(absRoot, wf.path)
+			relPath := idx.relKey(wf.path)
 			skippedByContent = append(skippedByContent, skippedFile{
-				relPath: pathkey.Normalize(rel), lang: wf.lang, size: wf.size, reason: reason,
+				relPath: relPath, lang: wf.lang, size: wf.size, reason: reason,
 			})
 			return
 		}
 		if reason, skip := contentGate.skip(wf.lang, wf.size); skip {
 			skippedContentBytes += wf.size
-			rel, _ := filepath.Rel(absRoot, wf.path)
+			relPath := idx.relKey(wf.path)
 			skippedByContent = append(skippedByContent, skippedFile{
-				relPath: pathkey.Normalize(rel), lang: wf.lang, size: wf.size, reason: reason,
+				relPath: relPath, lang: wf.lang, size: wf.size, reason: reason,
 			})
 			return
 		}
@@ -2771,9 +2796,8 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			if adm.oversize {
 				skippedLarge++
 				skippedBytes += wf.size
-				rel, _ := filepath.Rel(absRoot, wf.path)
 				skippedBySize = append(skippedBySize, skippedFile{
-					relPath: pathkey.Normalize(rel), lang: wf.lang, size: wf.size,
+					relPath: idx.relKey(wf.path), lang: wf.lang, size: wf.size,
 				})
 				return nil
 			}
@@ -2783,12 +2807,17 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	} else {
 		err = filepath.WalkDir(absRoot, func(path string, d os.DirEntry, err error) error {
 			if err != nil {
+				if !os.IsNotExist(err) && !idx.shouldExclude(path, absRoot, d != nil && d.IsDir()) {
+					recordFileOutcome(path, err)
+					walkFailures = append(walkFailures, IndexError{FilePath: path, Error: err.Error()})
+				}
 				return nil
 			}
 			if d.IsDir() {
 				if idx.admitWalkEntry(absRoot, path, -1, true).pruneDir {
 					return filepath.SkipDir
 				}
+				recordFileOutcome(path, nil)
 				return nil
 			}
 			// The FileInfo is taken before the admission gate rather than
@@ -2800,15 +2829,18 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			if statErr != nil {
 				// Couldn't read FileInfo (race with deletion, broken
 				// symlink, …). Skip — the worker would fail too.
+				if !os.IsNotExist(statErr) && idx.admitWalkEntry(absRoot, path, -1, false).admit {
+					recordFileOutcome(path, statErr)
+					walkFailures = append(walkFailures, IndexError{FilePath: path, Error: statErr.Error()})
+				}
 				return nil
 			}
 			adm := idx.admitWalkEntry(absRoot, path, info.Size(), false)
 			if adm.oversize {
 				skippedLarge++
 				skippedBytes += info.Size()
-				rel, _ := filepath.Rel(absRoot, path)
 				skippedBySize = append(skippedBySize, skippedFile{
-					relPath: pathkey.Normalize(rel), lang: adm.lang, size: info.Size(),
+					relPath: idx.relKey(path), lang: adm.lang, size: info.Size(),
 				})
 				return nil
 			}
@@ -2825,6 +2857,9 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		})
 	}
 	if err != nil {
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			recordFileOutcome(absRoot, err)
+		}
 		return nil, err
 	}
 	if skippedLarge > 0 {
@@ -3225,6 +3260,46 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			)
 			finishDrainPressure()
 			if retErr == nil {
+				// End of this repository's drain: this block runs on the way
+				// out of IndexCtx, after persistRepoIndexState. It is not the
+				// last thing the pass does — the compact sidecars below it,
+				// the backend symbol index and the FTS normalization all still
+				// follow — but it is the first point at which BOTH halves of
+				// the freshness verdict are current, and nothing earlier on
+				// this path has them: the rows have just landed in the
+				// physical tables, and the counters describing them were
+				// written a moment ago.
+				//
+				// BeginBulkLoad was a no-op if the store was already
+				// populated, so FlushBulk returned without re-analyzing
+				// anything; nothing else has, since the store was a fraction
+				// of this size. Cheap when the statistics are already fresh.
+				//
+				// This runs INSIDE the process-global reach topology writer
+				// gate and the caller's repository mutation lane (see the
+				// BeginTopologyMutation window in IndexRepo). Reach readers
+				// give up rather than wait, so anything blocking here turns
+				// MCP answers empty for its duration.
+				//
+				// What the cooperative shape buys, exactly: the refresh never
+				// QUEUES on the store's write gate underneath these, and never
+				// holds it across more than one bounded index — so other store
+				// writers, and the bounded-gate writers that drop their
+				// batches after 15 s, keep making progress. It also bounds
+				// what THIS boundary pays under the gates above: a pass stops
+				// starting indexes once its budget is spent, so the
+				// gate-holding cost here is that budget plus one index's
+				// ANALYZE plus one bounded sqlite_schema reload. It does not
+				// make the cost zero — the remaining indexes are carried to
+				// the next boundary on a resume cursor, which is where the
+				// mechanism converges.
+				//
+				// Outside that bound, and paid under these same wider gates:
+				// two health probes, the present-index list, and the set of
+				// indexes that already carry a statistics row. All four are
+				// read-pool queries taking no store lock.
+				graph.MaybeEnsurePlannerStatsFresh(ctx, diskTarget)
+
 				if serr := persistShadowCompactSidecars(
 					inMemShadow, diskTarget, idx.RepoPrefix(),
 				); serr != nil {
@@ -3455,7 +3530,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	var contractMu sync.Mutex
 
 	var errMu sync.Mutex
-	var errors []IndexError
+	errors := walkFailures
 	var processed int64
 	var fileCount int64
 	var skippedByTimeout int64
@@ -3609,7 +3684,13 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 						atomic.AddInt64(&parseSemWaitNS, int64(time.Since(semStart)))
 					}
 
-					relPath, _ := filepath.Rel(absRoot, path)
+					// relKey, not a raw filepath.Rel: this path is stamped onto
+					// every node ID and FilePath the extractor emits, and a graph
+					// key is slash-separated and NFC-folded on every platform.
+					// A native filepath.Rel would mint "pkg\sub\thing.go" on
+					// Windows, which no slash-keyed lookup — the watcher's evict,
+					// a symbol ID, a contract bridge — can ever match.
+					relPath := idx.relKey(path)
 					// Streaming content extractors (PDF / office docs) read the
 					// file themselves — one page/slide/sheet at a time — instead
 					// of materialising the whole file. Only the in-process route
@@ -3627,6 +3708,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 						if se, ok := walkExt.(parser.StreamingExtractor); ok {
 							result, serr := idx.extractStreaming(se, path, relPath)
 							if serr != nil {
+								recordFileOutcome(path, serr)
 								errMu.Lock()
 								errors = append(errors, IndexError{FilePath: path, Error: serr.Error()})
 								if result == nil {
@@ -3663,6 +3745,9 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 								}
 							}
 							sidecars.addConstValues(result)
+							if serr == nil {
+								recordFileOutcome(path, nil)
+							}
 							parseLease.Release()
 							continue
 						}
@@ -3672,6 +3757,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					src, err := readFile(wf)
 					atomic.AddInt64(&parseReadNS, int64(time.Since(readStart)))
 					if err != nil {
+						recordFileOutcome(path, err)
 						errMu.Lock()
 						errors = append(errors, IndexError{FilePath: path, Error: err.Error()})
 						errMu.Unlock()
@@ -3724,6 +3810,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 						nativePressure.afterParse(lang, int64(len(src)))
 					}
 					if err != nil {
+						recordFileOutcome(path, err)
 						errMu.Lock()
 						errors = append(errors, IndexError{FilePath: path, Error: err.Error()})
 						errMu.Unlock()
@@ -3853,6 +3940,9 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					// every tree in the chunk until the worker exits.
 					result.ReleaseTree()
 					parseLease.Release()
+					if err == nil {
+						recordFileOutcome(path, nil)
+					}
 					atomic.AddInt64(&fileCount, 1)
 				}
 				if len(localContracts) > 0 {
@@ -4163,7 +4253,9 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	}
 
 	// Retain parse errors and record index metadata.
-	idx.parseErrors = errors
+	idx.parseErrorsMu.Lock()
+	idx.parseErrors = append([]IndexError(nil), errors...)
+	idx.parseErrorsMu.Unlock()
 	idx.totalDetected = len(files)
 	idx.lastIndexTime = time.Now()
 
@@ -4376,6 +4468,31 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 
 	nodes, edges := idx.repoNodeEdgeCount()
 	idx.persistRepoIndexState(diskTarget, absRoot, workspaceFP, nodes, edges)
+	// The persisted counters are what the planner-statistics freshness check
+	// measures growth with, and on the direct-SQLite path this is the only
+	// point in the pass where they and the corpus are both current — which is
+	// why the target is resolved exactly as the counter write resolves it,
+	// rather than asserted on diskTarget (nil here, and this is precisely the
+	// incremental path a daemon spends its life on).
+	//
+	// Skipped on the shadow path. There, the payload is still in the shadow at
+	// this point: the drain, and its own check, run on the way out of this
+	// function. Asking here would judge growth against rows the physical
+	// tables do not hold yet, and would ANALYZE a table the pass has not
+	// written — which writes no statistics at all.
+	//
+	// Same lock posture as the shadow-drain site above: the reach topology
+	// writer gate and the repository mutation lane are both held here, so the
+	// refresh must never queue on the store's write gate — and it does not, it
+	// try-locks per index and defers. What this boundary pays under those
+	// wider gates is bounded the same way: the pass budget, plus the one index
+	// already in flight, plus one bounded sqlite_schema reload, with the rest
+	// carried to the next boundary on the resume cursor. The two health
+	// probes, the present-index list and the stat-row set sit outside that
+	// bound — read-pool queries taking no store lock.
+	if diskTarget == nil {
+		graph.MaybeEnsurePlannerStatsFresh(ctx, idx.indexStateTarget(nil))
+	}
 	result = &IndexResult{
 		NodeCount:        nodes,
 		EdgeCount:        edges,
@@ -4609,19 +4726,14 @@ func (idx *Indexer) indexFile(
 		return err
 	}
 
-	// Two keys for the same file, deliberately distinct on Windows.
-	// mtimeKey (relKey: slash form + NFC) is the fileMtimes map key.
-	// relPath (graphRelKey: OS-native separators + NFC) is what the
-	// graph stores a file's nodes under — the exact form the cold bulk
-	// walk stamped on their IDs / FilePaths. The evict below MUST use
-	// the graph form: a slash-keyed lookup misses the backslash-keyed
-	// cold nodes on Windows, so the re-parse would leak a duplicate node
-	// set on every save. On POSIX the two keys are identical
-	// (filepath.Rel already yields '/'), so this split is a Windows-only
-	// correction. Both drive an FSEvents-NFD / git-watcher-NFC path onto
-	// the same NFC key so a re-index still lands on the bulk-walk key.
-	mtimeKey := idx.relKey(absPath)
-	relPath := idx.graphRelKey(absPath)
+	// One key for the file: the slash-separated, NFC-folded spelling the
+	// cold bulk walk stamped on its nodes' IDs / FilePaths and recorded in
+	// fileMtimes. The evict below matches the graph string byte-for-byte,
+	// so a divergent spelling would leave the cold nodes un-evicted and
+	// leak a duplicate node set on every save. The NFC fold drives an
+	// FSEvents-NFD / git-watcher-NFC path onto the bulk-walk key.
+	relPath := idx.relKey(absPath)
+	mtimeKey := relPath
 
 	// In multi-repo mode, the graph stores prefixed file paths.
 	graphPath := idx.prefixPath(relPath)
@@ -4712,7 +4824,7 @@ func (idx *Indexer) indexFile(
 			evictExisting()
 			idx.graph.AddBatch([]*graph.Node{n}, nil)
 			if !idx.recordFileReadVersion(mtimeKey, absPath, readVersion) {
-				return errFileVersionChanged
+				return idx.fileIndexFailureError(absPath)
 			}
 			return nil
 		}
@@ -4728,7 +4840,7 @@ func (idx *Indexer) indexFile(
 			evictExisting()
 			idx.graph.AddBatch([]*graph.Node{n}, nil)
 			if !idx.recordFileReadVersion(mtimeKey, absPath, readVersion) {
-				return errFileVersionChanged
+				return idx.fileIndexFailureError(absPath)
 			}
 			return nil
 		}
@@ -4774,7 +4886,7 @@ func (idx *Indexer) indexFile(
 		// expensive shadow re-track path on every restart.
 		fresh := idx.recordFileReadVersion(mtimeKey, absPath, readVersion)
 		if err == nil && !fresh {
-			return errFileVersionChanged
+			return idx.fileIndexFailureError(absPath)
 		}
 		return err
 	}
@@ -5048,7 +5160,7 @@ func (idx *Indexer) indexFile(
 	// the fileMtimes map and IsStale / TrackedFileState all key on the
 	// slash form.
 	if !idx.recordFileReadVersion(mtimeKey, absPath, readVersion) {
-		return errFileVersionChanged
+		return idx.fileIndexFailureError(absPath)
 	}
 	if elapsed := time.Since(indexFileStarted); elapsed >= 2*time.Second {
 		idx.logger.Warn("indexer: slow incremental stages",
@@ -5086,19 +5198,27 @@ func (idx *Indexer) recordFileMtime(relPath, absPath string) {
 // queued event or the poller retries instead of treating newer bytes as done.
 func (idx *Indexer) recordFileReadVersion(relPath, absPath string, version fileReadVersion) bool {
 	if !version.valid {
+		idx.noteFileIndexFailure(absPath, errFileVersionChanged)
 		return false
 	}
 	if version.snapshot {
 		// An immutable snapshot has nothing to restat and no disk mtime
 		// worth stamping: the staleness ledger tracks the working tree,
 		// which this read never touched.
+		idx.noteFileIndexFailure(absPath, nil)
 		return true
 	}
 	current, err := os.Stat(absPath)
-	if err != nil || !sameFileVersion(version.info, current) {
+	if err != nil {
+		idx.noteFileIndexFailure(absPath, err)
+		return false
+	}
+	if !sameFileVersion(version.info, current) {
+		idx.noteFileIndexFailure(absPath, errFileVersionChanged)
 		return false
 	}
 	idx.recordFileMtimeValue(relPath, version.mtime)
+	idx.noteFileIndexFailure(absPath, nil)
 	return true
 }
 
@@ -5134,10 +5254,9 @@ func (idx *Indexer) StructuralSymbols(filePath string) ([]*graph.Node, bool) {
 	if err != nil {
 		return nil, false
 	}
-	relPath, err := filepath.Rel(idx.rootPath, absPath)
-	if err != nil {
-		relPath = filePath
-	}
+	// relKey: the probe compares its symbols against the graph's, so it
+	// must parse under the same slash-separated key the index pass stamps.
+	relPath := idx.relKey(absPath)
 
 	src, err := os.ReadFile(absPath)
 	if err != nil {
@@ -5328,10 +5447,10 @@ func (idx *Indexer) reresolveFileScopedRaw(filePath string) error {
 	if !filepath.IsAbs(absPath) {
 		absPath = filepath.Join(idx.rootPath, filePath)
 	}
-	// graphRelKey (OS-native + NFC): the graph keys nodes under OS-native
-	// separators, so a relKey slash-form graphPath would miss them on
-	// Windows and wrongly report the file as evicted.
-	graphPath := idx.prefixPath(idx.graphRelKey(absPath))
+	// relKey (slash + NFC) is the spelling the graph keys nodes under, so
+	// an empty node set here really means the file is gone rather than
+	// keyed under a form this lookup cannot see.
+	graphPath := idx.prefixPath(idx.relKey(absPath))
 	if len(idx.graph.GetFileNodes(graphPath)) == 0 {
 		return nil // file gone / evicted; nothing to re-resolve
 	}
@@ -5996,9 +6115,12 @@ func effectiveExcludePatterns(patterns []string) []string {
 	return patterns
 }
 
-// ParseErrors returns the parse errors from the last full index.
+// ParseErrors returns a snapshot of errors from the last full index, excluding
+// files that a later incremental pass successfully recovered or deleted.
 func (idx *Indexer) ParseErrors() []IndexError {
-	return idx.parseErrors
+	idx.parseErrorsMu.RLock()
+	defer idx.parseErrorsMu.RUnlock()
+	return append([]IndexError(nil), idx.parseErrors...)
 }
 
 // FileMtimes returns a copy of the file modification time map.
@@ -6221,7 +6343,7 @@ func (idx *Indexer) indexedFilesAbsentFromDisk(diskFiles map[string]bool) []stri
 	return out
 }
 
-// graphPathRelKey inverts prefixPath∘graphRelKey: it maps a graph file path
+// graphPathRelKey inverts prefixPath∘relKey: it maps a graph file path
 // back to the canonical repo-relative key fileMtimes and the disk walk share.
 // owned is false when the path does not belong to this repo, which is the only
 // safe answer — a path under another prefix must never be resolved against
@@ -6238,14 +6360,14 @@ func (idx *Indexer) graphPathRelKey(graphPath string) (relPath string, owned boo
 	if rel == "" {
 		return "", false
 	}
-	// relKey slash-normalises; graphRelKey keeps OS-native separators. Fold
-	// back to the slash form so the key matches diskFiles and fileMtimes on
-	// Windows too.
+	// Fold the same way relKey does, so a stored path that predates the
+	// slash contract (or arrives through another spelling) still matches
+	// diskFiles and fileMtimes.
 	return pathkey.Normalize(filepath.ToSlash(rel)), true
 }
 
 func (idx *Indexer) incrementalPathOwned(absPath string) bool {
-	graphPath := idx.prefixPath(idx.graphRelKey(absPath))
+	graphPath := idx.prefixPath(idx.relKey(absPath))
 	if len(idx.graph.GetFileNodes(graphPath)) > 0 {
 		return true
 	}
@@ -6267,6 +6389,8 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	mode incrementalPathMode,
 	markerBatches ...*reparsePendingEnrichmentBatch,
 ) (*IndexResult, error) {
+	idx.loadFileIndexFailures()
+	defer idx.flushFileIndexFailures()
 	fullRoot := len(paths) == 0
 	if fullRoot {
 		// An empty scope means the repository root. detectDeletions decides
@@ -6287,9 +6411,16 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	// Reconcile the complete durable corpus before any scoped mutation writes
 	// rows with this process's normalization mode. Doing this after a partial
 	// update would leave unchanged symbols in the previous mode.
+	normalizationTiming := startReconcilePhase(idx.logger, idx.repoPrefix, "fts_normalization")
+	defer normalizationTiming.abort()
 	if _, err := idx.reconcileSymbolFTSNormalization(nil); err != nil {
+		normalizationTiming.complete(err)
 		return nil, err
 	}
+	normalizationTiming.complete(nil)
+	discoveryTiming := startReconcilePhase(idx.logger, idx.repoPrefix, "scoped_discovery",
+		zap.Int("requested_paths", len(paths)), zap.Bool("full_root", fullRoot))
+	defer discoveryTiming.abort()
 
 	// scopeRels holds the repo-relative slash-paths the caller asked to
 	// reindex — used both to drive the discovery walk and to bound
@@ -6301,6 +6432,8 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	diskFiles := make(map[string]bool)
 	var staleFiles []string
 	var forcedDeletedFiles []string
+	var discoveryFailed []string
+	var walkedDirs []string
 
 	merkleMode := idx.merkleEnabled()
 
@@ -6344,18 +6477,25 @@ func (idx *Indexer) incrementalReindexPathsMode(
 				}
 				continue
 			}
+			idx.noteFileIndexFailure(absPath, statErr)
 			return nil, fmt.Errorf("incremental reindex: stat %q: %w", p, statErr)
 		}
 
 		if info.IsDir() {
 			walkErr := filepath.WalkDir(absPath, func(path string, d os.DirEntry, err error) error {
 				if err != nil {
+					if !os.IsNotExist(err) && !idx.shouldExclude(path, absRoot, d != nil && d.IsDir()) {
+						idx.noteFileIndexFailure(path, err)
+						discoveryFailed = append(discoveryFailed, path)
+					}
 					return nil
 				}
 				if d.IsDir() {
 					if idx.admitWalkEntry(absRoot, path, -1, true).pruneDir {
 						return filepath.SkipDir
 					}
+					idx.noteFileIndexFailure(path, nil)
+					walkedDirs = append(walkedDirs, path)
 					return nil
 				}
 				if !idx.admitScopedWalkFile(absRoot, path) {
@@ -6416,6 +6556,14 @@ func (idx *Indexer) incrementalReindexPathsMode(
 			}
 		}
 	}
+	// Failure rows also inventory files that have never produced graph nodes
+	// or mtimes. A recovered read must be retried even when those ledgers say
+	// nothing changed (including Merkle mode and prior parse failures).
+	for _, graphPath := range idx.fileIndexFailurePaths() {
+		if relPath, ok := idx.graphPathRelKey(graphPath); ok && diskFiles[relPath] {
+			staleFiles = append(staleFiles, filepath.Join(absRoot, filepath.FromSlash(relPath)))
+		}
+	}
 	staleFiles = appendUniqueSorted(nil, staleFiles...)
 
 	// Restored snapshots populate fileMtimes without running IndexCtx. Preserve
@@ -6435,6 +6583,11 @@ func (idx *Indexer) incrementalReindexPathsMode(
 		candidateSet := make(map[string]struct{}, len(forcedDeletedFiles)+4)
 		for _, relPath := range forcedDeletedFiles {
 			candidateSet[relPath] = struct{}{}
+		}
+		for _, graphPath := range idx.fileIndexFailurePaths() {
+			if relPath, ok := idx.graphPathRelKey(graphPath); ok && !diskFiles[relPath] && relPathInScope(relPath, scopeRels) {
+				candidateSet[relPath] = struct{}{}
+			}
 		}
 		idx.mtimeMu.RLock()
 		for relPath := range idx.fileMtimes {
@@ -6480,11 +6633,21 @@ func (idx *Indexer) incrementalReindexPathsMode(
 				deletedFiles = append(deletedFiles, relPath)
 				continue
 			}
-			idx.logger.Warn("incremental reindex: stat failed during scoped deletion detection, preserving",
-				zap.String("rel", relPath), zap.Error(statErr))
+			idx.noteFileIndexFailure(absPath, statErr)
+			discoveryFailed = append(discoveryFailed, absPath)
+			if !errors.Is(statErr, os.ErrPermission) {
+				idx.logger.Warn("incremental reindex: stat failed during scoped deletion detection, preserving",
+					zap.String("rel", relPath), zap.Error(statErr))
+			}
 		}
 	}
 	deletedFiles = appendUniqueSorted(nil, deletedFiles...)
+	discoveryTiming.complete(nil, zap.Int("detected_files", len(diskFiles)),
+		zap.Int("changed_files", len(staleFiles)), zap.Int("deleted_files", len(deletedFiles)),
+		zap.Int("failed_paths", len(discoveryFailed)))
+	dependencyTiming := startReconcilePhase(idx.logger, idx.repoPrefix, "deletion_frontier",
+		zap.Int("deleted_files", len(deletedFiles)))
+	defer dependencyTiming.abort()
 
 	// Capture surviving dependents before deletion evicts the target symbols and
 	// their incoming adjacency. The helper performs one batched node/edge
@@ -6498,7 +6661,7 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	if len(deletedFiles) > 0 {
 		graphPaths := make([]string, len(deletedFiles))
 		for i, relPath := range deletedFiles {
-			graphPaths[i] = idx.prefixPath(filepath.FromSlash(relPath))
+			graphPaths[i] = idx.prefixPath(relPath)
 		}
 		nodesByFile := idx.graph.GetFileNodesByPaths(graphPaths)
 		for _, graphPath := range graphPaths {
@@ -6509,6 +6672,7 @@ func (idx *Indexer) incrementalReindexPathsMode(
 		}
 	}
 	sourceStaleFiles, manifestFiles := splitIncrementalContractManifests(idx, staleFiles)
+	dependencyTiming.complete(nil, zap.Int("dependent_files", len(deletedDependencyFiles)))
 	markerBatch := &reparsePendingEnrichmentBatch{}
 	if len(markerBatches) > 0 && markerBatches[0] != nil {
 		markerBatch = markerBatches[0]
@@ -6516,9 +6680,13 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	invalidation, reparsedFiles, failedFiles, versionChangedFiles := idx.reindexIncrementalFilesBatched(
 		sourceStaleFiles, deletedFiles, markerBatch, mode.surfaceFirstVersionChange,
 	)
+	finalizeTiming := startReconcilePhase(idx.logger, idx.repoPrefix, "contracts_and_metadata",
+		zap.Int("manifest_files", len(manifestFiles)), zap.Int("reparsed_files", len(reparsedFiles)))
+	defer finalizeTiming.abort()
 	manifestPlan, manifestFailed := idx.refreshIncrementalContractManifests(manifestFiles)
 	invalidation.Merge(manifestPlan)
 	failedFiles = appendUniqueSorted(failedFiles, manifestFailed...)
+	failedFiles = appendUniqueSorted(failedFiles, discoveryFailed...)
 	invalidation.Files = appendUniqueSorted(invalidation.Files, idx.graphFilePaths(reparsedFiles)...)
 	invalidation.Files = appendUniqueSorted(invalidation.Files, deletedDependencyFiles...)
 	idx.pruneDeletedFileMtimes(deletedFiles)
@@ -6594,16 +6762,21 @@ func (idx *Indexer) incrementalReindexPathsMode(
 		DurationMs:          time.Since(start).Milliseconds(),
 		DerivedInvalidation: invalidation,
 	}
+	for _, path := range failedFiles {
+		result.Errors = append(result.Errors, IndexError{FilePath: path, Error: idx.fileIndexFailureError(path).Error()})
+	}
 	if mode.surfaceFirstVersionChange && len(versionChangedFiles) > 0 {
 		result.mutationErr = fmt.Errorf(
 			"%w: %s", errFileVersionChanged, strings.Join(versionChangedFiles, ", "),
 		)
+	} else if mode.surfaceFirstVersionChange && len(failedFiles) > 0 {
+		result.mutationErr = idx.fileIndexFailureError(failedFiles[0])
 	}
 	// A clean version-driven restage re-stamps the stored extractor
 	// versions; a failed file keeps the old row so the next full pass
 	// retries the language.
 	if len(extractorStaleLangs) > 0 && len(failedFiles) == 0 {
-		idx.reconcileRepoIndexState(absRoot)
+		idx.reconcileRepoIndexState(context.Background(), absRoot)
 	}
 	idx.warnIfEdgeSanityViolated(result)
 	// Partial work always queues the exact changed/deleted/dependent graph-file
@@ -6616,6 +6789,15 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	if len(failedFiles) == 0 && !idx.hasStaleGeneratedParserProjections() {
 		idx.persistExtractorVersion("c")
 	}
+	// Accepted receipts include inert and metadata-only reparses. Directory
+	// callbacks can subsequently fail while reading entries, so exclude the
+	// final failed set before clearing their own historical walk diagnostics.
+	recoveredFiles := make([]string, 0, len(staleFiles)+len(walkedDirs))
+	recoveredFiles = append(recoveredFiles, staleFiles...)
+	recoveredFiles = append(recoveredFiles, walkedDirs...)
+	idx.clearRecoveredParseErrors(recoveredFiles, failedFiles, nil)
+	finalizeTiming.complete(nil, zap.Int("failed_files", len(failedFiles)),
+		zap.Int("nodes", result.NodeCount), zap.Int("edges", result.EdgeCount))
 	return result, nil
 }
 
@@ -7140,12 +7322,16 @@ func (idx *Indexer) resolveProviderHandlers(reg *contracts.Registry) {
 		if src, _ := c.Meta["schema_source"].(string); src == "extracted" || src == "partial" {
 			continue
 		}
+		// srcDir goes through path.Dir, not filepath.Dir: c.FilePath is a
+		// graph path, slash-separated on every platform, and filepath.Dir
+		// would hand back "pkg\sub" on Windows for a directory the
+		// candidate filter then compares against slash spellings.
 		todo = append(todo, pending{
 			contractID: c.ID,
 			trail:      trail,
 			fallback:   fallback,
 			repoHint:   c.RepoPrefix,
-			srcDir:     filepath.Dir(c.FilePath),
+			srcDir:     path.Dir(c.FilePath),
 		})
 	}
 	// Always strip the internal handler hints from Meta at the end of
@@ -7415,7 +7601,7 @@ func pickHandlerCandidate(candidates []*graph.Node, repoHint, srcDir string) *gr
 		}
 		var samePkg []*graph.Node
 		for _, n := range pool {
-			if filepath.Dir(n.FilePath) == srcDir {
+			if path.Dir(n.FilePath) == srcDir {
 				samePkg = append(samePkg, n)
 			}
 		}
@@ -9186,6 +9372,54 @@ func (idx *Indexer) ChangedSinceMtimes(root string) (changed []string, deleted [
 	return changed, deleted, err
 }
 
+// reconcilePhaseTiming measures wall time for one serial phase. Chunk timings
+// are bounded summaries, never per-file logs. Abort distinguishes an early
+// return or panic from a successful completion. Do not share timers between
+// goroutines.
+type reconcilePhaseTiming struct {
+	logger   *zap.Logger
+	fields   []zap.Field
+	started  time.Time
+	finished bool
+}
+
+func startReconcilePhase(logger *zap.Logger, repo, phase string, fields ...zap.Field) *reconcilePhaseTiming {
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	timer := &reconcilePhaseTiming{
+		logger:  logger,
+		fields:  append([]zap.Field{zap.String("repo", repo), zap.String("phase", phase)}, fields...),
+		started: time.Now(),
+	}
+	logger.Info("indexer: reconcile phase started", timer.fields...)
+	return timer
+}
+
+func (timer *reconcilePhaseTiming) complete(err error, fields ...zap.Field) {
+	outcome := "complete"
+	if err != nil {
+		outcome = "error"
+		fields = append(fields, zap.Error(err))
+	}
+	timer.finish(outcome, fields...)
+}
+
+func (timer *reconcilePhaseTiming) abort() {
+	timer.finish("aborted")
+}
+
+func (timer *reconcilePhaseTiming) finish(outcome string, fields ...zap.Field) {
+	if timer.finished {
+		return
+	}
+	timer.finished = true
+	all := append([]zap.Field(nil), timer.fields...)
+	all = append(all, zap.Duration("elapsed", time.Since(timer.started)), zap.String("outcome", outcome))
+	all = append(all, fields...)
+	timer.logger.Info("indexer: reconcile phase complete", all...)
+}
+
 // changedSinceMtimesCensus also returns the complete tracked-source count from
 // the same walk. ReconcileRepoCtx uses that count to publish an honest clean
 // result without repeating the full-tree discovery in the incremental path.
@@ -9195,8 +9429,20 @@ func (idx *Indexer) changedSinceMtimesCensus(root string) (
 	detected int,
 	err error,
 ) {
+	timing := startReconcilePhase(idx.logger, idx.repoPrefix, "census")
+	returned := false
+	defer func() {
+		if !returned {
+			timing.abort()
+			return
+		}
+		timing.complete(err, zap.Int("detected_files", detected),
+			zap.Int("changed_files", len(changed)), zap.Int("deleted_files", len(deleted)),
+			zap.Bool("no_changes", err == nil && len(changed) == 0 && len(deleted) == 0))
+	}()
 	absRoot, absErr := filepath.Abs(root)
 	if absErr != nil {
+		returned = true
 		return nil, nil, 0, absErr
 	}
 	idx.storeRootPath(absRoot)
@@ -9230,6 +9476,7 @@ func (idx *Indexer) changedSinceMtimesCensus(root string) (
 		return nil
 	})
 	if walkErr != nil {
+		returned = true
 		return nil, nil, 0, walkErr
 	}
 
@@ -9260,6 +9507,7 @@ func (idx *Indexer) changedSinceMtimesCensus(root string) (
 			deleted = append(deleted, rel)
 		}
 	}
+	returned = true
 	return changed, deleted, len(diskFiles), nil
 }
 

@@ -2,7 +2,6 @@ package indexer
 
 import (
 	"context"
-	"path/filepath"
 	"sort"
 
 	"go.uber.org/zap"
@@ -110,7 +109,7 @@ func (mi *MultiIndexer) replayDeferredReconcileTail(ctx context.Context, tail *d
 		ctx = context.Background()
 	}
 	if seedDerivedFrontierFromCensus(tail.result, tail.changed, tail.deleted, func(relPath string) string {
-		return tail.idx.prefixPath(filepath.FromSlash(relPath))
+		return tail.idx.prefixPath(relPath)
 	}) && mi.logger != nil {
 		mi.logger.Info("daemon: deferred reconcile tail seeded derived frontier from census",
 			zap.String("prefix", tail.prefix),

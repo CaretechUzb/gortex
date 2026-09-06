@@ -129,10 +129,14 @@ func (idx *Indexer) refreshIncrementalContractManifests(files []string) (Derived
 	receipts := make([]fileReadReceipt, 0, len(files))
 	failed := make([]string, 0)
 	for _, absPath := range files {
-		relPath := idx.graphRelKey(absPath)
+		relPath := idx.relKey(absPath)
 		graphPath := idx.prefixPath(relPath)
 		src, readVersion, err := idx.readFileWithVersion(absPath)
 		if err != nil || !readVersion.valid {
+			if err == nil {
+				err = errFileVersionChanged
+			}
+			idx.noteFileIndexFailure(absPath, err)
 			failed = append(failed, absPath)
 			continue
 		}

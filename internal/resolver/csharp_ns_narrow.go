@@ -486,10 +486,11 @@ func csharpNearestProjDir(projDirs map[string]struct{}, dir string) string {
 	}
 }
 
-// csharpLastSep is the index of the last path separator. Windows stores
-// join the repo prefix with "/" but keep OS-native "\" below it
-// (the indexer's graphRelKey shape) — both must count, or every
-// project collapses to the repo-root key and globals leak repo-wide.
+// csharpLastSep is the index of the last path separator. Graph keys are
+// slash-spelled today (Indexer.relKey), but stores written before that
+// migration still hold Windows keys that join the repo prefix with "/" and
+// keep OS-native "\" below it — both must count, or every project in such a
+// store collapses to the repo-root key and globals leak repo-wide.
 func csharpLastSep(p string) int {
 	return strings.LastIndexAny(p, `/\`)
 }

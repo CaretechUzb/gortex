@@ -557,6 +557,9 @@ type Graph struct {
 	fileMetasMu sync.Mutex
 	fileMetas   map[string]map[string]FileMetaRow
 
+	fileIndexFailuresMu sync.Mutex
+	fileIndexFailures   map[string]map[string]FileIndexFailure
+
 	// mutationReceipts backs the optional, in-memory-only mutation receipt
 	// capability used to bound post-enrichment resolution. It is intentionally
 	// absent from disk stores until they can provide the same completeness
@@ -4018,6 +4021,7 @@ func (g *Graph) EvictRepo(repoPrefix string) (nodesRemoved, edgesRemoved int) {
 	if repoPrefix == "" {
 		return 0, 0
 	}
+	_ = g.ReplaceFileIndexFailures(repoPrefix, nil)
 	receiptActive := g.beginReceiptMutation()
 	if receiptActive {
 		defer g.endReceiptMutation()

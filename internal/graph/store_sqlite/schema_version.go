@@ -36,7 +36,7 @@ import (
 // index changes in a way an old on-disk DB would not already have, and append a
 // matching schemaMigrations entry describing how to bring an older store
 // forward (in place, or by rebuild).
-const currentSchemaVersion = 20
+const currentSchemaVersion = 21
 
 // schemaMigration is one forward step. Exactly one strategy applies:
 //   - rebuild=true: the change introduces structure/data that can only come
@@ -114,16 +114,17 @@ var schemaMigrations = []schemaMigration{
 	// Upstream renumbered this registry in the 2026-09-04 merge: it inserted
 	// six new steps at 13..18 and moved the two steps this fork had adopted —
 	// the coverage-spelling purge and the unresolved-tests-edge purge — out to
-	// 19 and 20. Upstream's numbering is adopted verbatim below, so
-	// currentSchemaVersion is 20, EQUAL to upstream's.
+	// 19 and 20. Upstream's numbering is adopted verbatim below. The 2026-09-06
+	// merge then took upstream's v21 (the per-file indexing-failure ledger)
+	// unchanged, so currentSchemaVersion is 21, EQUAL to upstream's.
 	//
-	// Standing rule, restated because this merge is the third time it decided
-	// the resolution: this fork's currentSchemaVersion must stay EQUAL to
+	// Standing rule, restated because every one of these merges has had to
+	// decide it again: this fork's currentSchemaVersion must stay EQUAL to
 	// upstream's, and fork-only work must live INSIDE a number upstream already
-	// shipped. Never mint a number of our own. Stamping our stores 21 would
-	// carry them past upstream's next migration, which pendingBetween — it
-	// selects `version > stored && version <= current` — would then skip
-	// PERMANENTLY.
+	// shipped. Never mint a number of our own. Stamping our stores one past
+	// upstream would carry them past upstream's NEXT migration, which
+	// pendingBetween — it selects `version > stored && version <= current` —
+	// would then skip PERMANENTLY.
 	//
 	// So this fork's readiness work rides v19, not a number of its own. v19 is
 	// upstream's coverage purge, which is the same purge the fork's old
@@ -149,6 +150,7 @@ var schemaMigrations = []schemaMigration{
 	{version: 18, name: "add sparse generation ownership masks", inPlace: createGenerationMaskTables},
 	{version: 19, name: "purge legacy coverage spellings and add per-repo readiness state", inPlace: migrateV19},
 	{version: 20, name: "purge unresolved derived tests edges", inPlace: purgeUnresolvedTestsEdges},
+	{version: 21, name: "persist per-file indexing failures", inPlace: createFileIndexFailuresTable},
 }
 
 // createGenerationMaskTables is the explicit v18 migration. The mask tables are
@@ -602,7 +604,7 @@ func createReadinessStateTables(tx *sql.Tx) error {
 	//   - "before v13 has shipped" died in the first merge, when main shipped
 	//     its OWN v13 and the two were folded into one number.
 	//   - "a store stamped 14 is wiped by `stored > current`" died in the
-	//     2026-09-04 merge. currentSchemaVersion is 20 now, so a fork store
+	//     2026-09-04 merge. currentSchemaVersion is 21 now, so a fork store
 	//     stamped 13 or 14 MIGRATES rather than being wiped, and it arrives
 	//     here already carrying these columns.
 	//

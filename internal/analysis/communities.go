@@ -586,9 +586,11 @@ func pureClusterLabel(files []string) string {
 func mixedClusterLabel(files []string) string {
 	dirCount := make(map[string]int)
 	for _, f := range files {
-		// Graph file paths keep OS-native separators (see graphRelKey), so
-		// normalise before taking the directory: the result is rendered into
-		// the label and trimmed by helpers that split on "/".
+		// Graph file paths are slash-spelled (Indexer.relKey), but a caller
+		// may still hand in an OS-native path, so normalise before taking the
+		// directory: the result is rendered into the label and trimmed by
+		// helpers that split on "/". ToSlash is a no-op on an already-slashed
+		// key.
 		dirCount[path.Dir(filepath.ToSlash(f))]++
 	}
 	if len(dirCount) == 0 {
@@ -626,11 +628,11 @@ func longestCommonDirPrefix(paths []string) string {
 	if len(paths) == 0 {
 		return ""
 	}
-	// Graph file paths keep OS-native separators (see graphRelKey), so
-	// normalise with ToSlash first, then take the directory with path.Dir —
-	// the trimming loop below cuts at "/", so a prefix carrying the OS
-	// separator could never be shortened and the function would bail out with
-	// "" on the first mismatch.
+	// Graph file paths are slash-spelled (Indexer.relKey), but this helper is
+	// also called with OS-native paths, so normalise with ToSlash first, then
+	// take the directory with path.Dir — the trimming loop below cuts at "/",
+	// so a prefix carrying an OS separator could never be shortened and the
+	// function would bail out with "" on the first mismatch.
 	pfx := path.Dir(filepath.ToSlash(paths[0]))
 	for _, p := range paths[1:] {
 		dir := path.Dir(filepath.ToSlash(p))

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"path"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -126,11 +127,14 @@ func GraphKey(repoPrefix, path string, domain PathDomain) string {
 		return path
 	}
 	// A repo-relative path is always converted, prefix or not. The key's shape
-	// is "<prefix>/" + the remainder in the indexing machine's native
-	// separators (see internal/graphpath); with no prefix the remainder IS the
-	// key, and a '/'-spelled git or forge path still misses a key stored with
-	// native separators on Windows. FromSlash is the identity on POSIX.
-	key := filepath.FromSlash(path)
+	// is "<prefix>/" + the remainder, and the indexer keys every graph path
+	// with forward slashes on every platform (Indexer.relKey folds through
+	// filepath.ToSlash), so the remainder stays '/'-spelled. Re-spelling it
+	// natively here produced "repo-a/pkg\widget.go" on Windows and missed
+	// every file node below the repo root — the diff joined no symbols at
+	// all. ToSlash is the identity on POSIX, where a backslash is an
+	// ordinary filename byte and must survive.
+	key := filepath.ToSlash(path)
 	if repoPrefix == "" {
 		return key
 	}
@@ -305,7 +309,7 @@ func parseDiffLines(output string) map[string][]HunkLine {
 		line := scanner.Text()
 
 		if strings.HasPrefix(line, "+++ b/") {
-			currentFile = filepath.Clean(strings.TrimPrefix(line, "+++ b/"))
+			currentFile = cleanDiffPath(strings.TrimPrefix(line, "+++ b/"))
 			newLine = 0
 			continue
 		}
@@ -553,14 +557,23 @@ func parseDiffFiles(output string) ([]DiffHunk, []FileChange) {
 	return hunks, changes
 }
 
-// cleanDiffPath normalizes a path lifted out of a diff header the same way
-// DiffHunk.FilePath and parseDiffLines do, so a hunk and its file record join.
-func cleanDiffPath(path string) string {
-	path = strings.TrimSpace(path)
-	if path == "" {
+// cleanDiffPath normalizes a path lifted out of a diff header. It is the one
+// cleaner every diff path goes through — the hunk header, the "+++ b/" file
+// header and the file records — so a hunk and its file record always join.
+//
+// Git spells diff paths with forward slashes on every platform, and so does
+// every consumer of DiffHunk.FilePath: a graph key is '/'-spelled (GraphKey
+// folds through filepath.ToSlash), and forge review comments and report rows
+// are a '/'-separated API. filepath.Clean would therefore be wrong on Windows —
+// it hands back "internal\forge\forge.go" and misses every join — so the
+// clean is path.Clean over the slash spelling. filepath.ToSlash is the
+// identity on POSIX, where a backslash is an ordinary filename byte.
+func cleanDiffPath(p string) string {
+	p = strings.TrimSpace(p)
+	if p == "" {
 		return ""
 	}
-	return filepath.Clean(path)
+	return path.Clean(filepath.ToSlash(p))
 }
 
 // parseDiffGitPaths recovers the path from a "diff --git a/P b/P" header. It is
@@ -624,7 +637,7 @@ func parseHunkHeader(line, filePath, side string) *DiffHunk {
 			}
 
 			// Normalize file path to be relative
-			relPath := filepath.Clean(filePath)
+			relPath := cleanDiffPath(filePath)
 
 			return &DiffHunk{
 				FilePath:  relPath,

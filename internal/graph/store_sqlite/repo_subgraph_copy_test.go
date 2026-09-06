@@ -453,3 +453,66 @@ func TestCopyRepoSubgraph_InboundFilterNeedsAPublishedGrouping(t *testing.T) {
 		t.Skip("store now identifies siblings without a published grouping; the caller's publish is no longer load-bearing")
 	}
 }
+
+// TestCopyRepoSubgraph_CarriesTheFileIndexFailureLedger pins the one sidecar
+// that a re-key deliberately DROPS and a copy must deliberately CARRY.
+//
+// A re-key is a re-index, so it can discard the v21 failure ledger and let the
+// re-index rewrite it. A copy exists precisely so no re-index runs: dropping
+// the ledger there publishes a destination that reports zero failed files over
+// a source with unreadable ones, and `gortex daemon status` calls a degraded
+// checkout healthy.
+//
+// The rows are also asserted to be REWRITTEN, not merely present. file_path
+// here follows the `files` convention (the indexer stores
+// prefixPath(relKey(path))), so a carried-but-unrewritten row would name the
+// source checkout's path under the destination prefix — a failure reported
+// against a path that does not exist in this checkout.
+func TestCopyRepoSubgraph_CarriesTheFileIndexFailureLedger(t *testing.T) {
+	store := copyFixture(t)
+
+	if err := store.ReplaceFileIndexFailures("local", []graph.FileIndexFailure{{
+		RepoPrefix: "local", Path: "local/models/order.py",
+		Error: "open local/models/order.py: permission denied", PermissionDenied: true,
+	}}); err != nil {
+		t.Fatalf("seed the source ledger: %v", err)
+	}
+	// A sibling checkout's own failure must stay behind: the copy's frontier is
+	// the source prefix, and "local@wt" starts with "local".
+	if err := store.ReplaceFileIndexFailures("local@wt", []graph.FileIndexFailure{{
+		RepoPrefix: "local@wt", Path: "local@wt/models/order.py", Error: "parse error",
+	}}); err != nil {
+		t.Fatalf("seed the sibling ledger: %v", err)
+	}
+
+	if _, err := store.CopyRepoSubgraph("local", "wt2"); err != nil {
+		t.Fatal(err)
+	}
+
+	failures, err := store.FileIndexFailuresForRepo("wt2")
+	if err != nil {
+		t.Fatalf("read the destination ledger: %v", err)
+	}
+	if len(failures) != 1 {
+		t.Fatalf("destination ledger = %v, want exactly the source's one row", failures)
+	}
+	got := failures[0]
+	if got.Path != "wt2/models/order.py" {
+		t.Errorf("file_path = %q, want %q: the prefixed path was not rewritten",
+			got.Path, "wt2/models/order.py")
+	}
+	if !got.PermissionDenied {
+		t.Error("permission_denied was not carried: an unreadable file would read as a parse failure")
+	}
+	if got.Error == "" {
+		t.Error("error text was not carried")
+	}
+
+	// The source keeps its own row, and the sibling is untouched.
+	if src, err := store.FileIndexFailuresForRepo("local"); err != nil || len(src) != 1 {
+		t.Errorf("source ledger = %v (err %v), want its one row intact", src, err)
+	}
+	if sib, err := store.FileIndexFailuresForRepo("local@wt"); err != nil || len(sib) != 1 {
+		t.Errorf("sibling ledger = %v (err %v), want its one row untouched", sib, err)
+	}
+}

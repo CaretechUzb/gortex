@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 
 	"github.com/zzet/gortex/internal/gitcmd"
+	"github.com/zzet/gortex/internal/pathkey"
 )
 
 // This file is the one place the indexer is allowed to ask "what commit is
@@ -197,25 +198,42 @@ func parseHeadIdentity(out, checkoutRoot string) (string, string, error) {
 }
 
 // sameGitPath reports whether two git administrative paths name the same
-// directory. Textual equality is the fast path; EvalSymlinks settles the rest,
-// because git reports the physical path getcwd() hands it while a caller's
-// baseline can carry a symlinked one (/tmp -> /private/tmp on Darwin, and
-// every t.TempDir() under it). A path that cannot be resolved is never
-// treated as equal: unverifiable means refuse.
+// directory.
+//
+// Both sides are canonicalised the way the view layer canonicalises a worktree
+// selector root (mcp.canonicalWorktreeSelectorRoot): EvalSymlinks when it
+// answers, the lexically cleaned path when it does not. The symlink step is
+// load-bearing rather than defensive — git reports the physical path getcwd()
+// hands it, while a caller's baseline can carry a symlinked one
+// (/tmp -> /private/tmp on Darwin, and every t.TempDir() under it).
+//
+// The comparison itself is pathkey.EqualPaths, not string equality, so the two
+// spellings a case-insensitive or Unicode-normalising filesystem can hand back
+// for one directory compare equal: macOS returns decomposed (NFD) names for
+// paths created with composed ones, and both macOS and Windows fold case.
+// String equality read those as two different repositories and refused a
+// checkout that was its own — a fail-closed guard's worst failure mode is
+// refusing the honest case, because nothing downstream retries it.
+//
+// Falling back to the lexical path rather than refusing an unresolvable one
+// cannot admit a foreign repository: the fold is a normalisation, so a lexical
+// comparison is exactly the fast path this function already accepted before it
+// ever called EvalSymlinks.
 func sameGitPath(a, b string) bool {
 	if a == "" || b == "" {
 		return false
 	}
-	if filepath.Clean(a) == filepath.Clean(b) {
-		return true
+	return pathkey.EqualPaths(canonicalGitPath(a), canonicalGitPath(b))
+}
+
+// canonicalGitPath resolves aliases where it can and keeps the lexical path
+// where it cannot. Mirrors mcp.canonicalWorktreeSelectorRoot deliberately: a
+// checkout root has to canonicalise identically on both sides of the daemon,
+// or the view layer and this guard would disagree about which checkout a
+// request names.
+func canonicalGitPath(p string) string {
+	if resolved, err := filepath.EvalSymlinks(p); err == nil {
+		return resolved
 	}
-	resolvedA, err := filepath.EvalSymlinks(a)
-	if err != nil {
-		return false
-	}
-	resolvedB, err := filepath.EvalSymlinks(b)
-	if err != nil {
-		return false
-	}
-	return filepath.Clean(resolvedA) == filepath.Clean(resolvedB)
+	return filepath.Clean(p)
 }

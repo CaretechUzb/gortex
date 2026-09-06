@@ -363,9 +363,11 @@ func TestUntrackWaitPollsThroughATrackedRootWhenTheRelayCannotHelp(t *testing.T)
 	require.ErrorIs(t, err, ErrUnboundWorktreeView,
 		"the fixture must reproduce the unbound-view refusal")
 
-	pollPath := demotionPollPath(worktree)
+	pollPath, inFamily := demotionPollPath(worktree)
 	require.Equal(t, mainRepo, pollPath,
 		"with no relay to lean on the poller must fall back to a tracked root")
+	require.True(t, inFamily,
+		"a tracked root the checkout lives under is the family's own repository")
 
 	mode, transition, found, err := checkoutEffectiveMode(pollPath, "co-1")
 	require.NoError(t, err)
@@ -413,22 +415,33 @@ func TestDemotionPollPathPrefersTheFamilyThenAnyTrackedRoot(t *testing.T) {
 		}
 	}
 
+	// inFamily is asserted alongside the path on every arm: list_checkouts
+	// clamps its answer to the calling session's workspace
+	// (checkoutOverviewInScope), so "which path" and "can that path see the
+	// subject's family" are two different answers and the poller acts on both.
 	t.Run("the relay names the family", func(t *testing.T) {
 		checkoutsRelayFn = func(string) string { return "/fam/main" }
 		trackStatusFn = status("/other")
-		require.Equal(t, "/fam/main", demotionPollPath("/fam/wt"))
+		path, inFamily := demotionPollPath("/fam/wt")
+		require.Equal(t, "/fam/main", path)
+		require.True(t, inFamily, "the relay's answer is the family's own working copy")
 	})
 
 	t.Run("a containing tracked root beats an unrelated one", func(t *testing.T) {
 		checkoutsRelayFn = func(p string) string { return p }
 		trackStatusFn = status("/other", filepath.Join(t.TempDir(), "nope"), "/fam")
-		require.Equal(t, "/fam", demotionPollPath("/fam/wt"))
+		path, inFamily := demotionPollPath("/fam/wt")
+		require.Equal(t, "/fam", path)
+		require.True(t, inFamily, "a tracked root the checkout lives under is its family's repository")
 	})
 
 	t.Run("any tracked root when none contains the checkout", func(t *testing.T) {
 		checkoutsRelayFn = func(p string) string { return p }
 		trackStatusFn = status("/elsewhere")
-		require.Equal(t, "/elsewhere", demotionPollPath("/fam/wt"))
+		path, inFamily := demotionPollPath("/fam/wt")
+		require.Equal(t, "/elsewhere", path)
+		require.False(t, inFamily,
+			"an unrelated tracked root may be scoped away from the subject's family")
 	})
 
 	t.Run("no status, no invention", func(t *testing.T) {
@@ -436,7 +449,9 @@ func TestDemotionPollPathPrefersTheFamilyThenAnyTrackedRoot(t *testing.T) {
 		trackStatusFn = func() (daemon.StatusResponse, error) {
 			return daemon.StatusResponse{}, errUntrackWaitTestPoll
 		}
-		require.Equal(t, "/fam/wt", demotionPollPath("/fam/wt"))
+		path, inFamily := demotionPollPath("/fam/wt")
+		require.Equal(t, "/fam/wt", path)
+		require.False(t, inFamily, "the unmoved subject path is not a family connection")
 	})
 }
 
@@ -613,3 +628,105 @@ var errUntrackWaitTestPoll = &untrackWaitTestPollError{}
 type untrackWaitTestPollError struct{}
 
 func (*untrackWaitTestPollError) Error() string { return "poll error: connection refused" }
+
+// TestUntrackWaitRecoversFromAScopeBlindPollPath pins the interaction between
+// the poller and list_checkouts' workspace clamp.
+//
+// list_checkouts' answer is filtered to the calling session's workspace
+// (checkoutOverviewInScope). The poller's connection is normally the family's
+// own working copy, which is inside that workspace — but when the relay fails
+// open on a busy daemon the poller falls back to any tracked root, and a root
+// in another workspace is handed an answer with the subject's family filtered
+// out of it. That reads exactly like "the checkout is gone", which used to end
+// the wait with an error on a demotion that was running perfectly.
+//
+// What is pinned: a not-found answer from such a connection re-asks for a poll
+// path instead of counting against the anomaly window, and the recovered relay
+// carries the next poll to an answer that can actually see the checkout.
+func TestUntrackWaitRecoversFromAScopeBlindPollPath(t *testing.T) {
+	withUntrackSeams(t)
+	origRelay, origStatus := checkoutsRelayFn, trackStatusFn
+	t.Cleanup(func() { checkoutsRelayFn, trackStatusFn = origRelay, origStatus })
+
+	// The tracked root the fail-open fallback lands on. It is in another
+	// workspace, so its answers never mention the subject's family.
+	const blind, family = "/elsewhere", "/fam/main"
+	trackStatusFn = func() (daemon.StatusResponse, error) {
+		return daemon.StatusResponse{
+			TrackedRepos: []daemon.TrackedRepoStatus{{Path: blind}},
+		}, nil
+	}
+	// The relay fails open once — the daemon was too busy to answer Status —
+	// and recovers on the retry the not-found answer triggers.
+	relayCalls := 0
+	checkoutsRelayFn = func(p string) string {
+		relayCalls++
+		if relayCalls == 1 {
+			return p
+		}
+		return family
+	}
+
+	untrackConfirm, untrackFormat, untrackWait, untrackWaitTimeout = false, "text", true, time.Hour
+	untrackDaemonTool = func(_ string, _ string, _ map[string]any) (json.RawMessage, error) {
+		return demotingToolPayload("co-1"), nil
+	}
+	var polled []string
+	listCheckoutsFn = func(path string) (json.RawMessage, error) {
+		polled = append(polled, path)
+		if path == family {
+			return listCheckoutsBody("co-1", "automatic", ""), nil
+		}
+		// The clamp: the subject's family is not in this session's workspace,
+		// so the answer carries someone else's families and never co-1.
+		return emptyCheckoutsBody(), nil
+	}
+
+	start := time.Now()
+	cmd, buf := newCheckoutsTestCmd(t)
+	require.NoError(t, untrackViaDaemon(cmd, buf, "/fam/wt", "/fam/wt"),
+		"a family filtered out of a scope-clamped answer is not a missing checkout")
+	require.Less(t, time.Since(start), 5*time.Second,
+		"the recovery must not wait out the anomaly window, let alone --wait-timeout")
+	require.Equal(t, []string{blind, family}, polled,
+		"the poller must move to the family's own working copy rather than keep asking a blind connection")
+	require.Contains(t, buf.String(), "to its family's automatic lane (via daemon)")
+}
+
+// TestUntrackWaitStillGivesUpWhenTheRelayCannotRecover is the other half: the
+// second chance is a second chance, not an exemption. A poll path that stays
+// outside the family still ends the wait on the anomaly window, because a
+// wait that could only ever end at --wait-timeout would be worse than one that
+// says what it could not see.
+func TestUntrackWaitStillGivesUpWhenTheRelayCannotRecover(t *testing.T) {
+	withUntrackSeams(t)
+	origRelay, origStatus := checkoutsRelayFn, trackStatusFn
+	t.Cleanup(func() { checkoutsRelayFn, trackStatusFn = origRelay, origStatus })
+
+	trackStatusFn = func() (daemon.StatusResponse, error) {
+		return daemon.StatusResponse{
+			TrackedRepos: []daemon.TrackedRepoStatus{{Path: "/elsewhere"}},
+		}, nil
+	}
+	checkoutsRelayFn = func(p string) string { return p }
+
+	untrackConfirm, untrackFormat, untrackWait, untrackWaitTimeout = false, "text", true, time.Hour
+	untrackDaemonTool = func(_ string, _ string, _ map[string]any) (json.RawMessage, error) {
+		return demotingToolPayload("co-1"), nil
+	}
+	polls := 0
+	listCheckoutsFn = func(string) (json.RawMessage, error) {
+		polls++
+		return emptyCheckoutsBody(), nil
+	}
+
+	start := time.Now()
+	cmd, buf := newCheckoutsTestCmd(t)
+	err := untrackViaDaemon(cmd, buf, "/fam/wt", "/fam/wt")
+	require.Error(t, err)
+	require.Less(t, time.Since(start), 5*time.Second, "must not burn the --wait-timeout")
+	require.Contains(t, err.Error(), "no longer listed")
+	require.Contains(t, err.Error(), "outside the checkout's workspace",
+		"the message must name the connection that could not see the family")
+	require.Greater(t, polls, 1, "the window must retry before giving up")
+}

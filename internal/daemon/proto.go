@@ -299,7 +299,13 @@ type StatusResponse struct {
 	UptimeSeconds int64               `json:"uptime_seconds"`
 	SocketPath    string              `json:"socket_path"`
 	TrackedRepos  []TrackedRepoStatus `json:"tracked_repos"`
-	Sessions      int                 `json:"sessions"`
+	// File indexing health is independent of query readiness. A health read
+	// error means completeness is unknown, not that indexing succeeded.
+	IndexHealthError string `json:"index_health_error,omitempty"`
+	IndexDegraded    bool   `json:"index_degraded,omitempty"`
+	FailedFiles      int    `json:"failed_files,omitempty"`
+	UnreadableFiles  int    `json:"unreadable_files,omitempty"`
+	Sessions         int    `json:"sessions"`
 	// MemoryBytes is runtime.MemStats.Alloc — live allocated heap.
 	// Retained for backwards compatibility with older clients; new
 	// clients should read from Runtime.
@@ -843,6 +849,11 @@ type TrackedRepoStatus struct {
 	// and `gortex repos` report the same inventory instead of one view
 	// dropping a repo the other still lists. Counts are zero.
 	Unloaded bool `json:"unloaded,omitempty"`
+	// File indexing health includes unresolved failures and ledger read errors.
+	IndexHealthError string `json:"index_health_error,omitempty"`
+	FailedFiles      int    `json:"failed_files,omitempty"`
+	UnreadableFiles  int    `json:"unreadable_files,omitempty"`
+	IndexDegraded    bool   `json:"index_degraded,omitempty"`
 }
 
 // WorkspaceSummary aggregates per-workspace stats so `gortex daemon

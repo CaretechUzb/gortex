@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"slices"
 	"sync"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/reconcile"
 	"github.com/zzet/gortex/internal/viewmetrics"
@@ -174,7 +176,7 @@ const viewArgName = "view"
 // else is a typo the caller must see, not a field to ignore — an ignored
 // selector field would silently answer about a different view.
 var viewSelectorFields = map[string]bool{
-	"kind": true, "graph_id": true, "checkout_id": true, "value": true,
+	"kind": true, "graph_id": true, "checkout_id": true, "value": true, "path": true,
 }
 
 // viewSelectorSchema is the single public schema for the request-level view
@@ -209,8 +211,12 @@ func viewSelectorSchema() map[string]any {
 			}, "kind", "graph_id"),
 			object(map[string]any{
 				"kind":        kind(string(graphview.SelectorWorktree)),
-				"checkout_id": text("Registered checkout identifier."),
+				"checkout_id": text("Registered checkout identifier, available from workspace.checkouts. For a filesystem path use view.path instead."),
 			}, "kind", "checkout_id"),
+			object(map[string]any{
+				"kind": kind(string(graphview.SelectorWorktree)),
+				"path": text("Absolute root path of an automatically discovered worktree. No explicit tracking is needed."),
+			}, "kind", "path"),
 			object(map[string]any{
 				"kind":     kind(string(graphview.SelectorGitRef)),
 				"graph_id": text("Optional dedicated graph identifier."),
@@ -283,7 +289,17 @@ func takeViewSelector(req *mcp.CallToolRequest) (graphview.Selector, error) {
 		}
 		fields[name] = text
 	}
-	return graphview.ParseSelector(fields["kind"], fields["graph_id"], fields["checkout_id"], fields["value"])
+	if _, hasPath := obj["path"]; hasPath {
+		if _, hasID := obj["checkout_id"]; hasID {
+			return graphview.Selector{}, graphview.NewViewError(graphview.CodeSelectorConflict,
+				"worktree selector requires exactly one of checkout_id or path")
+		}
+		if fields["path"] == "" {
+			return graphview.Selector{}, graphview.NewViewError(graphview.CodeInvalidViewSelector,
+				"view.path must be a non-empty absolute worktree root")
+		}
+	}
+	return graphview.ParseSelectorWithPath(fields["kind"], fields["graph_id"], fields["checkout_id"], fields["value"], fields["path"])
 }
 
 // requestViewPolicy carries the operation-level guarantees that affect view
@@ -549,14 +565,38 @@ func (s *Server) viewForWorktreeSelector(
 	policy requestViewPolicy,
 ) (*requestView, error) {
 	catalog := s.materializer.Catalog
-	checkout, found, err := catalog.GetCheckout(ctx, selector.CheckoutID)
+	var checkout store_sqlite.Checkout
+	var found bool
+	var err error
+	subject := selector.CheckoutID
+	if selector.Path != "" {
+		subject = selector.Path
+		root := canonicalWorktreeSelectorRoot(selector.Path)
+		checkout, found, err = graphview.CheckoutForPath(ctx, catalog, s.viewFamilies(ctx), root)
+		// A new nested worktree must not be mistaken for its already-indexed
+		// parent while discovery is pending. Path selectors name roots, unlike
+		// implicit session-CWD binding which also accepts directories inside one.
+		if err == nil && found {
+			found = pathkey.EqualPaths(root, canonicalWorktreeSelectorRoot(checkout.RootPath))
+		}
+	} else {
+		checkout, found, err = catalog.GetCheckout(ctx, selector.CheckoutID)
+	}
 	switch {
 	case err != nil:
 		return nil, graphview.WrapViewError(graphview.CodeCheckoutInaccessible,
-			fmt.Sprintf("read checkout %q", selector.CheckoutID), err)
+			fmt.Sprintf("read checkout %q", subject), err)
 	case !found:
+		if selector.Path == "" && filepath.IsAbs(selector.CheckoutID) {
+			return nil, graphview.NewViewError(graphview.CodeInvalidViewSelector,
+				fmt.Sprintf("view.checkout_id expects a registered identifier, not a filesystem path; use view:{kind:\"worktree\",path:%q} or workspace(operation:\"checkouts\") to find its checkout_id", selector.CheckoutID))
+		}
+		if selector.Path != "" {
+			return nil, graphview.NewViewError(graphview.CodeCheckoutInaccessible,
+				fmt.Sprintf("no registered worktree root matches path %q; supply the worktree root, and if automatic discovery is pending inspect workspace(operation:\"checkouts\") and retry", selector.Path))
+		}
 		return nil, graphview.NewViewError(graphview.CodeCheckoutInaccessible,
-			fmt.Sprintf("checkout %q is not registered", selector.CheckoutID))
+			fmt.Sprintf("checkout %q is not registered; use view.path for a filesystem path or workspace(operation:\"checkouts\") to find its checkout_id", selector.CheckoutID))
 	}
 	if checkout.State != store_sqlite.CheckoutStateReady {
 		stateErr := graphview.NewViewError(graphview.CodeCheckoutInaccessible,
@@ -594,6 +634,16 @@ func (s *Server) viewForWorktreeSelector(
 		return nil, err
 	}
 	return s.materializeRequestView(ctx, selector, checkout, true)
+}
+
+// Resolve aliases before containment lookup, so a symlink inside the primary
+// pointing to a sibling checkout selects the sibling. Keep the lexical root
+// when unavailable so removal-grace requests still reach the existing policy.
+func canonicalWorktreeSelectorRoot(root string) string {
+	if resolved, err := filepath.EvalSymlinks(root); err == nil {
+		return resolved
+	}
+	return filepath.Clean(root)
 }
 
 func checkoutStateAllowsBaseFallback(state store_sqlite.CheckoutState) bool {
@@ -866,23 +916,27 @@ func (s *Server) repoPrefixForCheckout(ctx context.Context, checkout store_sqlit
 	return primary
 }
 
-// refuseRoutedViewMutation blocks a source-mutating tool whose request reads
-// through a routed view.
-//
-// Path resolution follows the view, but nothing else on the write path does:
-// the view is a leased snapshot of generations, and a write beneath it leaves
-// the stack this request read describing content that is no longer there.
-// Refusing is the honest answer until the write path can invalidate the route
-// it wrote through; editing an automatic worktree comes with that.
+// refuseRoutedViewMutation admits only mutations that obtained checkout-local
+// coordination. An inexact fallback is read-only even when it has no routed
+// reader: allowing that case would silently write the primary checkout.
 func (s *Server) refuseRoutedViewMutation(ctx context.Context, tool string) *mcp.CallToolResult {
 	view := requestViewFromContext(ctx)
-	if !view.routed() || !s.facades.mutatesSource(tool) {
+	if !s.facades.mutatesSource(tool) || view == nil {
+		return nil
+	}
+	if view.rider != nil && !view.rider.Exact {
+		return mcp.NewToolResultError(fmt.Sprintf(
+			"%s: source edits require an exact live checkout; this request received a read-only fallback. Retry when the selected checkout is ready.",
+			graphview.CodeViewReadOnly))
+	}
+	if !view.routed() || checkoutMutationFromContext(ctx) != nil {
 		return nil
 	}
 	return mcp.NewToolResultError(fmt.Sprintf(
-		"%s: this request reads through %s, and %s would write the canonical checkout instead of that one. "+
-			"Read through the view; edit from the checkout's own working copy.",
-		graphview.CodeViewReadOnly, view.rider.ActualView, tool))
+		"%s: %s has no approved write path for this view. "+
+			"Only file edits, file writes, and symbol edits are supported on an exact live worktree with an active checkout coordinator. "+
+			"Batch operations, refactors, and immutable ref views remain read-only through routed views.",
+		graphview.CodeViewReadOnly, tool))
 }
 
 // attachViewRider puts the view fields on the response, inside the freshness
