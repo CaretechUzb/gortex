@@ -167,14 +167,26 @@ func TestCheckoutControlNeverRecoversUnregisteredNestedCheckoutAsParent(t *testi
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ran := false
-			res, err := stack.callWithView(t, tc.cwd, tc.operation, tc.args,
-				func(context.Context) (*mcp.CallToolResult, error) {
-					ran = true
-					return mcp.NewToolResultText(`{"ok":true}`), nil
-				})
-			require.NoError(t, err)
-			assertToolError(t, res, graphview.CodeCheckoutInaccessible)
-			require.False(t, ran)
+			deadline := time.Now().Add(10 * time.Second)
+			for {
+				res, err := stack.callWithView(t, tc.cwd, tc.operation, tc.args,
+					func(context.Context) (*mcp.CallToolResult, error) {
+						ran = true
+						return mcp.NewToolResultText(`{"ok":true}`), nil
+					})
+				require.NoError(t, err)
+				require.False(t, ran, "nested checkout must never invoke the parent handler")
+				require.True(t, res.IsError, viewResultText(t, res))
+				// Git discovery may outlast the short per-request admission budget.
+				// Retry pending discovery, but retain isolation on every attempt
+				// and require the same terminal error once discovery completes.
+				if strings.Contains(viewResultText(t, res), indexer.ErrCheckoutMutationBusy.Error()) {
+					require.True(t, time.Now().Before(deadline), "checkout discovery did not finish: %s", viewResultText(t, res))
+					continue
+				}
+				assertToolError(t, res, graphview.CodeCheckoutInaccessible)
+				break
+			}
 		})
 	}
 }
