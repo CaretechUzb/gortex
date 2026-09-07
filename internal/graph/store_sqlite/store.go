@@ -733,9 +733,9 @@ func hasGraphStoreTables(db *sql.DB) (bool, error) {
 // not shrink the file; explicit/final checkpoints use TRUNCATE instead.
 const (
 	walCheckpointInterval = 5 * time.Minute
-	// walCheckpointTimeout bounds explicit/final pool acquisition, contention
-	// retry, and SQLite execution. A caller gets an error instead of an
-	// unbounded shutdown or operator-command wait.
+	// walCheckpointTimeout bounds explicit maintenance pool acquisition,
+	// contention retry, and SQLite execution. Ordinary Close allows slow
+	// checkpoint I/O to finish before closing the connection pools.
 	walCheckpointTimeout = 10 * time.Second
 	// The periodic path is best-effort and one-shot. Its gate acquisition is a
 	// non-blocking TryLock; this context only protects an unexpected writer-pool
@@ -1024,7 +1024,11 @@ func (s *Store) Close() error {
 		if hadBulk {
 			checkpointErr = s.checkpointBulkWAL()
 		} else {
-			checkpointErr = s.CheckpointWAL()
+			// Close is a durability boundary, not an interactive checkpoint.
+			// A successful filesystem sync can exceed CheckpointWAL's deadline
+			// on a busy disk. Let it finish; withSQLiteBusyRetry still bounds
+			// repeated lock contention, and checkpoint errors remain fatal.
+			checkpointErr = s.checkpointWALWithContext(context.Background())
 		}
 	}
 	stmts := []*sql.Stmt{
