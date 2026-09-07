@@ -110,6 +110,74 @@ type contractLoaderAdapter struct {
 	graph.Store
 }
 
+func TestLoadRegistrySparseScalarSymbolPresence(t *testing.T) {
+	factories := map[string]func(*testing.T) graph.Store{
+		"memory": func(t *testing.T) graph.Store { return graph.New() },
+		"sqlite": func(t *testing.T) graph.Store { return openContractLoaderSQLite(t) },
+	}
+	for backend, factory := range factories {
+		for _, explicitEmpty := range []bool{false, true} {
+			name := "absent"
+			if explicitEmpty {
+				name = "explicit_empty"
+			}
+			t.Run(backend+"/"+name, func(t *testing.T) {
+				g := factory(t)
+				owner := contracts.Contract{
+					ID: "sparse-contract", Type: contracts.ContractGRPC, Role: contracts.RoleConsumer,
+					SymbolID: "repo::client", FilePath: "repo/client.go", RepoPrefix: "repo",
+					WorkspaceID: "workspace", ProjectID: "project", Confidence: 0.9,
+					Meta: map[string]any{"service": "Users", "method": "Get"},
+				}
+				scalarMeta := map[string]any{
+					"type": string(owner.Type), "role": string(owner.Role),
+					"contract_meta": owner.Meta, "confidence": owner.Confidence,
+				}
+				if explicitEmpty {
+					scalarMeta["symbol_id"] = ""
+				}
+				g.AddBatch([]*graph.Node{
+					{ID: owner.SymbolID, Kind: graph.KindFunction, Name: "client", FilePath: owner.FilePath, RepoPrefix: owner.RepoPrefix},
+					{ID: owner.ID, Kind: graph.KindContract, Name: owner.ID, FilePath: owner.FilePath,
+						RepoPrefix: owner.RepoPrefix, WorkspaceID: owner.WorkspaceID, ProjectID: owner.ProjectID, Meta: scalarMeta},
+				}, []*graph.Edge{{
+					From: owner.SymbolID, To: owner.ID, Kind: graph.EdgeConsumes, FilePath: owner.FilePath,
+					Meta: map[string]any{
+						"contract_owner_repo_prefix": owner.RepoPrefix,
+						"contract_owner_workspace":   owner.WorkspaceID,
+						"contract_owner_project":     owner.ProjectID,
+						"contract_owner_type":        string(owner.Type),
+						"contract_owner_confidence":  owner.Confidence,
+						"contract_owner_meta":        owner.Meta,
+						"contract_owner_symbol_id":   owner.SymbolID,
+					},
+				}})
+				require.Len(t, g.GetInEdges(owner.ID), 1, "a genuine source owner must be persisted")
+				canonical := g.GetNodesByIDs([]string{owner.ID})[owner.ID]
+				require.NotNil(t, canonical)
+				_, symbolPresent := canonical.Meta["symbol_id"]
+				require.Equal(t, explicitEmpty, symbolPresent, "fixture must preserve absence versus explicit empty")
+				expected := []contracts.Contract{owner}
+				if explicitEmpty {
+					symbolLess := owner
+					symbolLess.SymbolID = ""
+					expected = append(expected, symbolLess)
+				}
+				for _, scoped := range []bool{false, true} {
+					var loaded *contracts.Registry
+					if scoped {
+						loaded = contracts.LoadRegistryFromGraphWithScope(g, "repo", "workspace", "project")
+					} else {
+						loaded = contracts.LoadRegistryFromGraph(g, "repo")
+					}
+					require.NotNil(t, loaded)
+					require.ElementsMatch(t, expected, loaded.ByID(owner.ID), "full records, scoped=%v", scoped)
+				}
+			})
+		}
+	}
+}
+
 func TestLoadRegistryFromGraphProjectionEquivalent(t *testing.T) {
 	factories := map[string]func(*testing.T) graph.Store{
 		"memory": func(t *testing.T) graph.Store { return graph.New() },

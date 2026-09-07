@@ -144,6 +144,7 @@ func loadRegistryFromGraph(g graph.Store, repoPrefix, workspaceID, projectID str
 			}
 		}
 	}
+	var sparseOwnerIdentities map[persistedContractRecordKey]struct{}
 	ids = ids[:0]
 	for id := range nodes {
 		ids = append(ids, id)
@@ -165,7 +166,23 @@ func loadRegistryFromGraph(g graph.Store, repoPrefix, workspaceID, projectID str
 			// indexer's scope even when stale scalar scope is populated.
 			c.RepoPrefix, c.WorkspaceID, c.ProjectID = repoPrefix, workspaceID, projectID
 		}
-		if _, ownerExists := ownerIdentities[persistedContractKey(c)]; !ownerExists {
+		key := persistedContractKey(c)
+		_, ownerExists := ownerIdentities[key]
+		if _, symbolPresent := node.Meta["symbol_id"]; !symbolPresent && !ownerExists && len(ownerIdentities) > 0 {
+			// Missing symbol identity is sparse legacy data, unlike an
+			// explicitly empty string. Modern owner-backed loads never
+			// allocate this fallback index; build it only once if needed.
+			if sparseOwnerIdentities == nil {
+				sparseOwnerIdentities = make(map[persistedContractRecordKey]struct{}, len(ownerIdentities))
+				for ownerKey := range ownerIdentities {
+					ownerKey.symbol = ""
+					sparseOwnerIdentities[ownerKey] = struct{}{}
+				}
+			}
+			key.symbol = ""
+			_, ownerExists = sparseOwnerIdentities[key]
+		}
+		if !ownerExists {
 			add(c)
 		}
 	}
