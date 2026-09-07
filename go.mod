@@ -240,7 +240,7 @@ require (
 	github.com/jedib0t/go-pretty/v6 v6.8.3
 	github.com/knights-analytics/hugot v0.7.7
 	github.com/ledongthuc/pdf v0.0.0-20250511090121-5959a4027728
-	github.com/mark3labs/mcp-go v0.58.0
+	github.com/mark3labs/mcp-go v1.0.0
 	github.com/muesli/termenv v0.16.0
 	github.com/pelletier/go-toml/v2 v2.4.3
 	github.com/pkoukk/tiktoken-go v0.1.8
