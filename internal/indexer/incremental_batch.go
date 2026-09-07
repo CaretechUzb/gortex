@@ -90,6 +90,13 @@ func (idx *Indexer) reindexIncrementalFilesBatched(
 ) (DerivedInvalidationPlan, []string, []string, []string) {
 	idx.loadFileIndexFailures()
 	defer idx.flushFileIndexFailures()
+	// Capture persisted ownership before a deletion or structural reparse
+	// retires its source edges. Later contract refresh uses this registry to
+	// describe removed records and schedule the existing derived frontier.
+	// A true no-op batch must not hydrate any contract state.
+	if len(staleFiles) > 0 || len(deletedFiles) > 0 {
+		idx.ensureIncrementalContractRegistry()
+	}
 	var invalidation DerivedInvalidationPlan
 	deleteTiming := startReconcilePhase(idx.logger, idx.repoPrefix, "graph_delete",
 		zap.Int("deleted_files", len(deletedFiles)))
@@ -837,7 +844,7 @@ func (idx *Indexer) commitStructuralIncrementalBatch(
 ) {
 	deferResolverCatchup := markerBatch != nil && markerBatch.deferResolverCatchup
 	paths := make([]string, 0, len(stages))
-	oldNodeIDs := make([]string, 0)
+	oldFTSNodeIDs := make([]string, 0)
 	oldFuncIDs := make([]string, 0)
 	var nodes []*graph.Node
 	var edges []*graph.Edge
@@ -851,7 +858,9 @@ func (idx *Indexer) commitStructuralIncrementalBatch(
 			if node == nil {
 				continue
 			}
-			oldNodeIDs = append(oldNodeIDs, node.ID)
+			if node.Kind != graph.KindContract {
+				oldFTSNodeIDs = append(oldFTSNodeIDs, node.ID)
+			}
 			idx.removeFromSearch(node)
 			if node.Kind == graph.KindFunction || node.Kind == graph.KindMethod {
 				oldFuncIDs = append(oldFuncIDs, node.ID)
@@ -860,7 +869,9 @@ func (idx *Indexer) commitStructuralIncrementalBatch(
 	}
 
 	restubIncomingRefsFromView(idx.graph, stages, view)
-	idx.deleteSymbolFTS(oldNodeIDs)
+	// Canonical FTS lifetime follows the backend's atomic owner decision.
+	// Retained contracts keep existing rows; actual orphans are deleted there.
+	idx.deleteSymbolFTS(oldFTSNodeIDs)
 	evictFilesBatched(idx.graph, paths)
 	idx.graph.AddBatch(nodes, edges)
 
@@ -1540,6 +1551,9 @@ func (idx *Indexer) evictFileIncrementalRaw(relPath string) forcedFileEviction {
 	// bounded deletion core is idempotent and must still clear orphan mtimes,
 	// search content, ref facts, contracts, and enrichment state.
 	dependencyFiles := idx.semanticDependencyFrontierForDeletedFiles([]string{relPath})
+	// Once source ownership edges disappear, a reopened registry cannot
+	// recover this file's records from a sibling's canonical scalar payload.
+	idx.ensureIncrementalContractRegistry()
 	var invalidation DerivedInvalidationPlan
 	nodesRemoved, edgesRemoved := idx.evictDeletedFilesBatched([]string{relPath}, &invalidation)
 	graphPath := idx.prefixPath(relPath)
@@ -1608,7 +1622,7 @@ func (idx *Indexer) evictDeletedFilesBatched(deleted []string, plan *DerivedInva
 		}
 		nodesByFile := idx.graph.GetFileNodesByPaths(graphPaths)
 		stages := make([]*incrementalBatchStage, 0, len(graphPaths))
-		var nodeIDs []string
+		var nodeIDs, ftsNodeIDs []string
 		for i, graphPath := range graphPaths {
 			priorNodes := nodesByFile[graphPath]
 			stage := &incrementalBatchStage{graphPath: graphPath, priorNodes: priorNodes}
@@ -1624,6 +1638,9 @@ func (idx *Indexer) evictDeletedFilesBatched(deleted []string, plan *DerivedInva
 					continue
 				}
 				nodeIDs = append(nodeIDs, node.ID)
+				if node.Kind != graph.KindContract {
+					ftsNodeIDs = append(ftsNodeIDs, node.ID)
+				}
 				idx.removeFromSearch(node)
 			}
 			_ = i
@@ -1635,7 +1652,8 @@ func (idx *Indexer) evictDeletedFilesBatched(deleted []string, plan *DerivedInva
 		)
 		restubIncomingRefsFromView(idx.graph, stages, view)
 		idx.deleteEnrichmentByNodeIDs(nodeIDs)
-		idx.deleteSymbolFTS(nodeIDs)
+		// Canonical FTS lifetime is decided with its owners in the backend.
+		idx.deleteSymbolFTS(ftsNodeIDs)
 		idx.deleteRefFactsForFiles(idx.repoPrefix, graphPaths)
 		idx.deleteIncrementalSidecars(graphPaths)
 		idx.clearIncrementalContent(graphPaths)
