@@ -131,6 +131,20 @@ func ReplaceContractOwners(store Store, replacement ContractOwnerReplacement) (C
 	return result, nil
 }
 
+// ContractOwnerScalarLiveness advertises a nonmutating guarantee about owner
+// replacement. A true result means removed legacy scalar records are invalidated
+// conditionally in the same protected replacement boundary. Merely implementing
+// ContractOwnerReplacer does not imply this stronger, newer guarantee.
+// Adapters overriding mutation methods must preserve this contract before
+// forwarding true, including methods promoted through concrete embedding.
+type ContractOwnerScalarLiveness interface {
+	ContractOwnerScalarLivenessGuaranteed() bool
+}
+
+// ContractOwnerScalarLivenessGuaranteed reports the conditional scalar
+// invalidation performed by Graph's protected owner-replacement lifecycle.
+func (g *Graph) ContractOwnerScalarLivenessGuaranteed() bool { return true }
+
 // ContractOwnerScalarInvalidator invalidates a removed scalar record only if
 // that record still belongs to the exact replacement repository/file frontier.
 // It is a conditional node mutation, not an atomic replacement of owner edges.
