@@ -9,6 +9,10 @@ import (
 
 var _ graph.ContractOwnerReplacer = (*Store)(nil)
 
+// ContractOwnerScalarLivenessGuaranteed reports the conditional legacy scalar
+// invalidation performed inside ReplaceContractOwners' existing transaction.
+func (s *Store) ContractOwnerScalarLivenessGuaranteed() bool { return true }
+
 // ReplaceContractOwners atomically replaces only the contract-ownership rows
 // emitted by an exact repository/file frontier. Canonical contract IDs may be
 // shared by several repositories, so stale edge deletion is guarded by both
@@ -132,11 +136,41 @@ WHERE (from_id IN (SELECT id FROM orphan)
 		}
 		result.EdgesRemoved += int(rows)
 
-		removed, execErr = tx.Exec(orphanContractIDs+`
-DELETE FROM nodes WHERE id IN (SELECT id FROM orphan) AND view_gen = ?`,
+		orphanRows, err := tx.Query(orphanContractIDs+`SELECT id FROM orphan`,
 			prunableJSON, s.viewGen, string(graph.KindContract),
 			string(graph.EdgeProvides), string(graph.EdgeConsumes), string(graph.EdgeHandlesRoute),
-			s.viewGen, s.viewGen)
+			s.viewGen)
+		if err != nil {
+			return graph.ContractOwnerReplaceResult{}, err
+		}
+		var orphanIDs []string
+		for orphanRows.Next() {
+			var id string
+			if err := orphanRows.Scan(&id); err != nil {
+				_ = orphanRows.Close()
+				return graph.ContractOwnerReplaceResult{}, err
+			}
+			orphanIDs = append(orphanIDs, id)
+		}
+		if err := orphanRows.Err(); err != nil {
+			_ = orphanRows.Close()
+			return graph.ContractOwnerReplaceResult{}, err
+		}
+		if err := orphanRows.Close(); err != nil {
+			return graph.ContractOwnerReplaceResult{}, err
+		}
+		// Preserve the existing edge-delete then orphan-reevaluation order.
+		// Freeze the final node-deletion set so FTS and node cleanup agree
+		// within this transaction and selected payload generation.
+		if err := s.deleteSymbolFTSTx(tx, orphanIDs); err != nil {
+			return graph.ContractOwnerReplaceResult{}, err
+		}
+		frozenJSON, _ := projectionJSON(orphanIDs)
+		if frozenJSON == "" {
+			frozenJSON = "[]"
+		}
+		removed, execErr = tx.Exec(`DELETE FROM nodes
+WHERE id IN (SELECT CAST(value AS TEXT) FROM json_each(?)) AND view_gen = ?`, frozenJSON, s.viewGen)
 		if execErr != nil {
 			return graph.ContractOwnerReplaceResult{}, execErr
 		}
