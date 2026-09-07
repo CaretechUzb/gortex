@@ -2528,7 +2528,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	// same bytes would — save for the per-directory ignore files a snapshot
 	// cannot consult, which shouldExclude names and the producer state
 	// declares.
-	admitWalkedFile := func(wf walkedFile) {
+	admitWalkedFile := func(wf walkedFile, info os.FileInfo) {
 		if reason, skip := untrackedGate.skip(wf.lang, wf.path); skip {
 			skippedContentBytes += wf.size
 			relPath := idx.relKey(wf.path)
@@ -2543,6 +2543,12 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			skippedByContent = append(skippedByContent, skippedFile{
 				relPath: relPath, lang: wf.lang, size: wf.size, reason: reason,
 			})
+			// Content-policy stubs share the metadata-only, post-publication
+			// receipt boundary with size stubs. Snapshot and untracked-asset
+			// skips deliberately do not receive filesystem receipts here.
+			if info != nil && info.Mode().IsRegular() && supportsColdManifestReceipts(idx.graph) {
+				sizeReceipts = append(sizeReceipts, idx.coldSizeSkipReceipt(wf.path, info))
+			}
 			return
 		}
 		files = append(files, wf)
@@ -2564,7 +2570,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				})
 				return nil
 			}
-			admitWalkedFile(wf)
+			admitWalkedFile(wf, nil)
 			return nil
 		})
 	} else {
@@ -2623,7 +2629,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				lang:      adm.lang,
 				size:      info.Size(),
 				mtimeNano: info.ModTime().UnixNano(),
-			})
+			}, info)
 			return nil
 		})
 	}
@@ -9122,6 +9128,8 @@ func (idx *Indexer) changedSinceMtimesCensus(root string) (
 	}
 	idx.storeRootPath(absRoot)
 	sizeSkips := idx.sizeSkipCensusNodes()
+	contentGate := idx.newContentAdmissionGate()
+	var contentCandidates []contentPolicyCensusCandidate
 
 	diskFiles := make(map[string]bool)
 	projectionCandidates := make([]string, 0, 1)
@@ -9135,7 +9143,7 @@ func (idx *Indexer) changedSinceMtimesCensus(root string) (
 			}
 			return nil
 		}
-		_, supported := idx.effectiveLanguage(path, nil)
+		lang, supported := idx.effectiveLanguage(path, nil)
 		if !supported && !idx.isIncrementalContractManifest(path) {
 			return nil
 		}
@@ -9156,6 +9164,10 @@ func (idx *Indexer) changedSinceMtimesCensus(root string) (
 		oversize := supported && idx.config.MaxFileSize > 0 && info.Size() > idx.config.MaxFileSize
 		if idx.sizeSkipCensusIsStale(rel, info, oversize, sizeSkips) {
 			changed = append(changed, rel)
+		} else if !oversize && contentPolicyCensusAsset(contentGate, lang) {
+			contentCandidates = append(contentCandidates, contentPolicyCensusCandidate{
+				relPath: rel, lang: lang, size: info.Size(),
+			})
 		}
 		return nil
 	})
@@ -9163,6 +9175,8 @@ func (idx *Indexer) changedSinceMtimesCensus(root string) (
 		returned = true
 		return nil, nil, 0, walkErr
 	}
+
+	changed = append(changed, idx.staleContentPolicyFiles(contentGate, contentCandidates)...)
 
 	projectionRefresh := idx.staleGeneratedParserProjectionPaths(projectionCandidates)
 	changed = appendUniqueSorted(changed, projectionRefresh...)
