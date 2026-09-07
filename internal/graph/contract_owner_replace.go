@@ -99,12 +99,25 @@ func ReplaceContractOwners(store Store, replacement ContractOwnerReplacement) (C
 		return result, nil
 	}
 
+	scalarLivenessGuaranteed := false
+	if guarantee, ok := store.(ContractOwnerScalarLiveness); ok {
+		scalarLivenessGuaranteed = guarantee.ContractOwnerScalarLivenessGuaranteed()
+	}
+	removedOwnerIDs := make(map[string]struct{}, len(stale))
+	for _, edge := range stale {
+		removedOwnerIDs[edge.To] = struct{}{}
+	}
 	currentNodes := store.GetNodesByIDs(pruneIDs)
 	incoming := store.GetInEdgesByNodeIDs(pruneIDs)
 	orphanIDs := make([]string, 0, len(pruneIDs))
 	for _, id := range pruneIDs {
 		node := currentNodes[id]
-		if node != nil && node.Kind == KindContract {
+		_, removedOwner := removedOwnerIDs[id]
+		// Without a liveness guarantee, removing an actual owner makes an
+		// unmarked scalar ambiguous: it may belong to a previously removed
+		// owner. Preserve untouched scalar-only legacy records, but do not
+		// resurrect ambiguous records after their final owner disappears.
+		if node != nil && node.Kind == KindContract && (scalarLivenessGuaranteed || !removedOwner) {
 			removed, _ := node.Meta["contract_owner_removed"].(bool)
 			ownerBacked, _ := node.Meta["contract_owner_record"].(bool)
 			_, removedFile := files[node.FilePath]
