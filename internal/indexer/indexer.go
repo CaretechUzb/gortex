@@ -6774,72 +6774,8 @@ func (idx *Indexer) commitContracts(reg *contracts.Registry) {
 	idx.inlineEnvelopeShapes(reg)
 
 	all := reg.All()
-	nodes := make([]*graph.Node, 0, len(all))
-	edges := make([]*graph.Edge, 0, len(all))
-	for _, c := range all {
-		// dep::<module> nodes were materialised by extractGoModContracts
-		// before ResolveAll (so the import bridge could find them);
-		// re-emitting them here would PK-collide on backends whose bulk
-		// load is INSERT-only (the on-disk backend). The pre-pass is the single
-		// writer for that contract type.
-		if c.Type == contracts.ContractDependency {
-			continue
-		}
-		nodes = append(nodes, &graph.Node{
-			ID:          c.ID,
-			Kind:        graph.KindContract,
-			Name:        c.ID,
-			FilePath:    c.FilePath,
-			Language:    "contract",
-			RepoPrefix:  c.RepoPrefix,
-			WorkspaceID: c.EffectiveWorkspace(),
-			ProjectID:   c.EffectiveProject(),
-			Meta: map[string]any{
-				"type":          string(c.Type),
-				"role":          string(c.Role),
-				"symbol_id":     c.SymbolID,
-				"line":          c.Line,
-				"confidence":    c.Confidence,
-				"contract_meta": c.Meta,
-			},
-		})
-
-		if c.SymbolID == "" {
-			continue
-		}
-		edgeKind := graph.EdgeProvides
-		if c.Role == contracts.RoleConsumer {
-			edgeKind = graph.EdgeConsumes
-		}
-		edges = append(edges, &graph.Edge{
-			From:     c.SymbolID,
-			To:       c.ID,
-			Kind:     edgeKind,
-			FilePath: c.FilePath,
-			Line:     c.Line,
-			Meta:     contractOwnerEdgeMeta(c),
-		})
-		// Framework-layer EdgeHandlesRoute. Emitted alongside
-		// EdgeProvides for HTTP / gRPC / WS / GraphQL / topic
-		// providers so `analyze kind=routes` and other
-		// framework-aware tools walk one targeted edge instead
-		// of filtering EdgeProvides by contract type. Consumers
-		// (callers of routes) and non-route contract types (env,
-		// OpenAPI specs, DI tokens) intentionally skip this
-		// edge — they aren't route handlers.
-		if c.Role == contracts.RoleProvider && isRouteContractType(c.Type) {
-			routeMeta := contractOwnerEdgeMeta(c)
-			routeMeta["contract_type"] = string(c.Type)
-			edges = append(edges, &graph.Edge{
-				From:     c.SymbolID,
-				To:       c.ID,
-				Kind:     graph.EdgeHandlesRoute,
-				FilePath: c.FilePath,
-				Line:     c.Line,
-				Meta:     routeMeta,
-			})
-		}
-	}
+	nodes, edges, missingOwners := contractGraphRows(idx.graph, all, false)
+	idx.warnMissingContractOwners(missingOwners)
 
 	bulkStart := time.Now()
 	idx.bulkCommit(nodes, edges)
@@ -6855,6 +6791,14 @@ func (idx *Indexer) commitContracts(reg *contracts.Registry) {
 		zap.String("repo", repo),
 		zap.Int("count", len(all)),
 		zap.Duration("commit_bulk_elapsed", bulkElapsed))
+}
+
+func (idx *Indexer) warnMissingContractOwners(count int) {
+	if count == 0 {
+		return
+	}
+	idx.logger.Warn("contract records missing an admitted source owner",
+		zap.String("repo", idx.repoPrefix), zap.Int("count", count))
 }
 
 // recordContractStateMarker persists this repo's contract-tier completion
