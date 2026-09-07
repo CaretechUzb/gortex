@@ -148,8 +148,41 @@ type IndexError struct {
 	Error    string `json:"error"`
 }
 
+// Only root go.mod/go.work need deferred receipts. census is the existing
+// full-index candidate map, retained until authoritative pruning is safe.
+// Workers keep using successfulFiles; they never mutate this bundle.
+type coldManifestCensus struct {
+	ctx            context.Context
+	registry       *contracts.Registry
+	manifests      map[string]*coldManifestRead
+	census         map[string]int64
+	failed         bool
+	graphReady     bool
+	contractsReady bool
+}
+
+type coldManifestRead struct {
+	source          []byte
+	receipt         fileReadReceipt
+	err             error // never cleared inside this attempt
+	dependencyDone  bool
+	modulesDone     bool
+	modulesRequired bool
+}
+
+// deferredPassAttempt distinguishes deferred runs even when their expected
+// contract registry is nil. Access is protected by the repository mutation lane.
+type deferredPassAttempt struct {
+	indexer  *Indexer
+	registry *contracts.Registry
+	enrich   bool
+}
+
 // Indexer walks a repository and populates the graph.
 type Indexer struct {
+	pendingColdManifests *coldManifestCensus
+	deferredAttempt      *deferredPassAttempt
+
 	graph             graph.Store
 	fileIndexFailures fileIndexFailureState
 	parseErrorsMu     sync.RWMutex
@@ -1276,12 +1309,18 @@ func (idx *Indexer) MaybeSeedPendingEnrich() bool {
 // binding types are resolved in one batch from SQLite, with the provider's
 // compact string index as the in-memory-store fallback.
 func (idx *Indexer) runDeferredContracts() {
-	if idx.pendingContractReg == nil {
+	reg := idx.pendingContractReg
+	if reg == nil {
 		return
 	}
-	idx.extractExternalModules()
-	idx.extractDIContracts(idx.pendingContractReg)
-	idx.commitContracts(idx.pendingContractReg)
+	b := idx.coldManifestsForRegistry(reg)
+	idx.extractExternalModulesForCensus(reg)
+	idx.extractDIContracts(reg)
+	idx.commitContracts(reg)
+	if b != nil {
+		b.contractsReady = true
+		idx.finishColdManifests(b)
+	}
 	idx.pendingContractReg = nil
 	idx.deferredGoModDone = false
 }
@@ -2370,9 +2409,22 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, er
 // repository mutation lane.
 func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *IndexResult, retErr error) {
 	idx.loadFileIndexFailures()
+	idx.pendingColdManifests = nil // older attempts cannot publish into this one
+	idx.deferredAttempt = nil
+	var coldManifests *coldManifestCensus
+	var censusMtimes map[string]int64
+	var sizeReceipts []fileReadReceipt
+	sizeReceiptCtx := ctx
+	var fileFailed atomic.Bool
 	var successfulFiles sync.Map
 	recordFileOutcome := func(path string, err error) {
 		if err != nil {
+			fileFailed.Store(true)
+			if idx.contentSource() == nil && idx.isIncrementalContractManifest(path) {
+				if _, ok := idx.effectiveLanguage(path, nil); !ok {
+					idx.captureColdManifest(&coldManifests, ctx, path, err)
+				}
+			}
 			successfulFiles.Delete(path)
 			idx.noteFileIndexFailure(path, err)
 		} else {
@@ -2401,6 +2453,21 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			}
 		}
 		idx.flushFileIndexFailures()
+	}()
+	// Runs after shadow/FTS/vector publication and its panic recovery, but
+	// before the existing successful-file failure acknowledgements above.
+	defer func() {
+		defer func() {
+			if retErr != nil && idx.pendingColdManifests == coldManifests {
+				idx.pendingColdManifests = nil
+			}
+		}()
+		defer recoverIndexCtxRawStoragePanic(&result, &retErr)
+		published := retErr == nil && result != nil && censusMtimes != nil
+		if idx.finishColdSizeSkips(sizeReceiptCtx, sizeReceipts, censusMtimes, published) {
+			fileFailed.Store(true)
+		}
+		idx.finishColdIndexCensus(ctx, result, retErr, censusMtimes, coldManifests, fileFailed.Load())
 	}()
 	defer recoverIndexCtxRawStoragePanic(&result, &retErr)
 
@@ -2461,7 +2528,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	// same bytes would — save for the per-directory ignore files a snapshot
 	// cannot consult, which shouldExclude names and the producer state
 	// declares.
-	admitWalkedFile := func(wf walkedFile) {
+	admitWalkedFile := func(wf walkedFile, info os.FileInfo) {
 		if reason, skip := untrackedGate.skip(wf.lang, wf.path); skip {
 			skippedContentBytes += wf.size
 			relPath := idx.relKey(wf.path)
@@ -2476,6 +2543,12 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			skippedByContent = append(skippedByContent, skippedFile{
 				relPath: relPath, lang: wf.lang, size: wf.size, reason: reason,
 			})
+			// Content-policy stubs share the metadata-only, post-publication
+			// receipt boundary with size stubs. Snapshot and untracked-asset
+			// skips deliberately do not receive filesystem receipts here.
+			if info != nil && info.Mode().IsRegular() && supportsColdManifestReceipts(idx.graph) {
+				sizeReceipts = append(sizeReceipts, idx.coldSizeSkipReceipt(wf.path, info))
+			}
 			return
 		}
 		files = append(files, wf)
@@ -2497,7 +2570,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				})
 				return nil
 			}
-			admitWalkedFile(wf)
+			admitWalkedFile(wf, nil)
 			return nil
 		})
 	} else {
@@ -2525,7 +2598,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			if statErr != nil {
 				// Couldn't read FileInfo (race with deletion, broken
 				// symlink, …). Skip — the worker would fail too.
-				if !os.IsNotExist(statErr) && idx.admitWalkEntry(absRoot, path, -1, false).admit {
+				if !os.IsNotExist(statErr) && idx.admitScopedWalkFile(absRoot, path) {
 					recordFileOutcome(path, statErr)
 					walkFailures = append(walkFailures, IndexError{FilePath: path, Error: statErr.Error()})
 				}
@@ -2538,7 +2611,15 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				skippedBySize = append(skippedBySize, skippedFile{
 					relPath: idx.relKey(path), lang: adm.lang, size: info.Size(),
 				})
+				// Keep the walk's no-follow identity: a symlink cannot earn a
+				// target-follow receipt from its own DirEntry metadata.
+				if info.Mode().IsRegular() && supportsColdManifestReceipts(idx.graph) {
+					sizeReceipts = append(sizeReceipts, idx.coldSizeSkipReceipt(path, info))
+				}
 				return nil
+			}
+			if adm.lang == "" && idx.isIncrementalContractManifest(path) && !idx.shouldExclude(path, absRoot, false) {
+				idx.captureColdManifest(&coldManifests, ctx, path, nil)
 			}
 			if !adm.admit {
 				return nil
@@ -2548,7 +2629,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				lang:      adm.lang,
 				size:      info.Size(),
 				mtimeNano: info.ModTime().UnixNano(),
-			})
+			}, info)
 			return nil
 		})
 	}
@@ -3841,41 +3922,16 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	idx.emitContentSkipNodes(skippedByContent)
 	idx.emitParseFailedSkipNodes(parseFailedFiles)
 
-	// Populate fileMtimes for all detected files. Keyed through
-	// relKey so the mtime map agrees with the graph's file-node keys
-	// (and with the incremental / git-watcher paths) on the NFC form
-	// of every non-ASCII filename. Mtimes are the walk-time values
-	// captured via d.Info(); no per-file os.Stat round-trip here.
-	idx.mtimeMu.Lock()
-	idx.fileMtimes = make(map[string]int64, len(files))
-	idx.fileMtimesShared = false
+	// Keep the existing parser outcome ledger and walk-time versions.
+	// Publish only after the replacement graph and search indexes commit;
+	// newly admitted manifests have bounded version receipts.
+	censusMtimes = make(map[string]int64, len(files))
 	for _, f := range files {
-		if f.mtimeNano > 0 {
-			idx.fileMtimes[idx.relKey(f.path)] = f.mtimeNano
+		if _, ok := successfulFiles.Load(f.path); ok && f.mtimeNano > 0 {
+			censusMtimes[idx.relKey(f.path)] = f.mtimeNano
 		}
 	}
-	// Bulk persistence consumes the snapshot after mtimeMu is released.
-	// Publish it immutably so later mutations detach before writing.
-	idx.fileMtimesShared = true
-	mtimeSnapshot := idx.fileMtimes
-	idx.mtimeMu.Unlock()
 
-	// Persist the per-file mtimes through the store's optional
-	// FileMtime sidecar table. On the on-disk backend this lets warm
-	// restarts seed ReconcileRepoCtx without having to read them back
-	// out of the gob+gzip metadata snapshot; on the in-memory
-	// backend the capability isn't implemented and the assertion
-	// short-circuits.
-	//
-	// Multi-repo bug: when the shadow-swap path is active, idx.graph
-	// is the in-memory shadow graph at this point — graph.Graph does
-	// NOT implement FileMtimeWriter, so the type assertion fails and
-	// persistence is silently skipped. The actual disk store is
-	// the local diskTarget variable; checking it first ensures warm-
-	// restart-skip-reindex actually works. The defer that swaps
-	// idx.graph back to diskTarget runs LATER, when IndexCtx returns,
-	// so we can't rely on it here. Falls through to idx.graph for the
-	// non-shadow path.
 	idx.logger.Info("indexer: parse subphases",
 		zap.String("repo", idx.repoPrefix),
 		zap.Duration("wall", time.Since(parseWallStart)),
@@ -3885,41 +3941,6 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		zap.Duration("batch_workers", time.Duration(atomic.LoadInt64(&parseBatchNS))),
 		zap.Int("workers", workers),
 		zap.Int("files", totalFiles))
-	mtimeTarget := graph.Store(idx.graph)
-	if diskTarget != nil {
-		mtimeTarget = diskTarget
-	}
-	// Full-index persist is AUTHORITATIVE: replace the repo's entire mtime
-	// set so files deleted since the last index are pruned. An upsert-only
-	// write (BulkSetFileMtimes) leaves deleted-file rows behind, and warm-
-	// restart reconcile then detects them as phantom deletions on every
-	// restart — forcing a full re-track that never converges. Prefer the
-	// replace capability; fall back to upsert for backends without it.
-	if len(mtimeSnapshot) > 0 {
-		var perr error
-		persisted := false
-		authoritative := false
-		if r, ok := mtimeTarget.(graph.FileMtimeReplacer); ok {
-			perr, persisted, authoritative = r.ReplaceFileMtimes(idx.repoPrefix, mtimeSnapshot), true, true
-		} else if w, ok := mtimeTarget.(graph.FileMtimeWriter); ok {
-			perr, persisted = w.BulkSetFileMtimes(idx.repoPrefix, mtimeSnapshot), true
-		}
-		if persisted {
-			if perr != nil {
-				idx.markFileMtimePersistenceDirty()
-				idx.logger.Warn("persist file mtimes failed",
-					zap.String("repo", idx.repoPrefix), zap.Error(perr))
-			} else {
-				if authoritative {
-					idx.fileMtimePersistenceDirty.Store(false)
-				}
-				idx.logger.Info("persisted file mtimes",
-					zap.String("repo", idx.repoPrefix),
-					zap.Int("count", len(mtimeSnapshot)))
-			}
-		}
-
-	}
 
 	// Crash-safe content finalization is coupled to the completed authoritative
 	// walk above, not to mtimes. Snapshot ContentSources deliberately have no
@@ -3955,6 +3976,9 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	idx.totalDetected = len(files)
 	idx.lastIndexTime = time.Now()
 
+	if coldManifests != nil {
+		coldManifests.registry = contractReg
+	}
 	if idx.deferResolve.Load() {
 		// Multi-repo orchestrator runs these serially after wg.Wait()
 		// to avoid races on the shared graph between this goroutine's
@@ -4040,9 +4064,12 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		// nodes were available during ResolveAll's import-bridge pass;
 		// commitContracts is idempotent for those.
 		reporter.Report("extracting contracts", 0, 0)
-		idx.extractExternalModules()
+		idx.extractExternalModulesForCensus(contractReg)
 		idx.extractDIContracts(contractReg)
 		idx.commitContracts(contractReg)
+		if coldManifests != nil {
+			coldManifests.contractsReady = true
+		}
 
 		// Test-edge pass — runs once the call graph is final. Skipped
 		// under deferGlobalPasses so a batch caller can fold this into
@@ -6242,7 +6269,14 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	// comes from a content-addressed tree diff over the whole repo,
 	// then intersected back down to the requested scope.
 	if merkleMode {
-		for _, abs := range idx.merkleStaleFiles(absRoot, diskFiles) {
+		var merkleChanges []string
+		if fullRoot {
+			merkleChanges = idx.merkleStaleFiles(absRoot, diskFiles)
+		} else {
+			merkleScope := func(rel string) bool { return relPathInScope(rel, scopeRels) }
+			merkleChanges = idx.merkleStaleFilesInScope(absRoot, diskFiles, merkleScope)
+		}
+		for _, abs := range merkleChanges {
 			rel, relErr := filepath.Rel(absRoot, abs)
 			if relErr != nil {
 				continue
@@ -6752,72 +6786,8 @@ func (idx *Indexer) commitContracts(reg *contracts.Registry) {
 	idx.inlineEnvelopeShapes(reg)
 
 	all := reg.All()
-	nodes := make([]*graph.Node, 0, len(all))
-	edges := make([]*graph.Edge, 0, len(all))
-	for _, c := range all {
-		// dep::<module> nodes were materialised by extractGoModContracts
-		// before ResolveAll (so the import bridge could find them);
-		// re-emitting them here would PK-collide on backends whose bulk
-		// load is INSERT-only (the on-disk backend). The pre-pass is the single
-		// writer for that contract type.
-		if c.Type == contracts.ContractDependency {
-			continue
-		}
-		nodes = append(nodes, &graph.Node{
-			ID:          c.ID,
-			Kind:        graph.KindContract,
-			Name:        c.ID,
-			FilePath:    c.FilePath,
-			Language:    "contract",
-			RepoPrefix:  c.RepoPrefix,
-			WorkspaceID: c.EffectiveWorkspace(),
-			ProjectID:   c.EffectiveProject(),
-			Meta: map[string]any{
-				"type":          string(c.Type),
-				"role":          string(c.Role),
-				"symbol_id":     c.SymbolID,
-				"line":          c.Line,
-				"confidence":    c.Confidence,
-				"contract_meta": c.Meta,
-			},
-		})
-
-		if c.SymbolID == "" {
-			continue
-		}
-		edgeKind := graph.EdgeProvides
-		if c.Role == contracts.RoleConsumer {
-			edgeKind = graph.EdgeConsumes
-		}
-		edges = append(edges, &graph.Edge{
-			From:     c.SymbolID,
-			To:       c.ID,
-			Kind:     edgeKind,
-			FilePath: c.FilePath,
-			Line:     c.Line,
-			Meta:     contractOwnerEdgeMeta(c),
-		})
-		// Framework-layer EdgeHandlesRoute. Emitted alongside
-		// EdgeProvides for HTTP / gRPC / WS / GraphQL / topic
-		// providers so `analyze kind=routes` and other
-		// framework-aware tools walk one targeted edge instead
-		// of filtering EdgeProvides by contract type. Consumers
-		// (callers of routes) and non-route contract types (env,
-		// OpenAPI specs, DI tokens) intentionally skip this
-		// edge — they aren't route handlers.
-		if c.Role == contracts.RoleProvider && isRouteContractType(c.Type) {
-			routeMeta := contractOwnerEdgeMeta(c)
-			routeMeta["contract_type"] = string(c.Type)
-			edges = append(edges, &graph.Edge{
-				From:     c.SymbolID,
-				To:       c.ID,
-				Kind:     graph.EdgeHandlesRoute,
-				FilePath: c.FilePath,
-				Line:     c.Line,
-				Meta:     routeMeta,
-			})
-		}
-	}
+	nodes, edges, missingOwners := contractGraphRows(idx.graph, all, false)
+	idx.warnMissingContractOwners(missingOwners)
 
 	bulkStart := time.Now()
 	idx.bulkCommit(nodes, edges)
@@ -6833,6 +6803,14 @@ func (idx *Indexer) commitContracts(reg *contracts.Registry) {
 		zap.String("repo", repo),
 		zap.Int("count", len(all)),
 		zap.Duration("commit_bulk_elapsed", bulkElapsed))
+}
+
+func (idx *Indexer) warnMissingContractOwners(count int) {
+	if count == 0 {
+		return
+	}
+	idx.logger.Warn("contract records missing an admitted source owner",
+		zap.String("repo", idx.repoPrefix), zap.Int("count", count))
 }
 
 // recordContractStateMarker persists this repo's contract-tier completion
@@ -8772,10 +8750,23 @@ func readGoModModulePath(src []byte) string {
 // goes through the normal commit path which depends on a resolved
 // graph (UpgradeBareTypeRefs, resolveProviderHandlers).
 func (idx *Indexer) extractGoModContracts(reg *contracts.Registry) {
-	goModPath := filepath.Join(idx.rootPath, "go.mod")
-	goModSrc, err := idx.readFileContent(goModPath)
-	if err != nil {
-		return
+	var manifest *coldManifestRead
+	if b := idx.coldManifestsForRegistry(reg); b != nil {
+		manifest = b.manifests["go.mod"]
+	}
+	var goModSrc []byte
+	if manifest != nil {
+		if manifest.err != nil {
+			return
+		}
+		goModSrc = manifest.source
+	} else {
+		goModPath := filepath.Join(idx.rootPath, "go.mod")
+		var err error
+		goModSrc, err = idx.readFileContent(goModPath)
+		if err != nil {
+			return
+		}
 	}
 	goModExtractor := &contracts.GoModExtractor{TrackedRepos: idx.trackedRepoModules}
 	goModFilePath := "go.mod"
@@ -8814,6 +8805,9 @@ func (idx *Indexer) extractGoModContracts(reg *contracts.Registry) {
 	}
 	if len(nodes) > 0 {
 		idx.graph.AddBatch(nodes, nil)
+	}
+	if manifest != nil {
+		manifest.dependencyDone = true
 	}
 }
 
@@ -9139,6 +9133,9 @@ func (idx *Indexer) changedSinceMtimesCensus(root string) (
 		return nil, nil, 0, absErr
 	}
 	idx.storeRootPath(absRoot)
+	sizeSkips := idx.sizeSkipCensusNodes()
+	contentGate := idx.newContentAdmissionGate()
+	var contentCandidates []contentPolicyCensusCandidate
 
 	diskFiles := make(map[string]bool)
 	projectionCandidates := make([]string, 0, 1)
@@ -9152,7 +9149,8 @@ func (idx *Indexer) changedSinceMtimesCensus(root string) (
 			}
 			return nil
 		}
-		if _, ok := idx.effectiveLanguage(path, nil); !ok && !idx.isIncrementalContractManifest(path) {
+		lang, supported := idx.effectiveLanguage(path, nil)
+		if !supported && !idx.isIncrementalContractManifest(path) {
 			return nil
 		}
 		if idx.shouldExclude(path, absRoot, false) {
@@ -9163,8 +9161,19 @@ func (idx *Indexer) changedSinceMtimesCensus(root string) (
 		if filepath.Base(filepath.FromSlash(rel)) == "parser.c" {
 			projectionCandidates = append(projectionCandidates, rel)
 		}
-		if idx.IsStale(rel) {
+		// Reuse IsStale's stat for the current size policy as well as mtime.
+		info, statErr := os.Stat(path)
+		if statErr != nil {
 			changed = append(changed, rel)
+			return nil
+		}
+		oversize := supported && idx.config.MaxFileSize > 0 && info.Size() > idx.config.MaxFileSize
+		if idx.sizeSkipCensusIsStale(rel, info, oversize, sizeSkips) {
+			changed = append(changed, rel)
+		} else if !oversize && contentPolicyCensusAsset(contentGate, lang) {
+			contentCandidates = append(contentCandidates, contentPolicyCensusCandidate{
+				relPath: rel, lang: lang, size: info.Size(),
+			})
 		}
 		return nil
 	})
@@ -9172,6 +9181,8 @@ func (idx *Indexer) changedSinceMtimesCensus(root string) (
 		returned = true
 		return nil, nil, 0, walkErr
 	}
+
+	changed = append(changed, idx.staleContentPolicyFiles(contentGate, contentCandidates)...)
 
 	projectionRefresh := idx.staleGeneratedParserProjectionPaths(projectionCandidates)
 	changed = appendUniqueSorted(changed, projectionRefresh...)
