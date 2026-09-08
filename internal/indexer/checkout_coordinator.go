@@ -294,6 +294,32 @@ type CheckoutCoordinator struct {
 	// settledWithoutBuild and has no barrier.
 	cyclePreflight func(context.Context) (CheckoutCycle, bool)
 	cycleBarrier   func(context.Context)
+
+	// selectionDemand promotes a queued build independently of the debounce
+	// signal. mu guards initialization; the buffered channel coalesces demand.
+	selectionDemand chan struct{}
+}
+
+func (c *CheckoutCoordinator) selectionRequests() chan struct{} {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.selectionDemand == nil {
+		c.selectionDemand = make(chan struct{}, 1)
+	}
+	return c.selectionDemand
+}
+
+// PrioritizeSelection promotes queued work without cancelling an active build
+// or resetting the quiet window. A repeated request contributes at most one
+// buffered demand token; it does not schedule another reconcile cycle.
+func (c *CheckoutCoordinator) PrioritizeSelection() {
+	if c == nil {
+		return
+	}
+	select {
+	case c.selectionRequests() <- struct{}{}:
+	default:
+	}
 }
 
 // retainedCommitLayer is one commit generation kept for re-routing, keyed by
@@ -581,7 +607,7 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 	if through != 0 {
 		priority = ViewBuildInteractive
 	}
-	release, err := c.gate.Acquire(ctx, priority)
+	release, err := c.gate.AcquirePromotable(ctx, priority, c.selectionRequests())
 	if err != nil {
 		if errors.Is(err, ErrViewBuildQueueFull) {
 			c.logger.Debug("checkout coordinator: build deferred by admission capacity",

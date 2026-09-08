@@ -1685,6 +1685,7 @@ func (l *CheckoutLifecycle) ActivateCheckout(checkoutID, reason string) bool {
 	// closing or the id is empty (nudgeCheckout's fallback relies on false).
 	started, already := l.beginCheckoutActivation(checkoutID)
 	if already {
+		l.prioritizeCheckout(checkoutID)
 		return true
 	}
 	if !started {
@@ -1694,6 +1695,29 @@ func (l *CheckoutLifecycle) ActivateCheckout(checkoutID, reason string) bool {
 		zap.String("checkout", checkoutID), zap.String("reason", reason))
 	go l.activateCheckout(l.transitionCtx, checkoutID)
 	return true
+}
+
+// prioritizeCheckout reaches both registered loops and transition-owned loops
+// that have started but are not installed yet. Selection changes only their
+// admission priority; no registry lock is held while touching a coordinator.
+func (l *CheckoutLifecycle) prioritizeCheckout(checkoutID string) {
+	l.coordMu.Lock()
+	if l.coordinatorClosing {
+		l.coordMu.Unlock()
+		return
+	}
+	coordinator := l.coordinators[checkoutID]
+	if coordinator == nil || !coordinator.Running() {
+		coordinator = nil
+		for _, candidate := range l.started[checkoutID] {
+			if candidate.Running() {
+				coordinator = candidate
+				break
+			}
+		}
+	}
+	l.coordMu.Unlock()
+	coordinator.PrioritizeSelection()
 }
 
 // beginCheckoutActivation admits one activation. It returns (true, false) when
@@ -1761,6 +1785,7 @@ func (l *CheckoutLifecycle) activateCheckout(ctx context.Context, checkoutID str
 	// coordinator's quiet window and delay that build — the same starvation
 	// ActivateCheckout avoids on a live coordinator.
 	l.ensureCoordinator(ctx, primary.GraphID, checkout)
+	l.prioritizeCheckout(checkoutID)
 }
 
 // ensureCoordinator brings up the coordinator for one automatic checkout, or
