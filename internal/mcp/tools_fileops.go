@@ -1415,6 +1415,16 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 		// The URI stands in for the absolute path in the language probe: it
 		// carries the extension, and nothing can open it.
 		absPath = viewURI
+	} else if installedSkillPath(rawPath) {
+		// Gortex installs its own skills outside repository roots. Read those
+		// exact files without widening the resolver shared by mutation tools.
+		absPath = filepath.Clean(rawPath)
+		relPath = absPath
+		diskContent, physicalEvidence, err = s.readInstalledSkillFile(absPath)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		content = diskContent
 	} else {
 		var resolveErr error
 		absPath, relPath, resolveErr = s.resolveFilePath(ctx, rawPath)
