@@ -260,7 +260,10 @@ func (s *Server) handleGenerateSkill(ctx context.Context, req mcp.CallToolReques
 func buildSkillMarkdown(name, description string, refs []generateSkillRef, symbols []skillSymbol) string {
 	var b strings.Builder
 	b.WriteString("---\n")
-	b.WriteString("name: " + name + "\n")
+	// Both scalars are quoted and escaped: validateSkillNameComponent already
+	// keeps the name to a safe charset, but the frontmatter must be
+	// well-formed on its own terms rather than by trusting an upstream check.
+	b.WriteString("name: \"" + escapeYAMLDoubleQuoted(name) + "\"\n")
 	b.WriteString("description: \"" + escapeYAMLDoubleQuoted(description) + "\"\n")
 	b.WriteString("---\n\n")
 	b.WriteString("# " + name + "\n\n")
@@ -410,6 +413,14 @@ func collapseWhitespace(s string) string {
 func escapeYAMLDoubleQuoted(s string) string {
 	s = strings.ReplaceAll(s, `\`, `\\`)
 	s = strings.ReplaceAll(s, `"`, `\"`)
+	// Line breaks and tabs become escape sequences rather than riding into
+	// the file literally. A raw newline parses today only because a
+	// double-quoted scalar folds across lines; keeping the scalar on one
+	// physical line means the frontmatter does not depend on that folding
+	// behaviour being identical in every YAML reader that loads the skill.
+	s = strings.ReplaceAll(s, "\r", `\r`)
+	s = strings.ReplaceAll(s, "\n", `\n`)
+	s = strings.ReplaceAll(s, "\t", `\t`)
 	return s
 }
 
@@ -459,6 +470,22 @@ func validateSkillNameComponent(name string) error {
 		return fmt.Errorf("skill_name %q must be a single path component, not a path", name)
 	case name == ".", name == "..", filepath.Clean(name) != name:
 		return fmt.Errorf("skill_name %q must be a single path component, not a directory traversal", name)
+	}
+	// The name is also emitted as the YAML `name:` key and used as an
+	// on-disk directory name, so restrict it to the kebab-case charset the
+	// tool documents. Without this a newline in the name injects further
+	// frontmatter keys — `allowed-tools:` among them — into the generated
+	// SKILL.md, and the response payload then reports a skill_name that the
+	// file on disk does not declare. Deliberately ASCII: skill names are
+	// ecosystem identifiers, and every default derived here comes from
+	// sluggify, which already emits [a-z0-9-] only.
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '-', r == '_', r == '.':
+		default:
+			return fmt.Errorf("skill_name %q may only contain letters, digits, '-', '_' and '.' (got %q)", name, r)
+		}
 	}
 	return nil
 }
