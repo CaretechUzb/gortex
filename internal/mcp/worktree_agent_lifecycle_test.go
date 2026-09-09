@@ -175,7 +175,7 @@ func testNewWorktreeAgentLifecycle(t *testing.T, handshake bool) {
 	checkoutMutationGit(t, f.primary, "worktree", "add", "-b", "newly-added", root)
 	require.NoError(t, os.WriteFile(filepath.Join(root, "added.go"), []byte("package repo\n\nfunc NewlyDiscovered() {}\n"), 0o644))
 	started := time.Now()
-	deadline := started.Add(2 * time.Second)
+	deadline := started.Add(20 * time.Second)
 	if handshake {
 		// The daemon checks this before dispatching tools/call with the CWD.
 		ctx := WithSessionCWD(WithSessionID(context.Background(), "real-checkout-lifecycle"), root)
@@ -187,7 +187,7 @@ func testNewWorktreeAgentLifecycle(t *testing.T, handshake bool) {
 		first = f.facade(t, root, "search", map[string]any{
 			"operation": "symbols", "query": "Old", "options": map[string]any{"limit": 10},
 		})
-		require.Less(t, time.Since(callStarted), 2*time.Second, "each cold search must remain responsive")
+		require.Less(t, time.Since(callStarted), 6*time.Second, "each cold search must remain responsive")
 		if !first.IsError {
 			break
 		}
@@ -196,10 +196,10 @@ func testNewWorktreeAgentLifecycle(t *testing.T, handshake bool) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	require.False(t, first.IsError, "%+v", first.Content)
-	require.Less(t, time.Since(started), 2*time.Second, "cold search must not wait for indexing")
+	require.Less(t, time.Since(started), 20*time.Second, "cold search must resolve through the exact checkout")
 	freshness := resultFreshness(t, first)
-	require.Contains(t, freshness, "exact", "a cold fallback must identify whether it served the checkout: %+v", first.Content)
-	require.NotEmpty(t, lifecycleResultPayload(t, first)["results"], "the unchanged Old symbol must be available from the checkout or labeled base fallback")
+	require.Equal(t, true, freshness["exact"], "automatic cwd queries must not serve a base fallback for a half-built worktree: %+v", first.Content)
+	require.NotEmpty(t, lifecycleResultPayload(t, first)["results"], "the unchanged Old symbol must become available from the exact checkout")
 
 	var last *mcplib.CallToolResult
 	require.Eventually(t, func() bool {

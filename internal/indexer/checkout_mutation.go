@@ -25,8 +25,6 @@ var ErrCheckoutMutationPending = errors.New("indexer: checkout mutation refresh 
 // once the active checkout build releases its lane; no primary fallback writes.
 var ErrCheckoutMutationBusy = errors.New("indexer: checkout mutation lane is busy; retry")
 
-const checkoutMutationAdmissionTimeout = 250 * time.Millisecond
-
 // CheckoutMutation owns one checkout's physical build lane and route lock for
 // a source edit. Callers must Close it on every exit, including dry runs. It
 // never writes source itself and must not be used to update the primary corpus.
@@ -89,9 +87,7 @@ func (l *CheckoutLifecycle) BeginCheckoutMutation(ctx context.Context, checkoutI
 
 	waitCtx, cancel := checkoutMutationContext(ctx, c.lifetimeContext())
 	defer cancel()
-	admissionCtx, cancelAdmission := context.WithTimeout(waitCtx, checkoutMutationAdmissionTimeout)
-	defer cancelAdmission()
-	releaseGate, err := c.gate.Acquire(admissionCtx, ViewBuildInteractive)
+	releaseGate, err := c.gate.Acquire(waitCtx, ViewBuildInteractive)
 	if err != nil {
 		return nil, checkoutMutationAdmissionError(waitCtx, "shared view-build gate", err)
 	}
@@ -101,7 +97,7 @@ func (l *CheckoutLifecycle) BeginCheckoutMutation(ctx context.Context, checkoutI
 			releaseGate()
 		}
 	}()
-	if err := lockCheckoutMutationCycle(admissionCtx, c); err != nil {
+	if err := lockCheckoutMutationCycle(waitCtx, c); err != nil {
 		return nil, checkoutMutationAdmissionError(waitCtx, "checkout cycle lock", err)
 	}
 	cycleOwned := true
@@ -163,11 +159,8 @@ func (m *CheckoutMutation) Prepare(ctx context.Context) error {
 }
 
 func checkoutMutationAdmissionError(ctx context.Context, stage string, err error) error {
-	if ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
-		// The build gate is shared by independent checkouts and ref builds.
-		// A timeout there does not imply a source writer owns this checkout.
-		return fmt.Errorf("%w: waiting for %s (admission budget %s): %w",
-			ErrCheckoutMutationBusy, stage, checkoutMutationAdmissionTimeout, err)
+	if errors.Is(err, ErrViewBuildQueueFull) {
+		return fmt.Errorf("%w: waiting for %s: %w", ErrCheckoutMutationBusy, stage, err)
 	}
 	return err
 }

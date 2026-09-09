@@ -5,9 +5,10 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
-func TestCheckoutMutationContentionReportsAdmissionStage(t *testing.T) {
+func TestCheckoutMutationContentionWaitsForAdmissionInsteadOfRefusingActiveWork(t *testing.T) {
 	for _, stage := range []string{"shared view-build gate", "checkout cycle lock"} {
 		t.Run(stage, func(t *testing.T) {
 			f, c, lifecycle := newCheckoutMutationFixture(t)
@@ -30,33 +31,48 @@ func TestCheckoutMutationContentionReportsAdmissionStage(t *testing.T) {
 					release()
 				}
 			}()
-			lease, err := lifecycle.BeginCheckoutMutation(t.Context(), f.checkoutID, f.worktree, before.RouteEpoch)
-			if lease != nil {
-				lease.Close()
-				t.Fatal("busy checkout admitted a mutation")
+
+			type result struct {
+				lease *CheckoutMutation
+				err   error
 			}
-			if !errors.Is(err, ErrCheckoutMutationBusy) || !errors.Is(err, context.DeadlineExceeded) {
-				t.Fatalf("lost busy/deadline identity: %v", err)
+			resultc := make(chan result, 1)
+			go func() {
+				lease, err := lifecycle.BeginCheckoutMutation(t.Context(), f.checkoutID, f.worktree, before.RouteEpoch)
+				resultc <- result{lease: lease, err: err}
+			}()
+
+			select {
+			case got := <-resultc:
+				if got.lease != nil {
+					got.lease.Close()
+				}
+				t.Fatalf("mutation admission returned while %s was still held: %v", stage, got.err)
+			case <-time.After(2 * 250 * time.Millisecond):
 			}
-			if !strings.Contains(err.Error(), stage) || !strings.Contains(err.Error(), "250ms") {
-				t.Errorf("admission error omits stage or budget: %v", err)
-			}
+
 			if f.route() != before {
-				t.Fatal("refusal changed the route")
+				t.Fatal("waiting admission changed the route")
 			}
 			c.mu.Lock()
 			active := c.sourceMutations
 			c.mu.Unlock()
-			if active != 0 {
-				t.Fatalf("refusal leaked %d source mutation leases", active)
+			if active != 1 {
+				t.Fatalf("waiting admission should hold one tracked source mutation, got %d", active)
 			}
+
 			release()
 			release = nil
-			lease, err = lifecycle.BeginCheckoutMutation(t.Context(), f.checkoutID, f.worktree, before.RouteEpoch)
-			if err != nil {
-				t.Fatalf("admission did not recover after release: %v", err)
+
+			select {
+			case got := <-resultc:
+				if got.err != nil {
+					t.Fatalf("admission did not recover after release: %v", got.err)
+				}
+				got.lease.Close()
+			case <-time.After(5 * time.Second):
+				t.Fatal("mutation admission did not complete after contention released")
 			}
-			lease.Close()
 			if f.route() != before || c.gate.Stats().Active {
 				t.Fatal("dry-run admission leaked gate or changed route")
 			}
@@ -74,5 +90,18 @@ func TestCheckoutMutationAdmissionPreservesCallerCancellation(t *testing.T) {
 	}
 	if got := checkoutMutationAdmissionError(t.Context(), "shared view-build gate", ErrCheckoutMutationStale); got != ErrCheckoutMutationStale {
 		t.Fatalf("non-timeout admission error was replaced: %v", got)
+	}
+}
+
+func TestCheckoutMutationAdmissionReportsQueueFullAsBusy(t *testing.T) {
+	got := checkoutMutationAdmissionError(t.Context(), "shared view-build gate", &ViewBuildQueueFullError{
+		Priority: ViewBuildInteractive,
+		Limit:    1,
+	})
+	if !errors.Is(got, ErrCheckoutMutationBusy) || !errors.Is(got, ErrViewBuildQueueFull) {
+		t.Fatalf("queue-full admission did not preserve busy/queue identity: %v", got)
+	}
+	if !strings.Contains(got.Error(), "shared view-build gate") {
+		t.Fatalf("queue-full admission error omits stage: %v", got)
 	}
 }

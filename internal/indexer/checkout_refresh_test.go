@@ -400,21 +400,23 @@ func TestCheckoutRefreshHashRejectsOutsideAndReplacedPhysicalRoot(t *testing.T) 
 	}
 }
 
-func TestCheckoutMutationBusyAdmissionIsBounded(t *testing.T) {
+func TestCheckoutMutationConcurrentAdmissionIsBoundedByCaller(t *testing.T) {
 	f, _, l := newCheckoutMutationFixture(t)
 	m, err := l.BeginCheckoutMutation(t.Context(), f.checkoutID, f.worktree, f.route().RouteEpoch)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer m.Close()
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
 	started := time.Now()
-	other, err := l.BeginCheckoutMutation(t.Context(), f.checkoutID, f.worktree, f.route().RouteEpoch)
+	other, err := l.BeginCheckoutMutation(ctx, f.checkoutID, f.worktree, f.route().RouteEpoch)
 	if other != nil {
 		other.Close()
 		t.Fatal("admitted concurrent source mutation")
 	}
-	if !errors.Is(err, ErrCheckoutMutationBusy) || time.Since(started) > 2*time.Second {
-		t.Fatalf("unbounded or untyped admission: elapsed=%s error=%v", time.Since(started), err)
+	if !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrCheckoutMutationBusy) || time.Since(started) > 2*time.Second {
+		t.Fatalf("admission did not preserve caller deadline: elapsed=%s error=%v", time.Since(started), err)
 	}
 }
 

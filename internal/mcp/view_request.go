@@ -548,7 +548,7 @@ func (s *Server) viewForSessionCWD(ctx context.Context) (*requestView, error) {
 		return nil, err
 	}
 	requested := graphview.Selector{Kind: graphview.SelectorWorktree, CheckoutID: checkout.CheckoutID}
-	return s.materializeRequestView(ctx, requested, checkout, false)
+	return s.materializeRequestView(ctx, requested, checkout, true)
 }
 
 // A lookup error is not proof that the canonical corpus owns this CWD. Only
@@ -726,10 +726,9 @@ func (s *Server) viewForBaseSelector(ctx context.Context, selector graphview.Sel
 // materializeRequestView turns a routed checkout into the reader that answers
 // the request.
 //
-// strict separates the two callers. An explicit selector must fail rather than
-// answer about something else; a cwd binding falls back to the base corpus and
-// records why, so a half-built route degrades to today's answer instead of an
-// error — and never silently.
+// strict separates the callers. An explicit selector and an automatically bound
+// worktree CWD must fail rather than answer about another checkout; grace
+// fallback is reserved for explicitly allowed unavailable-checkout reads.
 func (s *Server) materializeRequestView(
 	ctx context.Context,
 	requested graphview.Selector,
