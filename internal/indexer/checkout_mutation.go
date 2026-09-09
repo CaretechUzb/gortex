@@ -93,7 +93,7 @@ func (l *CheckoutLifecycle) BeginCheckoutMutation(ctx context.Context, checkoutI
 	defer cancelAdmission()
 	releaseGate, err := c.gate.Acquire(admissionCtx, ViewBuildInteractive)
 	if err != nil {
-		return nil, checkoutMutationAdmissionError(waitCtx, err)
+		return nil, checkoutMutationAdmissionError(waitCtx, "shared view-build gate", err)
 	}
 	gateOwned := true
 	defer func() {
@@ -102,7 +102,7 @@ func (l *CheckoutLifecycle) BeginCheckoutMutation(ctx context.Context, checkoutI
 		}
 	}()
 	if err := lockCheckoutMutationCycle(admissionCtx, c); err != nil {
-		return nil, checkoutMutationAdmissionError(waitCtx, err)
+		return nil, checkoutMutationAdmissionError(waitCtx, "checkout cycle lock", err)
 	}
 	cycleOwned := true
 	defer func() {
@@ -162,9 +162,12 @@ func (m *CheckoutMutation) Prepare(ctx context.Context) error {
 	return nil
 }
 
-func checkoutMutationAdmissionError(ctx context.Context, err error) error {
+func checkoutMutationAdmissionError(ctx context.Context, stage string, err error) error {
 	if ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
-		return fmt.Errorf("%w: %w", ErrCheckoutMutationBusy, err)
+		// The build gate is shared by independent checkouts and ref builds.
+		// A timeout there does not imply a source writer owns this checkout.
+		return fmt.Errorf("%w: waiting for %s (admission budget %s): %w",
+			ErrCheckoutMutationBusy, stage, checkoutMutationAdmissionTimeout, err)
 	}
 	return err
 }
