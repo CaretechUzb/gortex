@@ -13,9 +13,15 @@ The replacement admits only the audited checkout-aware write paths.
 
 ## Safety and freshness
 
-- Admission obtains the existing checkout coordinator's interactive build
-  admission and reconciliation lock. It verifies that the checkout and the
-  route epoch still match the view used to interpret the edit.
+- Admission obtains the existing checkout coordinator's reconciliation lock,
+  not the daemon's shared build lane: a lease builds nothing, so another
+  checkout's build in progress does not delay an edit here. When that lock is
+  held, it checks the checkout's disk against the routed generations before
+  waiting, so a moved HEAD or a changed working tree is refused as stale at
+  once rather than after the rebuild that state has queued. An edit waits only
+  for its own checkout's work, bounded by the caller deadline. Under the lock
+  it verifies that the checkout, the route epoch and the disk snapshot still
+  match the view used to interpret the edit.
 - File targets must belong to that checkout, including after resolving symlinks
   and existing parent directories. Absolute primary/sibling paths, nested Git
   repositories, and Git metadata are refused rather than redirected.

@@ -220,10 +220,10 @@ func TestCheckoutMutationCloseJoinsLeaseAndCancelsWaitingAdmission(t *testing.T)
 
 func TestCheckoutMutationAdmissionCancellationReleasesResources(t *testing.T) {
 	f, c, l := newCheckoutMutationFixture(t)
-	block, err := c.gate.Acquire(t.Context(), ViewBuildBackground)
-	if err != nil {
-		t.Fatal(err)
-	}
+	// The cycle lock is the only thing admission waits on; the shared build
+	// lane is not an admission stage (checkout_mutation_lane_test.go).
+	c.cycleMu.Lock()
+	block := c.cycleMu.Unlock
 	ctx, cancel := context.WithTimeout(t.Context(), 25*time.Millisecond)
 	defer cancel()
 	if m, err := l.BeginCheckoutMutation(ctx, f.checkoutID, f.worktree, f.route().RouteEpoch); !errors.Is(err, context.DeadlineExceeded) {
@@ -248,9 +248,10 @@ func TestCheckoutMutationAdmissionCancellationReleasesResources(t *testing.T) {
 
 func TestCheckoutMutationAdmissionPanicReleasesResources(t *testing.T) {
 	f, c, l := newCheckoutMutationFixture(t)
-	// A backend panic recovered by MCP must not strand the shared build gate
-	// or the checkout route lock. A missing coordinator catalog injects failure after
-	// both locks have been acquired, without changing the production path.
+	// A backend panic recovered by MCP must not strand the checkout route lock,
+	// and admission must not have touched the shared build gate at all. A
+	// missing coordinator catalog injects failure after the lock has been
+	// acquired, without changing the production path.
 	catalog := c.catalog
 	c.catalog = nil
 	var panicValue any

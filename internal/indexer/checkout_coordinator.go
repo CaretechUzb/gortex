@@ -607,6 +607,22 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 	if through != 0 {
 		priority = ViewBuildInteractive
 	}
+	// Lock, then lane: the order every builder uses (RehomeTo, a lease's
+	// Refresh), so a lease that holds this lock while it queues for the lane is
+	// never waited on by a lane owner. The lock is held through the queue. A
+	// settled poll never gets here, and an edit on a checkout that needs a
+	// build is refused before it waits on this lock: view_building on a
+	// withdrawn route, stale on a moved HEAD or changed tree
+	// (refuseStaleAdmission). What remains behind the lock is this checkout's
+	// own work. The wait itself is cancellable, so stop and shutdown still
+	// reach a loop parked here.
+	if err := acquireCycleLock(ctx, c); err != nil {
+		out := CheckoutCycle{Err: err}
+		recordCoordinatorCycle(out)
+		c.reportCheckoutCycle(ctx, through, out)
+		return
+	}
+	defer c.cycleMu.Unlock()
 	release, err := c.gate.AcquirePromotable(ctx, priority, c.selectionRequests())
 	if err != nil {
 		if errors.Is(err, ErrViewBuildQueueFull) {
@@ -624,9 +640,6 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 		return
 	}
 	defer release()
-
-	c.cycleMu.Lock()
-	defer c.cycleMu.Unlock()
 	if c.cycleBarrier != nil {
 		c.cycleBarrier(ctx)
 	}
@@ -825,14 +838,17 @@ func (c *CheckoutCoordinator) RehomeTo(ctx context.Context, graphID string) (Che
 		stopLifetimeCancel()
 		cancel()
 	}()
+	// Lock before lane, as cycle does; the rebuild budget and the coordinator
+	// lifetime bound the lock wait as they bound the lane wait.
+	if err := acquireCycleLock(ctx, c); err != nil {
+		return out, fmt.Errorf("indexer: wait for checkout route lock: %w", err)
+	}
+	defer c.cycleMu.Unlock()
 	release, err := c.gate.Acquire(ctx, ViewBuildInteractive)
 	if err != nil {
 		return out, fmt.Errorf("indexer: wait for checkout build admission: %w", err)
 	}
 	defer release()
-
-	c.cycleMu.Lock()
-	defer c.cycleMu.Unlock()
 
 	dedicated, found, err := c.catalog.GetDedicatedGraph(ctx, graphID)
 	if err != nil {
