@@ -175,6 +175,64 @@ func TestReconcileRepoCtxUsesCleanCensusNoOp(t *testing.T) {
 	assert.Equal(t, "census_noop", entries[0].ContextMap()["route"])
 }
 
+func TestReconcileRepoCtxRetriesPersistedFailuresWithUnchangedMtimes(t *testing.T) {
+	root := t.TempDir()
+	for _, name := range []string{"main.go", "other.go", "third.go"} {
+		writeFile(t, filepath.Join(root, name), "package sample\n")
+	}
+	entry := config.RepoEntry{Path: root, Name: "repo"}
+	cm := newTestConfigManager(t)
+	cm.Global().Repos = []config.RepoEntry{entry}
+	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "store.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	seed := NewMultiIndexer(graph.Store(store), newTestRegistry(), search.NewNull(), cm, zap.NewNop())
+	_, err = seed.IndexAll()
+	require.NoError(t, err)
+	prior := seed.GetIndexer("repo").FileMtimes()
+	require.NoError(t, store.ReplaceFileIndexFailures("repo", []graph.FileIndexFailure{
+		{RepoPrefix: "repo", Path: "repo/main.go", Error: "previous parser failure"},
+	}))
+
+	core, logs := observer.New(zap.DebugLevel)
+	restarted := NewMultiIndexer(graph.Store(store), newTestRegistry(), search.NewNull(), cm, zap.New(core))
+	result, err := restarted.ReconcileRepoCtx(t.Context(), entry, prior)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Equal(t, 1, result.StaleFileCount)
+	require.False(t, result.FullRetrack)
+	require.Empty(t, result.FailedFiles)
+	require.Empty(t, LoadFileIndexFailures(store, "repo"))
+	require.Equal(t, prior, restarted.GetIndexer("repo").FileMtimes())
+	entries := logs.FilterMessage("daemon: reconciled repo from snapshot").All()
+	require.Len(t, entries, 1)
+	require.Equal(t, "scoped", entries[0].ContextMap()["route"])
+}
+
+func TestChangedSinceMtimesCensusIncludesFailuresWithoutMtime(t *testing.T) {
+	for _, excluded := range []bool{false, true} {
+		t.Run(fmt.Sprintf("excluded=%v", excluded), func(t *testing.T) {
+			root := t.TempDir()
+			if excluded {
+				writeFile(t, filepath.Join(root, "failed.go"), "package sample\n")
+			}
+			store := graph.New()
+			require.NoError(t, store.ReplaceFileIndexFailures("repo", []graph.FileIndexFailure{
+				{RepoPrefix: "repo", Path: "repo/failed.go", Error: "previous parser failure"},
+			}))
+			idx := newTestIndexer(store)
+			idx.SetRepoPrefix("repo")
+			if excluded {
+				idx.SetExcludePatterns([]string{"failed.go"})
+			}
+			changed, deleted, _, err := idx.changedSinceMtimesCensus(root)
+			require.NoError(t, err)
+			require.Empty(t, changed)
+			require.Equal(t, []string{"failed.go"}, deleted)
+		})
+	}
+}
+
 func BenchmarkCleanReconcileDiscovery(b *testing.B) {
 	root := b.TempDir()
 	const files = 512

@@ -115,6 +115,16 @@ func (h *HTTPExtractor) extractFlaskDecoratorRoutes(filePath, text string, lines
 		}
 		receiver, path, rest := m[1], m[2], m[3]
 		lineNum := i + 1
+		odooRoute := false
+		for _, node := range fileNodes {
+			if node.StartLine == lineNum && node.Meta["odoo_kind"] == "route" {
+				odooRoute = true
+				break
+			}
+		}
+		if odooRoute {
+			continue
+		}
 
 		methods := flaskMethodsKwarg(rest)
 		if len(methods) == 0 {

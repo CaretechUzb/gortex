@@ -56,6 +56,9 @@ func RegisterAll(reg *parser.Registry) {
 	// detect_content.go.
 	reg.Register(NewMyBatisExtractor())
 	reg.Register(NewSpringContextExtractor())
+	reg.Register(&OdooDataExtractor{})
+	reg.Register(&OdooDataExtractor{CSV: true})
+	reg.Register(&CSVFileExtractor{})
 	reg.Register(NewMarkdownExtractor())
 	reg.Register(NewQuartoExtractor())
 	// Multimodal assets — image files and PDF documents become graph

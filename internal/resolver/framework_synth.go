@@ -298,6 +298,7 @@ func (s synthFunc) synthesizeScoped(g graph.Store, scope map[string]bool) int {
 // pass may be skipped only when its candidate domain contains none of the
 // listed language families.
 var frameworkSynthLanguageFamilies = map[string][]string{
+	SynthOdoo:                {"python", "web", "odoo"},
 	SynthSwiftObjC:           {"apple"},
 	SynthReactNative:         {"web", "apple", "jvm"},
 	SynthReactNativePair:     {"apple", "jvm"},
@@ -867,6 +868,8 @@ func frameworkLanguageFamily(language string) string {
 		return "rust"
 	case "python", "py":
 		return "python"
+	case "odoo_xml", "odoo_csv":
+		return "odoo"
 	case "ruby":
 		return "ruby"
 	case "php":
@@ -964,6 +967,7 @@ func frameworkSynthNodeGatesPass(name string, present, markers map[string]int) b
 // Native-bridge resolvers append to this slice.
 func defaultFrameworkSynthesizers() []FrameworkSynthesizer {
 	return []FrameworkSynthesizer{
+		synthFunc{name: SynthOdoo, fn: ResolveOdoo, scopedFn: ResolveOdooScoped},
 		synthFunc{name: SynthGRPCStub, fn: ResolveGRPCStubCalls, candFn: resolveGRPCStubCalls},
 		synthFunc{name: SynthTemporalStub, fn: ResolveTemporalCalls, candFn: resolveTemporalCalls},
 		synthFunc{name: SynthEventChannel, fn: ResolveEventChannelCalls},

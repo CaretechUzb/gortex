@@ -456,6 +456,7 @@ func (e *PythonExtractor) Extract(filePath string, src []byte) (*parser.Extracti
 	captureFnValueCandidates(result, root, filePath, src)
 	captureCeleryDispatch(result, root, filePath, src)
 	captureDjangoDescriptors(result, root, filePath, src)
+	captureOdooPython(result, root, filePath, src, imports)
 	captureFastAPIRouterRefs(result, root, filePath, src)
 	return result, nil
 }

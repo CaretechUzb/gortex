@@ -9200,7 +9200,22 @@ func (idx *Indexer) changedSinceMtimesCensus(root string) (
 		}
 	}
 	idx.mtimeMu.RUnlock()
-	sort.Strings(candidates)
+	// A prior parse/read failure is unfinished work even when its timestamp
+	// matches the snapshot. Include it before warmup can select census_noop;
+	// the incremental path will retry the read and clear only accepted receipts.
+	// Failure rows also inventory files that never acquired an mtime, so use
+	// them to discover deletions and newly excluded files as well.
+	for _, graphPath := range idx.fileIndexFailurePaths() {
+		if rel, ok := idx.graphPathRelKey(graphPath); ok {
+			if diskFiles[rel] {
+				changed = append(changed, rel)
+			} else {
+				candidates = append(candidates, rel)
+			}
+		}
+	}
+	changed = appendUniqueSorted(nil, changed...)
+	candidates = appendUniqueSorted(nil, candidates...)
 	for _, rel := range candidates {
 		absPath := filepath.Join(absRoot, filepath.FromSlash(rel))
 		_, statErr := os.Stat(absPath)

@@ -115,6 +115,7 @@ var ambiguousExtensions = map[string]bool{
 	".inc":  true,
 	".m":    true,
 	".xml":  true,
+	".csv":  true,
 }
 
 // ExtensionNeedsContentProbe reports whether a file's extension maps to
@@ -177,7 +178,14 @@ func sniffAmbiguous(filePath, ext string, content []byte) (string, bool) {
 		if hasMathematicaMarkers(probe) {
 			return "mathematica", true
 		}
+	case ".csv":
+		if hasOdooCSVMarkers(filePath, probe) {
+			return "odoo_csv", true
+		}
 	case ".xml":
+		if hasOdooXMLMarkers(probe) {
+			return "odoo_xml", true
+		}
 		// A MyBatis mapper / Spring beans XML routes to its specific
 		// extractor; every other .xml keeps the generic "xml" default.
 		if hasMyBatisMapperMarkers(probe) {
