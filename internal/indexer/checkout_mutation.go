@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/zzet/gortex/internal/gitstate"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/pathkey"
 )
@@ -21,22 +22,25 @@ var ErrCheckoutMutationStale = errors.New("indexer: checkout mutation view is st
 // routed generation. It does not mean the disk mutation was rolled back.
 var ErrCheckoutMutationPending = errors.New("indexer: checkout mutation refresh is pending")
 
-// ErrCheckoutMutationBusy refuses admission before source is written. Retry
-// once the active checkout build releases its lane; no primary fallback writes.
+// ErrCheckoutMutationBusy reports work that ran out of the caller's budget or
+// found a queue full, with the stage named. At admission, before source is
+// written, that is this checkout's cycle lock or the lock-free snapshot
+// pre-check that runs while the lock is held; in the synchronous Refresh,
+// after the disk commit, it is the shared build lane. Retry once the active
+// work releases what it holds; no primary fallback writes. A Refresh that
+// gave up leaves its withdrawn route for Close to reschedule.
 var ErrCheckoutMutationBusy = errors.New("indexer: checkout mutation lane is busy; retry")
 
-const checkoutMutationAdmissionTimeout = 250 * time.Millisecond
-
-// CheckoutMutation owns one checkout's physical build lane and route lock for
-// a source edit. Callers must Close it on every exit, including dry runs. It
-// never writes source itself and must not be used to update the primary corpus.
+// CheckoutMutation owns one checkout's route lock for a source edit; it takes
+// the shared build lane only inside Refresh, for the length of that build.
+// Callers must Close it on every exit, including dry runs. It never writes
+// source itself and must not be used to update the primary corpus.
 type CheckoutMutation struct {
 	mu              sync.Mutex
 	coordinator     *CheckoutCoordinator
 	checkout        store_sqlite.Checkout
 	rootInfo        os.FileInfo
 	route           store_sqlite.CheckoutRoute
-	release         func()
 	prepared        bool
 	fresh           bool
 	closed          bool
@@ -50,8 +54,24 @@ type CheckoutMutation struct {
 
 // BeginCheckoutMutation admits a source edit against the exact checkout route
 // the caller materialized. It changes neither disk nor catalog: a dry run may
-// simply close the lease. Gate-before-cycleMu matches background reconciliation
-// so an edit can never hold the route lock while waiting on a build that needs it.
+// simply close the lease.
+//
+// Admission takes only this checkout's cycle lock, never the daemon's one
+// physical build lane. A lease builds nothing on its own: Prepare withdraws a
+// route and EnqueueRefresh hands publication to the coordinator loop, so the
+// lane would only make every edit wait for whichever checkout happens to be
+// building. The one lease operation that does build, Refresh, queues for the
+// lane itself. Lock then lane is the order every builder uses (the
+// coordinator's cycle and RehomeTo included), so nothing that owns the lane
+// ever waits for this lock.
+//
+// Admission waits until the caller deadline or coordinator shutdown, without a
+// separate admission timeout. Dry runs take the same lease to validate the exact
+// route and disk snapshot; they may therefore also wait behind this checkout's
+// own work in progress (an explicit reindex of a tree the edit still matches,
+// say), but not behind another checkout's. A tree the coordinator is rebuilding
+// for is refused as stale before any wait, and a checkout being rehomed has no
+// coordinator registered, so that is refused at once as well.
 func (l *CheckoutLifecycle) BeginCheckoutMutation(ctx context.Context, checkoutID, expectedRoot string, expectedRouteEpoch int64) (*CheckoutMutation, error) {
 	if l == nil || l.catalog == nil || checkoutID == "" || expectedRoot == "" || expectedRouteEpoch <= 0 {
 		return nil, fmt.Errorf("%w: exact checkout identity and route epoch are required", ErrCheckoutMutationStale)
@@ -89,20 +109,22 @@ func (l *CheckoutLifecycle) BeginCheckoutMutation(ctx context.Context, checkoutI
 
 	waitCtx, cancel := checkoutMutationContext(ctx, c.lifetimeContext())
 	defer cancel()
-	admissionCtx, cancelAdmission := context.WithTimeout(waitCtx, checkoutMutationAdmissionTimeout)
-	defer cancelAdmission()
-	releaseGate, err := c.gate.Acquire(admissionCtx, ViewBuildInteractive)
-	if err != nil {
-		return nil, checkoutMutationAdmissionError(waitCtx, err)
-	}
-	gateOwned := true
-	defer func() {
-		if gateOwned {
-			releaseGate()
+	// A free lock is taken at once and everything is validated under it, as
+	// before. A held lock means this checkout's coordinator is queued for the
+	// lane or building, and while that rebuild is pending the route still
+	// serves the last coherent generation: reads look exact and an edit gets
+	// this far, but the lock is held for the whole wait and the edit would be
+	// refused as stale the moment it got the lock anyway. So before waiting,
+	// admission checks lock-free whether the tree still matches the routed
+	// view and refuses a stale one now. The check under the lock below stays
+	// the authority.
+	if !c.cycleMu.TryLock() {
+		if err := c.refuseStaleAdmission(waitCtx, expectedRouteEpoch); err != nil {
+			return nil, err
 		}
-	}()
-	if err := lockCheckoutMutationCycle(admissionCtx, c); err != nil {
-		return nil, checkoutMutationAdmissionError(waitCtx, err)
+		if err := acquireCycleLock(waitCtx, c); err != nil {
+			return nil, checkoutMutationAdmissionError(waitCtx, "checkout cycle lock", err)
+		}
 	}
 	cycleOwned := true
 	defer func() {
@@ -110,7 +132,7 @@ func (l *CheckoutLifecycle) BeginCheckoutMutation(ctx context.Context, checkoutI
 			c.cycleMu.Unlock()
 		}
 	}()
-	m := &CheckoutMutation{coordinator: c, checkout: checkout, rootInfo: rootInfo, release: releaseGate}
+	m := &CheckoutMutation{coordinator: c, checkout: checkout, rootInfo: rootInfo}
 	if err := m.validateCheckout(waitCtx); err != nil {
 		return nil, err
 	}
@@ -125,7 +147,7 @@ func (l *CheckoutLifecycle) BeginCheckoutMutation(ctx context.Context, checkoutI
 	if err := m.validateSnapshot(waitCtx); err != nil {
 		return nil, err
 	}
-	admitted, gateOwned, cycleOwned = false, false, false // Close now owns every acquired resource.
+	admitted, cycleOwned = false, false // Close now owns every acquired resource.
 	return m, nil
 }
 
@@ -162,9 +184,12 @@ func (m *CheckoutMutation) Prepare(ctx context.Context) error {
 	return nil
 }
 
-func checkoutMutationAdmissionError(ctx context.Context, err error) error {
-	if ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
-		return fmt.Errorf("%w: %w", ErrCheckoutMutationBusy, err)
+func checkoutMutationAdmissionError(ctx context.Context, stage string, err error) error {
+	// Preserve the retry diagnosis and the deadline identity for a wait that
+	// ran out. Explicit cancellation (including coordinator shutdown) remains
+	// cancellation, rather than a retryable lane-busy error.
+	if errors.Is(err, ErrViewBuildQueueFull) || errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("%w: waiting for %s: %w", ErrCheckoutMutationBusy, stage, err)
 	}
 	return err
 }
@@ -172,6 +197,12 @@ func checkoutMutationAdmissionError(ctx context.Context, err error) error {
 // Refresh publishes the edited checkout through its sparse coordinator, never
 // through the primary's incremental indexer. Nil error promises an active route
 // containing both resulting generations. A failure leaves a retry to Close.
+//
+// This is the one lease operation that builds, so it is the one that queues
+// for the shared build lane. It queues while holding the cycle lock, the same
+// lock-then-lane order the coordinator's own builds use. A wait that runs out
+// reports the same busy identity and stage admission used to, and leaves the
+// withdrawn route for Close to retry.
 func (m *CheckoutMutation) Refresh(ctx context.Context) (CheckoutCycle, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -183,6 +214,11 @@ func (m *CheckoutMutation) Refresh(ctx context.Context) (CheckoutCycle, error) {
 	if err := m.validateCheckout(ctx); err != nil {
 		return CheckoutCycle{}, err
 	}
+	releaseLane, err := m.coordinator.gate.Acquire(ctx, ViewBuildInteractive)
+	if err != nil {
+		return CheckoutCycle{}, checkoutMutationAdmissionError(ctx, "shared view-build gate", err)
+	}
+	defer releaseLane()
 	out := m.coordinator.reconcile(ctx)
 	recordCoordinatorCycle(out)
 	if out.Err != nil {
@@ -222,7 +258,6 @@ func (m *CheckoutMutation) Close() {
 		m.coordinator.Signal("source mutation needs a dirty generation refresh")
 	}
 	m.coordinator.cycleMu.Unlock()
-	m.release()
 	m.coordinator.releaseSourceMutation()
 }
 
@@ -269,23 +304,8 @@ func (m *CheckoutMutation) validateSnapshot(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("%w: sample checkout: %w", ErrCheckoutMutationStale, err)
 	}
-	base, err := c.primaryBase(ctx)
-	if err != nil {
+	if err := c.checkRoutedSnapshot(ctx, m.route, sample); err != nil {
 		return err
-	}
-	commit, found, err := c.catalog.GetViewGeneration(ctx, m.route.CommitGenerationID)
-	if err != nil {
-		return err
-	}
-	if !found || !servableGeneration(commit.State) || m.route.GraphID != base.graphID || generationRowKey(commit) != generationIdentityKey(c.commitIdentity(base, sample.HeadTree)) {
-		return fmt.Errorf("%w: checkout HEAD or primary base changed", ErrCheckoutMutationStale)
-	}
-	dirty, found, err := c.catalog.GetViewGeneration(ctx, m.route.DirtyGenerationID)
-	if err != nil {
-		return err
-	}
-	if !found || !servableGeneration(dirty.State) || dirty.BaseGenerationID != m.route.CommitGenerationID || dirty.LowerViewFingerprint != sample.Fingerprint {
-		return fmt.Errorf("%w: checkout disk changed; wait for a fresh view and retry", ErrCheckoutMutationStale)
 	}
 	if m.snapshotPinned && (m.headRef != sample.HeadRef || m.headCommit != sample.HeadCommit || m.headTree != sample.HeadTree) {
 		return fmt.Errorf("%w: checkout HEAD changed since source admission", ErrCheckoutMutationStale)
@@ -293,6 +313,59 @@ func (m *CheckoutMutation) validateSnapshot(ctx context.Context) error {
 	m.snapshotPinned = true
 	m.headRef, m.headCommit, m.headTree = sample.HeadRef, sample.HeadCommit, sample.HeadTree
 	return nil
+}
+
+// checkRoutedSnapshot refuses a sample the routed generations do not describe:
+// a HEAD the commit layer was not built for, or a working tree whose dirty
+// fingerprint the dirty layer does not carry. Under the cycle lock it is the
+// authority; refuseStaleAdmission also runs it lock-free so an edit does not
+// queue behind the very rebuild that makes it stale.
+func (c *CheckoutCoordinator) checkRoutedSnapshot(ctx context.Context, route store_sqlite.CheckoutRoute, sample gitstate.DirtySnapshot) error {
+	base, err := c.primaryBase(ctx)
+	if err != nil {
+		return err
+	}
+	commit, found, err := c.catalog.GetViewGeneration(ctx, route.CommitGenerationID)
+	if err != nil {
+		return err
+	}
+	if !found || !servableGeneration(commit.State) || route.GraphID != base.graphID || generationRowKey(commit) != generationIdentityKey(c.commitIdentity(base, sample.HeadTree)) {
+		return fmt.Errorf("%w: checkout HEAD or primary base changed", ErrCheckoutMutationStale)
+	}
+	dirty, found, err := c.catalog.GetViewGeneration(ctx, route.DirtyGenerationID)
+	if err != nil {
+		return err
+	}
+	if !found || !servableGeneration(dirty.State) || dirty.BaseGenerationID != route.CommitGenerationID || dirty.LowerViewFingerprint != sample.Fingerprint {
+		return fmt.Errorf("%w: checkout disk changed; wait for a fresh view and retry", ErrCheckoutMutationStale)
+	}
+	return nil
+}
+
+// refuseStaleAdmission is the lock-free half of admission's snapshot check. It
+// reads the route the caller materialized and the checkout's disk state
+// without holding the cycle lock, so a stale tree is refused at once instead
+// of after the coordinator's queued build. A route that is not active at the
+// expected epoch is the same refusal the locked check would give.
+func (c *CheckoutCoordinator) refuseStaleAdmission(ctx context.Context, expectedRouteEpoch int64) error {
+	route, found, err := c.catalog.GetCheckoutRoute(ctx, c.checkoutID)
+	if err != nil {
+		return err
+	}
+	if !found || route.State != store_sqlite.RouteActive || route.RouteEpoch != expectedRouteEpoch || route.CommitGenerationID <= 0 || route.DirtyGenerationID <= 0 {
+		return fmt.Errorf("%w: checkout route changed; read the current exact view and retry", ErrCheckoutMutationStale)
+	}
+	sample, err := c.sampler.Sample(ctx)
+	if err != nil {
+		// A deadline that runs out inside the git call is the caller's
+		// budget ending during admission, not a stale tree: report it the way
+		// a wait for the lock reports it, stage included.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return checkoutMutationAdmissionError(ctx, "checkout snapshot pre-check", ctxErr)
+		}
+		return fmt.Errorf("%w: sample checkout: %w", ErrCheckoutMutationStale, err)
+	}
+	return c.checkRoutedSnapshot(ctx, route, sample)
 }
 
 func checkoutMutationContext(ctx, lifetime context.Context) (context.Context, context.CancelFunc) {
@@ -307,9 +380,11 @@ func checkoutMutationContext(ctx, lifetime context.Context) (context.Context, co
 	return merged, func() { stop(); cancel() }
 }
 
-// TryLock polling avoids leaving an unbounded goroutine behind when a caller
-// cancels while another checkout transition owns cycleMu.
-func lockCheckoutMutationCycle(ctx context.Context, c *CheckoutCoordinator) error {
+// acquireCycleLock takes the coordinator's cycle lock or returns the context's
+// error. TryLock polling keeps the wait cancellable: a caller deadline, the
+// coordinator's lifetime and a rehome's rebuild budget all end it, and no
+// goroutine is left behind blocked on a Lock nobody can interrupt.
+func acquireCycleLock(ctx context.Context, c *CheckoutCoordinator) error {
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
