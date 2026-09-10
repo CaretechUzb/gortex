@@ -21,8 +21,9 @@ var ErrCheckoutMutationStale = errors.New("indexer: checkout mutation view is st
 // routed generation. It does not mean the disk mutation was rolled back.
 var ErrCheckoutMutationPending = errors.New("indexer: checkout mutation refresh is pending")
 
-// ErrCheckoutMutationBusy refuses admission before source is written. Retry
-// once the active checkout build releases its lane; no primary fallback writes.
+// ErrCheckoutMutationBusy refuses admission before source is written when the
+// queue is full or the caller deadline expires waiting for a build lane. Retry
+// once active work releases its lane; no primary fallback writes.
 var ErrCheckoutMutationBusy = errors.New("indexer: checkout mutation lane is busy; retry")
 
 // CheckoutMutation owns one checkout's physical build lane and route lock for
@@ -50,6 +51,9 @@ type CheckoutMutation struct {
 // the caller materialized. It changes neither disk nor catalog: a dry run may
 // simply close the lease. Gate-before-cycleMu matches background reconciliation
 // so an edit can never hold the route lock while waiting on a build that needs it.
+// Admission waits until the caller deadline or coordinator shutdown, without a
+// separate admission timeout. Dry runs take the same lease to validate the exact
+// route and disk snapshot; they may therefore also wait behind active builds.
 func (l *CheckoutLifecycle) BeginCheckoutMutation(ctx context.Context, checkoutID, expectedRoot string, expectedRouteEpoch int64) (*CheckoutMutation, error) {
 	if l == nil || l.catalog == nil || checkoutID == "" || expectedRoot == "" || expectedRouteEpoch <= 0 {
 		return nil, fmt.Errorf("%w: exact checkout identity and route epoch are required", ErrCheckoutMutationStale)
@@ -159,7 +163,10 @@ func (m *CheckoutMutation) Prepare(ctx context.Context) error {
 }
 
 func checkoutMutationAdmissionError(ctx context.Context, stage string, err error) error {
-	if errors.Is(err, ErrViewBuildQueueFull) {
+	// Preserve the retry diagnosis and the deadline identity for a wait that
+	// ran out. Explicit cancellation (including coordinator shutdown) remains
+	// cancellation, rather than a retryable lane-busy error.
+	if errors.Is(err, ErrViewBuildQueueFull) || errors.Is(err, context.DeadlineExceeded) {
 		return fmt.Errorf("%w: waiting for %s: %w", ErrCheckoutMutationBusy, stage, err)
 	}
 	return err

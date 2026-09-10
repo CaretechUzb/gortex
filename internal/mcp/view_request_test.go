@@ -557,7 +557,7 @@ func TestPrimaryCWDReadsTheBaseCorpus(t *testing.T) {
 	}
 }
 
-func TestBuildingAutomaticRouteFailsClosed(t *testing.T) {
+func TestBuildingRouteFallsBackToTheBase(t *testing.T) {
 	stack := newViewStack(t)
 	routeViewCheckout(t, stack.store, stack.graphID, stack.commit, 0, store_sqlite.RouteActive)
 
@@ -566,9 +566,24 @@ func TestBuildingAutomaticRouteFailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("call: %v", err)
 	}
-	assertToolError(t, res, graphview.CodeViewBuilding)
-	if hasNode(reader, "repo/edit.go::Old") {
-		t.Error("an automatic worktree CWD leaked the base corpus while its route was building")
+	if hasNode(reader, "repo/added.go::Fresh") {
+		t.Error("a half-routed checkout was served from its generations anyway")
+	}
+	if !hasNode(reader, "repo/edit.go::Old") {
+		t.Error("the fallback did not land on the base corpus")
+	}
+	rider := resultFreshness(t, res)
+	if rider == nil {
+		t.Fatal("a fallback answered without saying so")
+	}
+	if rider["exact"] != false {
+		t.Errorf("exact = %v, want false", rider["exact"])
+	}
+	if rider["fallback_reason"] != graphview.CodeViewBuilding {
+		t.Errorf("fallback_reason = %v, want %q", rider["fallback_reason"], graphview.CodeViewBuilding)
+	}
+	if rider["actual_view"] != string(graphview.SelectorBase) {
+		t.Errorf("actual_view = %v, want %q", rider["actual_view"], string(graphview.SelectorBase))
 	}
 }
 

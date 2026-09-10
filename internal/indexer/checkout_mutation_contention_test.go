@@ -3,6 +3,8 @@ package indexer
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -83,7 +85,7 @@ func TestCheckoutMutationContentionWaitsForAdmissionInsteadOfRefusingActiveWork(
 func TestCheckoutMutationAdmissionPreservesCallerCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	for _, cause := range []error{context.Canceled, context.DeadlineExceeded} {
+	for _, cause := range []error{context.Canceled} {
 		if got := checkoutMutationAdmissionError(ctx, "shared view-build gate", cause); got != cause {
 			t.Fatalf("caller cancellation was relabeled as contention: %v", got)
 		}
@@ -103,5 +105,68 @@ func TestCheckoutMutationAdmissionReportsQueueFullAsBusy(t *testing.T) {
 	}
 	if !strings.Contains(got.Error(), "shared view-build gate") {
 		t.Fatalf("queue-full admission error omits stage: %v", got)
+	}
+}
+
+func TestCheckoutMutationContentionDeadlineReportsBusyAndReleasesAdmission(t *testing.T) {
+	for _, stage := range []string{"shared view-build gate", "checkout cycle lock"} {
+		t.Run(stage, func(t *testing.T) {
+			f, c, lifecycle := newCheckoutMutationFixture(t)
+			before := f.route()
+			path := filepath.Join(f.worktree, "helper.go")
+			original, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var release func()
+			if stage == "shared view-build gate" {
+				release, err = c.gate.Acquire(t.Context(), ViewBuildBackground)
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				c.cycleMu.Lock()
+				release = c.cycleMu.Unlock
+			}
+			defer func() {
+				if release != nil {
+					release()
+				}
+			}()
+			ctx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
+			defer cancel()
+			lease, err := lifecycle.BeginCheckoutMutation(ctx, f.checkoutID, f.worktree, before.RouteEpoch)
+			if lease != nil {
+				lease.Close()
+				t.Fatal("admitted mutation while lane was held")
+			}
+			if !errors.Is(err, ErrCheckoutMutationBusy) || !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("contention deadline lost busy/deadline identity: %v", err)
+			}
+			if !strings.Contains(err.Error(), "lane is busy; retry") || !strings.Contains(err.Error(), stage) {
+				t.Fatalf("contention deadline lost actionable stage diagnosis: %v", err)
+			}
+			c.mu.Lock()
+			active := c.sourceMutations
+			c.mu.Unlock()
+			stats := c.gate.Stats()
+			if active != 0 || stats.InteractiveQueued != 0 || (stage == "checkout cycle lock" && stats.Active) {
+				t.Fatalf("canceled admission leaked resources: mutations=%d gate=%+v", active, stats)
+			}
+			current, err := os.ReadFile(path)
+			if err != nil || string(current) != string(original) || f.route() != before {
+				t.Fatalf("failed admission changed source or route: %v", err)
+			}
+			release()
+			release = nil
+			lease, err = lifecycle.BeginCheckoutMutation(t.Context(), f.checkoutID, f.worktree, before.RouteEpoch)
+			if err != nil {
+				t.Fatalf("retry after contention released failed: %v", err)
+			}
+			lease.Close()
+			if c.gate.Stats().Active || f.route() != before {
+				t.Fatal("retry dry run leaked gate or changed route")
+			}
+		})
 	}
 }

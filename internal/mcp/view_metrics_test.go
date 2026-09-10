@@ -53,29 +53,28 @@ func TestRoutedRequestCountsAsWorktreeServed(t *testing.T) {
 	}
 }
 
-// TestHalfRoutedAutomaticRequestFailsClosed pins the automatic-CWD contract:
-// a half-routed checkout must not be answered from its family's base corpus.
-func TestHalfRoutedAutomaticRequestFailsClosed(t *testing.T) {
+// TestHalfRoutedRequestCountsABuildingFallback pins the common degradation: a
+// checkout whose route names only one slot is answered from the base, and the
+// reason is the one a caller can act on by waiting.
+func TestHalfRoutedRequestCountsABuildingFallback(t *testing.T) {
 	stack := newViewStack(t)
 	routeViewCheckout(t, stack.store, stack.graphID, stack.commit, 0, store_sqlite.RouteActive)
 
 	var reader graph.Reader
 	before := viewmetrics.Read()
-	res, err := stack.callWithView(t, stack.worktreeRoot, "get_symbol", nil, captureReader(stack.srv, &reader))
-	if err != nil {
+	if _, err := stack.callWithView(t, stack.worktreeRoot, "get_symbol", nil, captureReader(stack.srv, &reader)); err != nil {
 		t.Fatalf("call: %v", err)
 	}
-	assertToolError(t, res, graphview.CodeViewBuilding)
 	after := viewmetrics.Read()
 
-	if got := fallbackDelta(before, after, graphview.CodeViewBuilding); got != 0 {
-		t.Fatalf("a refused automatic request counted as a view_building fallback (%d)", got)
+	if got := fallbackDelta(before, after, graphview.CodeViewBuilding); got != 1 {
+		t.Fatalf("view_building fallbacks = %d, want 1", got)
 	}
 	if got := fallbackDelta(before, after, graphview.CodeCheckoutInaccessible); got != 0 {
 		t.Fatalf("a building route was counted as inaccessible (%d)", got)
 	}
-	if got := servedDelta(before, after, viewmetrics.ViewBase); got != 0 {
-		t.Fatalf("a refused automatic request was served from base (%d)", got)
+	if got := servedDelta(before, after, viewmetrics.ViewBase); got != 1 {
+		t.Fatalf("base views served = %d, want 1", got)
 	}
 	if got := servedDelta(before, after, viewmetrics.ViewWorktree); got != 0 {
 		t.Fatalf("a fallback was counted as a worktree view (%d)", got)

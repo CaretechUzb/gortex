@@ -263,7 +263,7 @@ func TestCheckoutSourcePrimitivesStillRequireCoordinatorForPreview(t *testing.T)
 	require.True(t, hasNode(reader, "repo/added.go::Fresh"))
 }
 
-func TestBuildingCheckoutSourceMutationFailsClosed(t *testing.T) {
+func TestCheckoutSourceFallbackRemainsReadOnly(t *testing.T) {
 	stack := newViewStack(t)
 	routeViewCheckout(t, stack.store, stack.graphID, stack.commit, 0, store_sqlite.RouteActive)
 	for _, dryRun := range []bool{true, false} {
@@ -274,8 +274,8 @@ func TestBuildingCheckoutSourceMutationFailsClosed(t *testing.T) {
 				return mcplib.NewToolResultText(`{"ok":true}`), nil
 			})
 		require.NoError(t, err)
-		assertToolError(t, res, graphview.CodeViewBuilding)
-		require.False(t, ran, "a building automatic checkout must not grant permission to edit the primary checkout")
+		assertToolError(t, res, graphview.CodeViewReadOnly)
+		require.False(t, ran, "base fallback must not grant permission to edit the primary checkout")
 	}
 }
 

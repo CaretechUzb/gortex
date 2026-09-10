@@ -381,7 +381,6 @@ func TestCheckoutStaleDiscoveryProofNeverReturnsBaseData(t *testing.T) {
 	f := newRealCheckoutMutationFixture(t)
 	root := filepath.Join(filepath.Dir(f.primary), "stale-proof")
 	checkoutMutationGit(t, f.primary, "worktree", "add", "-b", "stale-proof", root)
-	require.NoError(t, os.WriteFile(filepath.Join(root, "edit.go"), []byte("package repo\n\nfunc StaleProofWorktree() {}\n"), 0o644))
 	var changed atomic.Bool
 	reconcile.WithHEADSampler(func(ctx context.Context, observedRoot string) (gitstate.HEADState, error) {
 		head, err := gitstate.SampleHEAD(ctx, observedRoot)
@@ -400,19 +399,14 @@ func TestCheckoutStaleDiscoveryProofNeverReturnsBaseData(t *testing.T) {
 		}
 		return head, nil
 	})(f.srv.lifecycle.Reconciler())
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(2 * time.Second)
 	for {
 		started := time.Now()
 		result := f.facade(t, root, "search", map[string]any{
 			"operation": "symbols", "query": "Old", "options": map[string]any{"limit": 10},
 		})
-		require.Less(t, time.Since(started), 6*time.Second)
-		if !result.IsError {
-			require.True(t, changed.Load(), "the real post-proof Git marker mutation must execute")
-			require.Equal(t, true, resultFreshness(t, result)["exact"], "a successful answer must come from the worktree, not base fallback: %+v", result.Content)
-			require.NotContains(t, viewResultText(t, result), `"id":"repo/edit.go::Old"`, "stale proof must not expose the primary's Old symbol: %+v", result.Content)
-			break
-		}
+		require.Less(t, time.Since(started), time.Second)
+		require.True(t, result.IsError, "stale proof must not expose the primary's Old symbol: %+v", result.Content)
 		if strings.Contains(viewResultText(t, result), graphview.CodeViewBuilding) {
 			require.True(t, time.Now().Before(deadline), "stale proof was never resolved")
 			time.Sleep(10 * time.Millisecond)

@@ -415,7 +415,7 @@ func TestCheckoutMutationConcurrentAdmissionIsBoundedByCaller(t *testing.T) {
 		other.Close()
 		t.Fatal("admitted concurrent source mutation")
 	}
-	if !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrCheckoutMutationBusy) || time.Since(started) > 2*time.Second {
+	if !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, ErrCheckoutMutationBusy) || time.Since(started) > 2*time.Second {
 		t.Fatalf("admission did not preserve caller deadline: elapsed=%s error=%v", time.Since(started), err)
 	}
 }
