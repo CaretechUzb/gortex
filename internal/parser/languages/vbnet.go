@@ -86,6 +86,7 @@ var (
 type vbRange struct {
 	name  string
 	id    string
+	kind  graph.NodeKind
 	start int
 	end   int
 }
@@ -187,7 +188,9 @@ func (e *VBNetExtractor) Extract(filePath string, src []byte) (*parser.Extractio
 			}
 			id := add(filePath+"::"+name, name, spec.kind, line, end, meta)
 			if id != "" {
-				types = append(types, vbRange{name: name, id: id, start: line, end: end})
+				types = append(types, vbRange{
+					name: name, id: id, kind: spec.kind, start: line, end: end,
+				})
 			}
 		}
 	}
@@ -202,6 +205,11 @@ func (e *VBNetExtractor) Extract(filePath string, src []byte) (*parser.Extractio
 	}
 
 	// --- Pass 2: members ----------------------------------------------------
+	// Interface method names, keyed by the interface's node ID (not its name --
+	// two interfaces in one file can share a name and still be distinct nodes).
+	// Stamped onto Meta["methods"] below, which is what the resolver's
+	// InferImplements reads to derive an interface's method set.
+	ifaceMethods := map[string][]string{}
 	// ownerAt returns the innermost type covering line. Members inside a type
 	// become methods owned by it; members at file scope stay free functions,
 	// which is the normal shape for VB's script-style top-level code.
@@ -250,6 +258,11 @@ func (e *VBNetExtractor) Extract(filePath string, src []byte) (*parser.Extractio
 				From: id, To: owner.id, Kind: graph.EdgeMemberOf,
 				FilePath: filePath, Line: line,
 			})
+			// Only Sub/Function count as the interface's method set; a
+			// Property is emitted as a field and an Event as an event.
+			if kind == graph.KindMethod && owner.kind == graph.KindInterface {
+				ifaceMethods[owner.id] = append(ifaceMethods[owner.id], name)
+			}
 		}
 	}
 
@@ -286,6 +299,21 @@ func (e *VBNetExtractor) Extract(filePath string, src []byte) (*parser.Extractio
 		line := lineAt(src, m[0])
 		add(filePath+"::"+name, name, graph.KindFunction, line, line,
 			map[string]any{"external": true})
+	}
+
+	// Stamp interface method names onto interface nodes' Meta["methods"],
+	// matching csharp.go so a VB interface supports the same IMPLEMENTS
+	// inference as a C# one.
+	for _, n := range result.Nodes {
+		if n.Kind != graph.KindInterface {
+			continue
+		}
+		if methods, ok := ifaceMethods[n.ID]; ok {
+			if n.Meta == nil {
+				n.Meta = make(map[string]any)
+			}
+			n.Meta["methods"] = methods
+		}
 	}
 
 	// --- Imports, inheritance, implementations ------------------------------

@@ -297,9 +297,10 @@ func TestVBNetExtractor_EmptyInput(t *testing.T) {
 func vbSnapshot(res *parser.ExtractionResult) string {
 	var b strings.Builder
 	for _, n := range res.Nodes {
-		fmt.Fprintf(&b, "N\t%s\t%s\t%s\t%d\t%d\t%v\t%v\t%v\n",
+		fmt.Fprintf(&b, "N\t%s\t%s\t%s\t%d\t%d\t%v\t%v\t%v\t%v\n",
 			n.ID, n.Kind, n.Name, n.StartLine, n.EndLine,
-			n.Meta["receiver"], n.Meta["visibility"], n.Meta["scope_ns"])
+			n.Meta["receiver"], n.Meta["visibility"], n.Meta["scope_ns"],
+			n.Meta["methods"])
 	}
 	for _, e := range res.Edges {
 		fmt.Fprintf(&b, "E\t%s\t%s\t%s\t%d\n", e.Kind, e.From, e.To, e.Line)
@@ -471,6 +472,11 @@ Public Module M
         Return Util.Compute(1)
     End Function
 End Module
+
+Public Interface IWork
+    Sub Start()
+    Function Stop() As Boolean
+End Interface
 `)
 	e := NewVBNetExtractor()
 	first, err := e.Extract("d.vb", src)
@@ -720,4 +726,68 @@ func TestVBNetExtractor_UnterminatedBlockExtent(t *testing.T) {
 	// With the class extent collapsed, M no longer sits inside it, so it is a
 	// free function. Documents the degradation shape.
 	assert.Equal(t, graph.KindFunction, m.Kind)
+}
+
+// Interface method sets feed the resolver's IMPLEMENTS inference, which reads
+// Meta["methods"] rather than member edges. csharp.go stamps this and VB
+// mirrors it, so a VB interface supports the same inference as a C# one.
+//
+// Only Sub and Function belong to that set: a Property is emitted as a field
+// and an Event as an event, and neither is part of an interface's callable
+// contract for this purpose.
+func TestVBNetExtractor_InterfaceMethodSet(t *testing.T) {
+	src := []byte(`Public Interface IShape
+    Function Area() As Double
+    Sub Draw()
+    Property Name As String
+    Event Changed()
+End Interface
+
+Public Interface IStore
+    Sub Save()
+End Interface
+
+Public Class Widget
+    Public Sub Helper()
+    End Sub
+End Class
+`)
+	res, err := NewVBNetExtractor().Extract("i.vb", src)
+	require.NoError(t, err)
+
+	shape := vbFind(res.Nodes, "IShape")
+	require.NotNil(t, shape)
+	require.Equal(t, graph.KindInterface, shape.Kind)
+
+	methods, ok := shape.Meta["methods"].([]string)
+	require.True(t, ok, `IShape must carry a []string Meta["methods"]`)
+	assert.ElementsMatch(t, []string{"Area", "Draw"}, methods)
+	assert.NotContains(t, methods, "Name", "a Property is not part of the method set")
+	assert.NotContains(t, methods, "Changed", "an Event is not part of the method set")
+
+	// A second interface in the same file keeps its own set -- the map is
+	// keyed on node ID, so same-named members across interfaces cannot merge.
+	store := vbFind(res.Nodes, "IStore")
+	require.NotNil(t, store)
+	assert.Equal(t, []string{"Save"}, store.Meta["methods"])
+
+	// A class is never stamped, even though its members are methods.
+	widget := vbFind(res.Nodes, "Widget")
+	require.NotNil(t, widget)
+	assert.Equal(t, graph.KindType, widget.Kind)
+	assert.Nil(t, widget.Meta["methods"], "only interfaces carry a method set")
+}
+
+// A marker interface has no methods; the key must be absent rather than an
+// empty slice, so a consumer can tell "no methods" from "not extracted".
+func TestVBNetExtractor_EmptyInterfaceHasNoMethodSet(t *testing.T) {
+	res, err := NewVBNetExtractor().Extract("m.vb", []byte(`Public Interface IMarker
+End Interface
+`))
+	require.NoError(t, err)
+
+	iface := vbFind(res.Nodes, "IMarker")
+	require.NotNil(t, iface)
+	assert.Equal(t, graph.KindInterface, iface.Kind)
+	assert.Nil(t, iface.Meta["methods"])
 }
