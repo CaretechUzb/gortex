@@ -3860,6 +3860,13 @@ func (r *Resolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *Re
 	// A restubbed C# using-static bind keeps its tag through the restub;
 	// the tier re-stamps it on a rebind, and nothing else may inherit it.
 	csharpDropStaleUsingStaticTag(e)
+	// A C# simple name the caller's own declaration space binds (local
+	// function, delegate parameter, local) is that binding, which no tier
+	// below can point at — the stub stays, honestly unresolved.
+	if csharpLocalShadowed(e) {
+		stats.Unresolved++
+		return
+	}
 	callerRepo := r.callerRepoPrefix(e)
 	candidates := withoutReExportForwarders(r.cachedFindNodesByNameInRepoForEdge(funcName, callerRepo, e))
 	if len(candidates) == 0 {

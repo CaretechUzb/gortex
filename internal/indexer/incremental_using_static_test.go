@@ -74,6 +74,29 @@ func TestIncrementalSave_GlobalUsingStaticEditReresolvesReceiverlessBinds(t *tes
 		"the swap changed every dependent's visibility — Caller.cs must re-bind to H2")
 }
 
+// TestReuseResolutionTag_CarriesOnlyTheVisibilityTags (PR #797 review
+// P2): the reuse re-stamps exactly the two tags the visibility restub
+// consumes. Every other resolver-authored tag (scope, import_closure,
+// value_callee, useClass_binding, import_binding) is left to the fresh
+// resolve, as before — this change is C#-visibility-only.
+func TestReuseResolutionTag_CarriesOnlyTheVisibilityTags(t *testing.T) {
+	for tag, want := range map[string]string{
+		"extension_method": "extension_method",
+		"using_static":     "using_static",
+		"scope":            "",
+		"import_closure":   "",
+		"value_callee":     "",
+		"useClass_binding": "",
+		"import_binding":   "",
+		"":                 "",
+	} {
+		e := &graph.Edge{Meta: map[string]any{"resolution": tag}}
+		assert.Equal(t, want, reuseResolutionTag(e), "tag %q", tag)
+	}
+	assert.Equal(t, "", reuseResolutionTag(&graph.Edge{}), "no Meta, no tag")
+	assert.Equal(t, "", reuseResolutionTag(nil), "nil edge, no tag")
+}
+
 // TestIncrementalSave_UnrelatedCallerEditKeepsUsingStaticTag: an edit to
 // the caller that leaves the call untouched reuses the captured bind. The
 // reuse must carry the resolution tag with it — a later directive swap

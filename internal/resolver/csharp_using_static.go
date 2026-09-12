@@ -27,14 +27,22 @@ import (
 // §14.6.4: made available for extension invocation, never as static
 // methods; the extension binder owns those).
 //
+// The caller's OWN declaration space comes first of all: a local function,
+// a delegate-typed parameter or local named like the call is the callee
+// (spec §12.8.4), and none of those is a node the graph can point at. The
+// extractor stamps such a call edge Meta["local_shadow"] at the call's
+// offset (csharp.go, the receiverless branch; local functions join the
+// scope index in csharp_binding_scopes.go), and csharpLocalShadowed keeps
+// the stub unresolved before ANY tier runs — the same-file pick was
+// binding those at 0.9 too. What remains unseen is a member inherited
+// from an external base (`Ok(...)` in a controller), which the in-graph
+// ancestor walk cannot know about: the directive's member wins there.
+//
 // Deliberately NOT done: qualifying a bare name the repo does not declare
 // onto an external using-static target (`Sqrt` under `using static
-// System.Math` → `Math.Sqrt`). The negative evidence proves nothing — the
-// same bare shape is what a local function (no node is emitted for it), a
-// delegate invocation, `nameof(...)` (extracted as a call), or a member
-// inherited from an external base (`Ok(...)` in a controller) leave
-// behind, and the resolver cannot tell those apart from a static import.
-// That attribution needs a member model of the target or the LSP lane.
+// System.Math` → `Math.Sqrt`). With no in-repo node there is nothing to
+// bind, and the external-base ambiguity above applies with no upside;
+// that attribution needs a member model of the target or the LSP lane.
 //
 // Known limits, inherited from the visibility model the extension binder
 // already uses: the statics set is file-flat (a `using static` written
@@ -118,6 +126,19 @@ func csharpUsingStaticImportable(c *graph.Node) bool {
 		return false
 	}
 	return !isCSharpExtension(c)
+}
+
+// csharpLocalShadowed reports whether the C# extractor stamped this
+// receiverless call as bound by the caller's own declaration space — a
+// local function, a delegate-typed parameter or local of the same simple
+// name. Such a call has no in-graph callee; every tier must leave the
+// stub alone.
+func csharpLocalShadowed(e *graph.Edge) bool {
+	if e == nil || e.Meta == nil {
+		return false
+	}
+	shadow, _ := e.Meta["local_shadow"].(bool)
+	return shadow
 }
 
 // csharpDropStaleUsingStaticTag removes a using_static resolution tag

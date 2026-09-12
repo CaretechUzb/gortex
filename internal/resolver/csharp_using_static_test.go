@@ -378,6 +378,102 @@ namespace App {
 	assert.Nil(t, e.Meta["resolution"], "the stale using_static tag must not ride the new bind, got %q -> %v", e.To, e.Meta)
 }
 
+// TestResolveCSharp_LocalFunctionShadowsUsingStatic (PR #797 review P1):
+// the enclosing method's local declaration space comes before any
+// using-static import (C# spec §12.8.4), so a local function named
+// Clamp is the callee. No node exists for it; the honest answer is the
+// unresolved stub main already leaves, never the directive's member.
+func TestResolveCSharp_LocalFunctionShadowsUsingStatic(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Util/Helpers.cs": csUsingStaticHelpers,
+		"App/Caller.cs": `using static Util.Helpers;
+namespace App {
+    public class Runner {
+        public int Run() {
+            int Clamp(int x) { return x + 1; }
+            return Clamp(1);
+        }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	e := namedCallEdge(t, g, "App/Caller.cs::Runner.Run", "Clamp")
+	assert.True(t, graph.IsUnresolvedTarget(e.To),
+		"a local function shadows the directive; got %q (%s, %.2f)", e.To, e.Origin, e.Confidence)
+	assert.Nil(t, e.Meta["resolution"])
+}
+
+// TestResolveCSharp_LocalFunctionShadowsSameFilePick: the same rule
+// binds every tier, not just the using-static one — the same-file pick
+// used to hand the shadowed call to a same-file method at 0.9.
+func TestResolveCSharp_LocalFunctionShadowsSameFilePick(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"App/Caller.cs": `namespace App {
+    public class Runner {
+        public int Clamp(int x) { return x; }
+        public int Run() {
+            int Clamp(int x) { return x + 1; }
+            return Clamp(1);
+        }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	e := namedCallEdge(t, g, "App/Caller.cs::Runner.Run", "Clamp")
+	assert.True(t, graph.IsUnresolvedTarget(e.To),
+		"a local function shadows the same-file method too; got %q (%s, %.2f)", e.To, e.Origin, e.Confidence)
+}
+
+// TestResolveCSharp_DelegateParameterShadowsUsingStatic: a delegate-typed
+// parameter invoked by its simple name is the same class — the parameter
+// is the callee, the directive's member is not.
+func TestResolveCSharp_DelegateParameterShadowsUsingStatic(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Util/Helpers.cs": csUsingStaticHelpers,
+		"App/Caller.cs": `using static Util.Helpers;
+namespace App {
+    public class Runner {
+        public int Run(System.Func<int, int> Clamp) { return Clamp(1); }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	e := namedCallEdge(t, g, "App/Caller.cs::Runner.Run", "Clamp")
+	assert.True(t, graph.IsUnresolvedTarget(e.To),
+		"a delegate parameter shadows the directive; got %q (%s, %.2f)", e.To, e.Origin, e.Confidence)
+}
+
+// TestResolveCSharp_LocalShadowSurvivesTheCrossRepoPass: the per-repo
+// refusal is not the last word in a multi-repo daemon — CrossRepoResolver
+// runs after it and its first tier binds a leftover unresolved call to
+// the first same-repo function with no evidence at all. Observed on the
+// lab daemon: the stamped stub came back as the same-directory decoy at
+// confidence 0. The verdict must hold there too.
+func TestResolveCSharp_LocalShadowSurvivesTheCrossRepoPass(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"Util/Helpers.cs": csUsingStaticHelpers,
+		"App/Decoy.cs":    csUsingStaticDecoy,
+		"App/Caller.cs": `using static Util.Helpers;
+namespace App {
+    public class Runner {
+        public int Run() {
+            int Clamp(int x) { return x + 1; }
+            return Clamp(1);
+        }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+	NewCrossRepo(g).ResolveAll()
+
+	e := namedCallEdge(t, g, "App/Caller.cs::Runner.Run", "Clamp")
+	assert.True(t, graph.IsUnresolvedTarget(e.To),
+		"the cross-repo pass must not overturn the local-shadow verdict; got %q (%s, %.2f)", e.To, e.Origin, e.Confidence)
+}
+
 // TestResolveCSharp_TwoUsingStaticOwnersRefuse: two visible targets both
 // declaring the name is a compile-time ambiguity — the rule binds neither,
 // and with no locality evidence either the call stays unresolved.

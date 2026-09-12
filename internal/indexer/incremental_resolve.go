@@ -41,20 +41,26 @@ type reuseVal struct {
 	confLabel  string
 	origin     string
 	tier       string
-	// resolution is the resolver-authored provenance tag (extension_method,
-	// using_static, ...). It rides the reuse because the visibility restub
-	// (restubCSharpExtensionBinds) finds the edges to re-price BY this tag:
-	// a reused bind that lost it would never be re-priced again.
+	// resolution is the C# visibility tag (extension_method or
+	// using_static) when the captured bind carries one. It rides the reuse
+	// because the visibility restub (restubCSharpExtensionBinds) finds the
+	// edges to re-price BY this tag: a reused bind that lost it would never
+	// be re-priced again. Every other resolver-authored tag is left to the
+	// fresh resolve, as before.
 	resolution string
 }
 
-// reuseResolutionTag reads the provenance tag a reuse must carry.
+// reuseResolutionTag reads the provenance tag a reuse must carry —
+// exactly the two the visibility restub consumes, nothing else.
 func reuseResolutionTag(e *graph.Edge) string {
 	if e == nil || e.Meta == nil {
 		return ""
 	}
-	res, _ := e.Meta["resolution"].(string)
-	return res
+	switch res, _ := e.Meta["resolution"].(string); res {
+	case "extension_method", "using_static":
+		return res
+	}
+	return ""
 }
 
 // applyReuseResolutionTag re-stamps a reused edge with its captured tag.
