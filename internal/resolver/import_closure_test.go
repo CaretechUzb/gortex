@@ -154,7 +154,7 @@ func TestBuildImportClosure_ReExportTraversal(t *testing.T) {
 // Measure ordinary imports as well as shared chains; diamonds alone favor
 // removal of the recursive cache and do not show common-case overhead.
 func BenchmarkBuildImportClosure_ManyCallers(b *testing.B) {
-	for _, workload := range []string{"direct_imports", "shared_chain", "shared_directory_chain"} {
+	for _, workload := range []string{"direct_imports", "shared_chain", "shared_directory_chain", "overlapping_roots"} {
 		b.Run(workload, func(b *testing.B) {
 			const callers = 128
 			const targets = 64
@@ -181,12 +181,20 @@ func BenchmarkBuildImportClosure_ManyCallers(b *testing.B) {
 					addEdge(file(i), file(i+1), graph.EdgeReExports, 1)
 				}
 			}
-			for i := 0; i < callers; i++ {
+			callerCount := callers
+			if workload == "overlapping_roots" {
+				callerCount = 1
+			}
+			for i := 0; i < callerCount; i++ {
 				caller := fmt.Sprintf("repo/caller%d/main.ts", i)
 				addFile(caller)
 				if workload == "direct_imports" {
 					for j := 0; j < 16; j++ {
 						addEdge(caller, file((i+j)%targets), graph.EdgeImports, j+1)
+					}
+				} else if workload == "overlapping_roots" {
+					for j := 0; j < targets; j++ {
+						addEdge(caller, file(j), graph.EdgeImports, j+1)
 					}
 				} else {
 					addEdge(caller, file(0), graph.EdgeImports, 1)
@@ -208,5 +216,41 @@ func BenchmarkBuildImportClosure_ManyCallers(b *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+// Completed caches must be reusable even when the next root enters a cycle.
+// Query both orders explicitly instead of depending on graph iteration order.
+func TestImportReachableDirs_CompletedCacheOrders(t *testing.T) {
+	a, b := "repo/a/index.ts", "repo/b/index.ts"
+	x, y := "repo/x/value.ts", "repo/y/value.ts"
+	targets := map[string]map[string]struct{}{
+		a: {b: {}, x: {}},
+		b: {a: {}, y: {}},
+	}
+	for _, roots := range [][]string{{a, b}, {b, a}} {
+		completed := make(map[string][]string)
+		for i, root := range roots {
+			dirs := importReachableDirs(root, targets, completed)
+			if len(completed) != i {
+				t.Fatal("unexpected completed cache size")
+			}
+			if len(dirs) != 4 {
+				t.Fatalf("root %q produced %v, want four reachable directories", root, dirs)
+			}
+			seen := make(map[string]bool)
+			for _, dir := range dirs {
+				if seen[dir] {
+					t.Errorf("duplicate directory %q", dir)
+				}
+				seen[dir] = true
+			}
+			for _, dir := range []string{"repo/a", "repo/b", "repo/x", "repo/y"} {
+				if !seen[dir] {
+					t.Errorf("root %q is missing %q", root, dir)
+				}
+			}
+			completed[root] = dirs
+		}
 	}
 }
