@@ -175,17 +175,20 @@ func hookCommands(hook string, opts InstallOpts) []string {
 
 // boundedRunHelper returns the shell lines defining gortex_hook_run,
 // the watchdog every generated invocation routes through when
-// HookTimeoutSeconds > 0. The cascade prefers GNU timeout, falls back
-// to perl's alarm (macOS and Git-for-Windows both ship perl; SIGALRM's
-// default disposition terminates the exec'd image), and finally runs
-// the call unbounded — never worse than a hook without a watchdog.
+// HookTimeoutSeconds > 0. The cascade prefers GNU timeout — probed via
+// `timeout --version`, not mere PATH presence, so Git-for-Windows sh
+// cannot mistake C:\Windows\System32\timeout.exe (a delay command) for
+// a usable runner — then falls back to perl's alarm (macOS and
+// Git-for-Windows both ship perl; SIGALRM's default disposition
+// terminates the exec'd image), and finally runs the call unbounded —
+// never worse than a hook without a watchdog.
 // Redirection and failure tolerance live at the call site, not here.
 func boundedRunHelper() []string {
 	return []string{
 		"# Bound each gortex invocation so a busy daemon cannot hang git.",
 		"gortex_hook_run() {",
 		"  t=\"$1\"; shift",
-		"  if command -v timeout >/dev/null 2>&1; then",
+		"  if timeout --version >/dev/null 2>&1; then",
 		"    timeout \"$t\" \"$@\"",
 		"  elif command -v perl >/dev/null 2>&1; then",
 		"    perl -e 'alarm shift; exec @ARGV' \"$t\" \"$@\"",

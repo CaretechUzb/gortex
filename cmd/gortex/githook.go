@@ -109,6 +109,9 @@ func runGithookInstall(cmd *cobra.Command, args []string) error {
 	if err := supportedHook(hook); err != nil {
 		return err
 	}
+	if githookHookTimeout < 0 {
+		return fmt.Errorf("--hook-timeout must be >= 0 (got %d; 0 = unbounded)", githookHookTimeout)
+	}
 	repoRoot, err := resolveGithookRepoRoot()
 	if err != nil {
 		return err

@@ -1,6 +1,7 @@
 package githooks
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -293,7 +294,7 @@ func TestInstallHook_BoundedCallsWrapped(t *testing.T) {
 	for _, want := range []string{
 		"# Bound each gortex invocation so a busy daemon cannot hang git.",
 		"gortex_hook_run() {",
-		"command -v timeout",
+		"timeout --version",
 		"command -v perl",
 		`gortex_hook_run 7 gortex enrich churn --branch="origin/main" >/dev/null 2>&1 || true`,
 		`gortex_hook_run 7 gortex enrich releases --branch="origin/main" >/dev/null 2>&1 || true`,
@@ -417,7 +418,8 @@ func TestInstallHook_WatchdogKillsHangingBinary(t *testing.T) {
 	}
 	tmp := t.TempDir()
 	shim := filepath.Join(tmp, "fake-gortex")
-	if err := os.WriteFile(shim, []byte("#!/bin/sh\nsleep 60\n"), 0o755); err != nil {
+	sentinel := filepath.Join(tmp, "ran")
+	if err := os.WriteFile(shim, []byte(fmt.Sprintf("#!/bin/sh\ntouch %q\nsleep 60\n", sentinel)), 0o755); err != nil {
 		t.Fatalf("write shim: %v", err)
 	}
 	repo := initRepo(t)
@@ -432,6 +434,9 @@ func TestInstallHook_WatchdogKillsHangingBinary(t *testing.T) {
 	start := time.Now()
 	if _, err := exec.Command("sh", path).CombinedOutput(); err != nil {
 		t.Fatalf("hook run: %v", err)
+	}
+	if _, err := os.Stat(sentinel); err != nil {
+		t.Fatalf("hook never invoked the shim binary (sentinel missing): %v", err)
 	}
 	// The killed call is swallowed by || true so the hook exits 0; the
 	// assertion is purely that it did not take the shim's 60s.
@@ -467,5 +472,35 @@ func TestInstallHook_BoundedBlockRoundTrip(t *testing.T) {
 	}
 	if _, err := os.Stat(hookPath); !os.IsNotExist(err) {
 		t.Errorf("stub-only bounded hook should be deleted on uninstall; stat returned %v", err)
+	}
+}
+
+func TestInstallHook_LegacyToBoundedUpgrade(t *testing.T) {
+	repo := initRepo(t)
+	// Legacy install (zero timeout) — the shape every existing user has.
+	if _, err := InstallHook(repo, "post-commit", InstallOpts{RegenChurn: true}); err != nil {
+		t.Fatalf("legacy install: %v", err)
+	}
+	// Bounded reinstall — the upgrade `gortex githook install` delivers.
+	if _, err := InstallHook(repo, "post-commit", InstallOpts{RegenChurn: true, HookTimeoutSeconds: 30}); err != nil {
+		t.Fatalf("bounded reinstall: %v", err)
+	}
+	hookPath, err := HookPathFor(repo, "post-commit")
+	if err != nil {
+		t.Fatalf("HookPathFor: %v", err)
+	}
+	body, err := os.ReadFile(hookPath)
+	if err != nil {
+		t.Fatalf("read hook: %v", err)
+	}
+	got := string(body)
+	if !strings.Contains(got, "gortex_hook_run 30 gortex enrich churn >/dev/null 2>&1 || true") {
+		t.Errorf("upgrade must leave the bounded call. Body:\n%s", got)
+	}
+	if strings.Contains(got, "(gortex enrich churn) >/dev/null 2>&1 || true") {
+		t.Errorf("upgrade must replace the legacy line. Body:\n%s", got)
+	}
+	if c := strings.Count(got, MarkerBegin); c != 1 {
+		t.Errorf("expected one marker block after upgrade, got %d", c)
 	}
 }
