@@ -259,6 +259,110 @@ func TestInstallHook_RejectsUnsupportedHook(t *testing.T) {
 	}
 }
 
+func TestInstallHook_BoundedCallsWrapped(t *testing.T) {
+	repo := initRepo(t)
+	path, err := InstallHook(repo, "post-merge", InstallOpts{
+		RegenMermaid:       true,
+		RegenWiki:          true,
+		RegenDocs:          true,
+		RegenChurn:         true,
+		ChurnBranch:        "origin/main",
+		RegenReleases:      true,
+		ReleasesBranch:     "origin/main",
+		HookTimeoutSeconds: 7,
+	})
+	if err != nil {
+		t.Fatalf("InstallHook: %v", err)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read hook: %v", err)
+	}
+	got := string(body)
+	for _, want := range []string{
+		"# Bound each gortex invocation so a busy daemon cannot hang git.",
+		"gortex_hook_run() {",
+		"command -v timeout",
+		"command -v perl",
+		`gortex_hook_run 7 gortex enrich churn --branch="origin/main" >/dev/null 2>&1 || true`,
+		`gortex_hook_run 7 gortex enrich releases --branch="origin/main" >/dev/null 2>&1 || true`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("hook missing %q. Body:\n%s", want, got)
+		}
+	}
+	if c := strings.Count(got, "gortex_hook_run 7 "); c != 5 {
+		t.Errorf("expected 5 wrapped invocations (mermaid, wiki, docs, churn, releases), got %d. Body:\n%s", c, got)
+	}
+	if c := strings.Count(got, "gortex_hook_run() {"); c != 1 {
+		t.Errorf("expected exactly one helper definition, got %d", c)
+	}
+	if i, j := strings.Index(got, "gortex_hook_run() {"), strings.Index(got, "gortex_hook_run 7 "); i == -1 || j == -1 || i > j {
+		t.Errorf("helper must be defined before the first wrapped call. Body:\n%s", got)
+	}
+	if strings.Contains(got, "(gortex enrich churn)") {
+		t.Errorf("bounded install must not emit legacy unwrapped lines. Body:\n%s", got)
+	}
+}
+
+func TestInstallHook_ZeroTimeoutEmitsLegacyLines(t *testing.T) {
+	repo := initRepo(t)
+	path, err := InstallHook(repo, "post-commit", InstallOpts{RegenChurn: true})
+	if err != nil {
+		t.Fatalf("InstallHook: %v", err)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read hook: %v", err)
+	}
+	got := string(body)
+	want := "(gortex enrich churn) >/dev/null 2>&1 || true"
+	if !strings.Contains(got, want) {
+		t.Errorf("zero timeout must emit legacy line %q. Body:\n%s", want, got)
+	}
+	if strings.Contains(got, "gortex_hook_run") {
+		t.Errorf("zero timeout must not emit the watchdog helper. Body:\n%s", got)
+	}
+}
+
+func TestInstallHook_NoActionsNoHelper(t *testing.T) {
+	repo := initRepo(t)
+	path, err := InstallHook(repo, "post-commit", InstallOpts{HookTimeoutSeconds: 30})
+	if err != nil {
+		t.Fatalf("InstallHook: %v", err)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read hook: %v", err)
+	}
+	got := string(body)
+	if !strings.Contains(got, "# (no regeneration actions enabled)") {
+		t.Errorf("no-actions install should note it explicitly. Body:\n%s", got)
+	}
+	if strings.Contains(got, "gortex_hook_run") {
+		t.Errorf("no actions means no hang surface — helper must not ship. Body:\n%s", got)
+	}
+}
+
+func TestInstallHook_PostCheckoutUnchangedByTimeout(t *testing.T) {
+	repo := initRepo(t)
+	path, err := InstallHook(repo, "post-checkout", InstallOpts{HookTimeoutSeconds: 30})
+	if err != nil {
+		t.Fatalf("InstallHook: %v", err)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read hook: %v", err)
+	}
+	got := string(body)
+	if !strings.Contains(got, "touch .gortex/reindex.notify 2>/dev/null || true") {
+		t.Errorf("post-checkout body must stay unchanged. Body:\n%s", got)
+	}
+	if strings.Contains(got, "gortex_hook_run") {
+		t.Errorf("post-checkout has no gortex call — no helper expected. Body:\n%s", got)
+	}
+}
+
 func TestHookPathFor_HonoursCoreHooksPath(t *testing.T) {
 	repo := initRepo(t)
 	customHooks := filepath.Join(repo, "custom-hooks")
