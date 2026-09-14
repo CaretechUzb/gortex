@@ -30,7 +30,7 @@ var githookCmd = &cobra.Command{
 	Use:   "githook",
 	Short: "Manage local git hooks that regenerate gortex artefacts",
 	Long: `Install, uninstall, and inspect git hooks that re-run gortex
-commands. Supported hooks: post-commit, post-merge.
+commands. Supported hooks: post-commit, post-merge, post-checkout.
 
 The hook is idempotent: re-running install replaces only the gortex
 block, leaving any other hook content intact. Uninstall removes the
@@ -43,7 +43,7 @@ busy daemon can never hang the git operation.`,
 
 var githookInstallCmd = &cobra.Command{
 	Use:   "install <hook>",
-	Short: "Install a git hook (post-commit or post-merge)",
+	Short: "Install a git hook (post-commit, post-merge, or post-checkout)",
 	Args:  cobra.ExactArgs(1),
 	RunE:  runGithookInstall,
 }
