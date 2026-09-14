@@ -37,8 +37,9 @@ block, leaving any other hook content intact. Uninstall removes the
 block and deletes the hook file when it contains nothing else.
 
 Every gortex invocation the hook makes is bounded by a watchdog
-(default 30s; --hook-timeout to change; 0 disables the bound) so a
-busy daemon can never hang the git operation.`,
+(default 30s per command; --hook-timeout to change; 0 restores the old
+unbounded lines) when GNU timeout or perl is available, so a busy
+daemon cannot hang the git operation indefinitely.`,
 }
 
 var githookInstallCmd = &cobra.Command{

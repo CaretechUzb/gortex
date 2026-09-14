@@ -458,6 +458,60 @@ func TestInstallHook_WatchdogKillsHangingBinary(t *testing.T) {
 	}
 }
 
+func TestInstallHook_WatchdogKillsHangingBinary_PerlLaneForced(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("hook E2E executes via sh; not supported on windows")
+	}
+	if _, err := exec.LookPath("perl"); err != nil {
+		t.Skip("perl not on PATH — forced perl lane has nothing to drive")
+	}
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go toolchain not on PATH — cannot build the Go shim")
+	}
+	// A `timeout` that exists but fails the capability probe must push the
+	// cascade onto the perl lane — this is exactly the Git-for-Windows and
+	// busybox shape, and the lane macOS runs for real.
+	fakeBin := filepath.Join(t.TempDir(), "bin")
+	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
+		t.Fatalf("mkdir fake bin: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(fakeBin, "timeout"), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatalf("write fake timeout: %v", err)
+	}
+	tmp := t.TempDir()
+	shimSrc := filepath.Join(tmp, "main.go")
+	if err := os.WriteFile(shimSrc, []byte("package main\n\nimport (\n\t\"os\"\n\t\"path/filepath\"\n\t\"time\"\n)\n\nfunc main() {\n\t_ = os.WriteFile(filepath.Join(filepath.Dir(os.Args[0]), \"ran\"), []byte(\"x\"), 0o644)\n\ttime.Sleep(60 * time.Second)\n}\n"), 0o644); err != nil {
+		t.Fatalf("write shim source: %v", err)
+	}
+	shim := filepath.Join(tmp, "fake-gortex")
+	build := exec.Command("go", "build", "-o", shim, shimSrc)
+	build.Dir = tmp
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build Go shim: %v: %s", err, out)
+	}
+	repo := initRepo(t)
+	path, err := InstallHook(repo, "post-commit", InstallOpts{
+		RegenChurn:         true,
+		Binary:             shim,
+		HookTimeoutSeconds: 1,
+	})
+	if err != nil {
+		t.Fatalf("InstallHook: %v", err)
+	}
+	start := time.Now()
+	hookRun := exec.Command("sh", path)
+	hookRun.Env = append(os.Environ(), "PATH="+fakeBin+":"+os.Getenv("PATH"))
+	if _, err := hookRun.CombinedOutput(); err != nil {
+		t.Fatalf("hook run: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(tmp, "ran")); err != nil {
+		t.Fatalf("hook never invoked the shim binary (sentinel missing): %v", err)
+	}
+	if d := time.Since(start); d > 15*time.Second {
+		t.Fatalf("hook took %v — perl-lane watchdog did not kill the hanging Go shim", d)
+	}
+}
+
 func TestInstallHook_BoundedBlockRoundTrip(t *testing.T) {
 	repo := initRepo(t)
 	for i := range 2 {
