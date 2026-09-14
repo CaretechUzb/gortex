@@ -531,24 +531,27 @@ func (r *Resolver) buildImportClosureFiltered(repos map[string]struct{}) map[str
 		}
 	}
 
-	// Walk all of a caller's import roots together, so shared barrels are
-	// visited once without retaining transitive caches for every barrel.
-	importRoots := make(map[string]map[string]struct{})
+	// Cache only completed walks from directly imported roots. Publishing
+	// recursive partial results would make cyclic barrels order-dependent.
+	barrelDirCache := make(map[string][]string)
 	for _, e := range imports {
 		callerFile := e.FilePath
 		if from, ok := placements[e.From]; ok && from.FilePath != "" {
 			callerFile = from.FilePath
 		}
 		if target, ok := placements[e.To]; ok && target.FilePath != "" && callerFile != "" {
-			if importRoots[callerFile] == nil {
-				importRoots[callerFile] = make(map[string]struct{})
+			add(callerFile, filePathDir(target.FilePath))
+			if len(reexpTargets[target.FilePath]) == 0 {
+				continue
 			}
-			importRoots[callerFile][target.FilePath] = struct{}{}
-		}
-	}
-	for callerFile, roots := range importRoots {
-		for dir := range importReachableDirs(roots, reexpTargets) {
-			add(callerFile, dir)
+			dirs, ok := barrelDirCache[target.FilePath]
+			if !ok {
+				dirs = importReachableDirs(target.FilePath, reexpTargets, barrelDirCache)
+				barrelDirCache[target.FilePath] = dirs
+			}
+			for _, dir := range dirs {
+				add(callerFile, dir)
+			}
 		}
 	}
 	return closure
