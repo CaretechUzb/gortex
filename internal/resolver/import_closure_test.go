@@ -188,22 +188,24 @@ func BenchmarkBuildImportClosure_ManyCallers(b *testing.B) {
 			for i := 0; i < callerCount; i++ {
 				caller := fmt.Sprintf("repo/caller%d/main.ts", i)
 				addFile(caller)
-				if workload == "direct_imports" {
+				switch workload {
+				case "direct_imports":
 					for j := 0; j < 16; j++ {
 						addEdge(caller, file((i+j)%targets), graph.EdgeImports, j+1)
 					}
-				} else if workload == "overlapping_roots" {
+				case "overlapping_roots":
 					for j := 0; j < targets; j++ {
 						addEdge(caller, file(j), graph.EdgeImports, j+1)
 					}
-				} else {
+				default:
 					addEdge(caller, file(0), graph.EdgeImports, 1)
 				}
 			}
 			want := targets + 1
-			if workload == "direct_imports" {
+			switch workload {
+			case "direct_imports":
 				want = 17
-			} else if workload == "shared_directory_chain" {
+			case "shared_directory_chain":
 				want = 2
 			}
 			r := New(g)
