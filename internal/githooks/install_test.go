@@ -10,13 +10,23 @@ import (
 )
 
 // initRepo creates a fresh git repo at tmp and returns the root path.
+// core.hooksPath is pinned to a repo-local "hooks" dir so HookPathFor
+// (which reads merged local+global git config) can never resolve to a
+// machine-global hooks dir — without this, running the suite on a host
+// with a global core.hooksPath makes every install/uninstall test
+// write to the real global hooks.
 func initRepo(t *testing.T) string {
 	t.Helper()
 	tmp := t.TempDir()
+	hooksDir := filepath.Join(tmp, "hooks")
+	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
+		t.Fatalf("mkdir hooks: %v", err)
+	}
 	for _, args := range [][]string{
 		{"init", "--quiet"},
 		{"config", "user.email", "test@example.com"},
 		{"config", "user.name", "Tester"},
+		{"config", "core.hooksPath", hooksDir},
 	} {
 		cmd := exec.Command("git", args...)
 		cmd.Dir = tmp
@@ -360,6 +370,17 @@ func TestInstallHook_PostCheckoutUnchangedByTimeout(t *testing.T) {
 	}
 	if strings.Contains(got, "gortex_hook_run") {
 		t.Errorf("post-checkout has no gortex call — no helper expected. Body:\n%s", got)
+	}
+}
+
+func TestHookPathFor_StaysInsideRepo(t *testing.T) {
+	repo := initRepo(t)
+	path, err := HookPathFor(repo, "post-commit")
+	if err != nil {
+		t.Fatalf("HookPathFor: %v", err)
+	}
+	if !strings.HasPrefix(path, repo) {
+		t.Errorf("hook path %q escapes the temp repo %q — a machine-global core.hooksPath would make every test write to the real global hooks dir", path, repo)
 	}
 }
 
