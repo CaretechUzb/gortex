@@ -531,9 +531,25 @@ func (r *Resolver) buildImportClosureFiltered(repos map[string]struct{}) map[str
 		}
 	}
 
-	// Cache only completed walks from directly imported roots. Publishing
-	// recursive partial results would make cyclic barrels order-dependent.
+	// Schedule imported descendants first so overlapping roots can reuse
+	// completed closures. Cyclic members still require independent full
+	// walks: recursive partial cache entries would be order-dependent.
 	barrelDirCache := make(map[string][]string)
+	if len(reexpTargets) > 0 {
+		var roots []string
+		seenRoots := make(map[string]struct{})
+		for _, e := range imports {
+			if target, ok := placements[e.To]; ok && len(reexpTargets[target.FilePath]) > 0 {
+				if _, seen := seenRoots[target.FilePath]; !seen {
+					seenRoots[target.FilePath] = struct{}{}
+					roots = append(roots, target.FilePath)
+				}
+			}
+		}
+		for _, root := range importRootOrder(roots, reexpTargets) {
+			barrelDirCache[root] = importReachableDirs(root, reexpTargets, barrelDirCache)
+		}
+	}
 	for _, e := range imports {
 		callerFile := e.FilePath
 		if from, ok := placements[e.From]; ok && from.FilePath != "" {
