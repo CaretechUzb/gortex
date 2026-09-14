@@ -23,6 +23,7 @@ var (
 	githookChurnBranch    string
 	githookReleasesBranch string
 	githookBinary         string
+	githookHookTimeout    int
 )
 
 var githookCmd = &cobra.Command{
@@ -33,7 +34,11 @@ commands. Supported hooks: post-commit, post-merge.
 
 The hook is idempotent: re-running install replaces only the gortex
 block, leaving any other hook content intact. Uninstall removes the
-block and deletes the hook file when it contains nothing else.`,
+block and deletes the hook file when it contains nothing else.
+
+Every gortex invocation the hook makes is bounded by a watchdog
+(default 30s; --hook-timeout to change; 0 disables the bound) so a
+busy daemon can never hang the git operation.`,
 }
 
 var githookInstallCmd = &cobra.Command{
@@ -80,6 +85,8 @@ func init() {
 		"output path for the docs bundle")
 	githookInstallCmd.Flags().StringVar(&githookBinary, "binary", "gortex",
 		"gortex binary name (resolved from $PATH at runtime)")
+	githookInstallCmd.Flags().IntVar(&githookHookTimeout, "hook-timeout", 30,
+		"seconds a hook-invoked gortex command may run before the watchdog kills it (0 = unbounded)")
 
 	githookCmd.AddCommand(githookInstallCmd)
 	githookCmd.AddCommand(githookUninstallCmd)
@@ -112,24 +119,25 @@ func runGithookInstall(cmd *cobra.Command, args []string) error {
 		githookRegenMermaid = true
 	}
 	path, err := githooks.InstallHook(repoRoot, hook, githooks.InstallOpts{
-		Binary:         githookBinary,
-		RegenMermaid:   githookRegenMermaid,
-		RegenWiki:      githookRegenWiki,
-		RegenDocs:      githookRegenDocs,
-		RegenChurn:     githookRegenChurn,
-		ChurnBranch:    githookChurnBranch,
-		RegenReleases:  githookRegenReleases,
-		ReleasesBranch: githookReleasesBranch,
-		MermaidOutDir:  githookMermaidOutDir,
-		WikiOutDir:     githookWikiOutDir,
-		DocsOutPath:    githookDocsOutPath,
+		Binary:             githookBinary,
+		RegenMermaid:       githookRegenMermaid,
+		RegenWiki:          githookRegenWiki,
+		RegenDocs:          githookRegenDocs,
+		RegenChurn:         githookRegenChurn,
+		ChurnBranch:        githookChurnBranch,
+		RegenReleases:      githookRegenReleases,
+		ReleasesBranch:     githookReleasesBranch,
+		MermaidOutDir:      githookMermaidOutDir,
+		WikiOutDir:         githookWikiOutDir,
+		DocsOutPath:        githookDocsOutPath,
+		HookTimeoutSeconds: githookHookTimeout,
 	})
 	if err != nil {
 		return err
 	}
 	fmt.Fprintf(cmd.OutOrStdout(),
-		"installed %s hook at %s\nactions: mermaid=%t wiki=%t docs=%t churn=%t releases=%t\n",
-		hook, path, githookRegenMermaid, githookRegenWiki, githookRegenDocs, githookRegenChurn, githookRegenReleases)
+		"installed %s hook at %s\nactions: mermaid=%t wiki=%t docs=%t churn=%t releases=%t timeout=%ds\n",
+		hook, path, githookRegenMermaid, githookRegenWiki, githookRegenDocs, githookRegenChurn, githookRegenReleases, githookHookTimeout)
 	return nil
 }
 
