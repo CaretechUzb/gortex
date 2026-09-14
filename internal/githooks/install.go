@@ -175,23 +175,29 @@ func hookCommands(hook string, opts InstallOpts) []string {
 
 // boundedRunHelper returns the shell lines defining gortex_hook_run,
 // the watchdog every generated invocation routes through when
-// HookTimeoutSeconds > 0. The cascade prefers GNU timeout — probed via
-// `timeout --version`, not mere PATH presence, so Git-for-Windows sh
-// cannot mistake C:\Windows\System32\timeout.exe (a delay command) for
-// a usable runner — then falls back to perl's alarm (macOS and
-// Git-for-Windows both ship perl; SIGALRM's default disposition
-// terminates the exec'd image), and finally runs the call unbounded —
+// HookTimeoutSeconds > 0. The cascade probes for a usable GNU timeout
+// via `timeout --version </dev/null` — stdin closed so a stdin-waiting
+// fake cannot hang the probe, and version output (not mere PATH
+// presence) so Git-for-Windows sh cannot mistake
+// C:\Windows\System32\timeout.exe (a delay command) for a usable
+// runner. The GNU lane runs `timeout -k 2`: TERM at the deadline, then
+// KILL 2s later. The perl lane (macOS and Git-for-Windows both ship
+// perl) forks the child and delivers SIGKILL on alarm — the only
+// signal a Go runtime cannot defer (Go swallows SIGALRM, and TERM
+// alone is deferrable). The final lane runs the call unbounded —
 // never worse than a hook without a watchdog.
 // Redirection and failure tolerance live at the call site, not here.
 func boundedRunHelper() []string {
 	return []string{
 		"# Bound each gortex invocation so a busy daemon cannot hang git.",
+		"# Escalates to SIGKILL so even a wedged or signal-immune process",
+		"# (the Go runtime ignores SIGALRM) cannot outlive the bound.",
 		"gortex_hook_run() {",
-		"  t=\"$1\"; shift",
-		"  if timeout --version >/dev/null 2>&1; then",
-		"    timeout \"$t\" \"$@\"",
+		"  _gortex_hook_t=\"$1\"; shift",
+		"  if timeout --version </dev/null >/dev/null 2>&1; then",
+		"    timeout -k 2 \"$_gortex_hook_t\" \"$@\"",
 		"  elif command -v perl >/dev/null 2>&1; then",
-		"    perl -e 'alarm shift; exec @ARGV' \"$t\" \"$@\"",
+		"    perl -e '$t=shift; $p=fork(); if(!$p){ exec @ARGV } $SIG{ALRM}=sub{ kill 9,$p; exit 124 }; alarm $t; waitpid($p,0); exit $?>>8' \"$_gortex_hook_t\" \"$@\"",
 		"  else",
 		"    \"$@\"",
 		"  fi",

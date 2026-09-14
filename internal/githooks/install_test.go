@@ -1,7 +1,6 @@
 package githooks
 
 import (
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -295,7 +294,9 @@ func TestInstallHook_BoundedCallsWrapped(t *testing.T) {
 		"# Bound each gortex invocation so a busy daemon cannot hang git.",
 		"gortex_hook_run() {",
 		"timeout --version",
+		"timeout -k 2",
 		"command -v perl",
+		"kill 9,$p",
 		`gortex_hook_run 7 gortex enrich churn --branch="origin/main" >/dev/null 2>&1 || true`,
 		`gortex_hook_run 7 gortex enrich releases --branch="origin/main" >/dev/null 2>&1 || true`,
 	} {
@@ -417,11 +418,23 @@ func TestInstallHook_WatchdogKillsHangingBinary(t *testing.T) {
 		}
 	}
 	tmp := t.TempDir()
-	shim := filepath.Join(tmp, "fake-gortex")
-	sentinel := filepath.Join(tmp, "ran")
-	if err := os.WriteFile(shim, []byte(fmt.Sprintf("#!/bin/sh\ntouch %q\nsleep 60\n", sentinel)), 0o755); err != nil {
-		t.Fatalf("write shim: %v", err)
+	// The shim must be a compiled Go program: the Go runtime swallows
+	// SIGALRM, so a shell shim would pass under a broken (alarm-only)
+	// watchdog — exactly the regression this test exists to catch.
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go toolchain not on PATH — cannot build the Go shim")
 	}
+	shimSrc := filepath.Join(tmp, "main.go")
+	if err := os.WriteFile(shimSrc, []byte("package main\n\nimport (\n\t\"os\"\n\t\"path/filepath\"\n\t\"time\"\n)\n\nfunc main() {\n\t_ = os.WriteFile(filepath.Join(filepath.Dir(os.Args[0]), \"ran\"), []byte(\"x\"), 0o644)\n\ttime.Sleep(60 * time.Second)\n}\n"), 0o644); err != nil {
+		t.Fatalf("write shim source: %v", err)
+	}
+	shim := filepath.Join(tmp, "fake-gortex")
+	build := exec.Command("go", "build", "-o", shim, shimSrc)
+	build.Dir = tmp
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build Go shim: %v: %s", err, out)
+	}
+	sentinel := filepath.Join(tmp, "ran")
 	repo := initRepo(t)
 	path, err := InstallHook(repo, "post-commit", InstallOpts{
 		RegenChurn:         true,
