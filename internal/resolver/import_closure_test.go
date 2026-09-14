@@ -150,3 +150,63 @@ func TestBuildImportClosure_ReExportTraversal(t *testing.T) {
 		})
 	}
 }
+
+// Measure ordinary imports as well as shared chains; diamonds alone favor
+// removal of the recursive cache and do not show common-case overhead.
+func BenchmarkBuildImportClosure_ManyCallers(b *testing.B) {
+	for _, workload := range []string{"direct_imports", "shared_chain", "shared_directory_chain"} {
+		b.Run(workload, func(b *testing.B) {
+			const callers = 128
+			const targets = 64
+			g := graph.New()
+			addFile := func(file string) {
+				g.AddNode(&graph.Node{ID: file, Kind: graph.KindFile, Name: file,
+					FilePath: file, Language: "typescript", RepoPrefix: "repo"})
+			}
+			addEdge := func(from, to string, kind graph.EdgeKind, line int) {
+				g.AddEdge(&graph.Edge{From: from, To: to, Kind: kind,
+					FilePath: from, Line: line, Origin: graph.OriginASTResolved})
+			}
+			file := func(i int) string {
+				if workload == "shared_directory_chain" {
+					return fmt.Sprintf("repo/shared/file%d.ts", i)
+				}
+				return fmt.Sprintf("repo/target%d/index.ts", i)
+			}
+			for i := 0; i < targets; i++ {
+				addFile(file(i))
+			}
+			if workload != "direct_imports" {
+				for i := 0; i < targets-1; i++ {
+					addEdge(file(i), file(i+1), graph.EdgeReExports, 1)
+				}
+			}
+			for i := 0; i < callers; i++ {
+				caller := fmt.Sprintf("repo/caller%d/main.ts", i)
+				addFile(caller)
+				if workload == "direct_imports" {
+					for j := 0; j < 16; j++ {
+						addEdge(caller, file((i+j)%targets), graph.EdgeImports, j+1)
+					}
+				} else {
+					addEdge(caller, file(0), graph.EdgeImports, 1)
+				}
+			}
+			want := targets + 1
+			if workload == "direct_imports" {
+				want = 17
+			} else if workload == "shared_directory_chain" {
+				want = 2
+			}
+			r := New(g)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				closure := r.buildImportClosure()
+				if got := len(closure["repo/caller0/main.ts"]); got != want {
+					b.Fatalf("got %d reachable directories, want %d", got, want)
+				}
+			}
+		})
+	}
+}
