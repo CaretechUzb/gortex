@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 // initRepo creates a fresh git repo at tmp and returns the root path.
@@ -402,5 +403,69 @@ func TestHookPathFor_HonoursCoreHooksPath(t *testing.T) {
 	if filepath.Dir(path) != customHooks {
 		t.Errorf("HookPathFor should honour core.hooksPath, got %q under %q (want %q)",
 			path, filepath.Dir(path), customHooks)
+	}
+}
+
+func TestInstallHook_WatchdogKillsHangingBinary(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("hook E2E executes via sh; not supported on windows")
+	}
+	if _, err := exec.LookPath("timeout"); err != nil {
+		if _, perr := exec.LookPath("perl"); perr != nil {
+			t.Skip("neither timeout nor perl on PATH — watchdog cascade has nothing to drive")
+		}
+	}
+	tmp := t.TempDir()
+	shim := filepath.Join(tmp, "fake-gortex")
+	if err := os.WriteFile(shim, []byte("#!/bin/sh\nsleep 60\n"), 0o755); err != nil {
+		t.Fatalf("write shim: %v", err)
+	}
+	repo := initRepo(t)
+	path, err := InstallHook(repo, "post-commit", InstallOpts{
+		RegenChurn:         true,
+		Binary:             shim,
+		HookTimeoutSeconds: 1,
+	})
+	if err != nil {
+		t.Fatalf("InstallHook: %v", err)
+	}
+	start := time.Now()
+	if _, err := exec.Command("sh", path).CombinedOutput(); err != nil {
+		t.Fatalf("hook run: %v", err)
+	}
+	// The killed call is swallowed by || true so the hook exits 0; the
+	// assertion is purely that it did not take the shim's 60s.
+	if d := time.Since(start); d > 15*time.Second {
+		t.Fatalf("hook took %v — watchdog did not kill the hanging shim", d)
+	}
+}
+
+func TestInstallHook_BoundedBlockRoundTrip(t *testing.T) {
+	repo := initRepo(t)
+	for i := range 2 {
+		if _, err := InstallHook(repo, "post-commit", InstallOpts{RegenChurn: true, HookTimeoutSeconds: 5}); err != nil {
+			t.Fatalf("install %d: %v", i, err)
+		}
+	}
+	hookPath, err := HookPathFor(repo, "post-commit")
+	if err != nil {
+		t.Fatalf("HookPathFor: %v", err)
+	}
+	body, err := os.ReadFile(hookPath)
+	if err != nil {
+		t.Fatalf("read hook: %v", err)
+	}
+	got := string(body)
+	if c := strings.Count(got, MarkerBegin); c != 1 {
+		t.Errorf("expected one MarkerBegin after re-install, got %d", c)
+	}
+	if c := strings.Count(got, "gortex_hook_run() {"); c != 1 {
+		t.Errorf("expected exactly one helper definition, got %d", c)
+	}
+	if _, removed, err := UninstallHook(repo, "post-commit"); err != nil || !removed {
+		t.Fatalf("UninstallHook removed=%v err=%v", removed, err)
+	}
+	if _, err := os.Stat(hookPath); !os.IsNotExist(err) {
+		t.Errorf("stub-only bounded hook should be deleted on uninstall; stat returned %v", err)
 	}
 }
