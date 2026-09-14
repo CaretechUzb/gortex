@@ -457,9 +457,10 @@ function piAliasedDescription(bare: string, aliased: string, description: string
   );
 }
 
-// safeRegister registers under the alias name (piAliasName), tolerating a
-// redundant registration — a reload can re-fire session_start without
-// resetting the registry. Returns the name actually registered.
+// safeRegister registers under the alias name (piAliasName). registerTool is a
+// map insert, so a repeat registration is harmless; the catch is for a late
+// registration from a superseded session, which throws once Pi has invalidated
+// that extension instance. Returns the name actually registered.
 function safeRegister(pi: any, def: any): string {
   def.name = piAliasName(def.name);
   def.label = def.name;
@@ -604,11 +605,14 @@ export default function (pi: any) {
   // Settles when the current session_start handler is done — bridge up and
   // tools registered, or the handshake failed. Never rejects.
   //
-  // Armed at factory time: /reload re-imports this module (resource-loader.js
-  // clears the extension cache, and the loader runs jiti with
-  // moduleCache:false) and /new builds a fresh runtime, so an instance can be
-  // asked for a turn before its own session_start fires. Every path that
-  // constructs an extension goes on to emit session_start, so the wait ends.
+  // Armed at factory time: every session builds a fresh instance of this
+  // extension before its session_start fires — /reload re-imports the module
+  // (resource-loader.js clears the extension cache, and the loader runs jiti
+  // with moduleCache:false), while /new, /resume and fork re-invoke this
+  // factory against the cached module (agent-session-services.js builds a new
+  // resource loader per runtime). Either way an instance can be asked for a
+  // turn before its own session_start runs. Every path that constructs an
+  // extension goes on to emit session_start, so the wait ends.
   let sessionReady!: Promise<void>;
   let settleSessionReady: () => void = () => {};
   let sessionReadyPending = false;
@@ -625,19 +629,22 @@ export default function (pi: any) {
   }
   armSessionReady();
 
-  function waitForSession(ms: number): Promise<void> {
+  // Resolves true when session_start finished, false when the cap expired
+  // first — the caller has to tell those apart, since a cap expiry leaves
+  // bridgeError empty.
+  function waitForSession(ms: number): Promise<boolean> {
     const ready = sessionReady;
-    return new Promise<void>((resolve) => {
+    return new Promise<boolean>((resolve) => {
       let settled = false;
-      const done = () => {
+      const done = (ok: boolean) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
-        resolve();
+        resolve(ok);
       };
-      const timer = setTimeout(done, ms);
+      const timer = setTimeout(() => done(false), ms);
       (timer as any)?.unref?.();
-      ready.then(done, done);
+      ready.then(() => done(true), () => done(true));
     });
   }
 
@@ -650,10 +657,11 @@ export default function (pi: any) {
     pendingOrientation = "";
     bridgeError = "";
     armSessionReady(); // no-op when a turn is already parked on this session
+    const settle = settleSessionReady; // this invocation's resolver
     try {
       await startSession();
     } finally {
-      settleSessionReady();
+      settle();
     }
   });
 
@@ -700,7 +708,7 @@ export default function (pi: any) {
     if (orientationInjected) return;
     // Pi awaits each listener, so this holds the turn until the tools are
     // registered and bridgeError reflects the handshake (or the cap expires).
-    await waitForSession(READY_WAIT_MS);
+    const ready = await waitForSession(READY_WAIT_MS);
     const decision = callHook({ event: "session_start", cwd: pi?.cwd ?? process.cwd() });
     const parts: string[] = [];
     if (bridgeError) {
@@ -709,6 +717,16 @@ export default function (pi: any) {
         `Tell the user to run /reload to retry the connection.`,
       );
       bridgeError = "";
+    } else if (!ready) {
+      // Cap expired mid-handshake: bridgeError is still empty, and this is the
+      // only turn that reports it — orientationInjected latches below, so a
+      // handshake that fails after the cap never reaches the branch above.
+      parts.push(
+        `[Gortex] graph tools were still registering when this turn began, so a tool ` +
+        `named below may not be callable yet. If one is missing, say so and tell the ` +
+        `user to retry, or to run /reload if it stays missing — don't fall back to ` +
+        `native tools.`,
+      );
     }
     if (decision.orientation) parts.push(decision.orientation);
     if (parts.length > 0) {
@@ -1235,9 +1253,10 @@ function piAliasedDescription(bare: string, aliased: string, description: string
   );
 }
 
-// safeRegister registers under the alias name (piAliasName), tolerating a
-// redundant registration — a reload can re-fire session_start without
-// resetting the registry. Returns the name actually registered.
+// safeRegister registers under the alias name (piAliasName). registerTool is a
+// map insert, so a repeat registration is harmless; the catch is for a late
+// registration from a superseded session, which throws once Pi has invalidated
+// that extension instance. Returns the name actually registered.
 function safeRegister(pi: any, def: any): string {
   def.name = piAliasName(def.name);
   def.label = def.name;
@@ -1382,11 +1401,14 @@ export default function (pi: any) {
   // Settles when the current session_start handler is done — bridge up and
   // tools registered, or the handshake failed. Never rejects.
   //
-  // Armed at factory time: /reload re-imports this module (resource-loader.js
-  // clears the extension cache, and the loader runs jiti with
-  // moduleCache:false) and /new builds a fresh runtime, so an instance can be
-  // asked for a turn before its own session_start fires. Every path that
-  // constructs an extension goes on to emit session_start, so the wait ends.
+  // Armed at factory time: every session builds a fresh instance of this
+  // extension before its session_start fires — /reload re-imports the module
+  // (resource-loader.js clears the extension cache, and the loader runs jiti
+  // with moduleCache:false), while /new, /resume and fork re-invoke this
+  // factory against the cached module (agent-session-services.js builds a new
+  // resource loader per runtime). Either way an instance can be asked for a
+  // turn before its own session_start runs. Every path that constructs an
+  // extension goes on to emit session_start, so the wait ends.
   let sessionReady!: Promise<void>;
   let settleSessionReady: () => void = () => {};
   let sessionReadyPending = false;
@@ -1403,19 +1425,22 @@ export default function (pi: any) {
   }
   armSessionReady();
 
-  function waitForSession(ms: number): Promise<void> {
+  // Resolves true when session_start finished, false when the cap expired
+  // first — the caller has to tell those apart, since a cap expiry leaves
+  // bridgeError empty.
+  function waitForSession(ms: number): Promise<boolean> {
     const ready = sessionReady;
-    return new Promise<void>((resolve) => {
+    return new Promise<boolean>((resolve) => {
       let settled = false;
-      const done = () => {
+      const done = (ok: boolean) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
-        resolve();
+        resolve(ok);
       };
-      const timer = setTimeout(done, ms);
+      const timer = setTimeout(() => done(false), ms);
       (timer as any)?.unref?.();
-      ready.then(done, done);
+      ready.then(() => done(true), () => done(true));
     });
   }
 
@@ -1428,10 +1453,11 @@ export default function (pi: any) {
     pendingOrientation = "";
     bridgeError = "";
     armSessionReady(); // no-op when a turn is already parked on this session
+    const settle = settleSessionReady; // this invocation's resolver
     try {
       await startSession();
     } finally {
-      settleSessionReady();
+      settle();
     }
   });
 
@@ -1478,7 +1504,7 @@ export default function (pi: any) {
     if (orientationInjected) return;
     // Pi awaits each listener, so this holds the turn until the tools are
     // registered and bridgeError reflects the handshake (or the cap expires).
-    await waitForSession(READY_WAIT_MS);
+    const ready = await waitForSession(READY_WAIT_MS);
     const decision = callHook({ event: "session_start", cwd: pi?.cwd ?? process.cwd() });
     const parts: string[] = [];
     if (bridgeError) {
@@ -1487,6 +1513,16 @@ export default function (pi: any) {
         `Tell the user to run /reload to retry the connection.`,
       );
       bridgeError = "";
+    } else if (!ready) {
+      // Cap expired mid-handshake: bridgeError is still empty, and this is the
+      // only turn that reports it — orientationInjected latches below, so a
+      // handshake that fails after the cap never reaches the branch above.
+      parts.push(
+        `[Gortex] graph tools were still registering when this turn began, so a tool ` +
+        `named below may not be callable yet. If one is missing, say so and tell the ` +
+        `user to retry, or to run /reload if it stays missing — don't fall back to ` +
+        `native tools.`,
+      );
     }
     if (decision.orientation) parts.push(decision.orientation);
     if (parts.length > 0) {
