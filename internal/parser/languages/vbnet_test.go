@@ -796,6 +796,48 @@ End Interface
 // for a nested class is the inner one -- truncating the outer extent so every
 // member declared after the nested block loses its owner and its MEMBER_OF
 // edge. vbContainerEnd counts depth instead.
+// Namespaces nest too, and the outer one truncating at the inner terminator
+// costs every type declared after that inner block its scope_ns. Milder than
+// the class case -- no edge is lost, since types are not members of a
+// namespace -- but the same defect.
+func TestVBNetExtractor_NestedNamespaceExtent(t *testing.T) {
+	src := []byte(`Namespace Outer
+
+    Namespace Inner
+        Public Class InnerType
+        End Class
+    End Namespace
+
+    Public Class OuterType
+    End Class
+
+End Namespace
+`)
+	res, err := NewVBNetExtractor().Extract("ns.vb", src)
+	require.NoError(t, err)
+
+	outer := vbFind(res.Nodes, "Outer")
+	require.NotNil(t, outer)
+	assert.Equal(t, 1, outer.StartLine)
+	assert.Equal(t, 11, outer.EndLine, "outer namespace must span past the nested End Namespace")
+
+	inner := vbFind(res.Nodes, "Inner")
+	require.NotNil(t, inner)
+	assert.Equal(t, 3, inner.StartLine)
+	assert.Equal(t, 6, inner.EndLine)
+
+	// The type after the nested block is the one that regressed.
+	ot := vbFind(res.Nodes, "OuterType")
+	require.NotNil(t, ot)
+	assert.Equal(t, "Outer", ot.Meta["scope_ns"])
+
+	// The inner type still resolves to the innermost namespace, not the outer
+	// one, now that both cover it.
+	it := vbFind(res.Nodes, "InnerType")
+	require.NotNil(t, it)
+	assert.Equal(t, "Inner", it.Meta["scope_ns"])
+}
+
 func TestVBNetExtractor_NestedContainerExtent(t *testing.T) {
 	src := []byte(`Public Class Outer
     Public Class Inner

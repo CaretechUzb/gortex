@@ -141,7 +141,7 @@ func (e *VBNetExtractor) Extract(filePath string, src []byte) (*parser.Extractio
 	for _, m := range vbNamespaceRe.FindAllSubmatchIndex(src, -1) {
 		name := string(src[m[2]:m[3]])
 		line := lineAt(src, m[0])
-		end := findKeywordBlockEnd(lines, line, "end namespace")
+		end := vbContainerEnd(lines, line, vbNamespaceRe, "end namespace")
 		id := add(filePath+"::"+name, name, graph.KindPackage, line, end, nil)
 		if id != "" {
 			namespaces = append(namespaces, vbRange{name: name, id: id, start: line, end: end})
@@ -417,8 +417,10 @@ func (e *VBNetExtractor) Extract(filePath string, src []byte) (*parser.Extractio
 // stopping at the first match. findKeywordBlockEnd cannot be used here: a
 // nested `Class Inner ... End Class` would end the OUTER class early, and
 // every member declared after it would lose its owner and its MEMBER_OF
-// edge. Only the same keyword pair is counted, so a Structure nested in a
-// Class does not perturb the Class depth.
+// edge. Namespaces nest the same way, and a truncated one drops scope_ns
+// from every type declared after the inner block. Only the same keyword
+// pair is counted, so a Structure nested in a Class does not perturb the
+// Class depth.
 //
 // Returns startLine when no terminator is found, matching
 // findKeywordBlockEnd's degradation for an unterminated block.
