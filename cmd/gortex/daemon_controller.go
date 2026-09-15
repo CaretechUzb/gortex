@@ -366,7 +366,7 @@ func (c *realController) EnrichBlame(_ context.Context, p daemon.EnrichBlamePara
 	started := time.Now()
 	var combined daemon.EnrichBlameResult
 	for _, t := range targets {
-		count, err := blame.EnrichGraph(c.graph, t.root)
+		count, err := blame.EnrichGraph(c.graph, t.root, t.prefix)
 		if err != nil {
 			return daemon.EnrichBlameResult{}, fmt.Errorf("enrich %s: %w", t.prefix, err)
 		}
@@ -687,6 +687,10 @@ func resolveSearchBackend(b search.Backend) searchBackendInfo {
 	//    drilling into the text side for name/doc-count identification.
 	if hyb, ok := inner.(*search.HybridBackend); ok {
 		out.vectorBytes = hyb.VectorSizeBytes()
+		out.Hybrid = true
+		if vi := hyb.VectorIndex(); vi != nil {
+			out.VectorCount = vi.Count()
+		}
 		inner = hyb.TextBackend()
 		// TextBackend() itself could be a Swappable in some setups. Pin it
 		// too so a nested replacement cannot invalidate this inspection.
