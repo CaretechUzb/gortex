@@ -41,3 +41,18 @@ Each installer sentinel asserts it matched, and a final sweep rejects any
 added to `adapter.go` both fail here.
 The `node:child_process` seam and the `READY_WAIT_MS` declaration are fenced
 the same way.
+
+`testsupport/fixtures.mjs`'s `startGatedSession` fences the subtlest
+assumption: it captures the child spawned by an un-awaited `session_start` on
+the line after the emit, which holds only while `index.ts` spawns before its
+first `await` inside that handler. Move the spawn behind an `await` and it
+throws, instead of gating nothing and leaving the suite green.
+
+## Timing
+
+Assertions are structural, never wall-clock. A suite that needs registration
+to still be in flight gates the mock child (`startGatedSession`, then
+`child.releaseReplies()`) so the state under test holds for as long as the
+process takes. An upper bound on elapsed milliseconds would flake on a loaded
+CI runner — `go test -race ./...` saturates one, and `node --test` runs these
+files concurrently on top of that.

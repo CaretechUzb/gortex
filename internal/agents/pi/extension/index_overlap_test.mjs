@@ -15,46 +15,31 @@ import assert from "node:assert/strict";
 import { buildSubject, loadFactory } from "./testsupport/subject.mjs";
 import { control, resetInitializeAttempts } from "./testsupport/child-process-mock.mjs";
 import { createPi } from "./testsupport/pi-stub.mjs";
-import { ORIENTATION, TOOLS, freshSession, firstTurn } from "./testsupport/fixtures.mjs";
-
-// C is slow enough that A's post-backoff retry (~1s: start() backs off 1s and
-// retries once superseded) settles with a wide margin on either side of the
-// assertions below. Both bounds sit ~1s away from the value they fence.
-const SLOW_HANDSHAKE_MS = 2500;
-const SETTLED_BY_MS = 2000;
+import { ORIENTATION, TOOLS, delay, freshSession, firstTurn, startGatedSession } from "./testsupport/fixtures.mjs";
 
 describe("a stale session_start settling mid-turn", () => {
-  let pi, aFinished, releasedWhenAFinished, released;
+  let pi, releasedWhenAFinished, released, aFinishedAt;
 
   before(async () => {
     const subject = await buildSubject();
 
     resetInitializeAttempts();
-    control.reset({
-      handshakeDelayMs: 0,
-      toolsListDelayMs: 0,
-      tools: TOOLS,
-      hookDecision: { orientation: ORIENTATION },
-    });
+    control.reset({ tools: TOOLS, hookDecision: { orientation: ORIENTATION } });
 
     const factory = await loadFactory(subject, 0);
     pi = createPi();
     factory(pi);
 
-    // A: superseded by B, so its start() rejects, backs off 1s and retries —
-    // it settles roughly a second from now, long after B is done.
+    // A: superseded by B, so its start() rejects, backs off and retries. It
+    // settles on its own schedule; nothing here depends on when.
     const a = freshSession(pi, "startup");
 
     // B: fast, and overlaps A.
     await freshSession(pi, "new");
 
-    // C: starts after B settled and is still running when A finally finishes.
-    // The child reads the latency when the extension writes `initialize`, so
-    // dropping the global back to 0 immediately afterwards leaves C slow while
-    // letting A's post-backoff retry complete quickly.
-    control.handshakeDelayMs = SLOW_HANDSHAKE_MS;
-    const c = freshSession(pi, "reload");
-    control.handshakeDelayMs = 0;
+    // C: gated, so it is guaranteed to still be running when A settles.
+    // Ordering is structural — A is awaited before C is ever released.
+    const { settled: c, child: cChild } = startGatedSession(pi, "reload");
 
     const t0 = Date.now();
     released = 0;
@@ -63,24 +48,29 @@ describe("a stale session_start settling mid-turn", () => {
     });
 
     await a;
-    aFinished = Date.now() - t0;
+    aFinishedAt = Date.now() - t0;
+
+    // A settling releases the turn through a then(), so give that a full tick
+    // to land before reading. C stays gated throughout, so correct code has
+    // nothing that could release the turn no matter how long this waits.
+    await delay(20);
     releasedWhenAFinished = released;
 
+    cChild.releaseReplies();
     await turn;
     await c;
   });
 
-  it("settles the stale invocation first", () => {
-    // Precondition: without this the rest proves nothing.
-    assert.ok(aFinished < SETTLED_BY_MS, `A settled at ${aFinished}ms`);
-  });
-
   it("does not release the parked turn when the stale invocation settles", () => {
-    assert.equal(releasedWhenAFinished, 0, `released at ${releasedWhenAFinished}ms, when A settled at ${aFinished}ms`);
+    assert.equal(
+      releasedWhenAFinished,
+      0,
+      `released at ${releasedWhenAFinished}ms, while A settled at ${aFinishedAt}ms and C was still gated`,
+    );
   });
 
-  it("holds the turn until the invocation it parked on finishes", () => {
-    assert.ok(released >= SETTLED_BY_MS, `released at ${released}ms`);
+  it("releases the turn once the invocation it parked on finishes", () => {
+    assert.ok(released > 0, "the turn never resumed");
   });
 
   it("leaves the newest session's tools live", () => {

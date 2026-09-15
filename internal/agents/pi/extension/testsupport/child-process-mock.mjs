@@ -16,6 +16,10 @@ export const control = {
   hookDecision: {},
   // Make the first initialize fail, to exercise start()'s single retry.
   failFirstInitialize: false,
+  // Withhold the next spawned child's replies until releaseReplies(). A gate
+  // lets a suite hold registration open for as long as it needs without
+  // asserting on wall-clock latency.
+  holdNextChild: false,
 
   // Observations.
   spawns: [],
@@ -28,6 +32,7 @@ export const control = {
     this.tools = [];
     this.hookDecision = {};
     this.failFirstInitialize = false;
+    this.holdNextChild = false;
     this.spawns = [];
     this.hookCalls = [];
     this.children = [];
@@ -46,6 +51,8 @@ class FakeChild extends EventEmitter {
     this.stdin.write = (line) => this.#onWrite(line);
     this.killed = false;
     this.exited = false;
+    this.held = false;
+    this.pending = [];
   }
 
   #reply(obj, delayMs) {
@@ -53,8 +60,23 @@ class FakeChild extends EventEmitter {
       if (this.killed || this.exited) return;
       this.stdout.emit("data", Buffer.from(JSON.stringify(obj) + "\n", "utf8"));
     };
+    if (this.held) {
+      this.pending.push({ send, delayMs });
+      return;
+    }
     if (delayMs > 0) setTimeout(send, delayMs).unref?.();
     else queueMicrotask(send);
+  }
+
+  // Flush everything withheld and answer normally from here on.
+  releaseReplies() {
+    this.held = false;
+    const queued = this.pending;
+    this.pending = [];
+    for (const { send, delayMs } of queued) {
+      if (delayMs > 0) setTimeout(send, delayMs).unref?.();
+      else queueMicrotask(send);
+    }
   }
 
   #onWrite(line) {
@@ -131,6 +153,7 @@ export function spawn(bin, args = [], opts = {}) {
   }
 
   const child = new FakeChild();
+  child.held = control.holdNextChild;
   control.children.push(child);
   return child;
 }
