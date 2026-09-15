@@ -178,7 +178,7 @@ func (e *VBNetExtractor) Extract(filePath string, src []byte) (*parser.Extractio
 		for _, m := range spec.re.FindAllSubmatchIndex(src, -1) {
 			name := string(src[m[2]:m[3]])
 			line := lineAt(src, m[0])
-			end := findKeywordBlockEnd(lines, line, spec.endKw)
+			end := vbContainerEnd(lines, line, spec.re, spec.endKw)
 			meta := map[string]any{"type_flavor": spec.flavor}
 			if ns := enclosingNS(line); ns != "" {
 				meta["scope_ns"] = ns
@@ -230,9 +230,13 @@ func (e *VBNetExtractor) Extract(filePath string, src []byte) (*parser.Extractio
 
 	// emitCallable places a Sub/Function/Property/Event, owner-qualifying and
 	// emitting MEMBER_OF when it sits inside a type.
-	emitCallable := func(name string, line, end int, freeKind, memberKind graph.NodeKind) {
+	emitCallable := func(name string, line, end int, freeKind, memberKind graph.NodeKind,
+		extra map[string]any) {
 		owner := ownerAt(line)
 		meta := map[string]any{}
+		for k, v := range extra {
+			meta[k] = v
+		}
 		if ns := enclosingNS(line); ns != "" {
 			meta["scope_ns"] = ns
 		}
@@ -290,14 +294,18 @@ func (e *VBNetExtractor) Extract(filePath string, src []byte) (*parser.Extractio
 			// no terminator; findKeywordBlockEnd returns the start line, which
 			// is the correct single-line extent.
 			end := findKeywordBlockEnd(lines, line, spec.endKw)
-			emitCallable(name, line, end, spec.freeKind, spec.memberKind)
+			emitCallable(name, line, end, spec.freeKind, spec.memberKind, nil)
 		}
 	}
 
+	// A Declare is bodyless, so its extent is its own line. VB requires it
+	// inside a Class, Structure or Module, so it goes through the member
+	// path to pick up its owner; the free-function arm only catches the
+	// invalid-but-parseable case of one at file scope.
 	for _, m := range vbDeclareRe.FindAllSubmatchIndex(src, -1) {
 		name := string(src[m[2]:m[3]])
 		line := lineAt(src, m[0])
-		add(filePath+"::"+name, name, graph.KindFunction, line, line,
+		emitCallable(name, line, line, graph.KindFunction, graph.KindMethod,
 			map[string]any{"external": true})
 	}
 
@@ -402,6 +410,43 @@ func (e *VBNetExtractor) Extract(filePath string, src []byte) (*parser.Extractio
 	}
 
 	return result, nil
+}
+
+// vbContainerEnd returns the line of the terminator that closes the
+// container opened at startLine, counting nesting depth rather than
+// stopping at the first match. findKeywordBlockEnd cannot be used here: a
+// nested `Class Inner ... End Class` would end the OUTER class early, and
+// every member declared after it would lose its owner and its MEMBER_OF
+// edge. Only the same keyword pair is counted, so a Structure nested in a
+// Class does not perturb the Class depth.
+//
+// Returns startLine when no terminator is found, matching
+// findKeywordBlockEnd's degradation for an unterminated block.
+func vbContainerEnd(lines []string, startLine int, openRe *regexp.Regexp, endKw string) int {
+	if startLine < 1 || startLine > len(lines) {
+		return startLine
+	}
+	depth := 1
+	for i := startLine; i < len(lines); i++ {
+		trimmedLine := trimmed(lines[i])
+		if trimmedLine == "" {
+			continue
+		}
+		// Terminator first: "End Class" never satisfies the opening pattern
+		// (End is not a modifier), but checking it first keeps that
+		// independent of the pattern's exact shape.
+		if hasPrefixWord(toLower(trimmedLine), endKw) {
+			depth--
+			if depth == 0 {
+				return i + 1
+			}
+			continue
+		}
+		if openRe.MatchString(lines[i]) {
+			depth++
+		}
+	}
+	return startLine
 }
 
 // vbVisibility reads the access modifier off a declaration line. VB defaults

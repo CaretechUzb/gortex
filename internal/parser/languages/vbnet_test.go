@@ -791,3 +791,75 @@ End Interface
 	assert.Equal(t, graph.KindInterface, iface.Kind)
 	assert.Nil(t, iface.Meta["methods"])
 }
+
+// Nested containers. findKeywordBlockEnd stops at the FIRST terminator, which
+// for a nested class is the inner one -- truncating the outer extent so every
+// member declared after the nested block loses its owner and its MEMBER_OF
+// edge. vbContainerEnd counts depth instead.
+func TestVBNetExtractor_NestedContainerExtent(t *testing.T) {
+	src := []byte(`Public Class Outer
+    Public Class Inner
+        Public Sub InnerMethod()
+        End Sub
+    End Class
+
+    Public Sub OuterMethod()
+    End Sub
+End Class
+`)
+	res, err := NewVBNetExtractor().Extract("n.vb", src)
+	require.NoError(t, err)
+
+	outer := vbFind(res.Nodes, "Outer")
+	require.NotNil(t, outer)
+	assert.Equal(t, 1, outer.StartLine)
+	assert.Equal(t, 9, outer.EndLine, "outer extent must span past the nested End Class")
+
+	inner := vbFind(res.Nodes, "Inner")
+	require.NotNil(t, inner)
+	assert.Equal(t, 2, inner.StartLine)
+	assert.Equal(t, 5, inner.EndLine)
+
+	// The member after the nested block is the one that regressed.
+	om := vbFind(res.Nodes, "OuterMethod")
+	require.NotNil(t, om)
+	assert.Equal(t, graph.KindMethod, om.Kind)
+	assert.Equal(t, "Outer", om.Meta["receiver"])
+	assert.Equal(t, "n.vb::Outer.OuterMethod", om.ID)
+	assert.True(t, vbHasEdge(res.Edges, graph.EdgeMemberOf, om.ID, outer.ID),
+		"OuterMethod MEMBER_OF Outer")
+
+	// The inner member still belongs to the inner class, not the outer one.
+	im := vbFind(res.Nodes, "InnerMethod")
+	require.NotNil(t, im)
+	assert.Equal(t, "Inner", im.Meta["receiver"])
+	assert.True(t, vbHasEdge(res.Edges, graph.EdgeMemberOf, im.ID, inner.ID))
+}
+
+// A Declare is only valid inside a Class, Structure or Module, so a valid one
+// always has an owner. Emitting it at file scope dropped that owner and its
+// MEMBER_OF edge on every real declaration.
+func TestVBNetExtractor_DeclareInsideContainer(t *testing.T) {
+	src := []byte(`Public Module NativeApi
+    Public Declare Function GetTickCount Lib "kernel32" () As Long
+    Public Declare Sub SleepFor Lib "kernel32" (ByVal ms As Long)
+End Module
+`)
+	res, err := NewVBNetExtractor().Extract("d.vb", src)
+	require.NoError(t, err)
+
+	mod := vbFind(res.Nodes, "NativeApi")
+	require.NotNil(t, mod)
+
+	for _, name := range []string{"GetTickCount", "SleepFor"} {
+		n := vbFind(res.Nodes, name)
+		require.NotNil(t, n, name)
+		assert.Equal(t, graph.KindMethod, n.Kind, name)
+		assert.Equal(t, "NativeApi", n.Meta["receiver"], name)
+		assert.Equal(t, true, n.Meta["external"], name+" keeps its external marker")
+		assert.Equal(t, "d.vb::NativeApi."+name, n.ID)
+		assert.True(t, vbHasEdge(res.Edges, graph.EdgeMemberOf, n.ID, mod.ID), name)
+		// Bodyless: the extent is the declaration line itself.
+		assert.Equal(t, n.StartLine, n.EndLine, name)
+	}
+}
