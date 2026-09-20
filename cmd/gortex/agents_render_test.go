@@ -137,8 +137,10 @@ func TestAgentsRenderIsHermetic(t *testing.T) {
 	decoy := t.TempDir()
 	claudeDecoy := filepath.Join(decoy, "claude-config-dir")
 	kimiDecoy := filepath.Join(decoy, "kimi-code-home")
+	piDecoy := filepath.Join(decoy, "pi-coding-agent-dir")
 	t.Setenv("CLAUDE_CONFIG_DIR", claudeDecoy)
 	t.Setenv("KIMI_CODE_HOME", kimiDecoy)
+	t.Setenv("PI_CODING_AGENT_DIR", piDecoy)
 	t.Setenv("GORTEX_CODEX_HOOK_MODE", "suppress")
 	t.Setenv("GORTEX_INSTRUCTIONS_PROFILE", "full")
 
@@ -146,7 +148,7 @@ func TestAgentsRenderIsHermetic(t *testing.T) {
 
 	// 1. The decoy config roots must be untouched: if either had won,
 	//    the adapter's user-level artifacts would have landed there.
-	for _, dir := range []string{claudeDecoy, kimiDecoy} {
+	for _, dir := range []string{claudeDecoy, kimiDecoy, piDecoy} {
 		if _, err := os.Stat(dir); !os.IsNotExist(err) {
 			t.Errorf("render escaped the sandbox into %s (stat err: %v) — the config-dir env pin is not holding", dir, err)
 		}
