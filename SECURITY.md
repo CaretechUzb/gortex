@@ -182,6 +182,17 @@ from](#what-gortex-does-not-protect-you-from) for what this boundary is not.
   `github.com/alexaandru/go-sitter-forest`. The optional in-process LLM (the
   `local` provider) is compiled only with the `llama` build tag.
 - SQLite persistence uses the pure-Go `modernc.org/sqlite` driver (no CGO).
+- **Plugin publishing is a trusted operation.** The
+  `publish-claude-plugin` workflow builds the selected ref's Makefile and Go
+  code in the job that publishes to `gortexhq/claude-plugin`. Ref validation
+  and environment-variable handling prevent shell and workflow-output
+  injection; they do not sandbox the selected source code. Dispatch only
+  refs you trust. The repository-scoped `CLAUDE_PLUGIN_TOKEN` is within the
+  repository-writer trust boundary. If publishing must require a narrower
+  set of approvers, move the token to a protected GitHub environment, attach
+  that environment to the publishing job, and configure required reviewers
+  and deployment branch/tag restrictions. Input validation alone does not
+  enforce that authorization policy.
 
 ## Hardening checklist
 
