@@ -286,7 +286,7 @@ func TestAgentsRenderFenceCoverage(t *testing.T) {
 		"=== global/home/.claude/CLAUDE.md ===",
 		// Lifecycle hooks, both scopes.
 		"=== project/root/.claude/settings.local.json ===",
-		"=== global/home/.claude/settings.local.json ===",
+		"=== global/home/.claude/settings.json ===",
 		// Generated per-community skills.
 		"=== project/root/.claude/skills/generated/gortex-example-one/SKILL.md ===",
 		"=== project/root/.claude/skills/generated/gortex-example-two/SKILL.md ===",

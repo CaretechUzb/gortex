@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"math"
@@ -2557,6 +2558,16 @@ func (s *Server) handleFindHotspots(ctx context.Context, req mcp.CallToolRequest
 
 	var entries []analysis.HotspotEntry
 	if threshold == 0 {
+		// getHotspots serves the cached ranking, which does not exist
+		// until the first RunAnalysis pass lands (analysisEpoch == 0
+		// until then, and ensureHotspots fails closed with nil). Gating
+		// on the on-demand pass keeps this handler aligned with the
+		// sibling communities/processes handlers: before the pass the
+		// caller gets analysis_pending with a retry hint instead of an
+		// empty ranking indistinguishable from "no hotspots".
+		if pending := s.ensureAnalysis(); !pending.Ready {
+			return s.respondJSONOrTOON(ctx, req, analysisPendingPayload(pending, "hotspots"))
+		}
 		entries = s.getHotspots()
 	} else {
 		entries = analysis.FindHotspots(s.graph, s.getCommunities(), threshold)
@@ -2693,7 +2704,11 @@ func (s *Server) handleScaffold(ctx context.Context, req mcp.CallToolRequest) (*
 	}
 
 	if !dryRun && s.indexer != nil {
-		// Apply edits by writing files
+		// Apply edits by writing files. Every write funnels through
+		// commitFileMutation — the UTF-16 refusal (#846), the cancellation
+		// gate, and the mutation receipt live there. A direct os.WriteFile
+		// used to splice UTF-8 into NUL-interleaved bytes and corrupt the
+		// file from the insertion point on.
 		for _, edit := range result.Edits {
 			absPath := edit.FilePath
 			if root := s.indexer.RootPath(); root != "" {
@@ -2711,7 +2726,19 @@ func (s *Server) handleScaffold(ctx context.Context, req mcp.CallToolRequest) (*
 			newLines = append(newLines, "")
 			newLines = append(newLines, edit.Code)
 			newLines = append(newLines, lines[insertIdx:]...)
-			if writeErr := os.WriteFile(absPath, []byte(strings.Join(newLines, "\n")), 0o644); writeErr != nil {
+			// Keep the file's existing mode: the atomic commit applies perm
+			// to the replacement, so a fixed 0o644 would strip a script's
+			// executable bit.
+			perm := os.FileMode(0o644)
+			if info, err := os.Stat(absPath); err == nil {
+				perm = info.Mode().Perm()
+			}
+			commit, writeErr := s.commitFileMutation(ctx, "scaffold", "", "", edit.FilePath, absPath,
+				[]byte(strings.Join(newLines, "\n")), perm)
+			if writeErr != nil {
+				if errors.Is(writeErr, errMutationNotApplied) {
+					return mcp.NewToolResultError(mutationNotAppliedMessage("scaffold", commit, writeErr)), nil
+				}
 				return mcp.NewToolResultError(fmt.Sprintf("could not write %s: %v", edit.FilePath, writeErr)), nil
 			}
 		}
@@ -2887,7 +2914,7 @@ func (s *Server) handleDiffContext(ctx context.Context, req mcp.CallToolRequest)
 		return mcp.NewToolResultError(rootErr.Error()), nil
 	}
 
-	diff, err := analysis.MapGitDiff(s.readerFor(ctx), repoRoot, repoPrefix, scope, baseRef)
+	diff, err := analysis.MapGitDiffContext(ctx, s.readerFor(ctx), repoRoot, repoPrefix, scope, baseRef)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -2899,8 +2926,14 @@ func (s *Server) handleDiffContext(ctx context.Context, req mcp.CallToolRequest)
 		})
 	}
 
-	communities := s.getCommunities()
-	processes := s.getProcesses()
+	ids := make([]string, 0, len(diff.ChangedSymbols))
+	for _, cs := range diff.ChangedSymbols {
+		ids = append(ids, cs.ID)
+	}
+	communities, processes, err := s.analysisMembershipsForNodes(ctx, ids)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
 
 	// Build enriched symbol info. The lookups run on the request's
 	// reader, matching the caller/chain walks below which already go
@@ -2908,6 +2941,9 @@ func (s *Server) handleDiffContext(ctx context.Context, req mcp.CallToolRequest)
 	reader := s.readerFor(ctx)
 	var allSymbols []diffSymbolInfo
 	for _, cs := range diff.ChangedSymbols {
+		if err := ctx.Err(); err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
 		node := reader.GetNode(cs.ID)
 		if node == nil {
 			continue
@@ -2981,12 +3017,15 @@ func (s *Server) handleDiffContext(ctx context.Context, req mcp.CallToolRequest)
 	// Compute per-file risk
 	var groups []diffFileGroup
 	for fp, syms := range fileMap {
+		if err := ctx.Err(); err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
 		// Compute risk based on blast radius of symbols in this file
 		symbolIDs := make([]string, len(syms))
 		for i, sym := range syms {
 			symbolIDs[i] = sym.ID
 		}
-		impact := analysis.AnalyzeImpact(reader, symbolIDs, communities, processes)
+		impact := diffImpactContext(ctx, reader, symbolIDs, communities, processes)
 
 		groups = append(groups, diffFileGroup{
 			FilePath: fp,
@@ -3028,6 +3067,10 @@ func (s *Server) handleDiffContext(ctx context.Context, req mcp.CallToolRequest)
 			count += len(g.Symbols)
 		}
 		groups = truncGroups
+	}
+
+	if err := ctx.Err(); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
 	}
 
 	if isCompact(req) {
@@ -4189,6 +4232,12 @@ func (s *Server) applyBatchSymbolEdit(ctx context.Context, edit batchEditItem, w
 		res.Status, res.Error = "failed", fmt.Sprintf("could not read file: %v", readErr)
 		return res
 	}
+	// Same UTF-16 refusal as edit_symbol: the match below would fail
+	// with a misleading "not found" against NUL-interleaved bytes (#846).
+	if indexer.LooksUTF16Source(content) {
+		res.Status, res.Error = "failed", refuseUTF16Edit("batch edit_symbol", node.FilePath).Error()
+		return res
+	}
 	fileStr := string(content)
 	lines := strings.Split(fileStr, "\n")
 
@@ -4315,6 +4364,12 @@ func (s *Server) applyBatchFileEdit(ctx context.Context, edit batchEditItem, wri
 	content, readErr := os.ReadFile(absPath)
 	if readErr != nil {
 		res.Status, res.Error = "failed", fmt.Sprintf("could not read file: %v", readErr)
+		return res
+	}
+	// Same UTF-16 refusal as edit_file: the match below would fail with a
+	// misleading "not found" against NUL-interleaved bytes (#846).
+	if indexer.LooksUTF16Source(content) {
+		res.Status, res.Error = "failed", refuseUTF16Edit("batch edit_file", relPath).Error()
 		return res
 	}
 	fileStr := string(content)

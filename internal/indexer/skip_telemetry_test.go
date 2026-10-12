@@ -1,12 +1,15 @@
 package indexer
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf16"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -153,6 +156,7 @@ func TestSkipNodes_CarryUnifiedReason(t *testing.T) {
 		{"size", sizeSkipNode(skippedFile{relPath: "big.go", lang: "go", size: 1 << 20}, 1024), "size"},
 		{"timeout", timeoutSkipResult("slow.go", "go", 500).Nodes[0], "timeout"},
 		{"minified", minifiedSkipResult("bundle.js", "javascript", "long-lines").Nodes[0], "minified"},
+		{"binary", binarySkipResult("cache.pkl", "pkl", "binary source").Nodes[0], "binary"},
 		{"parse_failed", parseFailedSkipResult("bad.go", "go", errors.New("boom")).Nodes[0], "parse_failed"},
 		{"parse_panic", quarantineResult("crash.go", "go", "panic").Nodes[0], "parse_panic"},
 	}
@@ -194,6 +198,146 @@ func TestIndex_ParseFailedSkipTelemetry(t *testing.T) {
 	require.NotNil(t, n, "a full-index parse failure must leave a visible skip node")
 	require.Equal(t, graph.KindFile, n.Kind)
 	require.Equal(t, "parse_failed", n.Meta["skip_reason"])
+}
+
+// countingExtractor is a parser.Extractor that counts Extract calls, so
+// a test can prove the binary guard fired BEFORE any extraction work.
+// The counter lives on the extractor instance so each test owns its own —
+// a package-level counter made the assertions order- and run-count-
+// dependent (failing under -count=2 and -shuffle).
+type countingExtractor struct{ calls atomic.Int32 }
+
+func (e *countingExtractor) Language() string     { return "fake" }
+func (e *countingExtractor) Extensions() []string { return []string{".pkl", ".fk"} }
+func (e *countingExtractor) Extract(filePath string, _ []byte) (*parser.ExtractionResult, error) {
+	e.calls.Add(1)
+	return &parser.ExtractionResult{
+		Nodes: []*graph.Node{{ID: filePath, Kind: graph.KindFile, Name: filePath}},
+	}, nil
+}
+
+// TestIndex_BinarySkipTelemetry verifies a binary payload claimed by a
+// registered language (a .pkl tool cache against the Pkl extractor, the
+// reported case) becomes a synthetic skip node instead of feeding
+// tree-sitter's error recovery, and that the pass still completes. The
+// custom registry isolates the guard from the real Pkl grammar.
+func TestIndex_BinarySkipTelemetry(t *testing.T) {
+	ext := &countingExtractor{}
+	reg := parser.NewRegistry()
+	reg.Register(ext)
+	cfg := config.Default().Index
+	cfg.Workers = 1
+	idx := New(graph.New(), reg, cfg, zap.NewNop())
+
+	dir := t.TempDir()
+	binary := append([]byte("\x80\x04\x95"), 0x00, 0x00, 0x01, 0x02)
+	writeFile(t, filepath.Join(dir, "raw_document_symbols.pkl"), string(binary))
+	writeFile(t, filepath.Join(dir, "text.fk"), "real source")
+
+	result, err := idx.Index(dir)
+	require.NoError(t, err)
+	require.Equal(t, 1, result.SkippedFiles)
+
+	n := idx.graph.GetNode("raw_document_symbols.pkl")
+	require.NotNil(t, n, "a binary skip must leave a visible node")
+	require.Equal(t, graph.KindFile, n.Kind)
+	require.Equal(t, true, n.Meta["skipped_due_to_binary"])
+	require.NotEmpty(t, n.Meta["binary_reason"])
+	// The extractor never ran on the binary bytes.
+	require.Equal(t, int32(1), ext.calls.Load())
+
+	// The skip is a successful read: no failure row is recorded, so the
+	// file does not re-enter the failure-ledger retry path on the next
+	// reconcile. (fileIndexFailureError returns the errFileVersionChanged
+	// sentinel for a path with no ledger row — "nothing failed".)
+	for _, graphPath := range idx.fileIndexFailurePaths() {
+		require.NotEqual(t, "raw_document_symbols.pkl", graphPath,
+			"a binary skip must not land in the failure ledger")
+	}
+}
+
+// TestIndexFile_BinarySkip mirrors the skip onto the single-file
+// watcher path: a save of a binary file claimed by an extension yields
+// a synthetic node and a clean return, not a parse failure.
+func TestIndexFile_BinarySkip(t *testing.T) {
+	ext := &countingExtractor{}
+	reg := parser.NewRegistry()
+	reg.Register(ext)
+	cfg := config.Default().Index
+	idx := New(graph.New(), reg, cfg, zap.NewNop())
+
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "ok.fk"), "real source")
+	if _, err := idx.Index(dir); err != nil {
+		t.Fatalf("index: %v", err)
+	}
+
+	before := ext.calls.Load()
+	binary := filepath.Join(dir, "raw_document_symbols.pkl")
+	writeFile(t, binary, "\x80\x04\x95\x00\x00")
+	require.NoError(t, idx.indexFile(binary, false))
+
+	n := idx.graph.GetNode("raw_document_symbols.pkl")
+	require.NotNil(t, n)
+	require.Equal(t, true, n.Meta["skipped_due_to_binary"])
+	// The extractor never ran on the binary bytes.
+	require.Equal(t, before, ext.calls.Load())
+}
+
+
+// csExtractor claims the .cs extension so the UTF-16 fixture reaches the
+// admission path like a real C# source would.
+type csExtractor struct{ countingExtractor }
+
+func (e *csExtractor) Extensions() []string { return []string{".cs"} }
+
+// TestIndexFile_UTF16DecodedIndexed pins the decoded behaviour (#812,
+// rebase over #839): an ordinary UTF-16LE file no longer skips — the
+// always-on utf16-decode transform transcodes it to UTF-8 ahead of the
+// admission sniff, so the extractor runs on the decoded bytes and the
+// symbols land in the graph. No skip node, and — because the decode
+// succeeds — no failure-ledger row and no silent-zero diagnostic.
+func TestIndexFile_UTF16DecodedIndexed(t *testing.T) {
+	ext := &csExtractor{}
+	reg := parser.NewRegistry()
+	reg.Register(ext)
+	cfg := config.Default().Index
+	idx := New(graph.New(), reg, cfg, zap.NewNop())
+
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "ok.cs"), "real source")
+	units := utf16.Encode([]rune("public class Legacy\n{\n    public int B() { return 1; }\n}\n"))
+	var b bytes.Buffer
+	b.WriteByte(0xFF)
+	b.WriteByte(0xFE)
+	for _, u := range units {
+		b.WriteByte(byte(u))
+		b.WriteByte(byte(u >> 8))
+	}
+	writeFile(t, filepath.Join(dir, "legacy.cs"), b.String())
+
+	result, err := idx.Index(dir)
+	require.NoError(t, err)
+	require.Zero(t, result.SkippedFiles, "nothing may skip: the UTF-16 file is decoded, the text file indexes")
+	n := idx.graph.GetNode("legacy.cs")
+	require.NotNil(t, n, "the decoded file must leave a node")
+	require.NotEqual(t, true, n.Meta["skipped_due_to_binary"],
+		"a decoded UTF-16 source must not carry the binary-skip mark")
+	// The extractor ran on BOTH files — the decoded legacy.cs reached it
+	// as clean UTF-8.
+	require.Equal(t, int32(2), ext.calls.Load())
+	var legacySymbols int
+	for _, node := range idx.graph.AllNodes() {
+		if node != nil && strings.HasSuffix(node.ID, "legacy.cs") {
+			legacySymbols++
+		}
+	}
+	require.Positive(t, legacySymbols, "the decoded source must yield symbols")
+	// A successful decode is a successful read: no failure-ledger row.
+	for _, graphPath := range idx.fileIndexFailurePaths() {
+		require.NotEqual(t, "legacy.cs", graphPath,
+			"a decoded UTF-16 index must not land in the failure ledger")
+	}
 }
 
 func walkedFilePaths(fs []walkedFile) []string {

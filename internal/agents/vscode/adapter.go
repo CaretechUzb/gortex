@@ -34,6 +34,16 @@ func New() *Adapter                { return &Adapter{} }
 func (a *Adapter) Name() string    { return Name }
 func (a *Adapter) DocsURL() string { return DocsURL }
 
+// WritesCommunitiesRouting reports that this adapter merges the
+// communities routing block into its instruction file (project mode).
+func (a *Adapter) WritesCommunitiesRouting() bool { return true }
+
+// CommunitiesRoutingPath reports the instruction file that carries the
+// communities block in project mode.
+func (a *Adapter) CommunitiesRoutingPath(env agents.Env) string {
+	return filepath.Join(env.Root, ".github", "copilot-instructions.md")
+}
+
 func (a *Adapter) Detect(env agents.Env) (bool, error) {
 	if _, err := os.Stat(filepath.Join(env.Root, ".vscode")); err == nil {
 		return true, nil
@@ -95,12 +105,10 @@ func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, 
 			return false, nil
 		}
 		// VS Code's native MCP runtime (1.102+) infers stdio from
-		// command/args presence, so no "type" field is needed. Env
-		// is optional — we set it for parity with other adapters.
+		// command/args presence, so no "type" field is needed.
 		servers["gortex"] = map[string]any{
 			"command": "gortex",
 			"args":    []string{"mcp"},
-			"env":     map[string]string{"GORTEX_INDEX_WORKERS": "8"},
 		}
 		root["servers"] = servers
 		return true, nil

@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -994,6 +995,7 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 		totalFileChars int
 		viewURI        string
 		absPath        string
+		utf16Served    bool
 	)
 	if files := refViewFilesFor(ctx); files != nil {
 		// The symbol's lines belong to the committed tree the view pins, not
@@ -1002,9 +1004,13 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 		if viewErr != nil {
 			return mcp.NewToolResultError(viewErr.Error()), nil
 		}
+		decoded, utf16Decoded := decodedSourceForRead(content)
 		viewURI = files.uri(rel)
 		source, startLine, totalFileChars, _ = extractLinesFromContent(
-			string(content), node.StartLine, node.EndLine, contextLines)
+			string(decoded), node.StartLine, node.EndLine, contextLines)
+		if utf16Decoded {
+			utf16Served = true
+		}
 	} else {
 		var resolveErr error
 		absPath, resolveErr = s.resolveNodePath(ctx, node)
@@ -1052,11 +1058,15 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 	// Server-side accounting only — the savings value isn't returned to
 	// the caller (agents don't act on it and it burns tokens in every
 	// response). Aggregated stats remain available via the `savings` tool.
-	returned := tokens.CachedCountInt64(source)
-	fullFile := int64(tokens.EstimateFromSample(totalFileChars, source))
-	symStats := s.tokenStatsFor(ctx)
-	symStats.creditFile(absPath)
-	symStats.record(s.savingsAttributionNode(node), "get_symbol_source", returned, fullFile)
+	// Buffer until after the if_none_match gate so a warm poll does not
+	// book a whole-file baseline for a transfer of nothing.
+	pending := []pendingSavings{{
+		node:     node,
+		absPath:  absPath,
+		tool:     "get_symbol_source",
+		returned: tokens.CachedCountInt64(source),
+		fullFile: int64(tokens.EstimateFromSample(totalFileChars, source)),
+	}}
 
 	result := map[string]any{
 		"id":         node.ID,
@@ -1100,6 +1110,11 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 		omissions = append(omissions, omission("secrets_withheld",
 			"secret-shaped values in this config symbol were withheld; pass allow_secrets:true to read them"))
 	}
+	// The disk path decodes inside readLines; this bounded probe only
+	// decides whether to say so.
+	if utf16Served || (absPath != "" && fileLooksUTF16(absPath)) {
+		omissions = append(omissions, utf16DecodedOmission())
+	}
 	if len(omissions) > 0 {
 		result["omissions"] = omissions
 	}
@@ -1113,6 +1128,7 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 	if ifNoneMatch := req.GetString("if_none_match", ""); ifNoneMatch != "" && ifNoneMatch == etag {
 		return notModifiedResult(etag), nil
 	}
+	s.recordPendingSavings(ctx, pending)
 	result["etag"] = etag
 
 	if s.isGCX(ctx, req) {
@@ -1133,11 +1149,15 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 // Production handlers should call (*Server).readLinesForCtx so the
 // editor-buffer overlay is honoured when active.
 func readLines(path string, startLine, endLine, contextLines int) (string, int, int, error) {
-	f, err := os.Open(path)
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		return "", 0, 0, err
 	}
-	defer f.Close()
+	// Decode a UTF-16 source before line-scanning (#846): the graph holds
+	// symbols extracted from decoded text, so this path must serve the
+	// same text or discovery and reads disagree. Identity for every other
+	// file; the decode preserves line structure 1:1.
+	src := indexer.DecodeUTF16Source(raw)
 
 	from := startLine - contextLines
 	if from < 1 {
@@ -1147,7 +1167,7 @@ func readLines(path string, startLine, endLine, contextLines int) (string, int, 
 
 	var lines []string
 	var totalChars int
-	scanner := bufio.NewScanner(f)
+	scanner := bufio.NewScanner(bytes.NewReader(src))
 	lineNum := 0
 	for scanner.Scan() {
 		lineNum++
@@ -1266,6 +1286,7 @@ func (s *Server) handleBatchSymbols(ctx context.Context, req mcp.CallToolRequest
 	sessWS, _, _ := s.sessionScope(ctx)
 
 	var results []map[string]any
+	var pending []pendingSavings
 	for _, id := range ids {
 		node := s.engineFor(ctx).GetSymbol(id)
 		// A node outside the session's workspace is reported as a
@@ -1331,11 +1352,13 @@ func (s *Server) handleBatchSymbols(ctx context.Context, req mcp.CallToolRequest
 				if source, fromLine, totalFileChars, err := s.readLinesForCtx(ctx, absPath, node.StartLine, node.EndLine, contextLines); err == nil {
 					entry["source"] = source
 					entry["from_line"] = fromLine
-					returned := tokens.CachedCountInt64(source)
-					fullFile := int64(tokens.EstimateFromSample(totalFileChars, source))
-					batchStats := s.tokenStatsFor(ctx)
-					batchStats.creditFile(absPath)
-					batchStats.record(s.savingsAttributionNode(node), "batch_symbols", returned, fullFile)
+					pending = append(pending, pendingSavings{
+						node:     node,
+						absPath:  absPath,
+						tool:     "batch_symbols",
+						returned: tokens.CachedCountInt64(source),
+						fullFile: int64(tokens.EstimateFromSample(totalFileChars, source)),
+					})
 				}
 			}
 		}
@@ -1353,6 +1376,7 @@ func (s *Server) handleBatchSymbols(ctx context.Context, req mcp.CallToolRequest
 	if ifNoneMatch := req.GetString("if_none_match", ""); ifNoneMatch != "" && ifNoneMatch == etag {
 		return notModifiedResult(etag), nil
 	}
+	s.recordPendingSavings(ctx, pending)
 	batchResult["etag"] = etag
 
 	if s.isGCX(ctx, req) {
@@ -2213,6 +2237,7 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 	// need more can follow up with get_symbol_source for specific IDs.
 	sourcesEmbedded := 0
 	var symbolContexts []map[string]any
+	var pending []pendingSavings
 	for _, sym := range relevantSymbols {
 		entry := map[string]any{
 			"id":         sym.ID,
@@ -2235,11 +2260,13 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 					}
 					entry["source"] = source
 					sourcesEmbedded++
-					returned := tokens.CachedCountInt64(source)
-					fullFile := int64(tokens.EstimateFromSample(totalFileChars, source))
-					ctxStats := s.tokenStatsFor(ctx)
-					ctxStats.creditFile(absPath)
-					ctxStats.record(s.savingsAttributionNode(sym), "smart_context", returned, fullFile)
+					pending = append(pending, pendingSavings{
+						node:     sym,
+						absPath:  absPath,
+						tool:     "smart_context",
+						returned: tokens.CachedCountInt64(source),
+						fullFile: int64(tokens.EstimateFromSample(totalFileChars, source)),
+					})
 				}
 			}
 		}
@@ -2423,6 +2450,7 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 	if ifNoneMatch := req.GetString("if_none_match", ""); ifNoneMatch != "" && ifNoneMatch == etag {
 		return notModifiedResult(etag), nil
 	}
+	s.recordPendingSavings(ctx, pending)
 	result["etag"] = etag
 
 	// Delta context packing: cache this pack's canonical view under its
@@ -2972,6 +3000,13 @@ func (s *Server) handleEditSymbol(ctx context.Context, req mcp.CallToolRequest) 
 	content, err := os.ReadFile(absPath)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("could not read file: %v", err)), nil
+	}
+	// Refuse before any match attempt: a UTF-16 file's failure mode below
+	// this point is "old_source not found", which sends the agent to
+	// get_symbol_source — which serves the decoded text — a loop with no
+	// exit (#846).
+	if indexer.LooksUTF16Source(content) {
+		return mcp.NewToolResultError(refuseUTF16Edit("edit_symbol", node.FilePath).Error()), nil
 	}
 	if baseSHA != "" && gitBlobSHA(content) != baseSHA {
 		return mcp.NewToolResultError(errBaseSHADrift), nil

@@ -16,7 +16,11 @@ import (
 
 func TestStripBOM(t *testing.T) {
 	body := []byte("package main\n")
-	require.Equal(t, body, stripBOM(append([]byte{0xEF, 0xBB, 0xBF}, body...))) // UTF-8
+	// The decoder runs BEFORE the stripper, so a healthy UTF-16 source
+	// never reaches this transform with its mark; the strip here covers
+	// the residue the decoder's heuristic declined, matching the
+	// historical behavior for everything else.
+	require.Equal(t, body, stripBOM(append([]byte{0xEF, 0xBB, 0xBF}, body...)))  // UTF-8
 	require.Equal(t, body, stripBOM(append([]byte{0xFF, 0xFE}, body...)))       // UTF-16LE
 	require.Equal(t, body, stripBOM(append([]byte{0xFE, 0xFF}, body...)))       // UTF-16BE
 	require.Equal(t, body, stripBOM(body))                                      // no BOM
@@ -24,7 +28,7 @@ func TestStripBOM(t *testing.T) {
 }
 
 func TestTransformPipeline_BOMStripIsBuiltIn(t *testing.T) {
-	p := newTransformPipeline(nil, zap.NewNop())
+	p := newTransformPipeline(nil, nil, zap.NewNop())
 	withBOM := append([]byte{0xEF, 0xBB, 0xBF}, []byte("package main\n")...)
 	require.Equal(t, []byte("package main\n"), p.run("x.go", withBOM))
 }
@@ -36,8 +40,8 @@ func TestTransformPipeline_NilSafe(t *testing.T) {
 }
 
 func TestTransformPipeline_RuleWithNoCommandIgnored(t *testing.T) {
-	p := newTransformPipeline([]config.TransformRule{{Name: "broken"}}, zap.NewNop())
-	require.Len(t, p.transforms, 1) // only the built-in BOM stripper
+	p := newTransformPipeline([]config.TransformRule{{Name: "broken"}}, nil, zap.NewNop())
+	require.Len(t, p.transforms, 2) // the built-ins: BOM stripper + UTF-16 decoder
 }
 
 func TestCommandTransform_Matches(t *testing.T) {
@@ -70,7 +74,7 @@ func TestTransformPipeline_FailingCommandKeepsBytes(t *testing.T) {
 	// A failing transform must not drop the file — earlier bytes win.
 	p := newTransformPipeline([]config.TransformRule{{
 		Name: "broken", Command: []string{"gortex-no-such-binary-xyz"},
-	}}, zap.NewNop())
+	}}, nil, zap.NewNop())
 	require.Equal(t, []byte("untouched"), p.run("a.go", []byte("untouched")))
 }
 

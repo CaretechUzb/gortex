@@ -125,6 +125,95 @@ func TestObserveCheckoutPathDiscoversNewWorktreeWithoutTracking(t *testing.T) {
 	}
 }
 
+func TestObserveCheckoutPathStaleProofDuringHEADSamplingDoesNotAllocate(t *testing.T) {
+	lc, catalog, primary, familyID, _, _ := newCheckoutObservationFixture(t)
+	worktree := filepath.Join(filepath.Dir(primary), "stale-proof")
+	builderGit(t, primary, "worktree", "add", "-b", "stale-proof", worktree)
+	proof, err := lc.prepareCheckoutObservation(t.Context(), worktree)
+	if err != nil || proof == nil {
+		t.Fatalf("prepare proof: %+v %v", proof, err)
+	}
+	sampled := false
+	reconcile.WithHEADSampler(func(context.Context, string) (gitstate.HEADState, error) {
+		sampled = true
+		marker := filepath.Join(worktree, ".git")
+		data, err := os.ReadFile(marker)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(marker, append(data, '\n'), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return gitstate.HEADState{}, nil
+	})(lc.rec)
+	_, found, err := lc.applyCheckoutObservation(t.Context(), proof)
+	if found || !errors.Is(err, ErrCheckoutMutationStale) || !sampled {
+		t.Fatalf("stale observation: found=%v err=%v sampled=%v", found, err, sampled)
+	}
+	rows, err := catalog.ListCheckouts(t.Context(), familyID)
+	if err != nil || len(rows) != 1 || !pathkey.EqualPaths(rows[0].RootPath, pathkey.CanonicalExistingRoot(primary)) {
+		t.Fatalf("stale proof left a catalog identity: %+v %v", rows, err)
+	}
+	// The changed marker still names a valid Git family. A new proof may
+	// legitimately admit it; rejecting the old proof must not ban this root.
+	reconcile.WithHEADSampler(gitstate.SampleHEAD)(lc.rec)
+	fresh, err := lc.prepareCheckoutObservation(t.Context(), worktree)
+	if err != nil || fresh == nil {
+		t.Fatalf("prepare fresh proof: %+v %v", fresh, err)
+	}
+	checkout, found, err := lc.applyCheckoutObservation(t.Context(), fresh)
+	if err != nil || !found || checkout.State != store_sqlite.CheckoutStateReady || !pathkey.EqualPaths(checkout.RootPath, pathkey.CanonicalExistingRoot(worktree)) {
+		t.Fatalf("valid re-observation: %+v found=%v err=%v", checkout, found, err)
+	}
+}
+
+func TestObserveCheckoutPathRetainsStaleObservationAcrossRetries(t *testing.T) {
+	lc, catalog, primary, familyID, _, _ := newCheckoutObservationFixture(t)
+	worktree := filepath.Join(filepath.Dir(primary), "stale-retry")
+	builderGit(t, primary, "worktree", "add", "-b", "stale-retry", worktree)
+	var sampled atomic.Bool
+	reconcile.WithHEADSampler(func(context.Context, string) (gitstate.HEADState, error) {
+		if sampled.CompareAndSwap(false, true) {
+			marker := filepath.Join(worktree, ".git")
+			data, err := os.ReadFile(marker)
+			if err != nil {
+				return gitstate.HEADState{}, err
+			}
+			if err := os.WriteFile(marker, append(data, '\n'), 0o644); err != nil {
+				return gitstate.HEADState{}, err
+			}
+		}
+		return gitstate.HEADState{}, nil
+	})(lc.rec)
+	if _, found, err := observeCheckoutUntilSettled(t, lc, worktree); found || !errors.Is(err, ErrCheckoutMutationStale) || !sampled.Load() {
+		t.Fatalf("first stale observation: found=%v err=%v sampled=%v", found, err, sampled.Load())
+	}
+	// The newline leaves a valid Git target, but an immediate retry must reuse
+	// the stale refusal instead of admitting a fresh proof of that target.
+	if _, found, err := lc.ObserveCheckoutPath(t.Context(), worktree); found || !errors.Is(err, ErrCheckoutMutationStale) {
+		t.Fatalf("retry lost stale refusal: found=%v err=%v", found, err)
+	}
+	rows, err := catalog.ListCheckouts(t.Context(), familyID)
+	if err != nil || len(rows) != 1 || !pathkey.EqualPaths(rows[0].RootPath, pathkey.CanonicalExistingRoot(primary)) {
+		t.Fatalf("stale retry left a catalog identity: %+v %v", rows, err)
+	}
+	job := checkoutObservationJobForTest(lc, worktree)
+	if job == nil || job.ctx.Err() != nil {
+		t.Fatal("stale refusal did not retain a live discovery job")
+	}
+	// The retained job owns capacity and a worker until expiry or shutdown.
+	lc.closeCheckoutObservations()
+	if !errors.Is(job.ctx.Err(), context.Canceled) {
+		t.Fatalf("Close did not cancel retained stale discovery: %v", job.ctx.Err())
+	}
+	lc.observationMu.Lock()
+	active := len(lc.observationJobs)
+	lc.observationMu.Unlock()
+	if active != 0 {
+		t.Fatalf("Close retained %d discovery jobs", active)
+	}
+}
+
 func TestObserveCheckoutPathUnknownFamilyAndDeniedScopeHaveNoSideEffects(t *testing.T) {
 	lc, catalog, primary, familyID, configPath, _ := newCheckoutObservationFixture(t)
 	before, err := os.ReadFile(configPath)
@@ -380,7 +469,9 @@ func TestObserveCheckoutPathRejectsInventoryWithReboundGitMarker(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var inventories atomic.Int32
 	lc.observationInventory = func(ctx context.Context, path string) (*gitstate.FamilyInventory, error) {
+		inventories.Add(1)
 		inv, err := gitstate.Inventory(ctx, path)
 		if err != nil {
 			return nil, err
@@ -391,13 +482,23 @@ func TestObserveCheckoutPathRejectsInventoryWithReboundGitMarker(t *testing.T) {
 		}
 		return inv, nil
 	}
-	authorized := false
-	_, found, err := observeCheckoutUntilSettled(t, lc, worktree, func(string) error {
-		authorized = true
-		return nil
-	})
-	if found || !errors.Is(err, ErrCheckoutMutationStale) || authorized {
-		t.Fatalf("old inventory acquired new binding authority: found=%v err=%v authorized=%v", found, err, authorized)
+	// Judge the job that received the pre-rebind inventory, not a request retry
+	// loop. Slow Git can outlast the request wait, the refused job is then
+	// forgotten, and a retry's fresh inventory legitimately sees the new binding.
+	job, err := lc.checkoutObservation(pathkey.CanonicalExistingRoot(worktree))
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-job.done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("checkout observation did not finish")
+	}
+	if job.proof != nil || job.found || !errors.Is(job.proofErr, ErrCheckoutMutationStale) {
+		t.Fatalf("old inventory acquired new binding authority: proof=%v found=%v err=%v", job.proof != nil, job.found, job.proofErr)
+	}
+	if n := inventories.Load(); n != 1 {
+		t.Fatalf("observation took %d inventories, want only the pre-rebind one", n)
 	}
 	rows, err := catalog.ListCheckouts(t.Context(), familyID)
 	if err != nil || len(rows) != 1 {

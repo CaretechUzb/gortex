@@ -13,8 +13,7 @@
 //	    "gortex": {
 //	      "source": "custom",
 //	      "command": "gortex",
-//	      "args": ["mcp", "--index", ".", "--watch"],
-//	      "env": {"GORTEX_INDEX_WORKERS": "8"}
+//	      "args": ["mcp", "--index", ".", "--watch"]
 //	    }
 //	  }
 //	}
@@ -59,6 +58,16 @@ func userSettingsPath(home string) string {
 	default:
 		return ""
 	}
+}
+
+// WritesCommunitiesRouting reports that this adapter merges the
+// communities routing block into its instruction file (project mode).
+func (a *Adapter) WritesCommunitiesRouting() bool { return true }
+
+// CommunitiesRoutingPath reports the instruction file that carries the
+// communities block in project mode.
+func (a *Adapter) CommunitiesRoutingPath(env agents.Env) string {
+	return filepath.Join(env.Root, ".rules")
 }
 
 // Detect checks for the zed CLI on PATH or the platform-specific
@@ -121,7 +130,6 @@ func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, 
 			"source":  "custom",
 			"command": "gortex",
 			"args":    []string{"mcp"},
-			"env":     map[string]string{"GORTEX_INDEX_WORKERS": "8"},
 		}
 		root["context_servers"] = servers
 		return true, nil

@@ -84,10 +84,24 @@ func New() *Adapter                { return &Adapter{} }
 func (a *Adapter) Name() string    { return Name }
 func (a *Adapter) DocsURL() string { return DocsURL }
 
+// WritesSkillFiles reports that this adapter installs the generated
+// community skills as files under .copilot/skills.
+func (a *Adapter) WritesSkillFiles() bool { return true }
+
 // lookCopilotBinary is a seam so the "no Copilot installed" detection
 // test stays hermetic on a developer machine that happens to have the
 // CLI on PATH.
 var lookCopilotBinary = func() (string, error) { return exec.LookPath("copilot") }
+
+// WritesCommunitiesRouting reports that this adapter merges the
+// communities routing block into its instruction file (project mode).
+func (a *Adapter) WritesCommunitiesRouting() bool { return true }
+
+// CommunitiesRoutingPath reports the instruction file that carries the
+// communities block in project mode.
+func (a *Adapter) CommunitiesRoutingPath(env agents.Env) string {
+	return repoInstructionsPath(env.Root)
+}
 
 // Detect looks for the `copilot` binary or an existing config home.
 // Deliberately never keys off .vscode — Copilot-in-VS-Code is the
@@ -392,8 +406,9 @@ func upsertCopilotMCPServer(root map[string]any, w io.Writer, path string, opts 
 // reconcileRepoMCPJSON repairs a Gortex-authored entry in the repo's
 // .mcp.json so the file the CLI finds first does not shadow the config
 // we just wrote with one it cannot use. The claudecode adapter owns
-// that file and writes an entry with no "type" and a shell-style
-// "${GORTEX_WORKERS:-8}" default the CLI never expands.
+// that file and writes an entry with no "type"; entries written before
+// the worker default was dropped also carry a shell-style
+// "${GORTEX_WORKERS:-8}" env value the CLI never expands.
 //
 // The file is only ever edited, never created: an absent .mcp.json is
 // claudecode's to author, and every non-Gortex server entry in it is

@@ -6,8 +6,6 @@
 //	[mcp_servers.gortex]
 //	command = "gortex"
 //	args = ["mcp", "--index", ".", "--watch"]
-//	[mcp_servers.gortex.env]
-//	GORTEX_INDEX_WORKERS = "8"
 //
 // Docs: https://github.com/openai/codex/blob/main/docs/config.md
 package codex
@@ -87,6 +85,20 @@ type Adapter struct{}
 func New() *Adapter                { return &Adapter{} }
 func (a *Adapter) Name() string    { return Name }
 func (a *Adapter) DocsURL() string { return DocsURL }
+
+// WritesSkillFiles reports that this adapter installs the generated
+// community skills as files (~/.codex/skills).
+func (a *Adapter) WritesSkillFiles() bool { return true }
+
+// WritesCommunitiesRouting reports that this adapter merges the
+// communities routing block into its instruction file (project mode).
+func (a *Adapter) WritesCommunitiesRouting() bool { return true }
+
+// CommunitiesRoutingPath reports the instruction file that carries the
+// communities block in project mode.
+func (a *Adapter) CommunitiesRoutingPath(env agents.Env) string {
+	return filepath.Join(env.Root, "AGENTS.md")
+}
 
 // Detect checks for the codex CLI on PATH or ~/.codex/.
 func (a *Adapter) Detect(env agents.Env) (bool, error) {
@@ -329,9 +341,6 @@ func upsertCodexMCPServer(root map[string]any, opts agents.ApplyOpts) bool {
 		"command":             agents.ResolveGortexLaunchBinary(),
 		"args":                []string{"mcp"},
 		"startup_timeout_sec": codexMCPStartupTimeoutSeconds,
-		"env": map[string]any{
-			"GORTEX_INDEX_WORKERS": "8",
-		},
 	}
 	existing, exists := servers["gortex"]
 	if !exists || opts.Force {
@@ -348,6 +357,9 @@ func upsertCodexMCPServer(root map[string]any, opts agents.ApplyOpts) bool {
 	}
 	changed := migrateCodexFacadeToolApprovals(entry)
 	if pruneManagedCodexRequired(entry) {
+		changed = true
+	}
+	if pruneManagedCodexIndexWorkers(entry) {
 		changed = true
 	}
 	if pinCodexBareGortexCommand(entry) {
@@ -394,6 +406,31 @@ func pruneManagedCodexRequired(entry map[string]any) bool {
 		return false
 	}
 	delete(entry, "required")
+	return true
+}
+
+// pruneManagedCodexIndexWorkers removes the GORTEX_INDEX_WORKERS = "8" env
+// entry earlier releases wrote into their own Codex MCP entry, dropping the
+// env table when nothing else is left in it, and reports whether it removed
+// anything.
+//
+// The value was inert while per-repository configs ignored the variable.
+// Once they honour it, a daemon autostarted from Codex inherits it and
+// parses with 8 workers instead of runtime.NumCPU(), which is a cap the user
+// never chose. Only the exact value Gortex wrote is pruned; any other value
+// is the user's and stays.
+func pruneManagedCodexIndexWorkers(entry map[string]any) bool {
+	env, ok := entry["env"].(map[string]any)
+	if !ok {
+		return false
+	}
+	if v, _ := env["GORTEX_INDEX_WORKERS"].(string); v != "8" {
+		return false
+	}
+	delete(env, "GORTEX_INDEX_WORKERS")
+	if len(env) == 0 {
+		delete(entry, "env")
+	}
 	return true
 }
 

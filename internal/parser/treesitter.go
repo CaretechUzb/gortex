@@ -1,7 +1,9 @@
 package parser
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -62,9 +64,70 @@ type QueryResult struct {
 	Captures map[string]*CapturedNode
 }
 
+// ErrUTF16Source is returned when the source carries a UTF-16 byte-order
+// mark. Feeding UTF-16 bytes to a grammar as if they were UTF-8 produces
+// NUL-interleaved garbage whose error recovery is pathological (minutes
+// per file); transcoding to UTF-8 first would shift every byte coordinate
+// the extractor slices from the original buffer. The right fix per caller
+// is to skip the file (indexing) or transcode and keep the transcode as
+// the extraction buffer.
+var ErrUTF16Source = errors.New("source is UTF-16: refusing to parse NUL-interleaved bytes as UTF-8")
+
+// hasUTF16BOM reports whether src starts with a UTF-16 byte-order mark
+// (LE or BE).
+func hasUTF16BOM(src []byte) bool {
+	return len(src) >= 2 && ((src[0] == 0xFF && src[1] == 0xFE) || (src[0] == 0xFE && src[1] == 0xFF))
+}
+
+// ErrBinarySource is returned when the source carries a NUL byte within
+// its first binarySniffBytes — the same tell git uses to classify a blob
+// as binary. A NUL-bearing source is not text a text grammar can consume
+// without pathological error recovery: a binary payload that a language
+// extension nonetheless claimed (a tool cache .pkl, an object file)
+// drives tree-sitter into pathological balancing, burning the whole
+// parse budget for zero nodes. UTF-16 text is NUL-interleaved too and is
+// classified here as binary — the pipeline never transcodes it, so it
+// never yielded useful nodes as "text" either.
+var ErrBinarySource = errors.New("source is binary: refusing to feed NUL-bearing bytes to a text grammar")
+
+// binarySniffBytes bounds the binary content sniff. Git classifies a blob
+// as binary when its first 8000 bytes contain a NUL; 8 KiB is the same
+// heuristic rounded to a page-friendly bound.
+const binarySniffBytes = 8192
+
+// LooksBinary reports whether src carries a NUL byte within its first
+// binarySniffBytes. Exported so the indexer's extraction admission can
+// share one definition with this parse guard — a file the indexer skips
+// as binary and one ParseFile refuses must be the same file.
+func LooksBinary(src []byte) bool {
+	if len(src) > binarySniffBytes {
+		src = src[:binarySniffBytes]
+	}
+	return bytes.IndexByte(src, 0) >= 0
+}
+
 // ParseFile parses source bytes with the given language and returns the tree.
 // The caller must call tree.Close() when done.
 func ParseFile(src []byte, lang *sitter.Language) (*sitter.Tree, error) {
+	// Guard before the parser pool. The UTF-16 check must run BEFORE any
+	// binary/NUL sniff: a UTF-16 source's NUL-interleaved bytes would
+	// otherwise be labelled "binary" instead of "UTF-16", and nothing would
+	// name the real cause. The indexer's utf16-decode transform decodes
+	// healthy UTF-16 sources ahead of extraction (its BOM-strip then
+	// removes the mark), and a coordinate-stable preparation refuses a
+	// declined UTF-16 source outright — so this guard is a backstop for
+	// direct ParseFile callers, not the primary defence.
+	if hasUTF16BOM(src) {
+		return nil, ErrUTF16Source
+	}
+	// A binary payload (a tool-cache pickle, an object file) claimed by a
+	// language extension is not text a grammar can consume, and its error
+	// recovery is pathological. The indexer's extraction admission skips
+	// these before they reach here; this backstop covers every other
+	// ParseFile caller.
+	if LooksBinary(src) {
+		return nil, ErrBinarySource
+	}
 	parser := getParser(lang)
 	// Pool the parser only on a clean parse. An errored parse (cancelled
 	// / timed out) may have left the C parser's canceled_balancing flag
